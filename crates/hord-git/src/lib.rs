@@ -15,6 +15,7 @@
 mod error;
 mod export;
 mod import;
+mod leaf;
 mod oid;
 mod store;
 

@@ -10,6 +10,7 @@ use hord_core::{
     Snapshot, SnapshotId, SnapshotMetadata, Timestamp, Tree, TreeEntry, TreeOpKind,
 };
 
+use crate::leaf::{GitLeaf, MODE_BLOB};
 use crate::store::Store;
 use crate::{Error, GitOid};
 
@@ -20,10 +21,6 @@ fn git_import_toolchain() -> ObjectId {
 
 fn git_commit_ref(sha: &str) -> String {
     format!("git/commit/{sha}")
-}
-
-fn git_modes_ref(tree: ObjectId) -> String {
-    format!("git/modes/{tree}")
 }
 
 /// Import `HEAD` of `git_dir` into `store`.
@@ -280,41 +277,43 @@ fn import_tree<S: Store>(
 
     let tree = repo.find_tree(git_id).map_err(Error::git)?;
     let mut entries = BTreeMap::new();
-    let mut modes = BTreeMap::new();
 
     for entry in tree.iter() {
         let entry = entry.map_err(Error::git)?;
         let name = entry_name(entry.filename())?;
         let oid = entry.oid().to_owned();
         let kind = entry.mode().kind();
+        let octal = mode_octal(entry.mode());
         match kind {
             EntryKind::Tree => {
                 let child = import_tree(store, repo, oid, cache)?;
-                modes.insert(name.clone(), mode_octal(entry.mode()));
                 entries.insert(name, TreeEntry::Tree(child));
             }
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
                 let blob = import_blob(store, repo, oid, cache)?;
-                modes.insert(name.clone(), mode_octal(entry.mode()));
-                entries.insert(name, TreeEntry::Blob(blob));
+                entries.insert(name, TreeEntry::Blob(put_leaf(store, octal, blob)?));
             }
             EntryKind::Commit => {
                 // Submodule gitlink: store the target commit SHA as blob bytes.
                 let blob = store.put_object(&Blob::new(oid.to_hex().to_string().into_bytes()))?;
-                modes.insert(name.clone(), mode_octal(entry.mode()));
-                entries.insert(name, TreeEntry::Blob(blob));
+                entries.insert(name, TreeEntry::Blob(put_leaf(store, octal, blob)?));
             }
         }
     }
 
     let hord_tree = Tree { entries };
     let id = store.put_object(&hord_tree)?;
-    if !modes.is_empty() {
-        let modes_id = store.put_object(&modes)?;
-        store.set_ref(&git_modes_ref(id), modes_id)?;
-    }
     cache.trees.insert(git_id, id);
     Ok(id)
+}
+
+/// Regular `100644` files are stored as a plain [`Blob`]. Any other git mode
+/// is a [`GitLeaf`] so chmod-only trees get a distinct [`ObjectId`].
+fn put_leaf<S: Store>(store: &mut S, octal: String, blob: ObjectId) -> Result<ObjectId, Error> {
+    if octal == MODE_BLOB {
+        return Ok(blob);
+    }
+    store.put_object(&GitLeaf { mode: octal, blob })
 }
 
 fn import_blob<S: Store>(
@@ -496,8 +495,4 @@ pub(crate) fn open_repo(path: &Path) -> Result<gix::Repository, Error> {
             ))),
         },
     }
-}
-
-pub(crate) fn git_modes_ref_name(tree: ObjectId) -> String {
-    git_modes_ref(tree)
 }

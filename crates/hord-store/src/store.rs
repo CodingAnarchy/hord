@@ -1,25 +1,27 @@
 //! [`Store`]: content-addressed objects, log, refs, and workspaces.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hord_core::{ChangeId, ObjectId, SnapshotId};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::pack::{PackWriter, PackedLocation, atomic_write, pack_path, read_packed};
+use crate::pack::{PackWriter, PackedLocation, pack_path, read_packed};
 use crate::workspace::WorkspaceRow;
 use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
 
 /// Directory name of a Hord store, next to the repository root (spec §8.1).
 pub const HORD_DIR: &str = ".hord";
 
-/// Pack loose objects once this many have been written since the last pack.
-const PACK_THRESHOLD: u64 = 512;
+/// Persist buffered refs after this many `set_ref` calls without an intervening
+/// [`Store::append_log`], [`Store::set_head`], [`Store::pack`], or [`Store::flush`].
+const REF_FLUSH_BATCH: usize = 4096;
 
 const LOG: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("log");
 const REFS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("refs");
@@ -40,12 +42,22 @@ const META_NEXT_PACK: &str = "next_pack";
 /// - `objects/<ab>/<rest>` — uncompressed loose objects
 /// - `objects/pack/pack-<id>.pack` + `.idx` — zstd-compressed packs
 /// - `ws/<ulid>/` — workspace materialization directories
+///
+/// [`Store::put`] writes loose objects and does not pack. Spec §8.1 packs
+/// recently written data with a background job; call [`Store::pack`] for that.
 pub struct Store {
     repo_root: PathBuf,
     hord_dir: PathBuf,
+    objects_dir: PathBuf,
     db: Database,
     pack_lock: Mutex<()>,
-    loose_since_pack: AtomicU64,
+    /// Object ids written or observed by this process. Avoids a stat + redb
+    /// lookup on the git-import duplicate path.
+    present: Mutex<HashSet<ObjectId>>,
+    /// Refs waiting for the next write transaction (import does `set_ref` per
+    /// tree; flushing on [`Store::append_log`] batches them per commit).
+    pending_refs: Mutex<HashMap<String, ObjectId>>,
+    has_packs: AtomicBool,
 }
 
 impl std::fmt::Debug for Store {
@@ -67,16 +79,20 @@ impl Store {
             return Err(Error::AlreadyExists(hord_dir));
         }
         fs::create_dir_all(&hord_dir)?;
-        fs::create_dir_all(hord_dir.join("objects").join("pack"))?;
+        let objects_dir = hord_dir.join("objects");
+        create_shard_dirs(&objects_dir)?;
         fs::create_dir_all(hord_dir.join("ws"))?;
         let db = Database::create(hord_dir.join("index.redb")).map_err(Error::index)?;
         init_tables(&db)?;
         Ok(Self {
             repo_root,
             hord_dir,
+            objects_dir,
             db,
             pack_lock: Mutex::new(()),
-            loose_since_pack: AtomicU64::new(0),
+            present: Mutex::new(HashSet::with_capacity(1 << 16)),
+            pending_refs: Mutex::new(HashMap::new()),
+            has_packs: AtomicBool::new(false),
         })
     }
 
@@ -89,12 +105,17 @@ impl Store {
             return Err(Error::MissingStore(hord_dir));
         }
         let db = Database::open(index).map_err(Error::index)?;
+        let objects_dir = hord_dir.join("objects");
+        let has_packs = pack_dir_has_packs(&objects_dir.join("pack"));
         Ok(Self {
             repo_root,
             hord_dir,
+            objects_dir,
             db,
             pack_lock: Mutex::new(()),
-            loose_since_pack: AtomicU64::new(0),
+            present: Mutex::new(HashSet::with_capacity(1 << 16)),
+            pending_refs: Mutex::new(HashMap::new()),
+            has_packs: AtomicBool::new(has_packs),
         })
     }
 
@@ -113,15 +134,15 @@ impl Store {
     /// Store already-canonical CBOR bytes. The [`ObjectId`] is BLAKE3-256 of
     /// `canonical_cbor` (spec §3.1, §3.9).
     ///
-    /// Writes a loose object. Identical bytes are idempotent.
+    /// Writes a loose object. Identical bytes are idempotent. Does not pack;
+    /// call [`Store::pack`] (spec §8.1: packing is a background job).
     pub fn put(&self, canonical_cbor: &[u8]) -> Result<ObjectId> {
         let id = ObjectId::from_canonical(canonical_cbor);
-        if self.contains(id)? {
+        if self.cached_present(id) {
             return Ok(id);
         }
         self.write_loose(id, canonical_cbor)?;
-        self.loose_since_pack.fetch_add(1, Ordering::Relaxed);
-        self.maybe_pack()?;
+        self.mark_present(id);
         Ok(id)
     }
 
@@ -130,7 +151,9 @@ impl Store {
         if let Some(bytes) = self.read_loose(id)? {
             return ensure_id(id, bytes);
         }
-        if let Some(loc) = self.packed_location(id)? {
+        if self.has_packs.load(Ordering::Relaxed)
+            && let Some(loc) = self.packed_location(id)?
+        {
             let bytes = read_packed(&pack_path(&self.pack_dir(), loc.pack), &loc)?;
             return ensure_id(id, bytes);
         }
@@ -139,10 +162,18 @@ impl Store {
 
     /// Whether `id` is present as a loose or packed object.
     pub fn contains(&self, id: ObjectId) -> Result<bool> {
-        if self.loose_path(id).is_file() {
+        if self.cached_present(id) {
             return Ok(true);
         }
-        Ok(self.packed_location(id)?.is_some())
+        if self.loose_path(id).is_file() {
+            self.mark_present(id);
+            return Ok(true);
+        }
+        if self.has_packs.load(Ordering::Relaxed) && self.packed_location(id)?.is_some() {
+            self.mark_present(id);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Canonical-encode `value` and [`put`](Self::put) the bytes.
@@ -158,9 +189,14 @@ impl Store {
     }
 
     /// Append `change` to the landing log (spec §3.7). Order is landing order.
+    ///
+    /// Also persists any buffered [`Store::set_ref`] calls in the same write
+    /// transaction.
     pub fn append_log(&self, change: ChangeId) -> Result<()> {
+        let mut pending = lock_map(&self.pending_refs);
         let txn = self.db.begin_write().map_err(Error::index)?;
         {
+            write_pending_refs(&txn, &pending)?;
             let mut table = txn.open_table(LOG).map_err(Error::index)?;
             let next = match table.last().map_err(Error::index)? {
                 Some((k, _)) => k.value() + 1,
@@ -171,6 +207,7 @@ impl Store {
                 .map_err(Error::index)?;
         }
         txn.commit().map_err(Error::index)?;
+        pending.clear();
         Ok(())
     }
 
@@ -187,8 +224,21 @@ impl Store {
     }
 
     /// Set `head` to the latest landed change (spec §3.7).
+    ///
+    /// Also persists any buffered [`Store::set_ref`] calls in the same write
+    /// transaction.
     pub fn set_head(&self, change: ChangeId) -> Result<()> {
-        self.meta_set(META_HEAD, change.as_bytes().as_slice())
+        let mut pending = lock_map(&self.pending_refs);
+        let txn = self.db.begin_write().map_err(Error::index)?;
+        {
+            write_pending_refs(&txn, &pending)?;
+            let mut meta = txn.open_table(META).map_err(Error::index)?;
+            meta.insert(META_HEAD, change.as_bytes().as_slice())
+                .map_err(Error::index)?;
+        }
+        txn.commit().map_err(Error::index)?;
+        pending.clear();
+        Ok(())
     }
 
     /// Current `head`, if any change has landed.
@@ -204,26 +254,39 @@ impl Store {
     /// are not.
     pub fn set_ref(&self, name: &str, id: ObjectId) -> Result<()> {
         validate_ref_name(name)?;
-        let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            let mut table = txn.open_table(REFS).map_err(Error::index)?;
-            table
-                .insert(name, id.as_bytes().as_slice())
-                .map_err(Error::index)?;
+        let mut pending = lock_map(&self.pending_refs);
+        pending.insert(name.to_owned(), id);
+        if pending.len() >= REF_FLUSH_BATCH {
+            flush_pending_refs(&self.db, &mut pending)?;
         }
-        txn.commit().map_err(Error::index)?;
         Ok(())
     }
 
     /// Resolve a named ref.
     pub fn get_ref(&self, name: &str) -> Result<Option<ObjectId>> {
         validate_ref_name(name)?;
+        {
+            let pending = lock_map(&self.pending_refs);
+            if let Some(id) = pending.get(name) {
+                return Ok(Some(*id));
+            }
+        }
         let txn = self.db.begin_read().map_err(Error::index)?;
         let table = txn.open_table(REFS).map_err(Error::index)?;
         match table.get(name).map_err(Error::index)? {
             Some(v) => Ok(Some(object_id_from_value(v.value())?)),
             None => Ok(None),
         }
+    }
+
+    /// Persist buffered refs to the redb index.
+    ///
+    /// [`Store::set_ref`] batches into the next [`Store::append_log`],
+    /// [`Store::set_head`], [`Store::pack`], or this call. Called automatically
+    /// on drop.
+    pub fn flush(&self) -> Result<()> {
+        let mut pending = lock_map(&self.pending_refs);
+        flush_pending_refs(&self.db, &mut pending)
     }
 
     /// Create a workspace overlay on `base` and its materialization directory
@@ -284,25 +347,17 @@ impl Store {
 
     /// Pack all current loose objects into a new zstd pack file with a sidecar
     /// offset index. Returns the number of objects packed.
+    ///
+    /// Also persists any buffered [`Store::set_ref`] calls.
     pub fn pack(&self) -> Result<usize> {
+        self.flush()?;
         let _guard = self.pack_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.pack_inner()
-    }
-
-    fn maybe_pack(&self) -> Result<()> {
-        if self.loose_since_pack.load(Ordering::Relaxed) < PACK_THRESHOLD {
-            return Ok(());
-        }
-        if let Ok(_guard) = self.pack_lock.try_lock() {
-            self.pack_inner()?;
-        }
-        Ok(())
     }
 
     fn pack_inner(&self) -> Result<usize> {
         let loose = self.list_loose()?;
         if loose.is_empty() {
-            self.loose_since_pack.store(0, Ordering::Relaxed);
             return Ok(0);
         }
         let pack_id = self.next_pack_id()?;
@@ -311,17 +366,12 @@ impl Store {
         let mut locations: Vec<(ObjectId, PackedLocation)> = Vec::new();
         let mut packed_paths: Vec<PathBuf> = Vec::new();
         for (id, path) in &loose {
-            if self.packed_location(*id)?.is_some() {
-                let _ = fs::remove_file(path);
-                continue;
-            }
             let bytes = fs::read(path)?;
             let loc = writer.add(*id, &bytes)?;
             locations.push((*id, loc));
             packed_paths.push(path.clone());
         }
         if writer.is_empty() {
-            self.loose_since_pack.store(0, Ordering::Relaxed);
             return Ok(0);
         }
         writer.finish(&pack_dir)?;
@@ -346,16 +396,23 @@ impl Store {
                 fs::remove_file(path)?;
             }
         }
-        self.loose_since_pack.store(0, Ordering::Relaxed);
+        self.has_packs.store(true, Ordering::Relaxed);
         Ok(n)
     }
 
     fn write_loose(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
         let path = self.loose_path(id);
-        if path.is_file() {
-            return Ok(());
+        match fs::write(&path, bytes) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, bytes)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
         }
-        atomic_write(&path, bytes)
     }
 
     fn read_loose(&self, id: ObjectId) -> Result<Option<Vec<u8>>> {
@@ -367,15 +424,23 @@ impl Store {
     }
 
     fn loose_path(&self, id: ObjectId) -> PathBuf {
-        let hex = id.to_hex();
-        self.hord_dir
-            .join("objects")
-            .join(&hex[..2])
-            .join(&hex[2..])
+        let hex = hex_encode(id.as_bytes());
+        let mut path = self.objects_dir.clone();
+        path.push(std::str::from_utf8(&hex[..2]).expect("hex is ascii"));
+        path.push(std::str::from_utf8(&hex[2..]).expect("hex is ascii"));
+        path
     }
 
     fn pack_dir(&self) -> PathBuf {
-        self.hord_dir.join("objects").join("pack")
+        self.objects_dir.join("pack")
+    }
+
+    fn cached_present(&self, id: ObjectId) -> bool {
+        lock_set(&self.present).contains(&id)
+    }
+
+    fn mark_present(&self, id: ObjectId) {
+        lock_set(&self.present).insert(id);
     }
 
     fn workspace_dir(&self, id: WorkspaceId) -> PathBuf {
@@ -413,20 +478,10 @@ impl Store {
         }
     }
 
-    fn meta_set(&self, key: &str, value: &[u8]) -> Result<()> {
-        let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            let mut table = txn.open_table(META).map_err(Error::index)?;
-            table.insert(key, value).map_err(Error::index)?;
-        }
-        txn.commit().map_err(Error::index)?;
-        Ok(())
-    }
-
     fn list_loose(&self) -> Result<Vec<(ObjectId, PathBuf)>> {
-        let root = self.hord_dir.join("objects");
+        let root = &self.objects_dir;
         let mut out = Vec::new();
-        let shards = match fs::read_dir(&root) {
+        let shards = match fs::read_dir(root) {
             Ok(s) => s,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e.into()),
@@ -467,6 +522,12 @@ impl Store {
     }
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 fn init_tables(db: &Database) -> Result<()> {
     let txn = db.begin_write().map_err(Error::index)?;
     txn.open_table(LOG).map_err(Error::index)?;
@@ -500,4 +561,73 @@ fn validate_ref_name(name: &str) -> Result<()> {
         return Err(Error::InvalidRef(name.to_owned()));
     }
     Ok(())
+}
+
+fn lock_set(mutex: &Mutex<HashSet<ObjectId>>) -> std::sync::MutexGuard<'_, HashSet<ObjectId>> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_map(
+    mutex: &Mutex<HashMap<String, ObjectId>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, ObjectId>> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_pending_refs(txn: &WriteTransaction, pending: &HashMap<String, ObjectId>) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut table = txn.open_table(REFS).map_err(Error::index)?;
+    for (name, id) in pending {
+        table
+            .insert(name.as_str(), id.as_bytes().as_slice())
+            .map_err(Error::index)?;
+    }
+    Ok(())
+}
+
+fn flush_pending_refs(db: &Database, pending: &mut HashMap<String, ObjectId>) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let txn = db.begin_write().map_err(Error::index)?;
+    write_pending_refs(&txn, pending)?;
+    txn.commit().map_err(Error::index)?;
+    pending.clear();
+    Ok(())
+}
+
+fn create_shard_dirs(objects_dir: &Path) -> Result<()> {
+    fs::create_dir_all(objects_dir.join("pack"))?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &a in HEX {
+        for &b in HEX {
+            let shard = [a, b];
+            fs::create_dir_all(
+                objects_dir.join(std::str::from_utf8(&shard).expect("hex is ascii")),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn pack_dir_has_packs(pack_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return false;
+    };
+    entries.filter_map(std::result::Result::ok).any(|e| {
+        e.path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pack"))
+    })
+}
+
+fn hex_encode(bytes: &[u8; ObjectId::LEN]) -> [u8; ObjectId::LEN * 2] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; ObjectId::LEN * 2];
+    for (i, &b) in bytes.iter().enumerate() {
+        out[i * 2] = HEX[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    out
 }

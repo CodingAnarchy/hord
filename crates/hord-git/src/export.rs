@@ -1,6 +1,5 @@
 //! Project Hord snapshots to git trees and landed changes to git commits.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use gix::bstr::BString;
@@ -9,7 +8,8 @@ use hord_core::{
     Actor, Blob, ChangeId, ChangeRecord, NodeFile, ObjectId, SnapshotId, Tree, TreeEntry,
 };
 
-use crate::import::{git_modes_ref_name, open_repo};
+use crate::import::open_repo;
+use crate::leaf::{GitLeaf, parse_mode};
 use crate::store::Store;
 use crate::{Error, GitOid};
 
@@ -18,8 +18,8 @@ use crate::{Error, GitOid};
 ///
 /// `snapshot_id` is the [`ObjectId`] of the root [`Tree`] (spec §3.1), not of
 /// the [`hord_core::Snapshot`] wrapper. Exported trees are byte-identical to
-/// this projection. File modes other than `100644` are restored from git-bridge
-/// metadata recorded at import time.
+/// this projection. File modes other than `100644` are stored on the leaf
+/// object so chmod-only trees keep distinct ids.
 pub fn export_tree<S: Store>(
     store: &S,
     snapshot_id: SnapshotId,
@@ -74,27 +74,17 @@ fn export_tree_into<S: Store>(
     repo: &gix::Repository,
 ) -> Result<gix::ObjectId, Error> {
     let tree: Tree = store.get_object(tree_id)?;
-    let modes = load_modes(store, tree_id)?;
     let mut entries = Vec::with_capacity(tree.entries.len());
 
     for (name, entry) in &tree.entries {
-        let (kind, oid) = match entry {
-            TreeEntry::Tree(id) => (EntryKind::Tree, export_tree_into(store, *id, repo)?),
-            TreeEntry::Blob(id) => {
-                let kind = file_kind(modes.get(name).map(String::as_str));
-                let oid = export_blob_or_gitlink(store, *id, kind, repo)?;
-                (kind, oid)
-            }
+        let (mode, oid) = match entry {
+            TreeEntry::Tree(id) => (EntryKind::Tree.into(), export_tree_into(store, *id, repo)?),
+            TreeEntry::Blob(id) => export_leaf(store, *id, repo)?,
             TreeEntry::NodeFile(id) => {
-                let kind = file_kind(modes.get(name).map(String::as_str));
                 let oid = export_node_file(store, *id, repo)?;
-                (kind, oid)
+                (EntryKind::Blob.into(), oid)
             }
         };
-        let mode = modes
-            .get(name)
-            .and_then(|octal| EntryMode::from_bytes(octal.as_bytes()))
-            .unwrap_or_else(|| kind.into());
         entries.push(gix::objs::tree::Entry {
             mode,
             filename: BString::from(name.as_str()),
@@ -107,22 +97,34 @@ fn export_tree_into<S: Store>(
         .map_err(Error::git)
 }
 
-fn export_blob_or_gitlink<S: Store>(
+fn export_leaf<S: Store>(
     store: &S,
-    blob_id: ObjectId,
-    kind: EntryKind,
+    id: ObjectId,
     repo: &gix::Repository,
-) -> Result<gix::ObjectId, Error> {
-    let blob: Blob = store.get_object(blob_id)?;
-    if kind == EntryKind::Commit {
+) -> Result<(EntryMode, gix::ObjectId), Error> {
+    if let Ok(blob) = store.get_object::<Blob>(id) {
+        let oid = repo
+            .write_blob(blob.bytes.as_slice())
+            .map(|id| id.detach())
+            .map_err(Error::git)?;
+        return Ok((EntryKind::Blob.into(), oid));
+    }
+    let leaf: GitLeaf = store.get_object(id)?;
+    let mode = parse_mode(&leaf.mode)
+        .ok_or_else(|| Error::Git(format!("invalid stored git mode {:?}", leaf.mode)))?;
+    let blob: Blob = store.get_object(leaf.blob)?;
+    if mode.kind() == EntryKind::Commit {
         let hex = std::str::from_utf8(blob.bytes.as_slice())
             .map_err(|_| Error::Git("gitlink blob is not UTF-8 hex".into()))?;
-        return gix::ObjectId::from_hex(hex.as_bytes())
-            .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")));
+        let oid = gix::ObjectId::from_hex(hex.as_bytes())
+            .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")))?;
+        return Ok((mode, oid));
     }
-    repo.write_blob(blob.bytes.as_slice())
+    let oid = repo
+        .write_blob(blob.bytes.as_slice())
         .map(|id| id.detach())
-        .map_err(Error::git)
+        .map_err(Error::git)?;
+    Ok((mode, oid))
 }
 
 fn export_node_file<S: Store>(
@@ -202,20 +204,6 @@ fn lookup_exported(repo: &gix::Repository, change_id: ChangeId) -> Option<gix::O
     let reference = repo.find_reference(name.as_str()).ok()?;
     let id = reference.id();
     Some(id.detach())
-}
-
-fn load_modes<S: Store>(store: &S, tree_id: ObjectId) -> Result<BTreeMap<String, String>, Error> {
-    match store.get_ref(&git_modes_ref_name(tree_id))? {
-        Some(id) => store.get_object(id),
-        None => Ok(BTreeMap::new()),
-    }
-}
-
-fn file_kind(octal: Option<&str>) -> EntryKind {
-    match octal.and_then(|s| EntryMode::from_bytes(s.as_bytes())) {
-        Some(mode) => mode.kind(),
-        None => EntryKind::Blob,
-    }
 }
 
 /// Build the git commit message with Hord trailers (spec §9).

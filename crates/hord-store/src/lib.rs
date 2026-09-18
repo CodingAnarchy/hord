@@ -1,12 +1,14 @@
 //! Local content-addressed object store (spec §8.1).
 //!
 //! Objects are addressed by [`hord_core::ObjectId`] (BLAKE3-256 of canonical CBOR).
-//! Recently written data is stored as loose files under `.hord/objects/`;
-//! [`Store::pack`] (and automatic packing past a loose-object threshold)
-//! writes zstd-compressed pack files with a sidecar offset index.
+//! Recently written data is stored as loose files under `.hord/objects/`.
+//! [`Store::pack`] writes zstd-compressed pack files with a sidecar offset
+//! index (spec §8.1: packing is a background job, not part of [`Store::put`]).
 //!
 //! The redb index holds the landing [`Store::log`], named refs, workspace
-//! metadata, and packed-object locations. Tables `node_history` and
+//! metadata, and packed-object locations. [`Store::set_ref`] is buffered and
+//! flushed on [`Store::append_log`], [`Store::set_head`], [`Store::pack`],
+//! [`Store::flush`], or drop. Tables `node_history` and
 //! `evidence_by_snapshot` are created empty and are rebuildable.
 
 #![forbid(unsafe_code)]

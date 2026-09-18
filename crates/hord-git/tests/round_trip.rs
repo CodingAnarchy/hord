@@ -305,3 +305,64 @@ fn import_is_idempotent() {
     assert_eq!(a, b);
     assert_eq!(store.log().unwrap().len(), 4);
 }
+
+/// Same bytes, different git modes must keep distinct tree SHAs after a joint import.
+/// Sidecar `git/modes/{hord-tree-id}` refs collide here because the Hord tree id
+/// is content-only.
+#[test]
+fn chmod_only_and_gitlink_round_trip() {
+    let (dir, mut fx) = Fixture::init();
+
+    let script = fx.write_blob(b"#!/bin/sh\necho hi\n");
+    let readme = fx.write_blob(b"readme\n");
+    let link = fx.write_blob(b"readme");
+    let gitlink = gix::ObjectId::from_hex(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+
+    let tree_644 = fx.write_tree(vec![
+        fx.entry("README", EntryKind::Blob, readme),
+        fx.entry("run.sh", EntryKind::Blob, script),
+        fx.entry("alias", EntryKind::Link, link),
+        fx.entry("vendor", EntryKind::Commit, gitlink),
+    ]);
+    let a = fx.commit(tree_644, vec![], "regular script", "", 1_700_000_000);
+
+    let tree_755 = fx.write_tree(vec![
+        fx.entry("README", EntryKind::Blob, readme),
+        fx.entry("run.sh", EntryKind::BlobExecutable, script),
+        fx.entry("alias", EntryKind::Link, link),
+        fx.entry("vendor", EntryKind::Commit, gitlink),
+    ]);
+    let b = fx.commit(tree_755, vec![a], "chmod +x run.sh", "", 1_700_000_100);
+    fx.set_head(b);
+
+    let mut store = MemoryStore::new();
+    import_git(&mut store, dir.path()).unwrap();
+    assert_eq!(store.log().unwrap().len(), 2);
+
+    let dest = TempDir::new("modes-dst");
+    for change_id in store.log().unwrap() {
+        let change: ChangeRecord = store.get_object(change_id).unwrap();
+        let git_sha = change
+            .intent
+            .refs
+            .iter()
+            .find_map(|r| match r {
+                IntentRef::GitCommit { sha } => Some(sha.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        let expected = fx
+            .commits
+            .iter()
+            .find(|(sha, _, _)| sha == git_sha)
+            .unwrap();
+        let exported = export_tree(&store, change.result, dest.path()).unwrap();
+        assert_eq!(
+            exported.to_hex(),
+            expected.1,
+            "tree SHA mismatch for {} ({})",
+            expected.2,
+            git_sha
+        );
+    }
+}
