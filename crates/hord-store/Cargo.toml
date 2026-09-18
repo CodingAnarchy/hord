@@ -1,0 +1,21 @@
+[package]
+name = "hord-store"
+description = "Local content-addressed store (.hord/) for Hord"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hord-core.workspace = true
+hord-encoding.workspace = true
+redb.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

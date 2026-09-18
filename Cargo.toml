@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hord-encoding",
+    "crates/hord-core",
+    "crates/hord-store",
+    "crates/hord-git",
+    "crates/hord-cli",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+cbor2 = "1.1"
+clap = { version = "4", features = ["derive"] }
+gix = "0.87"
+hex = "0.4"
+hord-core = { path = "crates/hord-core" }
+hord-encoding = { path = "crates/hord-encoding" }
+hord-git = { path = "crates/hord-git" }
+hord-store = { path = "crates/hord-store" }
+proptest = "1"
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync"] }
+ulid = "3"
+zstd = "0.13"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"

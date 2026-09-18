@@ -1,0 +1,290 @@
+//! Project Hord snapshots to git trees and landed changes to git commits.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use gix::bstr::BString;
+use gix::objs::tree::EntryKind;
+use hord_core::{
+    Actor, Blob, ChangeId, ChangeRecord, NodeFile, ObjectId, SnapshotId, Tree, TreeEntry,
+};
+
+use crate::import::{git_modes_ref_name, open_repo};
+use crate::store::Store;
+use crate::{Error, GitOid};
+
+/// Project the snapshot root tree `snapshot_id` into `git_dir` and return the
+/// git tree SHA.
+///
+/// `snapshot_id` is the [`ObjectId`] of the root [`Tree`] (spec §3.1), not of
+/// the [`hord_core::Snapshot`] wrapper. Exported trees are byte-identical to
+/// this projection. File modes other than `100644` are restored from git-bridge
+/// metadata recorded at import time.
+pub fn export_tree<S: Store>(
+    store: &S,
+    snapshot_id: SnapshotId,
+    git_dir: impl AsRef<Path>,
+) -> Result<GitOid, Error> {
+    let git_dir = git_dir.as_ref();
+    let repo = open_or_init(git_dir)?;
+    let oid = export_tree_into(store, snapshot_id, &repo)?;
+    Ok(GitOid::from_gix(oid))
+}
+
+/// Export a landed change as a git commit with Hord trailers.
+///
+/// The commit message ends with:
+///
+/// ```text
+/// Hord-Change: <id>
+/// Hord-Intent: <summary>
+/// Hord-Actor: <actor>
+/// ```
+///
+/// The commit tree is the projection of `change.result`. Parent git commits
+/// are resolved from previously exported changes (`refs/hord/changes/<id>`)
+/// or from [`hord_core::IntentRef::GitCommit`] on the parent records.
+pub fn export_change<S: Store>(
+    store: &S,
+    change_id: ChangeId,
+    git_dir: impl AsRef<Path>,
+) -> Result<GitOid, Error> {
+    let git_dir = git_dir.as_ref();
+    let repo = open_or_init(git_dir)?;
+    let oid = export_change_into(store, change_id, &repo)?;
+    Ok(GitOid::from_gix(oid))
+}
+
+/// Export every landed change in log order. Returns the tip commit SHA.
+pub fn export_log<S: Store>(store: &S, git_dir: impl AsRef<Path>) -> Result<GitOid, Error> {
+    let git_dir = git_dir.as_ref();
+    let repo = open_or_init(git_dir)?;
+    let log = store.log()?;
+    let mut last = None;
+    for change_id in log {
+        last = Some(export_change_into(store, change_id, &repo)?);
+    }
+    last.map(GitOid::from_gix)
+        .ok_or_else(|| Error::Git("hord log is empty".into()))
+}
+
+fn export_tree_into<S: Store>(
+    store: &S,
+    tree_id: ObjectId,
+    repo: &gix::Repository,
+) -> Result<gix::ObjectId, Error> {
+    let tree: Tree = store.get_object(tree_id)?;
+    let modes = load_modes(store, tree_id)?;
+    let mut entries = Vec::with_capacity(tree.entries.len());
+
+    for (name, entry) in &tree.entries {
+        let (kind, oid) = match entry {
+            TreeEntry::Tree(id) => (EntryKind::Tree, export_tree_into(store, *id, repo)?),
+            TreeEntry::Blob(id) => {
+                let kind = file_kind(modes.get(name).copied());
+                let oid = export_blob_or_gitlink(store, *id, kind, repo)?;
+                (kind, oid)
+            }
+            TreeEntry::NodeFile(id) => {
+                let kind = file_kind(modes.get(name).copied());
+                let oid = export_node_file(store, *id, repo)?;
+                (kind, oid)
+            }
+        };
+        entries.push(gix::objs::tree::Entry {
+            mode: kind.into(),
+            filename: BString::from(name.as_str()),
+            oid,
+        });
+    }
+    entries.sort();
+    repo.write_object(&gix::objs::Tree { entries })
+        .map(|id| id.detach())
+        .map_err(Error::git)
+}
+
+fn export_blob_or_gitlink<S: Store>(
+    store: &S,
+    blob_id: ObjectId,
+    kind: EntryKind,
+    repo: &gix::Repository,
+) -> Result<gix::ObjectId, Error> {
+    let blob: Blob = store.get_object(blob_id)?;
+    if kind == EntryKind::Commit {
+        let hex = std::str::from_utf8(blob.bytes.as_slice())
+            .map_err(|_| Error::Git("gitlink blob is not UTF-8 hex".into()))?;
+        return gix::ObjectId::from_hex(hex.as_bytes())
+            .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")));
+    }
+    repo.write_blob(blob.bytes.as_slice())
+        .map(|id| id.detach())
+        .map_err(Error::git)
+}
+
+fn export_node_file<S: Store>(
+    store: &S,
+    id: ObjectId,
+    repo: &gix::Repository,
+) -> Result<gix::ObjectId, Error> {
+    if let Ok(blob) = store.get_object::<Blob>(id) {
+        return repo
+            .write_blob(blob.bytes.as_slice())
+            .map(|id| id.detach())
+            .map_err(Error::git);
+    }
+    let node_file: NodeFile = store.get_object(id)?;
+    let blob: Blob = store.get_object(node_file.raw_hash)?;
+    repo.write_blob(blob.bytes.as_slice())
+        .map(|id| id.detach())
+        .map_err(Error::git)
+}
+
+fn export_change_into<S: Store>(
+    store: &S,
+    change_id: ChangeId,
+    repo: &gix::Repository,
+) -> Result<gix::ObjectId, Error> {
+    if let Some(existing) = lookup_exported(repo, change_id) {
+        return Ok(existing);
+    }
+
+    let change: ChangeRecord = store.get_object(change_id)?;
+    let tree = export_tree_into(store, change.result, repo)?;
+
+    let mut parents = Vec::new();
+    for parent in &change.parents {
+        parents.push(export_change_into(store, *parent, repo)?);
+    }
+
+    let actor = actor_trailer(&change.provenance.actor);
+    let message = format_commit_message(
+        &change.intent.summary,
+        &change.intent.body,
+        change_id,
+        &actor,
+    );
+    let author = git_signature(
+        &change.provenance.actor,
+        change.provenance.created_at.as_millis(),
+    );
+
+    let commit = gix::objs::Commit {
+        tree,
+        parents: parents.into_iter().collect(),
+        author: author.clone(),
+        committer: author,
+        encoding: None,
+        message: BString::from(message),
+        extra_headers: Vec::new(),
+    };
+    let commit_id = repo
+        .write_object(&commit)
+        .map(|id| id.detach())
+        .map_err(Error::git)?;
+
+    let ref_name = format!("refs/hord/changes/{change_id}");
+    repo.reference(
+        ref_name.as_str(),
+        commit_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "hord export",
+    )
+    .map_err(Error::git)?;
+    Ok(commit_id)
+}
+
+fn lookup_exported(repo: &gix::Repository, change_id: ChangeId) -> Option<gix::ObjectId> {
+    let name = format!("refs/hord/changes/{change_id}");
+    let reference = repo.find_reference(name.as_str()).ok()?;
+    let id = reference.id();
+    Some(id.detach())
+}
+
+fn load_modes<S: Store>(store: &S, tree_id: ObjectId) -> Result<BTreeMap<String, u16>, Error> {
+    match store.get_ref(&git_modes_ref_name(tree_id))? {
+        Some(id) => store.get_object(id),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+fn file_kind(mode: Option<u16>) -> EntryKind {
+    match mode {
+        Some(m) if m == EntryKind::BlobExecutable as u16 => EntryKind::BlobExecutable,
+        Some(m) if m == EntryKind::Link as u16 => EntryKind::Link,
+        Some(m) if m == EntryKind::Commit as u16 => EntryKind::Commit,
+        Some(m) if m == EntryKind::Tree as u16 => EntryKind::Tree,
+        _ => EntryKind::Blob,
+    }
+}
+
+/// Build the git commit message with Hord trailers (spec §9).
+pub fn format_commit_message(
+    summary: &str,
+    body: &str,
+    change_id: ChangeId,
+    actor: &str,
+) -> String {
+    let mut msg = String::new();
+    msg.push_str(summary);
+    msg.push('\n');
+    if !body.is_empty() {
+        msg.push('\n');
+        msg.push_str(body);
+        if !body.ends_with('\n') {
+            msg.push('\n');
+        }
+    }
+    msg.push('\n');
+    msg.push_str(&format!("Hord-Change: {change_id}\n"));
+    msg.push_str(&format!("Hord-Intent: {summary}\n"));
+    msg.push_str(&format!("Hord-Actor: {actor}\n"));
+    msg
+}
+
+fn actor_trailer(actor: &Actor) -> String {
+    match actor {
+        Actor::Human { id } => id.clone(),
+        Actor::Agent {
+            id, model, harness, ..
+        } => format!("{id} ({model}, {harness})"),
+    }
+}
+
+fn git_signature(actor: &Actor, created_at_ms: u64) -> gix::actor::Signature {
+    let (name, email) = match actor {
+        Actor::Human { id } => parse_git_author(id),
+        Actor::Agent { id, .. } => (id.clone(), "agent@hord".to_owned()),
+    };
+    let seconds = (created_at_ms / 1000) as i64;
+    gix::actor::Signature {
+        name: BString::from(name),
+        email: BString::from(email),
+        time: gix::date::Time::new(seconds, 0),
+    }
+}
+
+fn parse_git_author(id: &str) -> (String, String) {
+    if let Some(start) = id.find('<')
+        && let Some(end) = id.rfind('>')
+        && end > start
+    {
+        let name = id[..start].trim().to_owned();
+        let email = id[start + 1..end].to_owned();
+        if !name.is_empty() && !email.is_empty() {
+            return (name, email);
+        }
+    }
+    (id.to_owned(), "unknown@hord".to_owned())
+}
+
+fn open_or_init(path: &Path) -> Result<gix::Repository, Error> {
+    if let Ok(mut repo) = open_repo(path) {
+        repo.object_cache_size_if_unset(4 * 1024 * 1024);
+        return Ok(repo);
+    }
+    std::fs::create_dir_all(path).map_err(|source| Error::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    gix::init_bare(path).map_err(|e| Error::git(format!("init {}: {e}", path.display())))
+}

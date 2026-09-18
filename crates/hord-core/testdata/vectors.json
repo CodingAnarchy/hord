@@ -1,0 +1,15 @@
+{
+  "comment": "Golden canonical CBOR (RFC 8949 §4.2.1) for hord-core objects. `hex` is the expected encoding; `object_id` is BLAKE3-256 of those bytes. Blob bytes are CBOR major type 2.",
+  "blob": {
+    "name": "deadbeef",
+    "comment": "Blob { bytes: h'deadbeef' }. Keys: bytes. Payload is bstr 0x44deadbeef, not an integer array.",
+    "hex": "a165627974657344deadbeef",
+    "object_id": "1e2b042924ed58c9682b28f58ee5798cce2660b480e1ba651247a727cb588a01"
+  },
+  "snapshot": {
+    "name": "zero-meta-null-index",
+    "comment": "Snapshot { tree: 32-byte 0x11, metadata.toolchain: null, index.identity/edges: null }. Map keys sort as tree, index, metadata (encoded-key order).",
+    "hex": "a364747265655820111111111111111111111111111111111111111111111111111111111111111165696e646578a2656564676573f6686964656e74697479f6686d65746164617461a169746f6f6c636861696ef6",
+    "object_id": "cab58178526fe75de0b4c049fbbc7ac292ba2241956303116dc6ca735c6ba30c"
+  }
+}

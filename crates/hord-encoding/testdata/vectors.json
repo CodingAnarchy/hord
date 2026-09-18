@@ -1,0 +1,78 @@
+{
+  "comment": "Golden canonical CBOR (RFC 8949 §4.2.1). `hex` is the expected encoding. Integer/bytes/text values are constructed in tests; maps include unsorted `insert` order that must encode with bytewise-sorted keys.",
+  "integers": [
+    { "name": "0", "i": 0, "hex": "00" },
+    { "name": "1", "i": 1, "hex": "01" },
+    { "name": "10", "i": 10, "hex": "0a" },
+    { "name": "23", "i": 23, "hex": "17" },
+    { "name": "24", "i": 24, "hex": "1818" },
+    { "name": "25", "i": 25, "hex": "1819" },
+    { "name": "100", "i": 100, "hex": "1864" },
+    { "name": "255", "i": 255, "hex": "18ff" },
+    { "name": "256", "i": 256, "hex": "190100" },
+    { "name": "1000", "i": 1000, "hex": "1903e8" },
+    { "name": "65535", "i": 65535, "hex": "19ffff" },
+    { "name": "65536", "i": 65536, "hex": "1a00010000" },
+    { "name": "1000000", "i": 1000000, "hex": "1a000f4240" },
+    { "name": "4294967295", "i": 4294967295, "hex": "1affffffff" },
+    { "name": "4294967296", "i": 4294967296, "hex": "1b0000000100000000" },
+    { "name": "1000000000000", "i": 1000000000000, "hex": "1b000000e8d4a51000" },
+    { "name": "u64-max", "u": "18446744073709551615", "hex": "1bffffffffffffffff" },
+    { "name": "minus-1", "i": -1, "hex": "20" },
+    { "name": "minus-10", "i": -10, "hex": "29" },
+    { "name": "minus-24", "i": -24, "hex": "37" },
+    { "name": "minus-25", "i": -25, "hex": "3818" },
+    { "name": "minus-100", "i": -100, "hex": "3863" },
+    { "name": "minus-256", "i": -256, "hex": "38ff" },
+    { "name": "minus-257", "i": -257, "hex": "390100" },
+    { "name": "minus-1000", "i": -1000, "hex": "3903e7" },
+    { "name": "minus-65536", "i": -65536, "hex": "39ffff" },
+    { "name": "minus-65537", "i": -65537, "hex": "3a00010000" },
+    { "name": "minus-4294967296", "i": -4294967296, "hex": "3affffffff" },
+    { "name": "minus-4294967297", "i": "-4294967297", "hex": "3b0000000100000000" },
+    { "name": "i64-min", "i": "-9223372036854775808", "hex": "3b7fffffffffffffff" }
+  ],
+  "bytes": [
+    { "name": "empty", "bytes": "", "hex": "40" },
+    { "name": "one", "bytes": "01", "hex": "4101" },
+    { "name": "deadbeef", "bytes": "deadbeef", "hex": "44deadbeef" },
+    { "name": "len-23", "bytes": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "hex": "57aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "name": "len-24", "bytes": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "hex": "5818aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+  ],
+  "text": [
+    { "name": "empty", "text": "", "hex": "60" },
+    { "name": "a", "text": "a", "hex": "6161" },
+    { "name": "IETF", "text": "IETF", "hex": "6449455446" },
+    { "name": "len-23", "text": "aaaaaaaaaaaaaaaaaaaaaaa", "hex": "776161616161616161616161616161616161616161616161" },
+    { "name": "len-24", "text": "aaaaaaaaaaaaaaaaaaaaaaaa", "hex": "7818616161616161616161616161616161616161616161616161" }
+  ],
+  "arrays": [
+    { "name": "empty", "hex": "80" },
+    { "name": "123", "hex": "83010203" },
+    { "name": "nested", "hex": "8301820203820405" }
+  ],
+  "maps": [
+    { "name": "empty", "hex": "a0" },
+    {
+      "name": "unsorted-text-keys",
+      "comment": "Inserted z, aa, b; encoded order is b, z, aa (bytewise encoded keys).",
+      "hex": "a3616203617a0162616102"
+    },
+    {
+      "name": "rfc8949-4.2.1-key-order",
+      "comment": "RFC 8949 §4.2.1 example keys, values 0, inserted in reverse of canonical order.",
+      "hex": "a80a001864002000617a006261610081186400812000f400"
+    },
+    {
+      "name": "nested-maps",
+      "comment": "Outer keys a, b; inner map inserted z then aa, encoded z then aa.",
+      "hex": "a26161006162a2617a0162616102"
+    }
+  ],
+  "object_id_fixture": {
+    "name": "blob-deadbeef",
+    "comment": "Map {kind: blob, bytes: h'deadbeef'}. Keys sort kind then bytes. ObjectId is BLAKE3-256 of hex.",
+    "hex": "a2646b696e6464626c6f6265627974657344deadbeef",
+    "object_id": "22183579ef684c8813557b8b2de345a69ed2114ea62b574f9cc75f3658e97f0d"
+  }
+}
