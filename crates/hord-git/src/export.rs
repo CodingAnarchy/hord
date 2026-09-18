@@ -1,9 +1,11 @@
 //! Project Hord snapshots to git trees and landed changes to git commits.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use gix::bstr::BString;
 use gix::objs::tree::{EntryKind, EntryMode};
+use gix::objs::{Kind as GitKind, WriteTo};
 use hord_core::{
     Actor, Blob, ChangeId, ChangeRecord, NodeFile, ObjectId, SnapshotId, Tree, TreeEntry,
 };
@@ -29,6 +31,127 @@ pub fn export_tree<S: Store>(
     let repo = open_or_init(git_dir)?;
     let oid = export_tree_into(store, snapshot_id, &repo)?;
     Ok(GitOid::from_gix(oid))
+}
+
+/// Memoizes git object ids already projected from Hord [`ObjectId`]s.
+///
+/// Shared blobs and subtrees are hashed once. The M0 eval walks every commit
+/// in a history; without this cache each commit re-hashes its whole tree.
+#[derive(Clone, Debug, Default)]
+pub struct ExportCache {
+    trees: HashMap<ObjectId, gix::ObjectId>,
+    leaves: HashMap<ObjectId, (EntryMode, gix::ObjectId)>,
+}
+
+/// Git tree SHA of a Hord tree, hashed in memory (no destination repository).
+///
+/// Same bytes as [`export_tree`], so `export(import(repo))` can be checked
+/// without writing a second git odb. `hash` must match the source repository
+/// (`repo.object_hash()`, SHA-1 for cargo/tokio).
+pub fn git_tree_sha<S: Store>(
+    store: &S,
+    snapshot_id: SnapshotId,
+    hash: gix::hash::Kind,
+    cache: &mut ExportCache,
+) -> Result<GitOid, Error> {
+    hash_tree(store, snapshot_id, hash, cache).map(GitOid::from_gix)
+}
+
+fn hash_tree<S: Store>(
+    store: &S,
+    tree_id: ObjectId,
+    hash: gix::hash::Kind,
+    cache: &mut ExportCache,
+) -> Result<gix::ObjectId, Error> {
+    if let Some(oid) = cache.trees.get(&tree_id) {
+        return Ok(*oid);
+    }
+    let tree: Tree = store.get_object(tree_id)?;
+    let mut entries = Vec::with_capacity(tree.entries.len());
+    for (name, entry) in &tree.entries {
+        let (mode, oid) = match entry {
+            TreeEntry::Tree(id) => (EntryKind::Tree.into(), hash_tree(store, *id, hash, cache)?),
+            TreeEntry::Blob(id) => hash_leaf(store, *id, hash, cache)?,
+            TreeEntry::NodeFile(id) => {
+                let oid = hash_node_file(store, *id, hash, cache)?;
+                (EntryKind::Blob.into(), oid)
+            }
+        };
+        entries.push(gix::objs::tree::Entry {
+            mode,
+            filename: BString::from(name.as_str()),
+            oid,
+        });
+    }
+    entries.sort();
+    let encoded = encode_tree(entries)?;
+    let oid = gix::objs::compute_hash(hash, GitKind::Tree, &encoded).map_err(Error::git)?;
+    cache.trees.insert(tree_id, oid);
+    Ok(oid)
+}
+
+fn hash_leaf<S: Store>(
+    store: &S,
+    id: ObjectId,
+    hash: gix::hash::Kind,
+    cache: &mut ExportCache,
+) -> Result<(EntryMode, gix::ObjectId), Error> {
+    if let Some(cached) = cache.leaves.get(&id) {
+        return Ok(*cached);
+    }
+    let pair = if let Ok(blob) = store.get_object::<Blob>(id) {
+        let oid = hash_blob(hash, blob.bytes.as_slice())?;
+        (EntryKind::Blob.into(), oid)
+    } else {
+        let leaf: GitLeaf = store.get_object(id)?;
+        let mode = parse_mode(&leaf.mode)
+            .ok_or_else(|| Error::Git(format!("invalid stored git mode {:?}", leaf.mode)))?;
+        let blob: Blob = store.get_object(leaf.blob)?;
+        let oid = if mode.kind() == EntryKind::Commit {
+            let hex = std::str::from_utf8(blob.bytes.as_slice())
+                .map_err(|_| Error::Git("gitlink blob is not UTF-8 hex".into()))?;
+            gix::ObjectId::from_hex(hex.as_bytes())
+                .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")))?
+        } else {
+            hash_blob(hash, blob.bytes.as_slice())?
+        };
+        (mode, oid)
+    };
+    cache.leaves.insert(id, pair);
+    Ok(pair)
+}
+
+fn hash_node_file<S: Store>(
+    store: &S,
+    id: ObjectId,
+    hash: gix::hash::Kind,
+    cache: &mut ExportCache,
+) -> Result<gix::ObjectId, Error> {
+    if let Some((_, oid)) = cache.leaves.get(&id) {
+        return Ok(*oid);
+    }
+    let bytes = if let Ok(blob) = store.get_object::<Blob>(id) {
+        blob.bytes
+    } else {
+        let node_file: NodeFile = store.get_object(id)?;
+        let blob: Blob = store.get_object(node_file.raw_hash)?;
+        blob.bytes
+    };
+    let oid = hash_blob(hash, bytes.as_slice())?;
+    cache.leaves.insert(id, (EntryKind::Blob.into(), oid));
+    Ok(oid)
+}
+
+fn hash_blob(hash: gix::hash::Kind, bytes: &[u8]) -> Result<gix::ObjectId, Error> {
+    gix::objs::compute_hash(hash, GitKind::Blob, bytes).map_err(Error::git)
+}
+
+fn encode_tree(entries: Vec<gix::objs::tree::Entry>) -> Result<Vec<u8>, Error> {
+    let tree = gix::objs::Tree { entries };
+    let mut buf = Vec::new();
+    tree.write_to(&mut buf)
+        .map_err(|e| Error::git(format!("encode git tree: {e}")))?;
+    Ok(buf)
 }
 
 /// Export a landed change as a git commit with Hord trailers.

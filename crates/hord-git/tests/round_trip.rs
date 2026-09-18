@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gix::bstr::{BString, ByteSlice};
 use gix::objs::tree::EntryKind;
 use hord_core::{ChangeRecord, IntentRef};
-use hord_git::{MemoryStore, Store, export_change, export_tree, import_git, import_git_window};
+use hord_git::{
+    ExportCache, MemoryStore, Store, export_change, export_tree, git_tree_sha, import_git,
+    import_git_window,
+};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -223,6 +226,19 @@ fn import_export_reproduces_every_tree_sha() {
             "tree SHA mismatch for commit {} ({})",
             expected.2,
             git_sha
+        );
+    }
+
+    let hash = fx.repo.object_hash();
+    let mut cache = ExportCache::default();
+    for change_id in &log {
+        let change: ChangeRecord = store.get_object(*change_id).unwrap();
+        let hashed = git_tree_sha(&store, change.result, hash, &mut cache).unwrap();
+        let written = export_tree(&store, change.result, dest.path()).unwrap();
+        assert_eq!(
+            hashed.to_hex(),
+            written.to_hex(),
+            "in-memory git_tree_sha must match export_tree"
         );
     }
 }

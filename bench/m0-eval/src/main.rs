@@ -24,7 +24,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use hord_core::{ChangeRecord, IntentRef};
-use hord_git::{Store as GitStore, export_tree, import_git, import_git_window};
+use hord_git::{ExportCache, Store as GitStore, git_tree_sha, import_git, import_git_window};
 use hord_store::Store;
 use serde::Serialize;
 
@@ -62,6 +62,7 @@ struct CaseReport {
     git_path: String,
     commits: u64,
     import_secs: f64,
+    check_secs: f64,
     commits_per_sec: f64,
     tree_mismatches: u64,
     throughput_ok: Option<bool>,
@@ -149,6 +150,7 @@ fn eval_hord() -> CaseReport {
             git_path: String::new(),
             commits: 0,
             import_secs: 0.0,
+            check_secs: 0.0,
             commits_per_sec: 0.0,
             tree_mismatches: 0,
             throughput_ok: None,
@@ -172,6 +174,7 @@ fn eval_remote(
             git_path: dest.display().to_string(),
             commits: 0,
             import_secs: 0.0,
+            check_secs: 0.0,
             commits_per_sec: 0.0,
             tree_mismatches: 0,
             throughput_ok: None,
@@ -204,6 +207,7 @@ fn eval_git(
             git_path: git_path_disp,
             commits: 0,
             import_secs: 0.0,
+            check_secs: 0.0,
             commits_per_sec: 0.0,
             tree_mismatches: 0,
             throughput_ok: None,
@@ -230,9 +234,11 @@ fn eval_git_inner(name: &str, git_path: &Path, window: Option<usize>) -> Result<
     let commits_per_sec = commits as f64 / import_secs;
     eprintln!("[{name}] imported {commits} commits in {import_secs:.2}s ({commits_per_sec:.1}/s)");
 
-    let dest = scratch(&format!("{name}-export"));
     let src = open_git(git_path)?;
+    let hash = src.object_hash();
+    let mut cache = ExportCache::default();
     let mut mismatches = 0u64;
+    let check_start = Instant::now();
     for (i, change_id) in log.iter().enumerate() {
         let change: ChangeRecord = GitStore::get_object(&store, *change_id)?;
         let git_sha = change
@@ -244,19 +250,25 @@ fn eval_git_inner(name: &str, git_path: &Path, window: Option<usize>) -> Result<
                 _ => None,
             })
             .context("imported change missing GitCommit ref")?;
-        let expected = git_tree_hex(&src, git_sha)?;
-        let exported = export_tree(&store, change.result, &dest)?;
-        if exported.to_hex() != expected {
+        let expected = git_tree_oid(&src, git_sha)?;
+        let exported = git_tree_sha(&store, change.result, hash, &mut cache)?;
+        if exported.as_gix() != expected {
             mismatches += 1;
             eprintln!(
-                "[{name}] tree SHA mismatch commit {git_sha}: expected {expected}, got {}",
+                "[{name}] tree SHA mismatch commit {git_sha}: expected {}, got {}",
+                expected.to_hex(),
                 exported.to_hex()
             );
         }
-        if (i + 1) % 200 == 0 {
+        if (i + 1) % 2000 == 0 {
             eprintln!("[{name}] checked {}/{commits} trees", i + 1);
         }
     }
+    let check_secs = check_start.elapsed().as_secs_f64();
+    eprintln!(
+        "[{name}] checked {commits} trees in {check_secs:.2}s ({:.1}/s)",
+        commits as f64 / check_secs.max(1e-9)
+    );
 
     let passed = mismatches == 0;
     Ok(CaseReport {
@@ -264,6 +276,7 @@ fn eval_git_inner(name: &str, git_path: &Path, window: Option<usize>) -> Result<
         git_path: git_path_disp,
         commits,
         import_secs,
+        check_secs,
         commits_per_sec,
         tree_mismatches: mismatches,
         throughput_ok: None,
@@ -272,12 +285,11 @@ fn eval_git_inner(name: &str, git_path: &Path, window: Option<usize>) -> Result<
     })
 }
 
-fn git_tree_hex(repo: &gix::Repository, commit_sha: &str) -> Result<String> {
+fn git_tree_oid(repo: &gix::Repository, commit_sha: &str) -> Result<gix::ObjectId> {
     let oid = gix::ObjectId::from_hex(commit_sha.as_bytes())
         .with_context(|| format!("parse git sha {commit_sha}"))?;
     let commit = repo.find_commit(oid).context("find source commit")?;
-    let tree = commit.tree_id().context("source tree")?.detach();
-    Ok(tree.to_hex().to_string())
+    Ok(commit.tree_id().context("source tree")?.detach())
 }
 
 fn open_git(path: &Path) -> Result<gix::Repository> {
@@ -342,8 +354,8 @@ fn scratch(prefix: &str) -> PathBuf {
 
 fn print_human(report: &Report) {
     println!(
-        "{:<8} {:>8} {:>10} {:>10} {:>12} result",
-        "corpus", "commits", "import-s", "comm/s", "mismatches"
+        "{:<8} {:>8} {:>10} {:>10} {:>10} {:>12} result",
+        "corpus", "commits", "import-s", "check-s", "comm/s", "mismatches"
     );
     for case in &report.cases {
         let result = if let Some(err) = &case.error {
@@ -358,8 +370,13 @@ fn print_human(report: &Report) {
             "PASS".into()
         };
         println!(
-            "{:<8} {:>8} {:>10.2} {:>10.1} {:>12} {result}",
-            case.name, case.commits, case.import_secs, case.commits_per_sec, case.tree_mismatches
+            "{:<8} {:>8} {:>10.2} {:>10.2} {:>10.1} {:>12} {result}",
+            case.name,
+            case.commits,
+            case.import_secs,
+            case.check_secs,
+            case.commits_per_sec,
+            case.tree_mismatches
         );
     }
     println!(
