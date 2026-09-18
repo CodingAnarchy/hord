@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hord_core::{ChangeId, ObjectId, SnapshotId};
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, Durability, ReadableTable, TableDefinition, WriteTransaction};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -22,6 +22,9 @@ pub const HORD_DIR: &str = ".hord";
 /// Persist buffered refs after this many `set_ref` calls without an intervening
 /// [`Store::append_log`], [`Store::set_head`], [`Store::pack`], or [`Store::flush`].
 const REF_FLUSH_BATCH: usize = 4096;
+/// Persist buffered log entries in one redb transaction. Git import is one
+/// `append_log` per commit; fsyncing each one caps throughput well below 200/s.
+const LOG_FLUSH_BATCH: usize = 4096;
 
 const LOG: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("log");
 const REFS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("refs");
@@ -55,8 +58,10 @@ pub struct Store {
     /// lookup on the git-import duplicate path.
     present: Mutex<HashSet<ObjectId>>,
     /// Refs waiting for the next write transaction (import does `set_ref` per
-    /// tree; flushing on [`Store::append_log`] batches them per commit).
+    /// tree; flushing on log batch / [`Store::set_head`] / [`Store::flush`]).
     pending_refs: Mutex<HashMap<String, ObjectId>>,
+    /// Landed changes not yet written to the redb `log` table.
+    pending_log: Mutex<Vec<ChangeId>>,
     has_packs: AtomicBool,
 }
 
@@ -92,6 +97,7 @@ impl Store {
             pack_lock: Mutex::new(()),
             present: Mutex::new(HashSet::with_capacity(1 << 16)),
             pending_refs: Mutex::new(HashMap::new()),
+            pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(false),
         })
     }
@@ -115,6 +121,7 @@ impl Store {
             pack_lock: Mutex::new(()),
             present: Mutex::new(HashSet::with_capacity(1 << 16)),
             pending_refs: Mutex::new(HashMap::new()),
+            pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(has_packs),
         })
     }
@@ -190,24 +197,18 @@ impl Store {
 
     /// Append `change` to the landing log (spec §3.7). Order is landing order.
     ///
-    /// Also persists any buffered [`Store::set_ref`] calls in the same write
-    /// transaction.
+    /// Buffered until a few thousand entries, [`Store::set_head`],
+    /// [`Store::pack`], [`Store::flush`], or drop. [`Store::log`] includes
+    /// entries that have not been flushed yet.
     pub fn append_log(&self, change: ChangeId) -> Result<()> {
-        let mut pending = lock_map(&self.pending_refs);
-        let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            write_pending_refs(&txn, &pending)?;
-            let mut table = txn.open_table(LOG).map_err(Error::index)?;
-            let next = match table.last().map_err(Error::index)? {
-                Some((k, _)) => k.value() + 1,
-                None => 0,
-            };
-            table
-                .insert(&next, change.as_bytes().as_slice())
-                .map_err(Error::index)?;
+        let flush = {
+            let mut log = lock_vec(&self.pending_log);
+            log.push(change);
+            log.len() >= LOG_FLUSH_BATCH
+        };
+        if flush {
+            self.persist_pending(Durability::None)?;
         }
-        txn.commit().map_err(Error::index)?;
-        pending.clear();
         Ok(())
     }
 
@@ -220,25 +221,17 @@ impl Store {
             let (_, v) = entry.map_err(Error::index)?;
             out.push(object_id_from_value(v.value())?);
         }
+        out.extend_from_slice(&lock_vec(&self.pending_log));
         Ok(out)
     }
 
     /// Set `head` to the latest landed change (spec §3.7).
     ///
-    /// Also persists any buffered [`Store::set_ref`] calls in the same write
-    /// transaction.
+    /// Flushes buffered refs and log entries in the same durable write.
     pub fn set_head(&self, change: ChangeId) -> Result<()> {
-        let mut pending = lock_map(&self.pending_refs);
-        let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            write_pending_refs(&txn, &pending)?;
-            let mut meta = txn.open_table(META).map_err(Error::index)?;
-            meta.insert(META_HEAD, change.as_bytes().as_slice())
-                .map_err(Error::index)?;
-        }
-        txn.commit().map_err(Error::index)?;
-        pending.clear();
-        Ok(())
+        let mut refs = lock_map(&self.pending_refs);
+        let mut log = lock_vec(&self.pending_log);
+        self.persist_locked(&mut refs, &mut log, Durability::Immediate, Some(change))
     }
 
     /// Current `head`, if any change has landed.
@@ -256,8 +249,10 @@ impl Store {
         validate_ref_name(name)?;
         let mut pending = lock_map(&self.pending_refs);
         pending.insert(name.to_owned(), id);
-        if pending.len() >= REF_FLUSH_BATCH {
-            flush_pending_refs(&self.db, &mut pending)?;
+        let flush = pending.len() >= REF_FLUSH_BATCH;
+        drop(pending);
+        if flush {
+            self.persist_pending(Durability::None)?;
         }
         Ok(())
     }
@@ -279,14 +274,44 @@ impl Store {
         }
     }
 
-    /// Persist buffered refs to the redb index.
+    /// Persist buffered refs and log entries to the redb index.
     ///
-    /// [`Store::set_ref`] batches into the next [`Store::append_log`],
-    /// [`Store::set_head`], [`Store::pack`], or this call. Called automatically
-    /// on drop.
+    /// [`Store::set_ref`] and [`Store::append_log`] batch into the next
+    /// [`Store::set_head`], [`Store::pack`], this call, or drop. Drop and this
+    /// method use durable commits; ingest batches do not fsync.
     pub fn flush(&self) -> Result<()> {
-        let mut pending = lock_map(&self.pending_refs);
-        flush_pending_refs(&self.db, &mut pending)
+        self.persist_pending(Durability::Immediate)
+    }
+
+    fn persist_pending(&self, durability: Durability) -> Result<()> {
+        let mut refs = lock_map(&self.pending_refs);
+        let mut log = lock_vec(&self.pending_log);
+        self.persist_locked(&mut refs, &mut log, durability, None)
+    }
+
+    fn persist_locked(
+        &self,
+        refs: &mut HashMap<String, ObjectId>,
+        log: &mut Vec<ChangeId>,
+        durability: Durability,
+        head: Option<ChangeId>,
+    ) -> Result<()> {
+        if refs.is_empty() && log.is_empty() && head.is_none() {
+            return Ok(());
+        }
+        let mut txn = self.db.begin_write().map_err(Error::index)?;
+        txn.set_durability(durability);
+        write_pending_refs(&txn, refs)?;
+        write_pending_log(&txn, log)?;
+        if let Some(change) = head {
+            let mut meta = txn.open_table(META).map_err(Error::index)?;
+            meta.insert(META_HEAD, change.as_bytes().as_slice())
+                .map_err(Error::index)?;
+        }
+        txn.commit().map_err(Error::index)?;
+        refs.clear();
+        log.clear();
+        Ok(())
     }
 
     /// Create a workspace overlay on `base` and its materialization directory
@@ -586,15 +611,26 @@ fn write_pending_refs(txn: &WriteTransaction, pending: &HashMap<String, ObjectId
     Ok(())
 }
 
-fn flush_pending_refs(db: &Database, pending: &mut HashMap<String, ObjectId>) -> Result<()> {
+fn write_pending_log(txn: &WriteTransaction, pending: &[ChangeId]) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
-    let txn = db.begin_write().map_err(Error::index)?;
-    write_pending_refs(&txn, pending)?;
-    txn.commit().map_err(Error::index)?;
-    pending.clear();
+    let mut table = txn.open_table(LOG).map_err(Error::index)?;
+    let start = match table.last().map_err(Error::index)? {
+        Some((k, _)) => k.value() + 1,
+        None => 0,
+    };
+    for (offset, id) in pending.iter().enumerate() {
+        let key = start + offset as u64;
+        table
+            .insert(&key, id.as_bytes().as_slice())
+            .map_err(Error::index)?;
+    }
     Ok(())
+}
+
+fn lock_vec(mutex: &Mutex<Vec<ChangeId>>) -> std::sync::MutexGuard<'_, Vec<ChangeId>> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn create_shard_dirs(objects_dir: &Path) -> Result<()> {

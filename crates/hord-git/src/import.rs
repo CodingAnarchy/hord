@@ -65,7 +65,7 @@ fn import_revwalk<S: Store>(
 ) -> Result<ChangeId, Error> {
     let git_dir = git_dir.as_ref();
     let mut repo = open_repo(git_dir)?;
-    repo.object_cache_size_if_unset(4 * 1024 * 1024);
+    repo.object_cache_size_if_unset(64 * 1024 * 1024);
 
     let tip = repo
         .rev_parse_single(git_ref)
@@ -168,6 +168,7 @@ fn topo_oldest_first(
 struct ImportCache {
     trees: HashMap<gix::ObjectId, ObjectId>,
     blobs: HashMap<gix::ObjectId, ObjectId>,
+    commits: HashMap<gix::ObjectId, ChangeId>,
 }
 
 fn import_commit<S: Store>(
@@ -178,8 +179,12 @@ fn import_commit<S: Store>(
     cache: &mut ImportCache,
     allow_missing_parents: bool,
 ) -> Result<ChangeId, Error> {
+    if let Some(existing) = cache.commits.get(&git_id) {
+        return Ok(*existing);
+    }
     let sha = GitOid::from_gix(git_id).to_hex();
     if let Some(existing) = store.get_ref(&git_commit_ref(&sha))? {
+        cache.commits.insert(git_id, existing);
         return Ok(existing);
     }
 
@@ -188,9 +193,16 @@ fn import_commit<S: Store>(
 
     let mut parents = Vec::with_capacity(parent_git_ids.len());
     for parent in &parent_git_ids {
+        if let Some(id) = cache.commits.get(parent) {
+            parents.push(*id);
+            continue;
+        }
         let parent_sha = GitOid::from_gix(*parent).to_hex();
         match store.get_ref(&git_commit_ref(&parent_sha))? {
-            Some(id) => parents.push(id),
+            Some(id) => {
+                cache.commits.insert(*parent, id);
+                parents.push(id);
+            }
             None if allow_missing_parents => {}
             None => {
                 return Err(Error::Git(format!(
@@ -262,6 +274,7 @@ fn import_commit<S: Store>(
     let change_id = store.put_object(&change)?;
     store.append_log(change_id)?;
     store.set_ref(&git_commit_ref(&sha), change_id)?;
+    cache.commits.insert(git_id, change_id);
     Ok(change_id)
 }
 
