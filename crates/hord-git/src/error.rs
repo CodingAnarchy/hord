@@ -54,3 +54,13 @@ impl Error {
         Self::Git(err.to_string())
     }
 }
+
+impl From<hord_store::Error> for Error {
+    fn from(err: hord_store::Error) -> Self {
+        match err {
+            hord_store::Error::MissingObject(id) => Self::Missing(id),
+            hord_store::Error::Encoding(e) => Self::Encoding(e),
+            other => Self::Git(other.to_string()),
+        }
+    }
+}

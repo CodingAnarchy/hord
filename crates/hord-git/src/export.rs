@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use gix::bstr::BString;
-use gix::objs::tree::EntryKind;
+use gix::objs::tree::{EntryKind, EntryMode};
 use hord_core::{
     Actor, Blob, ChangeId, ChangeRecord, NodeFile, ObjectId, SnapshotId, Tree, TreeEntry,
 };
@@ -81,18 +81,22 @@ fn export_tree_into<S: Store>(
         let (kind, oid) = match entry {
             TreeEntry::Tree(id) => (EntryKind::Tree, export_tree_into(store, *id, repo)?),
             TreeEntry::Blob(id) => {
-                let kind = file_kind(modes.get(name).copied());
+                let kind = file_kind(modes.get(name).map(String::as_str));
                 let oid = export_blob_or_gitlink(store, *id, kind, repo)?;
                 (kind, oid)
             }
             TreeEntry::NodeFile(id) => {
-                let kind = file_kind(modes.get(name).copied());
+                let kind = file_kind(modes.get(name).map(String::as_str));
                 let oid = export_node_file(store, *id, repo)?;
                 (kind, oid)
             }
         };
+        let mode = modes
+            .get(name)
+            .and_then(|octal| EntryMode::from_bytes(octal.as_bytes()))
+            .unwrap_or_else(|| kind.into());
         entries.push(gix::objs::tree::Entry {
-            mode: kind.into(),
+            mode,
             filename: BString::from(name.as_str()),
             oid,
         });
@@ -200,20 +204,17 @@ fn lookup_exported(repo: &gix::Repository, change_id: ChangeId) -> Option<gix::O
     Some(id.detach())
 }
 
-fn load_modes<S: Store>(store: &S, tree_id: ObjectId) -> Result<BTreeMap<String, u16>, Error> {
+fn load_modes<S: Store>(store: &S, tree_id: ObjectId) -> Result<BTreeMap<String, String>, Error> {
     match store.get_ref(&git_modes_ref_name(tree_id))? {
         Some(id) => store.get_object(id),
         None => Ok(BTreeMap::new()),
     }
 }
 
-fn file_kind(mode: Option<u16>) -> EntryKind {
-    match mode {
-        Some(m) if m == EntryKind::BlobExecutable as u16 => EntryKind::BlobExecutable,
-        Some(m) if m == EntryKind::Link as u16 => EntryKind::Link,
-        Some(m) if m == EntryKind::Commit as u16 => EntryKind::Commit,
-        Some(m) if m == EntryKind::Tree as u16 => EntryKind::Tree,
-        _ => EntryKind::Blob,
+fn file_kind(octal: Option<&str>) -> EntryKind {
+    match octal.and_then(|s| EntryMode::from_bytes(s.as_bytes())) {
+        Some(mode) => mode.kind(),
+        None => EntryKind::Blob,
     }
 }
 

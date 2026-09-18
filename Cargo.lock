@@ -1610,6 +1610,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hord-eval"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gix",
+ "hord-core",
+ "hord-git",
+ "hord-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hord-git"
 version = "0.0.0"
 dependencies = [

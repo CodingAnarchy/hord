@@ -6,6 +6,7 @@ members = [
     "crates/hord-store",
     "crates/hord-git",
     "crates/hord-cli",
+    "bench/m0-eval",
 ]
 
 [workspace.package]

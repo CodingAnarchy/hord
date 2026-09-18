@@ -1,0 +1,23 @@
+[package]
+name = "hord-eval"
+description = "M0 corpus round-trip evaluation (spec §12)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hord-eval"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gix.workspace = true
+hord-core.workspace = true
+hord-git.workspace = true
+hord-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true

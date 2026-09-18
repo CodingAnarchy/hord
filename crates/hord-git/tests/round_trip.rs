@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gix::bstr::{BString, ByteSlice};
 use gix::objs::tree::EntryKind;
 use hord_core::{ChangeRecord, IntentRef};
-use hord_git::{MemoryStore, Store, export_change, export_tree, import_git};
+use hord_git::{MemoryStore, Store, export_change, export_tree, import_git, import_git_window};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -286,6 +286,14 @@ fn export_change_writes_hord_trailers() {
     assert!(text.contains(&format!("Hord-Change: {head}")));
     assert!(text.contains("Hord-Intent: merge side"));
     assert!(text.contains("Hord-Actor: Ada Lovelace <ada@example.com>"));
+}
+
+#[test]
+fn window_imports_newest_n() {
+    let (src, _fx) = build_history();
+    let mut store = MemoryStore::new();
+    import_git_window(&mut store, src.path(), "HEAD", 2).unwrap();
+    assert_eq!(store.log().unwrap().len(), 2);
 }
 
 #[test]

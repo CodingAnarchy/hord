@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use gix::bstr::ByteSlice;
-use gix::objs::tree::EntryKind;
+use gix::objs::tree::{EntryKind, EntryMode};
 use hord_core::{
     Actor, Blob, ChangeId, ChangeRecord, Intent, IntentRef, ObjectId, Op, Provenance, RepoPath,
     Snapshot, SnapshotId, SnapshotMetadata, Timestamp, Tree, TreeEntry, TreeOpKind,
@@ -44,6 +44,28 @@ pub fn import_git_ref<S: Store>(
     git_dir: impl AsRef<Path>,
     git_ref: &str,
 ) -> Result<ChangeId, Error> {
+    import_revwalk(store, git_dir, git_ref, None)
+}
+
+/// Import up to `max_commits` newest ancestors of `git_ref` (spec §12 tokio window).
+///
+/// Parents that fall outside the window are omitted from [`ChangeRecord::parents`];
+/// the commit's tree is still imported so `export(import)` can check those SHAs.
+pub fn import_git_window<S: Store>(
+    store: &mut S,
+    git_dir: impl AsRef<Path>,
+    git_ref: &str,
+    max_commits: usize,
+) -> Result<ChangeId, Error> {
+    import_revwalk(store, git_dir, git_ref, Some(max_commits))
+}
+
+fn import_revwalk<S: Store>(
+    store: &mut S,
+    git_dir: impl AsRef<Path>,
+    git_ref: &str,
+    max_commits: Option<usize>,
+) -> Result<ChangeId, Error> {
     let git_dir = git_dir.as_ref();
     let mut repo = open_repo(git_dir)?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
@@ -58,24 +80,91 @@ pub fn import_git_ref<S: Store>(
     for info in walk {
         let info = info.map_err(Error::git)?;
         commit_ids.push(info.id);
+        if let Some(max) = max_commits
+            && commit_ids.len() >= max
+        {
+            break;
+        }
     }
     if commit_ids.is_empty() {
         return Err(Error::EmptyHistory(git_ref.to_owned()));
     }
-    commit_ids.reverse();
+    // Date order is not topological (clock skew, merges). Parents must come first.
+    commit_ids = topo_oldest_first(&repo, commit_ids)?;
 
     let empty_tree = store.put_object(&Tree::default())?;
     let mut cache = ImportCache::default();
     let mut last = None;
+    let allow_missing_parents = max_commits.is_some();
 
     for git_id in commit_ids {
-        let change = import_commit(store, &repo, git_id, empty_tree, &mut cache)?;
+        let change = import_commit(
+            store,
+            &repo,
+            git_id,
+            empty_tree,
+            &mut cache,
+            allow_missing_parents,
+        )?;
         last = Some(change);
     }
 
     let last = last.ok_or_else(|| Error::EmptyHistory(git_ref.to_owned()))?;
     store.set_head(last)?;
     Ok(last)
+}
+
+/// Order `ids` so every parent that is also in `ids` appears before its children.
+fn topo_oldest_first(
+    repo: &gix::Repository,
+    ids: Vec<gix::ObjectId>,
+) -> Result<Vec<gix::ObjectId>, Error> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let set: HashSet<gix::ObjectId> = ids.iter().copied().collect();
+    let mut remaining: HashMap<gix::ObjectId, usize> = HashMap::with_capacity(ids.len());
+    let mut children: HashMap<gix::ObjectId, Vec<gix::ObjectId>> = HashMap::new();
+
+    for id in &ids {
+        let commit = repo.find_commit(*id).map_err(Error::git)?;
+        let mut n = 0usize;
+        for parent in commit.parent_ids() {
+            let parent = parent.detach();
+            if set.contains(&parent) {
+                n += 1;
+                children.entry(parent).or_default().push(*id);
+            }
+        }
+        remaining.insert(*id, n);
+    }
+
+    let mut queue: VecDeque<gix::ObjectId> = ids
+        .iter()
+        .copied()
+        .filter(|id| remaining.get(id).copied() == Some(0))
+        .collect();
+    let mut out = Vec::with_capacity(ids.len());
+    while let Some(id) = queue.pop_front() {
+        out.push(id);
+        if let Some(kids) = children.get(&id) {
+            for child in kids {
+                if let Some(n) = remaining.get_mut(child) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        queue.push_back(*child);
+                    }
+                }
+            }
+        }
+    }
+    if out.len() != ids.len() {
+        return Err(Error::Git(format!(
+            "commit graph cycle or missing parent during import ({} of {} ordered)",
+            out.len(),
+            ids.len()
+        )));
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -90,6 +179,7 @@ fn import_commit<S: Store>(
     git_id: gix::ObjectId,
     empty_tree: ObjectId,
     cache: &mut ImportCache,
+    allow_missing_parents: bool,
 ) -> Result<ChangeId, Error> {
     let sha = GitOid::from_gix(git_id).to_hex();
     if let Some(existing) = store.get_ref(&git_commit_ref(&sha))? {
@@ -104,6 +194,7 @@ fn import_commit<S: Store>(
         let parent_sha = GitOid::from_gix(*parent).to_hex();
         match store.get_ref(&git_commit_ref(&parent_sha))? {
             Some(id) => parents.push(id),
+            None if allow_missing_parents => {}
             None => {
                 return Err(Error::Git(format!(
                     "parent {parent_sha} of {sha} was not imported"
@@ -199,19 +290,18 @@ fn import_tree<S: Store>(
         match kind {
             EntryKind::Tree => {
                 let child = import_tree(store, repo, oid, cache)?;
+                modes.insert(name.clone(), mode_octal(entry.mode()));
                 entries.insert(name, TreeEntry::Tree(child));
             }
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
                 let blob = import_blob(store, repo, oid, cache)?;
-                if kind != EntryKind::Blob {
-                    modes.insert(name.clone(), kind as u16);
-                }
+                modes.insert(name.clone(), mode_octal(entry.mode()));
                 entries.insert(name, TreeEntry::Blob(blob));
             }
             EntryKind::Commit => {
                 // Submodule gitlink: store the target commit SHA as blob bytes.
                 let blob = store.put_object(&Blob::new(oid.to_hex().to_string().into_bytes()))?;
-                modes.insert(name.clone(), kind as u16);
+                modes.insert(name.clone(), mode_octal(entry.mode()));
                 entries.insert(name, TreeEntry::Blob(blob));
             }
         }
@@ -240,6 +330,12 @@ fn import_blob<S: Store>(
     let id = store.put_object(&Blob::new(blob.data.clone()))?;
     cache.blobs.insert(git_id, id);
     Ok(id)
+}
+
+fn mode_octal(mode: EntryMode) -> String {
+    let mut buf = [0u8; 6];
+    let encoded = mode.as_bytes(&mut buf);
+    encoded.to_str().unwrap_or("100644").to_owned()
 }
 
 fn entry_name(name: &gix::bstr::BStr) -> Result<String, Error> {

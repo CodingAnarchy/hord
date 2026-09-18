@@ -1,10 +1,7 @@
 //! Store contract used by import/export (spec §8.1).
 //!
-//! `hord-store` is written in parallel. These methods match the expected
-//! `hord_store::Store` surface (`create`/`open`, `put`/`get`/`put_object`/
-//! `get_object`, `append_log`/`log`, `set_head`/`head`, `set_ref`/`get_ref`).
-//! [`MemoryStore`] is an in-memory stand-in for unit tests; integration tests
-//! should use `hord_store::Store` once that crate compiles.
+//! [`hord_store::Store`] implements this trait. [`MemoryStore`] is an in-memory
+//! stand-in for unit tests.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,8 +13,6 @@ use serde::de::DeserializeOwned;
 use crate::Error;
 
 /// Content-addressed object store plus the append-only change log.
-///
-/// Implement this for `hord_store::Store` when that crate is available.
 pub trait Store {
     /// Write canonical bytes at `id`.
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), Error>;
@@ -62,7 +57,7 @@ pub trait Store {
     fn get_ref(&self, name: &str) -> Result<Option<ObjectId>, Error>;
 }
 
-/// In-memory [`Store`] for tests while `hord-store` is a stub.
+/// In-memory [`Store`] for unit tests.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
     objects: HashMap<ObjectId, Vec<u8>>,
@@ -124,5 +119,45 @@ impl Store for MemoryStore {
 
     fn get_ref(&self, name: &str) -> Result<Option<ObjectId>, Error> {
         Ok(self.refs.get(name).copied())
+    }
+}
+
+impl Store for hord_store::Store {
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), Error> {
+        let got = hord_store::Store::put(self, &bytes)?;
+        if got != id {
+            return Err(Error::Git(format!(
+                "object id mismatch: store computed {got}, importer supplied {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Vec<u8>, Error> {
+        hord_store::Store::get(self, id).map_err(Into::into)
+    }
+
+    fn append_log(&mut self, change: ChangeId) -> Result<(), Error> {
+        hord_store::Store::append_log(self, change).map_err(Into::into)
+    }
+
+    fn log(&self) -> Result<Vec<ChangeId>, Error> {
+        hord_store::Store::log(self).map_err(Into::into)
+    }
+
+    fn set_head(&mut self, change: ChangeId) -> Result<(), Error> {
+        hord_store::Store::set_head(self, change).map_err(Into::into)
+    }
+
+    fn head(&self) -> Result<Option<ChangeId>, Error> {
+        hord_store::Store::head(self).map_err(Into::into)
+    }
+
+    fn set_ref(&mut self, name: &str, id: ObjectId) -> Result<(), Error> {
+        hord_store::Store::set_ref(self, name, id).map_err(Into::into)
+    }
+
+    fn get_ref(&self, name: &str) -> Result<Option<ObjectId>, Error> {
+        hord_store::Store::get_ref(self, name).map_err(Into::into)
     }
 }

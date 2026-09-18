@@ -5,8 +5,8 @@
 //! [`gix`]. Export projects a snapshot to a git tree. The round-trip invariant
 //! is `export(import(repo))` reproduces every git tree SHA.
 //!
-//! [`Store`] is the object-store contract (`hord_store::Store` once that crate
-//! compiles). [`MemoryStore`] is an in-memory stand-in for tests.
+//! [`hord_store::Store`] implements [`Store`]. [`MemoryStore`] is an in-memory
+//! stand-in for tests.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -20,7 +20,7 @@ mod store;
 
 pub use error::Error;
 pub use export::{export_change, export_log, export_tree, format_commit_message};
-pub use import::{import_git, import_git_ref};
+pub use import::{import_git, import_git_ref, import_git_window};
 pub use oid::GitOid;
 pub use store::{MemoryStore, Store};
 
