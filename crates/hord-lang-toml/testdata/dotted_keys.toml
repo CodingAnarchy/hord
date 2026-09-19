@@ -1,0 +1,13 @@
+package.name = "hord"
+package.version = "0.0.0"
+package.edition = "2024"
+
+dependencies.hord-core.version = "0.0.0"
+dependencies.hord-core.path = "../hord-core"
+
+"quoted.key" = 1
+'literal.key' = 2
+
+inline = { a.b = 3, c = { d = 4 } }
+
+array = [1, 2, { nested = true }]

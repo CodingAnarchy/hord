@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "9877fa2a97db0a0429f0f13b4cc1dd56e2e5db39",
+  "ours": "f3ce29a0038c04094c39915c0221c8e428fe7ac3",
+  "theirs": "0f898a3148c41dffe3f5cd8d5c391ea603d1b22b",
+  "base": "171ce0ff8d38b87a39c1e6a16fedc9a2373720e0",
+  "path": "tokio/Cargo.toml",
+  "git_conflicted": true
+}

@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "fd37fb0f17ab0f3761f956efccaa386263cc6e9c",
+  "ours": "a41c0800f9ea74d4fe20476c61e87732c6ac334d",
+  "theirs": "e140dabed2d92c09707f1fa8d456febd9c6500be",
+  "base": "1fe55b2b5527fdd32ca7b8895cb5764f6ac0958f",
+  "path": "src/reactor/mod.rs",
+  "git_conflicted": true
+}

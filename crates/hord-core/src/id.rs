@@ -21,94 +21,34 @@ pub type ChangeId = ObjectId;
 /// Assigned once and carried forward. Encoded as a ULID (26-character Crockford
 /// Base32). The timestamp component is informational only (spec §3.1).
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct NodeId(Ulid);
+pub struct NodeId(u128);
 
 impl NodeId {
-    /// Size of a [`NodeId`] in bytes (ULID / 128-bit).
-    pub const LEN: usize = 16;
-
     /// Generate a new ULID using the current time and random bits.
     ///
     /// This is non-deterministic by design. Do not call it while constructing a
     /// value whose [`ObjectId`](crate::ObjectId) must be stable.
     #[must_use]
     pub fn generate() -> Self {
-        Self(Ulid::generate())
+        Self(Ulid::generate().0)
     }
 
     /// The nil ULID (all bits zero).
     #[must_use]
     pub const fn nil() -> Self {
-        Self(Ulid::nil())
+        Self(0)
     }
 
     /// Wrap a raw 128-bit ULID.
     #[must_use]
     pub const fn from_u128(id: u128) -> Self {
-        Self(Ulid(id))
+        Self(id)
     }
 
     /// The inner 128-bit value.
     #[must_use]
     pub const fn as_u128(self) -> u128 {
-        self.0.0
-    }
-
-    /// Wrap a ULID.
-    #[must_use]
-    pub const fn from_ulid(ulid: Ulid) -> Self {
-        Self(ulid)
-    }
-
-    /// The inner ULID.
-    #[must_use]
-    pub const fn as_ulid(self) -> Ulid {
         self.0
-    }
-
-    /// Wrap 16 big-endian bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
-        Self(Ulid::from_bytes(bytes))
-    }
-
-    /// 16 big-endian bytes.
-    #[must_use]
-    pub const fn to_bytes(self) -> [u8; Self::LEN] {
-        self.0.to_bytes()
-    }
-
-    /// ULID timestamp in milliseconds since the Unix epoch.
-    ///
-    /// Informational only; identity does not depend on this value being a real
-    /// birth time.
-    #[must_use]
-    pub const fn timestamp_ms(self) -> u64 {
-        self.0.timestamp_ms()
-    }
-}
-
-impl Default for NodeId {
-    fn default() -> Self {
-        Self::nil()
-    }
-}
-
-impl From<Ulid> for NodeId {
-    fn from(ulid: Ulid) -> Self {
-        Self(ulid)
-    }
-}
-
-impl From<NodeId> for Ulid {
-    fn from(id: NodeId) -> Self {
-        id.0
-    }
-}
-
-impl From<u128> for NodeId {
-    fn from(id: u128) -> Self {
-        Self::from_u128(id)
     }
 }
 
@@ -121,7 +61,7 @@ impl fmt::Debug for NodeId {
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut buf = [0u8; ulid::ULID_LEN];
-        f.write_str(self.0.array_to_str(&mut buf))
+        f.write_str(Ulid(self.0).array_to_str(&mut buf))
     }
 }
 
@@ -130,7 +70,7 @@ impl FromStr for NodeId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ulid::from_string(s)
-            .map(Self)
+            .map(|id| Self(id.0))
             .map_err(|e| Error::NodeId(format!("{s}: {e}")))
     }
 }
@@ -138,7 +78,7 @@ impl FromStr for NodeId {
 impl Serialize for NodeId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut buf = [0u8; ulid::ULID_LEN];
-        serializer.serialize_str(self.0.array_to_str(&mut buf))
+        serializer.serialize_str(Ulid(self.0).array_to_str(&mut buf))
     }
 }
 
@@ -185,7 +125,6 @@ mod tests {
         let id = NodeId::nil();
         assert_eq!(id.to_string(), "00000000000000000000000000");
         assert_eq!(id.as_u128(), 0);
-        assert_eq!(id.timestamp_ms(), 0);
     }
 
     #[test]

@@ -15,13 +15,9 @@ pub fn fail(json: bool, err: &Error) {
         let payload = serde_json::json!({ "error": format!("{err:#}") });
         match serde_json::to_string_pretty(&payload) {
             Ok(s) => eprintln!("{s}"),
-            Err(_) => eprintln!("{{\"error\":{}}}", json_escape(&format!("{err:#}"))),
+            Err(_) => eprintln!("error: {err:#}"),
         }
     } else {
         eprintln!("error: {err:#}");
     }
-}
-
-fn json_escape(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"unknown error\"".to_owned())
 }

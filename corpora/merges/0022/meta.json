@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "47e19f057e27d3049647639eab609205de5b823a",
+  "ours": "27987b670640fb8c79ee148575eaa384d3f54e44",
+  "theirs": "c3abcfe8a75901c7c701557a728941e8fb19399e",
+  "base": "a3c2627fbc2f5391c65ba45ab53b81bf71fa323c",
+  "path": "tests/testsuite/doc.rs",
+  "git_conflicted": true
+}

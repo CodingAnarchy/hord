@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "e56ff72fe7574867c6c9bbd171afd8717897ea43",
+  "ours": "e77885a494d91baaaeeb9590436e555dea8dd1cb",
+  "theirs": "4abe9d732eb01f7b092a571c3dcc4fbd266f4067",
+  "base": "9271e3ed05928eafbeed9dd31d93aebaa49d2aad",
+  "path": "tokio/src/runtime/scheduler/multi_thread/queue.rs",
+  "git_conflicted": true
+}

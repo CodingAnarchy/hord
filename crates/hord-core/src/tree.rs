@@ -43,10 +43,12 @@ pub struct NodeFile {
 /// Repository-relative path, stored as path components.
 ///
 /// Display and [`FromStr`] use `/` as the separator. The empty path is the
-/// repository root.
+/// repository root. Encoded as a CBOR array of text strings (not a joined
+/// path), so changing that representation would retag every `Op` that carries
+/// a path.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct RepoPath(Vec<String>);
+pub struct RepoPath(Box<[String]>);
 
 impl RepoPath {
     /// Build a path from components.
@@ -54,7 +56,7 @@ impl RepoPath {
     /// Empty components are not rejected here; [`FromStr`] rejects them.
     #[must_use]
     pub fn new(components: impl Into<Vec<String>>) -> Self {
-        Self(components.into())
+        Self(components.into().into_boxed_slice())
     }
 
     /// Path components, without separators.
@@ -81,18 +83,23 @@ impl FromStr for RepoPath {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
-            return Ok(Self(Vec::new()));
+            return Ok(Self(Box::from([])));
         }
         if s.split('/').any(|c| c.is_empty()) {
             return Err(Error::RepoPath(s.to_owned()));
         }
-        Ok(Self(s.split('/').map(str::to_owned).collect()))
+        Ok(Self(
+            s.split('/')
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ))
     }
 }
 
 impl From<Vec<String>> for RepoPath {
     fn from(components: Vec<String>) -> Self {
-        Self(components)
+        Self(components.into_boxed_slice())
     }
 }
 

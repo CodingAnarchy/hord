@@ -3,9 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use hord_core::{ChangeId, ChangeRecord, ObjectId, SnapshotId};
+use hord_core::{ChangeId, ObjectId, SnapshotId};
 use hord_store::Store;
 use serde::Serialize;
+
+use crate::repo;
 
 /// Result of importing git history into a hord store.
 #[derive(Clone, Debug, Serialize)]
@@ -38,57 +40,6 @@ pub struct ExportReport {
     pub git_commit: Option<String>,
 }
 
-/// Adapter so [`hord_store::Store`] can be passed to [`hord_git`] (orphan rule).
-struct GitAdapter<'a>(&'a Store);
-
-impl hord_git::Store for GitAdapter<'_> {
-    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> hord_git::Result<()> {
-        let got = self.0.put(&bytes).map_err(store_err)?;
-        if got != id {
-            return Err(hord_git::Error::Git(format!(
-                "object id mismatch: store computed {got}, importer supplied {id}"
-            )));
-        }
-        Ok(())
-    }
-
-    fn get(&self, id: ObjectId) -> hord_git::Result<Vec<u8>> {
-        self.0.get(id).map_err(store_err)
-    }
-
-    fn append_log(&mut self, change: ChangeId) -> hord_git::Result<()> {
-        self.0.append_log(change).map_err(store_err)
-    }
-
-    fn log(&self) -> hord_git::Result<Vec<ChangeId>> {
-        self.0.log().map_err(store_err)
-    }
-
-    fn set_head(&mut self, change: ChangeId) -> hord_git::Result<()> {
-        self.0.set_head(change).map_err(store_err)
-    }
-
-    fn head(&self) -> hord_git::Result<Option<ChangeId>> {
-        self.0.head().map_err(store_err)
-    }
-
-    fn set_ref(&mut self, name: &str, id: ObjectId) -> hord_git::Result<()> {
-        self.0.set_ref(name, id).map_err(store_err)
-    }
-
-    fn get_ref(&self, name: &str) -> hord_git::Result<Option<ObjectId>> {
-        self.0.get_ref(name).map_err(store_err)
-    }
-}
-
-fn store_err(err: hord_store::Error) -> hord_git::Error {
-    match err {
-        hord_store::Error::MissingObject(id) => hord_git::Error::Missing(id),
-        hord_store::Error::Encoding(e) => hord_git::Error::Encoding(e),
-        other => hord_git::Error::Git(other.to_string()),
-    }
-}
-
 /// Fail if the git path is not a repository.
 pub fn ensure_git_repo(path: &Path) -> Result<()> {
     if !path.exists() {
@@ -105,13 +56,16 @@ pub fn ensure_git_repo(path: &Path) -> Result<()> {
 /// Import git history at `git_path` into `store`.
 ///
 /// `git_ref == None` means `HEAD` (used by `hord init --from-git`).
-pub fn import_git(store: &Store, git_path: &Path, git_ref: Option<&str>) -> Result<ImportReport> {
+pub fn import_git(
+    store: &mut Store,
+    git_path: &Path,
+    git_ref: Option<&str>,
+) -> Result<ImportReport> {
     let git_path_disp = abs_display(git_path)?;
     ensure_git_repo(Path::new(&git_path_disp))?;
-    let mut adapter = GitAdapter(store);
     let head = match git_ref {
-        None | Some("HEAD") | Some("head") => hord_git::import_git(&mut adapter, &git_path_disp)?,
-        Some(git_ref) => hord_git::import_git_ref(&mut adapter, &git_path_disp, git_ref)?,
+        None | Some("HEAD") | Some("head") => hord_git::import_git(store, &git_path_disp)?,
+        Some(git_ref) => hord_git::import_git_ref(store, &git_path_disp, git_ref)?,
     };
     Ok(ImportReport {
         git_path: git_path_disp,
@@ -125,10 +79,9 @@ pub fn import_git(store: &Store, git_path: &Path, git_ref: Option<&str>) -> Resu
 pub fn export_tree(store: &Store, hord_ref: &str, git_path: &Path) -> Result<ExportReport> {
     let git_path_disp = abs_display(git_path)?;
     ensure_git_repo(Path::new(&git_path_disp))?;
-    let adapter = GitAdapter(store);
     match resolve_export_target(store, hord_ref)? {
         ExportTarget::Change(change) => {
-            let commit = hord_git::export_change(&adapter, change, &git_path_disp)?;
+            let commit = hord_git::export_change(store, change, &git_path_disp)?;
             Ok(ExportReport {
                 hord_ref: hord_ref.to_owned(),
                 git_path: git_path_disp,
@@ -137,7 +90,7 @@ pub fn export_tree(store: &Store, hord_ref: &str, git_path: &Path) -> Result<Exp
             })
         }
         ExportTarget::Tree(snapshot) => {
-            let tree = hord_git::export_tree(&adapter, snapshot, &git_path_disp)?;
+            let tree = hord_git::export_tree(store, snapshot, &git_path_disp)?;
             Ok(ExportReport {
                 hord_ref: hord_ref.to_owned(),
                 git_path: git_path_disp,
@@ -170,12 +123,9 @@ fn resolve_export_target(store: &Store, hord_ref: &str) -> Result<ExportTarget> 
 }
 
 fn classify_id(store: &Store, id: ObjectId) -> Result<ExportTarget> {
-    match store.get_object::<ChangeRecord>(id) {
-        Ok(_) => Ok(ExportTarget::Change(id)),
-        Err(hord_store::Error::MissingObject(_)) | Err(hord_store::Error::Encoding(_)) => {
-            Ok(ExportTarget::Tree(id))
-        }
-        Err(err) => Err(err.into()),
+    match repo::try_change(store, id)? {
+        Some(_) => Ok(ExportTarget::Change(id)),
+        None => Ok(ExportTarget::Tree(id)),
     }
 }
 

@@ -1,0 +1,12 @@
+basic = "hello"
+spaces = " x "
+escapes = "a\nb\t\"c"
+literal = 'x'
+quoted_key."q k" = 1
+multiline = """
+hello
+world
+"""
+literal_ml = '''
+keep
+'''

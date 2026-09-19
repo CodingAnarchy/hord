@@ -1,6 +1,6 @@
 //! `hord status [-w <ws>]`
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::output;
@@ -20,13 +20,7 @@ struct StatusResult {
     evidence_stale: bool,
 }
 
-pub async fn run(json: bool, workspace: Option<String>) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_blocking(json, workspace))
-        .await
-        .context("status task panicked")?
-}
-
-fn run_blocking(json: bool, workspace: Option<String>) -> Result<()> {
+pub fn run(json: bool, workspace: Option<String>) -> Result<()> {
     let store = repo::discover()?;
     let ws = repo::resolve_workspace(&store, workspace.as_deref())?;
     let head = store.head()?.map(|id| id.to_hex());

@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "0d8fe5fe75f0f71f5dee8eb968732d1d40927c2f",
+  "ours": "ba81945ffc2695b71f2bbcadbfb5e46ec55aaef3",
+  "theirs": "171ce0ff8d38b87a39c1e6a16fedc9a2373720e0",
+  "base": "9241c3eddf4a6a218681b088d71f7191513e2376",
+  "path": "tokio/src/io/split.rs",
+  "git_conflicted": true
+}

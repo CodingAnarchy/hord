@@ -1,0 +1,13 @@
+[package]
+name = "hord-lang-toml"
+version = "0.0.0"
+
+[package.metadata]
+description = "nested table via dotted header"
+
+[dependencies]
+hord-core = { path = "../hord-core" }
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]

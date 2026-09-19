@@ -47,9 +47,3 @@ impl Timestamp {
         self.0
     }
 }
-
-impl From<u64> for Timestamp {
-    fn from(ms: u64) -> Self {
-        Self(ms)
-    }
-}

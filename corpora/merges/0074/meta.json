@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "ac69840ba5db8c6eeb17a370120f480d5d32f890",
+  "ours": "d1ec90b3d867e8115f81a1328532b5e7d5851ccc",
+  "theirs": "5fb7a4f1cc7eb2fa4d47a0df9ec8addef3c4f58e",
+  "base": "4e236c8558f88a8107f90ef068e6e1a90cedc538",
+  "path": "src/bin/cargo-rustc.rs",
+  "git_conflicted": true
+}

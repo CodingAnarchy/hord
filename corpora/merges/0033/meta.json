@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "fb7536122614be024285905af06095863304a3d2",
+  "ours": "f352af91f5f5590eb8227042e15ce74a2671b1c8",
+  "theirs": "73d8d2d329495aabaa5f7962404f108d573a1395",
+  "base": "cdf7f6380a7a23a5bffc26ab35fc434200f30ad6",
+  "path": "src/cargo/core/compiler/timings.rs",
+  "git_conflicted": true
+}

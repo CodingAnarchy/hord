@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -10,14 +11,23 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// Serializes as a CBOR byte string (major type 2). Serde's default `Vec<u8>`
 /// encoding is an array of integers and must not be used for hashed objects.
-#[derive(Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Bytes(Vec<u8>);
+///
+/// Stored as [`Arc<[u8]>`] so cloning a [`crate::Node`] does not copy `raw`.
+/// The wire form is unchanged.
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Bytes(Arc<[u8]>);
+
+impl Default for Bytes {
+    fn default() -> Self {
+        Self(Arc::from([] as [u8; 0]))
+    }
+}
 
 impl Bytes {
     /// Wrap owned bytes.
     #[must_use]
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into())
+        Self(Arc::from(bytes.into().into_boxed_slice()))
     }
 
     /// Borrow the bytes.
@@ -38,10 +48,10 @@ impl Bytes {
         self.0.is_empty()
     }
 
-    /// Consume and return the inner vector.
+    /// Consume and return the inner bytes as a vector.
     #[must_use]
     pub fn into_vec(self) -> Vec<u8> {
-        self.0
+        self.0.to_vec()
     }
 }
 
@@ -61,19 +71,13 @@ impl AsRef<[u8]> for Bytes {
 
 impl From<Vec<u8>> for Bytes {
     fn from(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(Arc::from(bytes.into_boxed_slice()))
     }
 }
 
 impl From<&[u8]> for Bytes {
     fn from(bytes: &[u8]) -> Self {
-        Self(bytes.to_vec())
-    }
-}
-
-impl From<Bytes> for Vec<u8> {
-    fn from(bytes: Bytes) -> Self {
-        bytes.0
+        Self(Arc::from(bytes))
     }
 }
 
@@ -101,11 +105,11 @@ impl<'de> Deserialize<'de> for Bytes {
             }
 
             fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                Ok(Bytes(v.to_vec()))
+                Ok(Bytes(Arc::from(v)))
             }
 
             fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                Ok(Bytes(v))
+                Ok(Bytes(Arc::from(v.into_boxed_slice())))
             }
         }
 
@@ -142,5 +146,12 @@ mod tests {
     fn empty_is_one_byte() {
         let encoded = encode(&Bytes::new(Vec::new())).unwrap();
         assert_eq!(encoded, [0x40]);
+    }
+
+    #[test]
+    fn clone_does_not_copy_payload() {
+        let a = Bytes::from(vec![1, 2, 3, 4]);
+        let b = a.clone();
+        assert!(std::ptr::eq(a.as_slice(), b.as_slice()));
     }
 }

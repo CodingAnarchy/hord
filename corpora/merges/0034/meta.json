@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "375a46f18b4a9cb298fb2e255e7bc8d1fdd7805b",
+  "ours": "ced10bddf2f12607591b2e67cf69e9024c3a9eda",
+  "theirs": "cdf7f6380a7a23a5bffc26ab35fc434200f30ad6",
+  "base": "ad9e4219e5568b6e59dbf13707f80d7667b34246",
+  "path": "src/cargo/core/compiler/job_queue.rs",
+  "git_conflicted": true
+}

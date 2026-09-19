@@ -230,10 +230,10 @@ fn import_export_reproduces_every_tree_sha() {
     }
 
     let hash = fx.repo.object_hash();
-    let mut cache = ExportCache::default();
+    let cache = ExportCache::default();
     for change_id in &log {
         let change: ChangeRecord = store.get_object(*change_id).unwrap();
-        let hashed = git_tree_sha(&store, change.result, hash, &mut cache).unwrap();
+        let hashed = git_tree_sha(&store, change.result, hash, &cache).unwrap();
         let written = export_tree(&store, change.result, dest.path()).unwrap();
         assert_eq!(
             hashed.to_hex(),

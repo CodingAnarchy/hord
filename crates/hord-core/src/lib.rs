@@ -19,6 +19,7 @@ mod error;
 mod evidence;
 mod id;
 mod identity;
+mod intern;
 mod node;
 mod policy;
 mod snapshot;

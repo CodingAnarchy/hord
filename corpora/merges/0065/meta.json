@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "5d7ac0d316b4ee4f2725ebe48501c38328be7482",
+  "ours": "e95044e3135fdc0458fb8b103053445637bcc5c7",
+  "theirs": "b1b69738322cee046d2d47c994764cf1f2040b4b",
+  "base": "9fcdbb44fec18d10c086b6aba8143bc06a199761",
+  "path": "src/cargo/ops/cargo_rustc/custom_build.rs",
+  "git_conflicted": true
+}

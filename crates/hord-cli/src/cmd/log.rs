@@ -1,6 +1,6 @@
 //! `hord log`
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::output;
@@ -13,13 +13,7 @@ struct LogResult {
     log: Vec<String>,
 }
 
-pub async fn run(json: bool) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_blocking(json))
-        .await
-        .context("log task panicked")?
-}
-
-fn run_blocking(json: bool) -> Result<()> {
+pub fn run(json: bool) -> Result<()> {
     let store = repo::discover()?;
     let log = store.log()?;
     let result = LogResult {

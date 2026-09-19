@@ -18,22 +18,16 @@ struct InitResult {
     imported: Option<ImportReport>,
 }
 
-pub async fn run(json: bool, from_git: Option<PathBuf>) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_blocking(json, from_git))
-        .await
-        .context("init task panicked")?
-}
-
-fn run_blocking(json: bool, from_git: Option<PathBuf>) -> Result<()> {
+pub fn run(json: bool, from_git: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().context("current directory")?;
     if let Some(ref git_path) = from_git {
         git_bridge::ensure_git_repo(git_path)?;
     }
 
-    let store = repo::create(&cwd)?;
+    let mut store = repo::create(&cwd)?;
     let mut imported = None;
     if let Some(ref git_path) = from_git {
-        imported = Some(git_bridge::import_git(&store, git_path, None)?);
+        imported = Some(git_bridge::import_git(&mut store, git_path, None)?);
     }
 
     let result = InitResult {

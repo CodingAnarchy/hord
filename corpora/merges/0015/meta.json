@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "ba584a95ae25eae6fbf132768489173253bb8f2d",
+  "ours": "3b23a37acce63d4d38e0ad16c707801527ee9519",
+  "theirs": "7204d3989d4400d7c57b0015dc1d560330b8fd91",
+  "base": "90691f2bfe9a50291a98983b1ed2feab51d5ca55",
+  "path": "src/cargo/core/features.rs",
+  "git_conflicted": true
+}

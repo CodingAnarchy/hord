@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "a8fe333cc45c14b0566d450dff8ff85fbe974fa0",
+  "ours": "3ce5a2681c734e134c2aa6d6cf91b8d2631bd82b",
+  "theirs": "ba81945ffc2695b71f2bbcadbfb5e46ec55aaef3",
+  "base": "3d95a4626fc136b55e82e6bd480e14459a77a22c",
+  "path": "tokio/src/net/windows/named_pipe.rs",
+  "git_conflicted": true
+}

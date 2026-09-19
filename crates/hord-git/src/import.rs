@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::rc::Rc;
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::{EntryKind, EntryMode};
@@ -164,11 +165,46 @@ fn topo_oldest_first(
     Ok(out)
 }
 
+/// Decoded [`Tree`]s kept for [`diff_trees`] before the memo is cleared.
+///
+/// Root trees of recent commits and hot subtrees stay resident, so the diff
+/// rarely reads back what [`import_tree`] just wrote. Cargo-sized trees are
+/// a few KiB each; this bounds the memo to tens of MiB.
+const DECODED_TREE_CAP: usize = 16 * 1024;
+
 #[derive(Default)]
 struct ImportCache {
     trees: HashMap<gix::ObjectId, ObjectId>,
     blobs: HashMap<gix::ObjectId, ObjectId>,
     commits: HashMap<gix::ObjectId, ChangeId>,
+    /// [`GitLeaf`] ids by (blob, raw git mode); every tree holding an
+    /// executable or symlink would otherwise rewrite the same leaf object.
+    leaves: HashMap<(ObjectId, u16), ObjectId>,
+    decoded: HashMap<ObjectId, Rc<Tree>>,
+    empty: Rc<Tree>,
+}
+
+impl ImportCache {
+    fn remember(&mut self, id: ObjectId, tree: Tree) -> Rc<Tree> {
+        if self.decoded.len() >= DECODED_TREE_CAP {
+            self.decoded.clear();
+        }
+        let tree = Rc::new(tree);
+        self.decoded.insert(id, Rc::clone(&tree));
+        tree
+    }
+
+    /// `None` is the empty tree (a missing side of a diff).
+    fn tree<S: Store>(&mut self, store: &S, id: Option<ObjectId>) -> Result<Rc<Tree>, Error> {
+        let Some(id) = id else {
+            return Ok(Rc::clone(&self.empty));
+        };
+        if let Some(tree) = self.decoded.get(&id) {
+            return Ok(Rc::clone(tree));
+        }
+        let tree: Tree = store.get_object(id)?;
+        Ok(self.remember(id, tree))
+    }
 }
 
 fn import_commit<S: Store>(
@@ -245,7 +281,15 @@ fn import_commit<S: Store>(
     let actor_id = format!("{name} <{email}>");
     let created_at = timestamp_from_git(author.seconds());
 
-    let ops = diff_trees(store, &RepoPath::default(), Some(base), Some(result))?;
+    let mut ops = Vec::new();
+    diff_trees(
+        store,
+        cache,
+        &RepoPath::default(),
+        Some(base),
+        Some(result),
+        &mut ops,
+    )?;
 
     let change = ChangeRecord {
         base,
@@ -295,21 +339,20 @@ fn import_tree<S: Store>(
         let entry = entry.map_err(Error::git)?;
         let name = entry_name(entry.filename())?;
         let oid = entry.oid().to_owned();
-        let kind = entry.mode().kind();
-        let octal = mode_octal(entry.mode());
-        match kind {
+        let mode = entry.mode();
+        match mode.kind() {
             EntryKind::Tree => {
                 let child = import_tree(store, repo, oid, cache)?;
                 entries.insert(name, TreeEntry::Tree(child));
             }
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
                 let blob = import_blob(store, repo, oid, cache)?;
-                entries.insert(name, TreeEntry::Blob(put_leaf(store, octal, blob)?));
+                entries.insert(name, TreeEntry::Blob(put_leaf(store, mode, blob, cache)?));
             }
             EntryKind::Commit => {
                 // Submodule gitlink: store the target commit SHA as blob bytes.
                 let blob = store.put_object(&Blob::new(oid.to_hex().to_string().into_bytes()))?;
-                entries.insert(name, TreeEntry::Blob(put_leaf(store, octal, blob)?));
+                entries.insert(name, TreeEntry::Blob(put_leaf(store, mode, blob, cache)?));
             }
         }
     }
@@ -317,16 +360,31 @@ fn import_tree<S: Store>(
     let hord_tree = Tree { entries };
     let id = store.put_object(&hord_tree)?;
     cache.trees.insert(git_id, id);
+    cache.remember(id, hord_tree);
     Ok(id)
 }
 
 /// Regular `100644` files are stored as a plain [`Blob`]. Any other git mode
 /// is a [`GitLeaf`] so chmod-only trees get a distinct [`ObjectId`].
-fn put_leaf<S: Store>(store: &mut S, octal: String, blob: ObjectId) -> Result<ObjectId, Error> {
-    if octal == MODE_BLOB {
+fn put_leaf<S: Store>(
+    store: &mut S,
+    mode: EntryMode,
+    blob: ObjectId,
+    cache: &mut ImportCache,
+) -> Result<ObjectId, Error> {
+    if mode.kind() == EntryKind::Blob {
         return Ok(blob);
     }
-    store.put_object(&GitLeaf { mode: octal, blob })
+    let key = (blob, mode.value());
+    if let Some(id) = cache.leaves.get(&key) {
+        return Ok(*id);
+    }
+    let mut buf = [0u8; 6];
+    let octal = mode.as_bytes(&mut buf);
+    let mode = octal.to_str().unwrap_or(MODE_BLOB).to_owned();
+    let id = store.put_object(&GitLeaf { mode, blob })?;
+    cache.leaves.insert(key, id);
+    Ok(id)
 }
 
 fn import_blob<S: Store>(
@@ -338,16 +396,10 @@ fn import_blob<S: Store>(
     if let Some(id) = cache.blobs.get(&git_id) {
         return Ok(*id);
     }
-    let blob = repo.find_blob(git_id).map_err(Error::git)?;
-    let id = store.put_object(&Blob::new(blob.data.clone()))?;
+    let data = repo.find_blob(git_id).map_err(Error::git)?.take_data();
+    let id = store.put_object(&Blob::new(data))?;
     cache.blobs.insert(git_id, id);
     Ok(id)
-}
-
-fn mode_octal(mode: EntryMode) -> String {
-    let mut buf = [0u8; 6];
-    let encoded = mode.as_bytes(&mut buf);
-    encoded.to_str().unwrap_or("100644").to_owned()
 }
 
 fn entry_name(name: &gix::bstr::BStr) -> Result<String, Error> {
@@ -361,138 +413,109 @@ fn timestamp_from_git(seconds: i64) -> Timestamp {
     Timestamp::from_millis(ms)
 }
 
+/// Append the ops that turn tree `from` into tree `to` (both rooted at `path`).
 fn diff_trees<S: Store>(
     store: &S,
+    cache: &mut ImportCache,
     path: &RepoPath,
     from: Option<ObjectId>,
     to: Option<ObjectId>,
-) -> Result<Vec<Op>, Error> {
+    ops: &mut Vec<Op>,
+) -> Result<(), Error> {
     if from == to {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let from_tree = match from {
-        Some(id) => store.get_object::<Tree>(id)?,
-        None => Tree::default(),
-    };
-    let to_tree = match to {
-        Some(id) => store.get_object::<Tree>(id)?,
-        None => Tree::default(),
-    };
+    let from_tree = cache.tree(store, from)?;
+    let to_tree = cache.tree(store, to)?;
 
-    let mut ops = Vec::new();
     let mut names: BTreeSet<&str> = BTreeSet::new();
     names.extend(from_tree.entries.keys().map(String::as_str));
     names.extend(to_tree.entries.keys().map(String::as_str));
 
     for name in names {
-        let child_path = join_path(path, name);
         let old = from_tree.entries.get(name);
         let new = to_tree.entries.get(name);
+        if old == new {
+            continue;
+        }
+        let child_path = join_path(path, name);
         match (old, new) {
-            (None, Some(TreeEntry::Blob(id))) => {
-                ops.push(Op::Tree {
-                    path: child_path.clone(),
-                    kind: TreeOpKind::CreateFile,
-                });
-                ops.push(Op::Blob {
-                    path: child_path,
-                    from: None,
-                    to: Some(*id),
-                });
-            }
-            (None, Some(TreeEntry::Tree(id))) => {
-                ops.push(Op::Tree {
-                    path: child_path.clone(),
-                    kind: TreeOpKind::CreateDir,
-                });
-                ops.extend(diff_trees(store, &child_path, None, Some(*id))?);
-            }
-            (None, Some(TreeEntry::NodeFile(id))) => {
-                ops.push(Op::Tree {
-                    path: child_path.clone(),
-                    kind: TreeOpKind::CreateFile,
-                });
-                ops.push(Op::Blob {
-                    path: child_path,
-                    from: None,
-                    to: Some(*id),
-                });
-            }
-            (Some(TreeEntry::Blob(old_id)), Some(TreeEntry::Blob(new_id))) => {
-                if old_id != new_id {
-                    ops.push(Op::Blob {
-                        path: child_path,
-                        from: Some(*old_id),
-                        to: Some(*new_id),
-                    });
-                }
-            }
+            (None, Some(new_e)) => create_entry(store, cache, child_path, new_e, ops)?,
+            (Some(old_e), None) => delete_entry(store, cache, &child_path, old_e, ops)?,
+            (Some(TreeEntry::Blob(old_id)), Some(TreeEntry::Blob(new_id))) => ops.push(Op::Blob {
+                path: child_path,
+                from: Some(*old_id),
+                to: Some(*new_id),
+            }),
             (Some(TreeEntry::Tree(old_id)), Some(TreeEntry::Tree(new_id))) => {
-                ops.extend(diff_trees(
-                    store,
-                    &child_path,
-                    Some(*old_id),
-                    Some(*new_id),
-                )?);
-            }
-            (Some(_), None) => {
-                ops.extend(delete_entry(store, &child_path, old.expect("matched"))?);
+                diff_trees(store, cache, &child_path, Some(*old_id), Some(*new_id), ops)?;
             }
             (Some(old_e), Some(new_e)) => {
-                ops.extend(delete_entry(store, &child_path, old_e)?);
-                match new_e {
-                    TreeEntry::Blob(id) | TreeEntry::NodeFile(id) => {
-                        ops.push(Op::Tree {
-                            path: child_path.clone(),
-                            kind: TreeOpKind::CreateFile,
-                        });
-                        ops.push(Op::Blob {
-                            path: child_path,
-                            from: None,
-                            to: Some(*id),
-                        });
-                    }
-                    TreeEntry::Tree(id) => {
-                        ops.push(Op::Tree {
-                            path: child_path.clone(),
-                            kind: TreeOpKind::CreateDir,
-                        });
-                        ops.extend(diff_trees(store, &child_path, None, Some(*id))?);
-                    }
-                }
+                delete_entry(store, cache, &child_path, old_e, ops)?;
+                create_entry(store, cache, child_path, new_e, ops)?;
             }
             (None, None) => {}
         }
     }
-    Ok(ops)
+    Ok(())
 }
 
-fn delete_entry<S: Store>(store: &S, path: &RepoPath, entry: &TreeEntry) -> Result<Vec<Op>, Error> {
+fn create_entry<S: Store>(
+    store: &S,
+    cache: &mut ImportCache,
+    path: RepoPath,
+    entry: &TreeEntry,
+    ops: &mut Vec<Op>,
+) -> Result<(), Error> {
     match entry {
-        TreeEntry::Blob(id) | TreeEntry::NodeFile(id) => Ok(vec![
-            Op::Blob {
-                path: path.clone(),
-                from: Some(*id),
-                to: None,
-            },
-            Op::Tree {
-                path: path.clone(),
-                kind: TreeOpKind::Delete,
-            },
-        ]),
-        TreeEntry::Tree(id) => {
-            let mut ops = diff_trees(store, path, Some(*id), None)?;
+        TreeEntry::Blob(id) | TreeEntry::NodeFile(id) => {
             ops.push(Op::Tree {
                 path: path.clone(),
-                kind: TreeOpKind::Delete,
+                kind: TreeOpKind::CreateFile,
             });
-            Ok(ops)
+            ops.push(Op::Blob {
+                path,
+                from: None,
+                to: Some(*id),
+            });
+        }
+        TreeEntry::Tree(id) => {
+            ops.push(Op::Tree {
+                path: path.clone(),
+                kind: TreeOpKind::CreateDir,
+            });
+            diff_trees(store, cache, &path, None, Some(*id), ops)?;
         }
     }
+    Ok(())
+}
+
+fn delete_entry<S: Store>(
+    store: &S,
+    cache: &mut ImportCache,
+    path: &RepoPath,
+    entry: &TreeEntry,
+    ops: &mut Vec<Op>,
+) -> Result<(), Error> {
+    match entry {
+        TreeEntry::Blob(id) | TreeEntry::NodeFile(id) => ops.push(Op::Blob {
+            path: path.clone(),
+            from: Some(*id),
+            to: None,
+        }),
+        TreeEntry::Tree(id) => diff_trees(store, cache, path, Some(*id), None, ops)?,
+    }
+    ops.push(Op::Tree {
+        path: path.clone(),
+        kind: TreeOpKind::Delete,
+    });
+    Ok(())
 }
 
 fn join_path(parent: &RepoPath, name: &str) -> RepoPath {
-    let mut parts = parent.components().to_vec();
+    let parent = parent.components();
+    let mut parts = Vec::with_capacity(parent.len() + 1);
+    parts.extend_from_slice(parent);
     parts.push(name.to_owned());
     RepoPath::new(parts)
 }

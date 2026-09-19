@@ -1,0 +1,14 @@
+[package]
+name = "hord-lang"
+description = "Language adapter trait and lossless CST helpers (spec §4)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hord-core.workspace = true
+hord-encoding.workspace = true
+thiserror.workspace = true

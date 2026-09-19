@@ -6,7 +6,12 @@ members = [
     "crates/hord-store",
     "crates/hord-git",
     "crates/hord-cli",
+    "crates/hord-lang",
+    "crates/hord-lang-rust",
+    "crates/hord-lang-toml",
+    "crates/hord-diff",
     "bench/m0-eval",
+    "bench/m1-eval",
 ]
 
 [workspace.package]
@@ -19,13 +24,25 @@ anyhow = "1"
 blake3 = "1"
 cbor2 = "1.1"
 clap = { version = "4", features = ["derive"] }
+diffy = "0.4"
 gix = "0.87"
 hex = "0.4"
 hord-core = { path = "crates/hord-core" }
+hord-diff = { path = "crates/hord-diff" }
 hord-encoding = { path = "crates/hord-encoding" }
 hord-git = { path = "crates/hord-git" }
+hord-lang = { path = "crates/hord-lang" }
+hord-lang-rust = { path = "crates/hord-lang-rust" }
+hord-lang-toml = { path = "crates/hord-lang-toml" }
 hord-store = { path = "crates/hord-store" }
+lasso = { version = "0.7", features = ["multi-threaded"] }
 proptest = "1"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+# crates.io `tree-sitter-toml` is frozen at 0.20 (tree-sitter 0.20). The
+# maintained grammar (tree-sitter-grammars/tree-sitter-toml) publishes as
+# `tree-sitter-toml-ng` 0.7, which matches this pin and tree-sitter 0.25.
+tree-sitter-toml = { package = "tree-sitter-toml-ng", version = "0.7" }
 redb = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

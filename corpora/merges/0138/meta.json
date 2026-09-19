@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "42d5a9fcd4cf87fb0dd96a1850bdd2e9345a84b9",
+  "ours": "cf94ffc6fd84b411043a70b47a4c4d7f131bcf59",
+  "theirs": "cdb132d333c9f8d20f6f4daef0bd72a67ce83f5b",
+  "base": "aa03622cf3205b2afd37b2cf4067c3474d2779c4",
+  "path": "tokio-util/src/sync/cancellation_token.rs",
+  "git_conflicted": true
+}

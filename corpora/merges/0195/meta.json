@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "cde8f6f692fbf1223a925ad246c381bf0a07efaa",
+  "ours": "3dfbecd68c7418741a5fe4bbf5df8ab04b605e2b",
+  "theirs": "8ba2cb6a76eb85c7eabef3f229cf4634bae273ea",
+  "base": "bd5db301b0c45ae540afcb19e030dd7c29d2ea4f",
+  "path": "src/doc/src/reference/unstable.md",
+  "git_conflicted": true
+}

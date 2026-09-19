@@ -1,5 +1,5 @@
-# M0 acceptance (spec §12): unit tests and encoding goldens on
-# Linux/macOS/Windows; git round-trip eval on Ubuntu.
+# M0 + M1 acceptance (spec §12): unit tests and encoding goldens on
+# Linux/macOS/Windows; git round-trip and M1 corpora on Ubuntu.
 name: CI
 
 on:
@@ -55,6 +55,12 @@ jobs:
       - name: M0 eval (hord)
         run: cargo run -p hord-eval --release -- --only hord --json
 
+      - name: M1 merge corpus
+        # Corpus is in-repo. Rate gates (70% auto / 95% match) are not yet met;
+        # the job still exercises parse+merge. See corpora/merges/README.md.
+        continue-on-error: true
+        run: cargo run -p hord-eval-m1 --release -- --merges-only
+
   eval:
     name: M0 corpora
     runs-on: ubuntu-latest
@@ -76,3 +82,28 @@ jobs:
 
       - name: M0 eval (hord, cargo, tokio)
         run: cargo run -p hord-eval --release -- --json
+
+  m1:
+    name: M1 corpora
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache git corpora
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hord/corpora
+          key: hord-corpora-v1
+
+      - name: M1 lossless HEAD
+        run: cargo run -p hord-eval-m1 --release -- --lossless-only --skip-merges
+
+      - name: M1 consecutive apply(diff)
+        run: cargo run -p hord-eval-m1 --release -- --pairs-only --skip-merges

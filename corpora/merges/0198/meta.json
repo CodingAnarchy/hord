@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "d613cd66c70775519753fa3ea2378d4842729b5c",
+  "ours": "3d042688a851d985013ee8ff64a9caef47b7b495",
+  "theirs": "af64bd644982cc43b231fb39d7e19f697ec8680d",
+  "base": "1f6c6bd5e7bbdf596f7e88e6db347af5268ab113",
+  "path": "src/doc/src/commands/cargo-check.md",
+  "git_conflicted": true
+}

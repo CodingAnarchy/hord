@@ -1,7 +1,6 @@
 //! Discover and open a local [`hord_store::Store`], plus CLI-level resolution
 //! of `--base` and `-w`.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -105,18 +104,19 @@ fn current_workspace_id(store: &Store) -> Result<Option<WorkspaceId>> {
     }
 }
 
-fn snapshot_of(store: &Store, id: ObjectId) -> Result<SnapshotId> {
+/// Decode `id` as a [`ChangeRecord`], or `None` if it is missing or another kind.
+pub fn try_change(store: &Store, id: ObjectId) -> Result<Option<ChangeRecord>> {
     match store.get_object::<ChangeRecord>(id) {
-        Ok(change) => Ok(change.result),
-        Err(hord_store::Error::MissingObject(_)) | Err(hord_store::Error::Encoding(_)) => Ok(id),
+        Ok(change) => Ok(Some(change)),
+        Err(hord_store::Error::MissingObject(_)) | Err(hord_store::Error::Encoding(_)) => Ok(None),
         Err(err) => Err(err.into()),
     }
 }
 
+fn snapshot_of(store: &Store, id: ObjectId) -> Result<SnapshotId> {
+    Ok(try_change(store, id)?.map(|c| c.result).unwrap_or(id))
+}
+
 fn empty_tree(store: &Store) -> Result<SnapshotId> {
-    store
-        .put_object(&Tree {
-            entries: BTreeMap::new(),
-        })
-        .map_err(Into::into)
+    store.put_object(&Tree::default()).map_err(Into::into)
 }

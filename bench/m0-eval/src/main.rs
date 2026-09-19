@@ -19,12 +19,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use hord_core::{ChangeRecord, IntentRef};
-use hord_git::{ExportCache, Store as GitStore, git_tree_sha, import_git, import_git_window};
+use hord_git::{ExportCache, git_tree_sha, import_git, import_git_window};
 use hord_store::Store;
 use serde::Serialize;
 
@@ -218,8 +221,8 @@ fn eval_git(
 }
 
 fn eval_git_inner(name: &str, git_path: &Path, window: Option<usize>) -> Result<CaseReport> {
-    let work = scratch(&format!("{name}-store"));
-    let mut store = Store::create(&work).context("create eval store")?;
+    let work = Scratch::new(&format!("{name}-store"));
+    let mut store = Store::create(&work.0).context("create eval store")?;
     let git_path_disp = git_path.display().to_string();
 
     eprintln!("[{name}] importing {}", git_path.display());
@@ -229,41 +232,77 @@ fn eval_git_inner(name: &str, git_path: &Path, window: Option<usize>) -> Result<
         None => import_git(&mut store, git_path)?,
     };
     let import_secs = start.elapsed().as_secs_f64().max(1e-9);
-    let log = hord_store::Store::log(&store)?;
+    let log = store.log()?;
     let commits = log.len() as u64;
     let commits_per_sec = commits as f64 / import_secs;
     eprintln!("[{name}] imported {commits} commits in {import_secs:.2}s ({commits_per_sec:.1}/s)");
 
     let src = open_git(git_path)?;
     let hash = src.object_hash();
-    let mut cache = ExportCache::default();
-    let mut mismatches = 0u64;
-    let check_start = Instant::now();
-    for (i, change_id) in log.iter().enumerate() {
-        let change: ChangeRecord = GitStore::get_object(&store, *change_id)?;
+    let mut jobs = Vec::with_capacity(log.len());
+    for change_id in &log {
+        let change: ChangeRecord = store.get_object(*change_id)?;
         let git_sha = change
             .intent
             .refs
             .iter()
             .find_map(|r| match r {
-                IntentRef::GitCommit { sha } => Some(sha.as_str()),
+                IntentRef::GitCommit { sha } => Some(sha.clone()),
                 _ => None,
             })
             .context("imported change missing GitCommit ref")?;
-        let expected = git_tree_oid(&src, git_sha)?;
-        let exported = git_tree_sha(&store, change.result, hash, &mut cache)?;
-        if exported.as_gix() != expected {
-            mismatches += 1;
-            eprintln!(
-                "[{name}] tree SHA mismatch commit {git_sha}: expected {}, got {}",
-                expected.to_hex(),
-                exported.to_hex()
-            );
-        }
-        if (i + 1) % 2000 == 0 {
-            eprintln!("[{name}] checked {}/{commits} trees", i + 1);
-        }
+        let expected = git_tree_oid(&src, &git_sha)?;
+        jobs.push((change.result, git_sha, expected));
     }
+
+    let cache = ExportCache::default();
+    let mismatches = AtomicU64::new(0);
+    let checked = AtomicU64::new(0);
+    let first_err: Mutex<Option<String>> = Mutex::new(None);
+    let check_start = Instant::now();
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(jobs.len().max(1));
+    let chunk_len = jobs.len().div_ceil(workers).max(1);
+    thread::scope(|s| {
+        for chunk in jobs.chunks(chunk_len) {
+            let store = &store;
+            let cache = &cache;
+            let mismatches = &mismatches;
+            let checked = &checked;
+            let first_err = &first_err;
+            s.spawn(move || {
+                for (snapshot, git_sha, expected) in chunk {
+                    match git_tree_sha(store, *snapshot, hash, cache) {
+                        Ok(exported) if exported.as_gix() == *expected => {}
+                        Ok(exported) => {
+                            mismatches.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[{name}] tree SHA mismatch commit {git_sha}: expected {}, got {}",
+                                expected.to_hex(),
+                                exported.to_hex()
+                            );
+                        }
+                        Err(err) => {
+                            let mut slot = first_err.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(err.to_string());
+                            }
+                        }
+                    }
+                    let n = checked.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(2000) {
+                        eprintln!("[{name}] checked {n}/{commits} trees");
+                    }
+                }
+            });
+        }
+    });
+    if let Some(err) = first_err.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        bail!("{err}");
+    }
+    let mismatches = mismatches.load(Ordering::Relaxed);
     let check_secs = check_start.elapsed().as_secs_f64();
     eprintln!(
         "[{name}] checked {commits} trees in {check_secs:.2}s ({:.1}/s)",
@@ -338,18 +377,30 @@ fn find_hord_git() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn scratch(prefix: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "hord-eval-{prefix}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).expect("scratch dir");
-    path
+/// Temporary store directory, removed on drop (a cargo import is ~2 GiB of
+/// loose objects; leaving one per run fills the temp volume).
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "hord-eval-{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("scratch dir");
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn print_human(report: &Report) {

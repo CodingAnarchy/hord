@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "8d0f102de83f8aa59661b9d1839ecc57e50873a7",
+  "ours": "619efed28b64858016c9a3a5b0f425f3e32e076e",
+  "theirs": "5dcb379f6da6e7bd97f5dde94706eecc1eed2de0",
+  "base": "475dabe96d98d56e641e2ce0dd2ed23031e8523f",
+  "path": "tokio/src/lib.rs",
+  "git_conflicted": true
+}

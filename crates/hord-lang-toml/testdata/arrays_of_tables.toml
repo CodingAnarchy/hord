@@ -1,0 +1,10 @@
+[[bin]]
+name = "hord"
+path = "src/main.rs"
+
+[[bin]]
+name = "hord-eval"
+path = "src/eval.rs"
+
+[[workspace.members]]
+path = "crates/hord-core"

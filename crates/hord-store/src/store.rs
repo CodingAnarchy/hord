@@ -1,6 +1,6 @@
 //! [`Store`]: content-addressed objects, log, refs, and workspaces.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -54,9 +54,6 @@ pub struct Store {
     objects_dir: PathBuf,
     db: Database,
     pack_lock: Mutex<()>,
-    /// Object ids written or observed by this process. Avoids a stat + redb
-    /// lookup on the git-import duplicate path.
-    present: Mutex<HashSet<ObjectId>>,
     /// Refs waiting for the next write transaction (import does `set_ref` per
     /// tree; flushing on log batch / [`Store::set_head`] / [`Store::flush`]).
     pending_refs: Mutex<HashMap<String, ObjectId>>,
@@ -95,7 +92,6 @@ impl Store {
             objects_dir,
             db,
             pack_lock: Mutex::new(()),
-            present: Mutex::new(HashSet::with_capacity(1 << 16)),
             pending_refs: Mutex::new(HashMap::new()),
             pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(false),
@@ -119,7 +115,6 @@ impl Store {
             objects_dir,
             db,
             pack_lock: Mutex::new(()),
-            present: Mutex::new(HashSet::with_capacity(1 << 16)),
             pending_refs: Mutex::new(HashMap::new()),
             pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(has_packs),
@@ -141,15 +136,13 @@ impl Store {
     /// Store already-canonical CBOR bytes. The [`ObjectId`] is BLAKE3-256 of
     /// `canonical_cbor` (spec §3.1, §3.9).
     ///
-    /// Writes a loose object. Identical bytes are idempotent. Does not pack;
-    /// call [`Store::pack`] (spec §8.1: packing is a background job).
+    /// Writes a loose object. Identical bytes are idempotent (the file is
+    /// rewritten with the same content; there is no existence check, since a
+    /// stat costs about as much as the write). Does not pack; call
+    /// [`Store::pack`] (spec §8.1: packing is a background job).
     pub fn put(&self, canonical_cbor: &[u8]) -> Result<ObjectId> {
         let id = ObjectId::from_canonical(canonical_cbor);
-        if self.cached_present(id) {
-            return Ok(id);
-        }
         self.write_loose(id, canonical_cbor)?;
-        self.mark_present(id);
         Ok(id)
     }
 
@@ -169,18 +162,10 @@ impl Store {
 
     /// Whether `id` is present as a loose or packed object.
     pub fn contains(&self, id: ObjectId) -> Result<bool> {
-        if self.cached_present(id) {
-            return Ok(true);
-        }
         if self.loose_path(id).is_file() {
-            self.mark_present(id);
             return Ok(true);
         }
-        if self.has_packs.load(Ordering::Relaxed) && self.packed_location(id)?.is_some() {
-            self.mark_present(id);
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(self.has_packs.load(Ordering::Relaxed) && self.packed_location(id)?.is_some())
     }
 
     /// Canonical-encode `value` and [`put`](Self::put) the bytes.
@@ -450,7 +435,8 @@ impl Store {
 
     fn loose_path(&self, id: ObjectId) -> PathBuf {
         let hex = hex_encode(id.as_bytes());
-        let mut path = self.objects_dir.clone();
+        let mut path = PathBuf::with_capacity(self.objects_dir.as_os_str().len() + hex.len() + 2);
+        path.push(&self.objects_dir);
         path.push(std::str::from_utf8(&hex[..2]).expect("hex is ascii"));
         path.push(std::str::from_utf8(&hex[2..]).expect("hex is ascii"));
         path
@@ -458,14 +444,6 @@ impl Store {
 
     fn pack_dir(&self) -> PathBuf {
         self.objects_dir.join("pack")
-    }
-
-    fn cached_present(&self, id: ObjectId) -> bool {
-        lock_set(&self.present).contains(&id)
-    }
-
-    fn mark_present(&self, id: ObjectId) {
-        lock_set(&self.present).insert(id);
     }
 
     fn workspace_dir(&self, id: WorkspaceId) -> PathBuf {
@@ -586,10 +564,6 @@ fn validate_ref_name(name: &str) -> Result<()> {
         return Err(Error::InvalidRef(name.to_owned()));
     }
     Ok(())
-}
-
-fn lock_set(mutex: &Mutex<HashSet<ObjectId>>) -> std::sync::MutexGuard<'_, HashSet<ObjectId>> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn lock_map(

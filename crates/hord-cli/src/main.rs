@@ -11,7 +11,7 @@ mod git_bridge;
 mod output;
 mod repo;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use cli::{Cli, Command, GitCommand, WsCommand};
@@ -27,16 +27,22 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    tokio::task::spawn_blocking(move || run_blocking(cli))
+        .await
+        .context("command task panicked")?
+}
+
+fn run_blocking(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init { from_git } => cmd::init::run(cli.json, from_git).await,
+        Command::Init { from_git } => cmd::init::run(cli.json, from_git),
         Command::Ws { command } => match command {
-            WsCommand::New { base } => cmd::ws::run_new(cli.json, base).await,
+            WsCommand::New { base } => cmd::ws::run_new(cli.json, base),
         },
-        Command::Status { workspace } => cmd::status::run(cli.json, workspace).await,
-        Command::Log => cmd::log::run(cli.json).await,
+        Command::Status { workspace } => cmd::status::run(cli.json, workspace),
+        Command::Log => cmd::log::run(cli.json),
         Command::Git { command } => match command {
-            GitCommand::Import { git_ref } => cmd::git::run_import(cli.json, git_ref).await,
-            GitCommand::Export { hord_ref } => cmd::git::run_export(cli.json, hord_ref).await,
+            GitCommand::Import { git_ref } => cmd::git::run_import(cli.json, git_ref),
+            GitCommand::Export { hord_ref } => cmd::git::run_export(cli.json, hord_ref),
         },
     }
 }

@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 hord-encoding.workspace = true
+lasso.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 ulid.workspace = true

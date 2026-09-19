@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "42bec961894426ca5ce0b76105dda82c76dcd43c",
+  "ours": "38a9c6c1a5bc81ec0e44a73ea9ebbc682f4f2baf",
+  "theirs": "4f6a95badc181ff0fa3b8462350bf6cd45547792",
+  "base": "f3ce29a0038c04094c39915c0221c8e428fe7ac3",
+  "path": "tokio/tests/sync_broadcast.rs",
+  "git_conflicted": true
+}

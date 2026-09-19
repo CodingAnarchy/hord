@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "f962ec1f44222361bdbd0f8987ba4b5dce4f6033",
+  "ours": "1372afc6bdf0ee52fa08e4b7f07300f70fc1b334",
+  "theirs": "58790d3b5e0ce55ac8b7929e4632b277f8c7c21a",
+  "base": "a359ce16073401f28b84840da85b268aa3d37c88",
+  "path": "Cargo.toml",
+  "git_conflicted": true
+}

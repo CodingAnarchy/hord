@@ -1,27 +1,15 @@
 //! `hord git import <ref>` / `hord git export <ref>`
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::git_bridge;
 use crate::output;
 use crate::repo;
 
-pub async fn run_import(json: bool, git_ref: String) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_import_blocking(json, git_ref))
-        .await
-        .context("git import task panicked")?
-}
-
-pub async fn run_export(json: bool, hord_ref: String) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_export_blocking(json, hord_ref))
-        .await
-        .context("git export task panicked")?
-}
-
-fn run_import_blocking(json: bool, git_ref: String) -> Result<()> {
-    let store = repo::discover()?;
+pub fn run_import(json: bool, git_ref: String) -> Result<()> {
+    let mut store = repo::discover()?;
     let git_path = git_bridge::sibling_git(&store)?;
-    let report = git_bridge::import_git(&store, &git_path, Some(&git_ref))?;
+    let report = git_bridge::import_git(&mut store, &git_path, Some(&git_ref))?;
     if json {
         output::print_json(&report)?;
     } else {
@@ -36,7 +24,7 @@ fn run_import_blocking(json: bool, git_ref: String) -> Result<()> {
     Ok(())
 }
 
-fn run_export_blocking(json: bool, hord_ref: String) -> Result<()> {
+pub fn run_export(json: bool, hord_ref: String) -> Result<()> {
     let store = repo::discover()?;
     let git_path = git_bridge::sibling_git(&store)?;
     let report = git_bridge::export_tree(&store, &hord_ref, &git_path)?;

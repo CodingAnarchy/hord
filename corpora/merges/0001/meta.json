@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "3cecc8e4a319816f667a0d5fa086d704d8f6f85d",
+  "ours": "26e08ab0cd4e594026a5c282689b1eef3e7008c2",
+  "theirs": "a871a90d8b35deac0d68fd21e1166d2555289f62",
+  "base": "605506ab67bb28a3d890ea8e19307bd1275d0da1",
+  "path": "src/cargo/sources/git/known_hosts.rs",
+  "git_conflicted": true
+}

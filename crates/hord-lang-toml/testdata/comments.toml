@@ -1,0 +1,11 @@
+# leading file comment
+
+# comment before a pair
+name = "hord" # trailing same-line comment
+
+# comment before a table
+[package]
+# inner table comment
+version = "0.0.0"
+
+# trailing file comment

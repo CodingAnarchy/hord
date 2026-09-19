@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "b020d3789a1f61a1962f6f291f832844f13a7fcf",
+  "ours": "89f43938fed4d6b653c2410cbf21fb2821e357a5",
+  "theirs": "5984312202bb6472392dd2d1e81b405fb88b5a47",
+  "base": "065e3ef98d3edbce5c9e66d927d9ac9944cc6639",
+  "path": "tests/testsuite/cross_publish.rs",
+  "git_conflicted": true
+}

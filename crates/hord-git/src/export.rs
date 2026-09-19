@@ -1,7 +1,9 @@
 //! Project Hord snapshots to git trees and landed changes to git commits.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::Mutex;
 
 use gix::bstr::BString;
 use gix::objs::tree::{EntryKind, EntryMode};
@@ -27,20 +29,23 @@ pub fn export_tree<S: Store>(
     snapshot_id: SnapshotId,
     git_dir: impl AsRef<Path>,
 ) -> Result<GitOid, Error> {
-    let git_dir = git_dir.as_ref();
-    let repo = open_or_init(git_dir)?;
-    let oid = export_tree_into(store, snapshot_id, &repo)?;
-    Ok(GitOid::from_gix(oid))
+    let repo = open_or_init(git_dir.as_ref())?;
+    let cache = ExportCache::default();
+    walk_tree(store, snapshot_id, &Sink::Repo(&repo), &cache).map(GitOid::from_gix)
 }
 
 /// Memoizes git object ids already projected from Hord [`ObjectId`]s.
 ///
-/// Shared blobs and subtrees are hashed once. The M0 eval walks every commit
-/// in a history; without this cache each commit re-hashes its whole tree.
-#[derive(Clone, Debug, Default)]
+/// Shared blobs and subtrees are hashed once. Interior mutexes let the M0
+/// eval walk commits in parallel against one cache.
+#[derive(Debug, Default)]
 pub struct ExportCache {
-    trees: HashMap<ObjectId, gix::ObjectId>,
-    leaves: HashMap<ObjectId, (EntryMode, gix::ObjectId)>,
+    trees: Mutex<HashMap<ObjectId, gix::ObjectId>>,
+    leaves: Mutex<HashMap<ObjectId, (EntryMode, gix::ObjectId)>>,
+}
+
+fn lock_map<K, V>(mutex: &Mutex<HashMap<K, V>>) -> std::sync::MutexGuard<'_, HashMap<K, V>> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Git tree SHA of a Hord tree, hashed in memory (no destination repository).
@@ -52,30 +57,61 @@ pub fn git_tree_sha<S: Store>(
     store: &S,
     snapshot_id: SnapshotId,
     hash: gix::hash::Kind,
-    cache: &mut ExportCache,
+    cache: &ExportCache,
 ) -> Result<GitOid, Error> {
-    hash_tree(store, snapshot_id, hash, cache).map(GitOid::from_gix)
+    walk_tree(store, snapshot_id, &Sink::Hash(hash), cache).map(GitOid::from_gix)
 }
 
-fn hash_tree<S: Store>(
+/// Where projected git objects go: hashed only, or written to a repository.
+/// Both yield the same object ids.
+enum Sink<'a> {
+    Hash(gix::hash::Kind),
+    Repo(&'a gix::Repository),
+}
+
+impl Sink<'_> {
+    fn blob(&self, bytes: &[u8]) -> Result<gix::ObjectId, Error> {
+        match self {
+            Self::Hash(hash) => {
+                gix::objs::compute_hash(*hash, GitKind::Blob, bytes).map_err(Error::git)
+            }
+            Self::Repo(repo) => repo
+                .write_blob(bytes)
+                .map(|id| id.detach())
+                .map_err(Error::git),
+        }
+    }
+
+    fn tree(&self, tree: &gix::objs::Tree) -> Result<gix::ObjectId, Error> {
+        match self {
+            Self::Hash(hash) => {
+                let mut buf = Vec::new();
+                tree.write_to(&mut buf).map_err(Error::git)?;
+                gix::objs::compute_hash(*hash, GitKind::Tree, &buf).map_err(Error::git)
+            }
+            Self::Repo(repo) => repo
+                .write_object(tree)
+                .map(|id| id.detach())
+                .map_err(Error::git),
+        }
+    }
+}
+
+fn walk_tree<S: Store>(
     store: &S,
     tree_id: ObjectId,
-    hash: gix::hash::Kind,
-    cache: &mut ExportCache,
+    sink: &Sink<'_>,
+    cache: &ExportCache,
 ) -> Result<gix::ObjectId, Error> {
-    if let Some(oid) = cache.trees.get(&tree_id) {
-        return Ok(*oid);
+    if let Some(oid) = lock_map(&cache.trees).get(&tree_id).copied() {
+        return Ok(oid);
     }
     let tree: Tree = store.get_object(tree_id)?;
     let mut entries = Vec::with_capacity(tree.entries.len());
     for (name, entry) in &tree.entries {
         let (mode, oid) = match entry {
-            TreeEntry::Tree(id) => (EntryKind::Tree.into(), hash_tree(store, *id, hash, cache)?),
-            TreeEntry::Blob(id) => hash_leaf(store, *id, hash, cache)?,
-            TreeEntry::NodeFile(id) => {
-                let oid = hash_node_file(store, *id, hash, cache)?;
-                (EntryKind::Blob.into(), oid)
-            }
+            TreeEntry::Tree(id) => (EntryKind::Tree.into(), walk_tree(store, *id, sink, cache)?),
+            TreeEntry::Blob(id) | TreeEntry::NodeFile(id) => walk_leaf(store, *id, sink, cache)?,
         };
         entries.push(gix::objs::tree::Entry {
             mode,
@@ -84,74 +120,44 @@ fn hash_tree<S: Store>(
         });
     }
     entries.sort();
-    let encoded = encode_tree(entries)?;
-    let oid = gix::objs::compute_hash(hash, GitKind::Tree, &encoded).map_err(Error::git)?;
-    cache.trees.insert(tree_id, oid);
+    let oid = sink.tree(&gix::objs::Tree { entries })?;
+    lock_map(&cache.trees).insert(tree_id, oid);
     Ok(oid)
 }
 
-fn hash_leaf<S: Store>(
+/// A leaf is a plain [`Blob`] (`100644`), a [`GitLeaf`] carrying another
+/// mode, or a [`NodeFile`] whose raw bytes are exported.
+fn walk_leaf<S: Store>(
     store: &S,
     id: ObjectId,
-    hash: gix::hash::Kind,
-    cache: &mut ExportCache,
+    sink: &Sink<'_>,
+    cache: &ExportCache,
 ) -> Result<(EntryMode, gix::ObjectId), Error> {
-    if let Some(cached) = cache.leaves.get(&id) {
-        return Ok(*cached);
+    if let Some(cached) = lock_map(&cache.leaves).get(&id).copied() {
+        return Ok(cached);
     }
     let pair = if let Ok(blob) = store.get_object::<Blob>(id) {
-        let oid = hash_blob(hash, blob.bytes.as_slice())?;
-        (EntryKind::Blob.into(), oid)
-    } else {
-        let leaf: GitLeaf = store.get_object(id)?;
+        (EntryKind::Blob.into(), sink.blob(&blob.bytes)?)
+    } else if let Ok(leaf) = store.get_object::<GitLeaf>(id) {
         let mode = parse_mode(&leaf.mode)
             .ok_or_else(|| Error::Git(format!("invalid stored git mode {:?}", leaf.mode)))?;
         let blob: Blob = store.get_object(leaf.blob)?;
         let oid = if mode.kind() == EntryKind::Commit {
-            let hex = std::str::from_utf8(blob.bytes.as_slice())
+            let hex = std::str::from_utf8(&blob.bytes)
                 .map_err(|_| Error::Git("gitlink blob is not UTF-8 hex".into()))?;
             gix::ObjectId::from_hex(hex.as_bytes())
                 .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")))?
         } else {
-            hash_blob(hash, blob.bytes.as_slice())?
+            sink.blob(&blob.bytes)?
         };
         (mode, oid)
-    };
-    cache.leaves.insert(id, pair);
-    Ok(pair)
-}
-
-fn hash_node_file<S: Store>(
-    store: &S,
-    id: ObjectId,
-    hash: gix::hash::Kind,
-    cache: &mut ExportCache,
-) -> Result<gix::ObjectId, Error> {
-    if let Some((_, oid)) = cache.leaves.get(&id) {
-        return Ok(*oid);
-    }
-    let bytes = if let Ok(blob) = store.get_object::<Blob>(id) {
-        blob.bytes
     } else {
         let node_file: NodeFile = store.get_object(id)?;
         let blob: Blob = store.get_object(node_file.raw_hash)?;
-        blob.bytes
+        (EntryKind::Blob.into(), sink.blob(&blob.bytes)?)
     };
-    let oid = hash_blob(hash, bytes.as_slice())?;
-    cache.leaves.insert(id, (EntryKind::Blob.into(), oid));
-    Ok(oid)
-}
-
-fn hash_blob(hash: gix::hash::Kind, bytes: &[u8]) -> Result<gix::ObjectId, Error> {
-    gix::objs::compute_hash(hash, GitKind::Blob, bytes).map_err(Error::git)
-}
-
-fn encode_tree(entries: Vec<gix::objs::tree::Entry>) -> Result<Vec<u8>, Error> {
-    let tree = gix::objs::Tree { entries };
-    let mut buf = Vec::new();
-    tree.write_to(&mut buf)
-        .map_err(|e| Error::git(format!("encode git tree: {e}")))?;
-    Ok(buf)
+    lock_map(&cache.leaves).insert(id, pair);
+    Ok(pair)
 }
 
 /// Export a landed change as a git commit with Hord trailers.
@@ -172,117 +178,39 @@ pub fn export_change<S: Store>(
     change_id: ChangeId,
     git_dir: impl AsRef<Path>,
 ) -> Result<GitOid, Error> {
-    let git_dir = git_dir.as_ref();
-    let repo = open_or_init(git_dir)?;
-    let oid = export_change_into(store, change_id, &repo)?;
-    Ok(GitOid::from_gix(oid))
+    let repo = open_or_init(git_dir.as_ref())?;
+    let cache = ExportCache::default();
+    export_change_into(store, change_id, &repo, &cache).map(GitOid::from_gix)
 }
 
 /// Export every landed change in log order. Returns the tip commit SHA.
 pub fn export_log<S: Store>(store: &S, git_dir: impl AsRef<Path>) -> Result<GitOid, Error> {
-    let git_dir = git_dir.as_ref();
-    let repo = open_or_init(git_dir)?;
-    let log = store.log()?;
+    let repo = open_or_init(git_dir.as_ref())?;
+    let cache = ExportCache::default();
     let mut last = None;
-    for change_id in log {
-        last = Some(export_change_into(store, change_id, &repo)?);
+    for change_id in store.log()? {
+        last = Some(export_change_into(store, change_id, &repo, &cache)?);
     }
     last.map(GitOid::from_gix)
         .ok_or_else(|| Error::Git("hord log is empty".into()))
-}
-
-fn export_tree_into<S: Store>(
-    store: &S,
-    tree_id: ObjectId,
-    repo: &gix::Repository,
-) -> Result<gix::ObjectId, Error> {
-    let tree: Tree = store.get_object(tree_id)?;
-    let mut entries = Vec::with_capacity(tree.entries.len());
-
-    for (name, entry) in &tree.entries {
-        let (mode, oid) = match entry {
-            TreeEntry::Tree(id) => (EntryKind::Tree.into(), export_tree_into(store, *id, repo)?),
-            TreeEntry::Blob(id) => export_leaf(store, *id, repo)?,
-            TreeEntry::NodeFile(id) => {
-                let oid = export_node_file(store, *id, repo)?;
-                (EntryKind::Blob.into(), oid)
-            }
-        };
-        entries.push(gix::objs::tree::Entry {
-            mode,
-            filename: BString::from(name.as_str()),
-            oid,
-        });
-    }
-    entries.sort();
-    repo.write_object(&gix::objs::Tree { entries })
-        .map(|id| id.detach())
-        .map_err(Error::git)
-}
-
-fn export_leaf<S: Store>(
-    store: &S,
-    id: ObjectId,
-    repo: &gix::Repository,
-) -> Result<(EntryMode, gix::ObjectId), Error> {
-    if let Ok(blob) = store.get_object::<Blob>(id) {
-        let oid = repo
-            .write_blob(blob.bytes.as_slice())
-            .map(|id| id.detach())
-            .map_err(Error::git)?;
-        return Ok((EntryKind::Blob.into(), oid));
-    }
-    let leaf: GitLeaf = store.get_object(id)?;
-    let mode = parse_mode(&leaf.mode)
-        .ok_or_else(|| Error::Git(format!("invalid stored git mode {:?}", leaf.mode)))?;
-    let blob: Blob = store.get_object(leaf.blob)?;
-    if mode.kind() == EntryKind::Commit {
-        let hex = std::str::from_utf8(blob.bytes.as_slice())
-            .map_err(|_| Error::Git("gitlink blob is not UTF-8 hex".into()))?;
-        let oid = gix::ObjectId::from_hex(hex.as_bytes())
-            .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")))?;
-        return Ok((mode, oid));
-    }
-    let oid = repo
-        .write_blob(blob.bytes.as_slice())
-        .map(|id| id.detach())
-        .map_err(Error::git)?;
-    Ok((mode, oid))
-}
-
-fn export_node_file<S: Store>(
-    store: &S,
-    id: ObjectId,
-    repo: &gix::Repository,
-) -> Result<gix::ObjectId, Error> {
-    if let Ok(blob) = store.get_object::<Blob>(id) {
-        return repo
-            .write_blob(blob.bytes.as_slice())
-            .map(|id| id.detach())
-            .map_err(Error::git);
-    }
-    let node_file: NodeFile = store.get_object(id)?;
-    let blob: Blob = store.get_object(node_file.raw_hash)?;
-    repo.write_blob(blob.bytes.as_slice())
-        .map(|id| id.detach())
-        .map_err(Error::git)
 }
 
 fn export_change_into<S: Store>(
     store: &S,
     change_id: ChangeId,
     repo: &gix::Repository,
+    cache: &ExportCache,
 ) -> Result<gix::ObjectId, Error> {
     if let Some(existing) = lookup_exported(repo, change_id) {
         return Ok(existing);
     }
 
     let change: ChangeRecord = store.get_object(change_id)?;
-    let tree = export_tree_into(store, change.result, repo)?;
+    let tree = walk_tree(store, change.result, &Sink::Repo(repo), cache)?;
 
     let mut parents = Vec::new();
     for parent in &change.parents {
-        parents.push(export_change_into(store, *parent, repo)?);
+        parents.push(export_change_into(store, *parent, repo, cache)?);
     }
 
     let actor = actor_trailer(&change.provenance.actor);
@@ -336,9 +264,7 @@ pub fn format_commit_message(
     change_id: ChangeId,
     actor: &str,
 ) -> String {
-    let mut msg = String::new();
-    msg.push_str(summary);
-    msg.push('\n');
+    let mut msg = format!("{summary}\n");
     if !body.is_empty() {
         msg.push('\n');
         msg.push_str(body);
@@ -346,10 +272,10 @@ pub fn format_commit_message(
             msg.push('\n');
         }
     }
-    msg.push('\n');
-    msg.push_str(&format!("Hord-Change: {change_id}\n"));
-    msg.push_str(&format!("Hord-Intent: {summary}\n"));
-    msg.push_str(&format!("Hord-Actor: {actor}\n"));
+    let _ = write!(
+        msg,
+        "\nHord-Change: {change_id}\nHord-Intent: {summary}\nHord-Actor: {actor}\n"
+    );
     msg
 }
 

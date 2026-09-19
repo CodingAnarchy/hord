@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "23e613d552bdf8edbb0dc7265d1cf400d1077ef5",
+  "ours": "27da33c67d05e0225f20f71a1294f1f747c549d4",
+  "theirs": "23229178506c8dd309210bbb944c6fdadc3dd206",
+  "base": "137a36f07004c33eaf742b85c04abe296aa4aa17",
+  "path": "src/cargo/util/command_prelude.rs",
+  "git_conflicted": true
+}

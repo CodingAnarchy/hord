@@ -1,0 +1,9 @@
+{
+  "repo": "cargo",
+  "merge": "8c2d0dffa4dd9bf2e9d14e153abf7383bea958d8",
+  "ours": "2bbbca31265cc7fddee3ba2d4f14e66517a3aadc",
+  "theirs": "9ddf75a9da333102c63e054ae2e3bade0a204e9a",
+  "base": "0ec7281b9c36ca7f724bfac8b029633910270a48",
+  "path": "tests/testsuite/fix.rs",
+  "git_conflicted": true
+}

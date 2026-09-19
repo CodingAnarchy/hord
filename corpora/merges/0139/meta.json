@@ -1,0 +1,9 @@
+{
+  "repo": "tokio",
+  "merge": "0de05422ce17e124937bf806111fbed7e68439d5",
+  "ours": "afb734d1893a898aea9e8d7eeee05bbe8f22ce1f",
+  "theirs": "2b731c0e01756d695af4d2a77f372a7e6874761e",
+  "base": "714704253443787cc0c9a395b6d94947bcf26687",
+  "path": "tokio/src/task/local.rs",
+  "git_conflicted": true
+}

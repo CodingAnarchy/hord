@@ -1,6 +1,6 @@
 //! `hord ws new [--base <snap|ref>]`
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::output;
@@ -13,13 +13,7 @@ struct WsNewResult {
     materialization: String,
 }
 
-pub async fn run_new(json: bool, base: Option<String>) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_new_blocking(json, base))
-        .await
-        .context("ws new task panicked")?
-}
-
-fn run_new_blocking(json: bool, base: Option<String>) -> Result<()> {
+pub fn run_new(json: bool, base: Option<String>) -> Result<()> {
     let store = repo::discover()?;
     let base_id = repo::resolve_base(&store, base.as_deref())?;
     let ws = store.create_workspace(base_id)?;

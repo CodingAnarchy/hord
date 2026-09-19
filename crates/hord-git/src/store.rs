@@ -4,7 +4,6 @@
 //! stand-in for unit tests.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use hord_core::{ChangeId, ObjectId};
 use serde::Serialize;
@@ -14,18 +13,25 @@ use crate::Error;
 
 /// Content-addressed object store plus the append-only change log.
 pub trait Store {
-    /// Write canonical bytes at `id`.
+    /// Write canonical bytes at `id`, which must be their BLAKE3 hash.
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), Error>;
+
+    /// Write canonical bytes and return their [`ObjectId`].
+    ///
+    /// Stores that hash on write (like [`hord_store::Store`]) override this
+    /// so the import path hashes each object once.
+    fn put_bytes(&mut self, bytes: Vec<u8>) -> Result<ObjectId, Error> {
+        let id = ObjectId::from_canonical(&bytes);
+        self.put(id, bytes)?;
+        Ok(id)
+    }
 
     /// Read canonical bytes for `id`.
     fn get(&self, id: ObjectId) -> Result<Vec<u8>, Error>;
 
     /// Canonical-encode `value`, store it, and return its [`ObjectId`].
     fn put_object<T: Serialize>(&mut self, value: &T) -> Result<ObjectId, Error> {
-        let bytes = hord_encoding::encode(value)?;
-        let id = ObjectId::from_canonical(&bytes);
-        self.put(id, bytes)?;
-        Ok(id)
+        self.put_bytes(hord_encoding::encode(value)?)
     }
 
     /// Load and decode the object at `id`.
@@ -71,16 +77,6 @@ impl MemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Create a new in-memory store. `repo_root` is ignored.
-    pub fn create(_repo_root: impl AsRef<Path>) -> Result<Self, Error> {
-        Ok(Self::new())
-    }
-
-    /// Open an in-memory store. `repo_root` is ignored; always empty.
-    pub fn open(_repo_root: impl AsRef<Path>) -> Result<Self, Error> {
-        Ok(Self::new())
     }
 }
 
@@ -131,6 +127,10 @@ impl Store for hord_store::Store {
             )));
         }
         Ok(())
+    }
+
+    fn put_bytes(&mut self, bytes: Vec<u8>) -> Result<ObjectId, Error> {
+        hord_store::Store::put(self, &bytes).map_err(Into::into)
     }
 
     fn get(&self, id: ObjectId) -> Result<Vec<u8>, Error> {

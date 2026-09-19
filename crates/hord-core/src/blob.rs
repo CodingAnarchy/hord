@@ -20,15 +20,3 @@ impl Blob {
         }
     }
 }
-
-impl From<Vec<u8>> for Blob {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self::new(bytes)
-    }
-}
-
-impl From<Bytes> for Blob {
-    fn from(bytes: Bytes) -> Self {
-        Self { bytes }
-    }
-}
