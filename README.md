@@ -50,6 +50,6 @@ The first language with real semantic support is Rust, so Hord can eventually ho
 
 This is early. The contract is [`docs/spec.md`](docs/spec.md). Architecture decisions live in [`docs/adr/`](docs/adr/).
 
-**M0** (in progress) is the skeleton: content-addressed objects, a local store, and a git bridge that treats every file as a blob. Later milestones add structural Rust, identity, transactions, verification, replay, and self-hosting.
+**M0** is the skeleton: content-addressed objects, a local store, and a git bridge that treats every file as a blob. CI runs the test suite on Linux, macOS, and Windows (encoding goldens must agree) and the git round-trip eval on Ubuntu. Later milestones add structural Rust, identity, transactions, verification, replay, and self-hosting.
 
 If you want the detailed argument, start at spec §0 and §2. If you want to implement, the same spec is the contract the code is written against.
