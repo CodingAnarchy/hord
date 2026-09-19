@@ -52,4 +52,4 @@ This is early. The contract is [`docs/spec.md`](docs/spec.md). Architecture deci
 
 **M0** is the skeleton: content-addressed objects, a local store, and a git bridge that treats every file as a blob. CI runs the test suite on Linux, macOS, and Windows (encoding goldens must agree) and the git round-trip eval on Ubuntu. Later milestones add structural Rust, identity, transactions, verification, replay, and self-hosting.
 
-If you want the detailed argument, start at spec §0 and §2. If you want to implement, the same spec is the contract the code is written against.
+If you want the detailed argument, start at spec §0 and §2. If you want to implement, the same spec is the contract the code is written against. Grok and Claude both follow `AGENTS.md` and the project skills (`.grok/skills/`, also linked as `.claude/skills/`). In Herdr, the orchestrator picks `--kind grok` or `--kind claude` per pane.

@@ -1,17 +1,18 @@
 ---
 name: hord-herdr
 description: >
-  Fan out Grok Build agents inside Herdr to implement Hord in parallel crate
-  slices. Use when the user asks to use Herdr, spawn grok panes, parallelize
-  hord work, run a team of grok agents, or /hord-herdr. Requires HERDR_ENV=1.
+  Fan out Grok or Claude agents inside Herdr to implement Hord in parallel
+  crate slices. Use when the user asks to use Herdr, spawn grok or claude
+  panes, parallelize hord work, run a team of agents, or /hord-herdr.
+  Requires HERDR_ENV=1.
 metadata:
-  short-description: "Parallel Grok agents in Herdr for Hord"
+  short-description: "Parallel Grok/Claude agents in Herdr for Hord"
 argument-hint: "[M0|M1|M2|M3|M4|M5|M6|M7]"
 ---
 
 # Hord × Herdr
 
-Coordinate Grok Build agents in sibling Herdr panes. You orchestrate; they implement. Follow the `hord` skill for spec discipline.
+Coordinate coding agents in sibling Herdr panes. You orchestrate; they implement. Follow the `hord` skill for spec discipline. Supported pane kinds: **Grok** (`--kind grok`) and **Claude** (`--kind claude`).
 
 ## Gate
 
@@ -19,13 +20,13 @@ Coordinate Grok Build agents in sibling Herdr panes. You orchestrate; they imple
 test "${HERDR_ENV:-}" = 1
 ```
 
-If this fails, do not inspect or control Herdr. Tell the user to open a Herdr workspace with cwd set to this repo, start Grok in a pane, and rerun `/hord-herdr`.
+If this fails, do not inspect or control Herdr. Tell the user to open a Herdr workspace with cwd set to this repo, start Grok or Claude in a pane, and rerun `/hord-herdr`.
 
 Then learn the live CLI (`herdr --help`, `herdr agent`, `herdr pane`). Do not run bare `herdr`.
 
 ## Repo cwd
 
-Resolve the hord root (directory containing `docs/spec.md`). Every split pane must use `--cwd` of that root so each Grok session loads these project skills.
+Resolve the hord root (directory containing `docs/spec.md`). Every split pane must use `--cwd` of that root so each session loads project skills (Grok: `.grok/skills/`; Claude: `.claude/skills/`, a symlink to the same files).
 
 If the calling pane is not in that root, split with `--cwd <hord-root>` anyway. Do not create a new workspace unless the user asked.
 
@@ -40,9 +41,18 @@ If the calling pane is not in that root, split with `--cwd <hord-root>` anyway. 
    - `hord-git` import/export (depends on store)
    - `hord-cli` `init` / `ws` / `status` / `log` / `git` (depends on the rest)
 4. Launch independent slices first. Dependent slices wait until their upstream agent is `idle`/`done` and the files exist.
-5. Cap live Grok agents at 3 unless the user asked for more. Prefer one agent per crate, not per function.
+5. Cap live agents at 3 unless the user asked for more. Prefer one agent per crate, not per function.
 
-OPEN decisions stay on **this** orchestrating session via `/hord-adr`. Do not ask two Grok panes to pick different answers to the same OPEN item.
+OPEN decisions stay on **this** orchestrating session via `/hord-adr`. Do not ask two panes (Grok or Claude) to pick different answers to the same OPEN item.
+
+## Kind
+
+The orchestrator chooses `--kind` per pane. Mix Grok and Claude across independent crates when useful.
+
+- **Default: `grok`.**
+- **Use `claude`** when the user asked for Claude, `grok` is not ready (`agent_not_ready` / missing binary), or a second independent crate benefits from a different agent.
+- If `herdr agent start` fails for one kind, retry the other on that pane before giving up.
+- Do not assign kinds to “sides” of an OPEN decision.
 
 ## Launch
 
@@ -53,10 +63,11 @@ herdr pane layout --pane "$HERDR_PANE_ID"
 herdr pane split --current --direction right --cwd "<hord-root>" --no-focus
 ```
 
-The new pane must be an idle shell. Start Grok:
+The new pane must be an idle shell. Start the chosen kind:
 
 ```bash
 herdr agent start <name> --kind grok --pane <pane-id>
+herdr agent start <name> --kind claude --pane <pane-id>
 ```
 
 Names: `[a-z][a-z0-9_-]{0,31}`, unique, crate-derived (`encoding`, `core`, `store`, `git-bridge`, `cli`).
@@ -70,7 +81,7 @@ Each agent gets a self-contained prompt. They do not share this conversation.
 ```text
 You are implementing one Hord crate slice in this repo.
 
-Follow the project skill /hord and AGENTS.md. Spec is docs/spec.md.
+Follow the project skill /hord and AGENTS.md (same files for Grok and Claude). Spec is docs/spec.md.
 Milestone: <M?>
 Your slice: <crate>
 In scope: <files / types / acceptance>

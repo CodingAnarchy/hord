@@ -16,7 +16,7 @@ Write one short ADR per decision. Do not implement the choice in the same turn u
 
 ## Locate the question
 
-1. Read spec §14 and the section cited by the user (or by the current milestone in `.grok/skills/hord/references/sections.md`).
+1. Read spec §14 and the section cited by the user (or by the current milestone in `hord/references/sections.md` under `.grok/skills` or `.claude/skills`).
 2. If the item is **DECIDED** and the user is not asking to supersede it, stop. Quote the decided text.
 3. List existing files in `docs/adr/` matching `NNNN-*.md`, ignoring `0000-template.md`. Next number is max+1, zero-padded to 4 digits.
 

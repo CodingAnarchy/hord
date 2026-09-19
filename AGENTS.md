@@ -10,7 +10,7 @@ Semantic VCS. The spec is the contract: `docs/spec.md`.
 
 ## Current target
 
-Until M0 acceptance passes, all work is M0. Do not start M1+ crates except as a documented, required dependency of an M0 deliverable.
+M0 acceptance is green. Current work is **M1** (structural tier: `hord-lang*`, `hord-diff`). Do not start M2+ crates except as a documented, required dependency of an M1 deliverable.
 
 ## Engineering (spec §11.1)
 
@@ -32,4 +32,13 @@ Crate map is spec §11. ADRs are `docs/adr/NNNN-slug.md`. Intent files (when pro
 
 ## Skills
 
-Follow `.grok/skills/hord` for implementation. Use `/hord-adr` for OPEN decisions. Use `/hord-herdr` only inside Herdr to fan Grok panes out.
+Same skill files for Grok and Claude:
+
+- Canonical: `.grok/skills/` (`hord`, `hord-adr`, `hord-herdr`)
+- Claude Code also loads `.claude/skills/` (symlink to `.grok/skills/`)
+
+Follow `/hord` for implementation. Use `/hord-adr` for OPEN decisions. Use `/hord-herdr` only inside Herdr to fan panes out.
+
+## Herdr
+
+`herdr agent start` supports `--kind grok` and `--kind claude`. The **orchestrating** agent picks the kind per pane (mix allowed). Default to Grok unless Claude is a better fit (user asked, the other kind is not ready, or independent crates benefit from a second implementation). Both kinds must `--cwd` this repo root so they load these skills. OPEN items stay on the orchestrator; do not let two panes answer the same OPEN.

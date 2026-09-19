@@ -17,7 +17,7 @@ You are implementing Hord. The spec at `docs/spec.md` is the contract. Project r
 ## Setup
 
 1. Confirm cwd is the hord repo root (contains `docs/spec.md`). If not, stop and say so.
-2. Read `AGENTS.md` and `.grok/skills/hord/references/sections.md`.
+2. Read `AGENTS.md` and `hord/references/sections.md` under the project skills dir (`.grok/skills` or `.claude/skills`; they are the same files).
 3. Infer the current milestone:
    - No `crates/` workspace → **M0**
    - Otherwise the first milestone in spec §12 whose acceptance suite is not green
@@ -48,4 +48,4 @@ After a slice of work:
 - `cargo clippy --all-targets -- -D warnings`
 - the tests that slice claims to cover
 
-If you are inside Herdr and the user asked to parallelize across panes, switch to the `hord-herdr` skill. Do not spawn Herdr agents just because the milestone is large.
+If you are inside Herdr and the user asked to parallelize across panes, switch to the `hord-herdr` skill. The orchestrator may start Grok or Claude panes. Do not spawn Herdr agents just because the milestone is large.
