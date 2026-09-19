@@ -107,7 +107,9 @@ impl FromStr for ObjectId {
             )));
         }
         let mut bytes = [0u8; Self::LEN];
-        for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        let (chunks, rest) = s.as_bytes().as_chunks::<2>();
+        debug_assert!(rest.is_empty());
+        for (i, chunk) in chunks.iter().enumerate() {
             bytes[i] = hex_byte(chunk[0], chunk[1])
                 .map_err(|c| Error::ObjectIdHex(format!("invalid hex digit {c:?} in {s:?}")))?;
         }
