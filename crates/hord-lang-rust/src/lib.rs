@@ -10,7 +10,7 @@
 
 mod cst;
 
-use hord_core::{Bytes, LangId, NodeKind, RepoPath};
+use hord_core::{LangId, NodeKind, RepoPath};
 use hord_lang::{LangAdapter, NodeTree, ParseError, Tier};
 
 /// tree-sitter-rust adapter (spec §4.2, Tier 1).
@@ -37,10 +37,6 @@ impl LangAdapter for RustAdapter {
 
     fn parse(&self, bytes: &[u8]) -> Result<NodeTree, ParseError> {
         cst::parse(bytes, &self.lang())
-    }
-
-    fn project(&self, tree: &NodeTree) -> Bytes {
-        tree.to_bytes()
     }
 
     fn is_definition(&self, kind: &NodeKind) -> bool {

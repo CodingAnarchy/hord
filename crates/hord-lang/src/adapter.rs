@@ -87,7 +87,11 @@ pub trait LangAdapter: Send + Sync {
     fn parse(&self, bytes: &[u8]) -> Result<NodeTree, ParseError>;
 
     /// Tier 1. Project a tree back to source bytes.
-    fn project(&self, tree: &NodeTree) -> Bytes;
+    ///
+    /// The default walks `tree` with [`NodeTree::to_bytes`].
+    fn project(&self, tree: &NodeTree) -> Bytes {
+        tree.to_bytes()
+    }
 
     /// Tier 1. Which node kinds bear durable identity (spec §3.4).
     fn is_definition(&self, kind: &NodeKind) -> bool;

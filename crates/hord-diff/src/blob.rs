@@ -18,6 +18,7 @@ pub fn merge_blob(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>, Co
             nodes: Vec::new(),
             kind: ConflictKind::Hard,
             reason: "blob 3-way line merge conflict (spec §5.2 rule 5)".into(),
+            delete_vs: false,
         }),
     }
 }
@@ -27,5 +28,6 @@ fn utf8<'a>(bytes: &'a [u8], side: &str) -> Result<&'a str, Conflict> {
         nodes: Vec::<NodeId>::new(),
         kind: ConflictKind::Hard,
         reason: format!("binary blob conflict on {side} (spec §5.2 rule 5)"),
+        delete_vs: false,
     })
 }

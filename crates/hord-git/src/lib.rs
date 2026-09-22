@@ -20,9 +20,7 @@ mod oid;
 mod store;
 
 pub use error::Error;
-pub use export::{
-    ExportCache, export_change, export_log, export_tree, format_commit_message, git_tree_sha,
-};
+pub use export::{ExportCache, export_change, export_tree, git_tree_sha};
 pub use import::{import_git, import_git_ref, import_git_window};
 pub use oid::GitOid;
 pub use store::{MemoryStore, Store};

@@ -39,7 +39,7 @@ pub type Result<T, E = ParseError> = std::result::Result<T, E>;
 #[cfg(test)]
 mod test_util {
     use super::*;
-    use hord_core::{Bytes, LangId, NodeKind, RepoPath};
+    use hord_core::{LangId, NodeKind, RepoPath};
 
     /// Synthetic adapter with no grammar. `fn` and `mod` are definitions.
     pub(crate) struct TestAdapter;
@@ -61,10 +61,6 @@ mod test_util {
             Err(ParseError::failed(
                 "hord-lang has no grammar; adapters own parse",
             ))
-        }
-
-        fn project(&self, tree: &NodeTree) -> Bytes {
-            tree.to_bytes()
         }
 
         fn is_definition(&self, kind: &NodeKind) -> bool {

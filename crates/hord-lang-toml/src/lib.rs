@@ -25,7 +25,7 @@
 
 mod cst;
 
-use hord_core::{Bytes, LangId, NodeKind, RepoPath};
+use hord_core::{LangId, NodeKind, RepoPath};
 use hord_lang::{LangAdapter, NodeTree, ParseError, Tier};
 
 /// tree-sitter-toml adapter (spec §4.4, Tier 1).
@@ -35,17 +35,9 @@ pub struct TomlAdapter;
 /// Language id reported by [`TomlAdapter`] (`toml`).
 pub const LANG: &str = "toml";
 
-impl TomlAdapter {
-    /// Language id for this adapter.
-    #[must_use]
-    pub fn lang_id() -> LangId {
-        LangId::new(LANG)
-    }
-}
-
 impl LangAdapter for TomlAdapter {
     fn lang(&self) -> LangId {
-        Self::lang_id()
+        LangId::new(LANG)
     }
 
     fn tier(&self) -> Tier {
@@ -60,10 +52,6 @@ impl LangAdapter for TomlAdapter {
 
     fn parse(&self, bytes: &[u8]) -> Result<NodeTree, ParseError> {
         cst::parse(bytes, &self.lang())
-    }
-
-    fn project(&self, tree: &NodeTree) -> Bytes {
-        tree.to_bytes()
     }
 
     fn is_definition(&self, kind: &NodeKind) -> bool {

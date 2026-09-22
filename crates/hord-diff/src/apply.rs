@@ -156,10 +156,8 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
 /// Only fields and enum variants. A shared token such as `i32` must not pick
 /// up a comma just because one occurrence was followed by one.
 fn trailing_commas(store: &NodeTree) -> BTreeMap<ObjectId, ObjectId> {
-    let mut ids: Vec<ObjectId> = store.iter().map(|(id, _)| id).collect();
-    ids.sort();
     let mut map = BTreeMap::new();
-    for id in ids {
+    for (id, _) in store.iter() {
         let Some(parent) = store.get(id) else {
             continue;
         };
@@ -343,7 +341,6 @@ fn find_def_container(
     fn walk(
         tree: &NodeTree,
         oid: ObjectId,
-        start: ObjectId,
         ids: &std::collections::BTreeMap<ObjectId, NodeId>,
     ) -> Option<ObjectId> {
         let node = tree.get(oid)?;
@@ -351,16 +348,13 @@ fn find_def_container(
             return Some(oid);
         }
         for child in &node.children {
-            if ids.contains_key(child) && *child != start {
-                continue;
-            }
-            if let Some(found) = walk(tree, *child, start, ids) {
+            if let Some(found) = walk(tree, *child, ids) {
                 return Some(found);
             }
         }
         None
     }
-    walk(tree, start, start, ids)
+    walk(tree, start, ids)
 }
 
 fn fallback_insert_index(tree: &NodeTree, container: ObjectId) -> usize {
