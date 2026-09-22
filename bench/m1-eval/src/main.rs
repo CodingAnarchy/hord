@@ -444,9 +444,10 @@ fn find_line(bytes: &[u8], from: usize, marker: &[u8]) -> Option<usize> {
     while i < bytes.len() {
         if bytes[i..].starts_with(marker)
             && (i == 0 || bytes[i - 1] == b'\n')
-            && bytes
-                .get(i + marker.len())
-                .is_none_or(|byte| *byte == b'\n' || *byte == b' ')
+            && bytes.get(i + marker.len()).is_none_or(|byte| {
+                // Git for Windows writes CRLF, so the byte after `=======` is `\r`.
+                matches!(*byte, b'\n' | b'\r' | b' ')
+            })
         {
             return Some(i);
         }
@@ -993,4 +994,28 @@ fn walk_tree(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod conflict_marker_tests {
+    use super::conflict_bodies;
+
+    #[test]
+    fn lf_conflict_hunks_keep_each_side() {
+        let text = b"keep\n<<<<<<< ours\nours line\n=======\ntheirs line\n>>>>>>> theirs\n";
+        let hunks = conflict_bodies(text);
+        assert_eq!(hunks.len(), 1, "lf hunks");
+        assert_eq!(hunks[0].0, b"ours line\n");
+        assert_eq!(hunks[0].1, b"theirs line\n");
+    }
+
+    #[test]
+    fn crlf_conflict_hunks_keep_each_side() {
+        let text =
+            b"keep\r\n<<<<<<< ours\r\nours line\r\n=======\r\ntheirs line\r\n>>>>>>> theirs\r\n";
+        let hunks = conflict_bodies(text);
+        assert_eq!(hunks.len(), 1, "crlf hunks");
+        assert_eq!(hunks[0].0, b"ours line\r\n");
+        assert_eq!(hunks[0].1, b"theirs line\r\n");
+    }
 }
