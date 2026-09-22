@@ -1,3 +1,5 @@
+use std::fmt;
+
 mod inner {
     pub const N: u8 = 1;
 }

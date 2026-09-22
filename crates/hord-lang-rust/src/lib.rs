@@ -59,6 +59,12 @@ impl LangAdapter for RustAdapter {
                 | "type_item"
                 | "associated_type"
                 | "union_item"
+                | "use_declaration"
+                | "extern_crate_declaration"
+                | "enum_variant"
+                | "field_declaration"
+                | "inner_attribute_item"
+                | "foreign_mod_item"
         )
     }
 }
@@ -159,6 +165,9 @@ mod tests {
             "macro_definition",
             "type_item",
             "union_item",
+            "use_declaration",
+            "enum_variant",
+            "field_declaration",
         ] {
             assert!(kinds.contains(kind), "fixture missing kind {kind}");
             assert!(
@@ -166,6 +175,9 @@ mod tests {
                 "{kind} should be a definition"
             );
         }
+        assert!(a.is_definition(&NodeKind::new("extern_crate_declaration")));
+        assert!(a.is_definition(&NodeKind::new("inner_attribute_item")));
+        assert!(a.is_definition(&NodeKind::new("foreign_mod_item")));
         assert!(!a.is_definition(&NodeKind::new("let_declaration")));
         assert!(!a.is_definition(&NodeKind::new("source_file")));
         assert!(!a.is_definition(&NodeKind::new("line_comment")));

@@ -10,7 +10,7 @@ use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree};
 /// The CST root (`source_file`, `document`, …) is not a definition, but
 /// [`hord_core::Op::Insert`] requires a parent id. [`NodeId::nil`] stands in
 /// for that file root. [`hord_core::Op::Replace`] on this id replaces the
-/// whole file (non-definition glue such as `use` items).
+/// whole file (file-level non-definition glue).
 #[must_use]
 pub fn file_parent() -> NodeId {
     NodeId::nil()
@@ -76,7 +76,7 @@ pub(crate) fn result_ids(mapping: &IdentityMapping) -> &BTreeMap<ObjectId, NodeI
 /// Glue leaves of the file root: tokens not inside any definition.
 ///
 /// Equal glue means definition-granularity ops suffice. Unequal glue
-/// (e.g. a `use` item) collapses to [`file_parent`] Replace.
+/// with no def ops collapses to [`file_parent`] Replace.
 pub(crate) fn root_glue(tree: &NodeTree, def_oids: &BTreeSet<ObjectId>) -> Vec<ObjectId> {
     let Some(root) = tree.root() else {
         return Vec::new();
@@ -110,45 +110,49 @@ fn glue_walk(
     }
 }
 
-/// Local skeleton of a definition: leaves, with child definitions as holes.
-pub(crate) fn local_skeleton(
+/// Non-definition leaves of a definition, using `normalized` so trivia-only
+/// edits do not look like a container change.
+///
+/// Child definitions are skipped entirely (not recorded as holes). Adding,
+/// deleting, or editing a method therefore does not [`Op::Replace`] the
+/// enclosing `impl`/`mod`/`table`; those edits are child ops so two sides
+/// that touch different children can compose (spec §5.2 rule 1).
+pub(crate) fn local_glue(
     tree: &NodeTree,
     start: ObjectId,
     def_ids: &BTreeMap<ObjectId, NodeId>,
-) -> Vec<Skel> {
+) -> Vec<ObjectId> {
     let mut out = Vec::new();
-    skel_walk(tree, start, start, def_ids, &mut out);
+    glue_skel(tree, start, start, def_ids, &mut out);
     out
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Skel {
-    Leaf(ObjectId),
-    Def(NodeId),
-}
-
-fn skel_walk(
+fn glue_skel(
     tree: &NodeTree,
     oid: ObjectId,
     start: ObjectId,
     def_ids: &BTreeMap<ObjectId, NodeId>,
-    out: &mut Vec<Skel>,
+    out: &mut Vec<ObjectId>,
 ) {
-    if oid != start
-        && let Some(&nid) = def_ids.get(&oid)
-    {
-        out.push(Skel::Def(nid));
+    if oid != start && def_ids.contains_key(&oid) {
         return;
     }
     let Some(node) = tree.get(oid) else {
         return;
     };
     if node.children.is_empty() {
-        out.push(Skel::Leaf(oid));
+        // List separators sit between child definitions (`struct { a, b }`,
+        // `enum { A, B }`). They are not container header glue; skipping
+        // them lets adding a field/variant be a child Insert instead of
+        // Replace on the parent.
+        if matches!(node.kind.as_str(), "," | ";") {
+            return;
+        }
+        out.push(node.normalized);
         return;
     }
     for child in &node.children {
-        skel_walk(tree, *child, start, def_ids, out);
+        glue_skel(tree, *child, start, def_ids, out);
     }
 }
 

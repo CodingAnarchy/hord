@@ -27,10 +27,10 @@ pub fn parse_identified<A: LangAdapter>(adapter: &A, src: &[u8]) -> IdentifiedTr
 /// Identify `result` against `base`, then pair leftover defs by a source
 /// label (`fn foo`, `mod bar`, `[table]`).
 ///
-/// M1 adapters do not set [`hord_core::Node::name`], so
-/// [`default_identify`] named-matching never fires. Body edits would
-/// otherwise be death+birth. Tests that need Replace/Move supply this
-/// mapping instead.
+/// Identify `result` against `base`. Named matching uses interned
+/// [`hord_core::Node::name`]; leftover defs are rebound by a source label
+/// (`fn foo`, `mod bar`, `[table]`) so tests stay robust if a kind has no
+/// name.
 pub fn identify_result<A: LangAdapter>(
     adapter: &A,
     base: &IdentifiedTree,

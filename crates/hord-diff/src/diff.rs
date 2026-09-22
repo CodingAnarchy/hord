@@ -6,7 +6,7 @@ use hord_core::{IdentityDelta, NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree};
 
 use crate::defs::{
-    collect_sites, def_oids, file_parent, local_skeleton, result_ids, root_glue, sites_by_id,
+    collect_sites, def_oids, file_parent, local_glue, result_ids, root_glue, sites_by_id,
 };
 
 /// Diff `base` → `result` at definition granularity.
@@ -20,10 +20,24 @@ use crate::defs::{
 /// `result` and must be passed to [`crate::apply`] as `store`.
 #[must_use]
 pub fn diff(base: &IdentifiedTree, result: &NodeTree, mapping: &IdentityMapping) -> Vec<Op> {
-    let Some(base_root) = base.tree.root() else {
+    ensure_apply_identity(base, result, diff_structural(base, result, mapping))
+}
+
+/// Definition-granularity script **without** a whole-file Replace fallback.
+///
+/// [`diff`] adds that fallback so `apply(diff)` reconstructs `result`. [`crate::merge`]
+/// uses this form so two Git-conflicted sides are not collapsed to
+/// `Replace(file)` vs `Replace(file)` (which either hard-conflicts or
+/// picks one entire file).
+pub(crate) fn diff_structural(
+    base: &IdentifiedTree,
+    result: &NodeTree,
+    mapping: &IdentityMapping,
+) -> Vec<Op> {
+    let Some(_base_root) = base.tree.root() else {
         return root_only(result);
     };
-    let Some(result_root) = result.root() else {
+    let Some(_result_root) = result.root() else {
         return deaths_only(base, mapping);
     };
 
@@ -35,13 +49,7 @@ pub fn diff(base: &IdentifiedTree, result: &NodeTree, mapping: &IdentityMapping)
 
     let base_glue = root_glue(&base.tree, &def_oids(&base.ids));
     let result_glue = root_glue(result, &def_oids(result_ids));
-    if base_glue != result_glue {
-        return vec![Op::Replace {
-            node: file_parent(),
-            from: base_root,
-            to: result_root,
-        }];
-    }
+    let glue_changed = base_glue != result_glue;
 
     let dead: BTreeSet<NodeId> = mapping
         .deltas
@@ -70,9 +78,10 @@ pub fn diff(base: &IdentifiedTree, result: &NodeTree, mapping: &IdentityMapping)
         if b.object_id == r.object_id {
             continue;
         }
-        let base_skel = local_skeleton(&base.tree, b.object_id, &base.ids);
-        let result_skel = local_skeleton(result, r.object_id, result_ids);
-        if base_skel == result_skel {
+        let base_glue = local_glue(&base.tree, b.object_id, &base.ids);
+        let result_glue = local_glue(result, r.object_id, result_ids);
+        if base_glue == result_glue {
+            // Container header/braces unchanged: child def ops carry the edit.
             continue;
         }
         if covered(*nid, &result_by_id, &replace_cover) {
@@ -175,7 +184,22 @@ pub fn diff(base: &IdentifiedTree, result: &NodeTree, mapping: &IdentityMapping)
         });
     }
 
-    ensure_apply_identity(base, result, ops)
+    // File-level non-definition glue (comments, leftover tokens) has no
+    // NodeId. Represent it as a file-level Replace only when there are no
+    // def ops; otherwise keep the def script so merge can compose disjoint
+    // definition edits.
+    if glue_changed
+        && ops.is_empty()
+        && let (Some(from), Some(to)) = (base.tree.root(), result.root())
+    {
+        return vec![Op::Replace {
+            node: file_parent(),
+            from,
+            to,
+        }];
+    }
+
+    ops
 }
 
 /// If the script does not reconstruct `result`'s root, fall back to a file-level

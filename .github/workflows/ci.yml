@@ -56,8 +56,9 @@ jobs:
         run: cargo run -p hord-eval --release -- --only hord --json
 
       - name: M1 merge corpus
-        # Corpus is in-repo. Rate gates (70% auto / 95% match) are not yet met;
-        # the job still exercises parse+merge. See corpora/merges/README.md.
+        # Auto-resolve is above 70%. Label match is not: only byte-equal,
+        # trivia-stripped, or same definition `normalized` count (ADR 0005).
+        # Name presence is not a match. Required once that gate passes.
         continue-on-error: true
         run: cargo run -p hord-eval-m1 --release -- --merges-only
 

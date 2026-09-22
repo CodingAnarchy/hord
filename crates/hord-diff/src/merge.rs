@@ -2,11 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hord_core::{NodeId, Op};
+use hord_core::{NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree};
 
 use crate::apply::apply;
-use crate::diff::diff;
+
 use crate::graft::union_trees;
 
 /// Hard vs soft conflict (spec §5.2).
@@ -82,11 +82,73 @@ pub fn merge<A: LangAdapter + ?Sized>(
 ) -> Result<MergeResult, Conflict> {
     let ours_map = crate::defs::mapping_between(base, ours);
     let theirs_map = crate::defs::mapping_between(base, theirs);
-    let ours_ops = diff(base, &ours.tree, &ours_map);
-    let theirs_ops = diff(base, &theirs.tree, &theirs_map);
-    let store = union_trees(&ours.tree, &theirs.tree)
+    let ours_ops = crate::diff::diff_structural(base, &ours.tree, &ours_map);
+    let theirs_ops = crate::diff::diff_structural(base, &theirs.tree, &theirs_map);
+    let mut store = union_trees(&base.tree, &ours.tree)
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
-    merge_ops(adapter, base, &ours_ops, &theirs_ops, &store)
+    store = union_trees(&store, &theirs.tree)
+        .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
+    match merge_ops(adapter, base, &ours_ops, &theirs_ops, &store) {
+        Ok(ok) => Ok(ok),
+        Err(structural) => {
+            if let Some(ok) = cst_file_fallback(adapter, base, ours, theirs, &mut store) {
+                return Ok(ok);
+            }
+            match blob_file_fallback(adapter, base, ours, theirs) {
+                Some(ok) => Ok(ok),
+                None => Err(structural),
+            }
+        }
+    }
+}
+
+/// Positional 3-way of the file CST (spec §3.4) when definition-granularity
+/// compose hard-conflicts.
+fn cst_file_fallback<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+    store: &mut NodeTree,
+) -> Option<MergeResult> {
+    let b = base.tree.root()?;
+    let o = ours.tree.root()?;
+    let t = theirs.tree.root()?;
+    let merged = crate::cst_merge::merge_cst(store, b, o, t).ok()?;
+    let mut tree = NodeTree::new();
+    crate::graft::graft(&mut tree, store, merged).ok()?;
+    tree.set_root(merged).ok()?;
+    let bytes = adapter.project(&tree);
+    let parsed = adapter.parse(bytes.as_slice()).ok()?;
+    let mapping = adapter.identify(base, &parsed);
+    Some(MergeResult {
+        tree: IdentifiedTree::new(parsed, mapping.nodes),
+        soft: vec![Conflict::soft(
+            Vec::new(),
+            "positional CST 3-way of the file (spec §3.4)",
+        )],
+    })
+}
+
+/// When structural compose hard-conflicts, a clean line merge of the whole
+/// file still counts as auto-resolve (spec §5.2 rule 5). Git may have
+/// conflicted with a different 3-way than `diffy`.
+fn blob_file_fallback<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+) -> Option<MergeResult> {
+    let b = adapter.project(&base.tree);
+    let o = adapter.project(&ours.tree);
+    let t = adapter.project(&theirs.tree);
+    let merged = crate::merge_blob(b.as_slice(), o.as_slice(), t.as_slice()).ok()?;
+    let parsed = adapter.parse(merged.as_slice()).ok()?;
+    let mapping = adapter.identify(base, &parsed);
+    Some(MergeResult {
+        tree: IdentifiedTree::new(parsed, mapping.nodes),
+        soft: Vec::new(),
+    })
 }
 
 /// Compose two edit scripts against `base` and apply them.
@@ -99,8 +161,15 @@ pub fn merge_ops<A: LangAdapter + ?Sized>(
     theirs: &[Op],
     store: &NodeTree,
 ) -> Result<MergeResult, Conflict> {
-    let (composed, soft) = compose(ours, theirs, store)?;
-    let applied = apply(base, &composed, store)
+    let mut store = store.clone();
+    let (composed, soft) = compose(ours, theirs, &mut store)?;
+    if composed.is_empty() && (!ours.is_empty() || !theirs.is_empty()) {
+        return Err(Conflict::hard(
+            Vec::new(),
+            "structural compose dropped all ops; refusing a silent base (spec §5.2)",
+        ));
+    }
+    let applied = apply(base, &composed, &store)
         .map_err(|e| Conflict::hard(Vec::new(), format!("apply composed ops: {e}")))?;
     let bytes = adapter.project(&applied.tree);
     let parsed = adapter
@@ -116,7 +185,7 @@ pub fn merge_ops<A: LangAdapter + ?Sized>(
 fn compose(
     ours: &[Op],
     theirs: &[Op],
-    store: &NodeTree,
+    store: &mut NodeTree,
 ) -> Result<(Vec<Op>, Vec<Conflict>), Conflict> {
     let mut soft = Vec::new();
     let mut out = Vec::new();
@@ -186,7 +255,7 @@ fn resolve_same_node(
     nid: NodeId,
     ours: &[Op],
     theirs: &[Op],
-    store: &NodeTree,
+    store: &mut NodeTree,
 ) -> Result<Vec<Op>, Conflict> {
     let o_del = ours.iter().any(|o| matches!(o, Op::Delete { .. }));
     let t_del = theirs.iter().any(|o| matches!(o, Op::Delete { .. }));
@@ -204,17 +273,24 @@ fn resolve_same_node(
     let t_rep = find_replace(theirs);
     match (o_rep, t_rep) {
         (Some(o), Some(t)) => {
-            if !same_normalized(store, o, t) {
-                return Err(Conflict::hard(
-                    vec![nid],
-                    "Replace on the same NodeId with different normalized (spec §5.2 rule 2)",
-                ));
+            if same_normalized(store, o, t) {
+                let mut ops = vec![o.clone()];
+                ops.extend(non_replace(ours).cloned());
+                ops.extend(non_replace(theirs).cloned());
+                return Ok(dedup_tail(ops));
             }
-            // Same semantic edit: landing order picks ours.
+            if let Some(merged) = merge_replace_via_cst(nid, o, t, store) {
+                let mut ops = vec![merged];
+                ops.extend(non_replace(ours).cloned());
+                ops.extend(non_replace(theirs).cloned());
+                return Ok(dedup_tail(ops));
+            }
+            // Landing order: keep ours, then insert named child defs that
+            // exist only on theirs (fields, methods, uses).
             let mut ops = vec![o.clone()];
+            ops.extend(child_inserts_only_in(nid, o, t, store));
             ops.extend(non_replace(ours).cloned());
             ops.extend(non_replace(theirs).cloned());
-            // Drop duplicate moves/renames that match ours.
             Ok(dedup_tail(ops))
         }
         (Some(o), None) => {
@@ -233,6 +309,79 @@ fn resolve_same_node(
             compose_move_rename(nid, ours, theirs)
         }
     }
+}
+
+fn child_inserts_only_in(parent: NodeId, ours: &Op, theirs: &Op, store: &NodeTree) -> Vec<Op> {
+    let (Op::Replace { to: ours_to, .. }, Op::Replace { to: theirs_to, .. }) = (ours, theirs)
+    else {
+        return Vec::new();
+    };
+    let ours_names = named_children(store, *ours_to);
+    let theirs_kids = named_children(store, *theirs_to);
+    let mut extra = Vec::new();
+    for (name, (oid, index)) in theirs_kids {
+        if ours_names.contains_key(&name) {
+            continue;
+        }
+        extra.push(Op::Insert {
+            parent,
+            index,
+            node: oid,
+        });
+    }
+    extra
+}
+
+fn named_children(store: &NodeTree, root: ObjectId) -> BTreeMap<String, (ObjectId, u32)> {
+    let mut out = BTreeMap::new();
+    collect_named(store, root, root, &mut out);
+    out
+}
+
+fn collect_named(
+    store: &NodeTree,
+    oid: ObjectId,
+    root: ObjectId,
+    out: &mut BTreeMap<String, (ObjectId, u32)>,
+) {
+    let Some(node) = store.get(oid) else {
+        return;
+    };
+    if oid != root
+        && let Some(name) = &node.name
+    {
+        out.entry(name.as_str().to_owned()).or_insert((oid, 0));
+        return;
+    }
+    for (i, child) in node.children.iter().enumerate() {
+        if oid == root
+            && let Some(n) = store.get(*child)
+            && let Some(name) = &n.name
+        {
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            out.entry(name.as_str().to_owned()).or_insert((*child, idx));
+            continue;
+        }
+        collect_named(store, *child, root, out);
+    }
+}
+
+fn merge_replace_via_cst(nid: NodeId, ours: &Op, theirs: &Op, store: &mut NodeTree) -> Option<Op> {
+    let (
+        Op::Replace {
+            from, to: ours_to, ..
+        },
+        Op::Replace { to: theirs_to, .. },
+    ) = (ours, theirs)
+    else {
+        return None;
+    };
+    let merged = crate::cst_merge::merge_cst(store, *from, *ours_to, *theirs_to).ok()?;
+    Some(Op::Replace {
+        node: nid,
+        from: *from,
+        to: merged,
+    })
 }
 
 fn find_replace(ops: &[Op]) -> Option<&Op> {

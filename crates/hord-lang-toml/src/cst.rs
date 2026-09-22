@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 
-use hord_core::{LangId, NodeKind, ObjectId};
+use hord_core::{LangId, NodeKind, ObjectId, QualifiedName};
 use hord_lang::{AttachedSpan, NodeTree, ParseError, TokenSpan, attach_trivia_spans};
 
 /// Kind for bytes that tree-sitter-toml omits from the tree (string contents).
@@ -200,8 +200,59 @@ fn intern(
         NodeKind::new(node.kind()),
         *lang,
         children,
-        None,
+        toml_def_name(node, source),
     )?))
+}
+
+fn toml_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<QualifiedName> {
+    let local = toml_local_name(node, source)?;
+    if node.kind() != "pair" {
+        return Some(QualifiedName::new(local));
+    }
+    let mut parts = Vec::new();
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if matches!(p.kind(), "table" | "table_array_element")
+            && let Some(table) = toml_local_name(p, source)
+        {
+            parts.push(table);
+            break;
+        }
+        parent = p.parent();
+    }
+    parts.reverse();
+    parts.push(local);
+    Some(QualifiedName::new(parts.join("::")))
+}
+
+fn toml_local_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "table" | "table_array_element" => {
+            let text = node.utf8_text(source).ok()?.trim();
+            let inner = text
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim();
+            let name = inner.lines().next()?.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_owned())
+            }
+        }
+        "pair" => {
+            let key = node.child(0)?;
+            let text = key.utf8_text(source).ok()?.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_owned())
+            }
+        }
+        _ => None,
+    }
 }
 
 fn with_parser<T>(f: impl FnOnce(&mut tree_sitter::Parser) -> T) -> Result<T, ParseError> {

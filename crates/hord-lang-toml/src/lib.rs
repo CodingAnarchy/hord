@@ -8,14 +8,15 @@
 //!
 //! ## Definition-bearing kinds
 //!
-//! Conservative. Only named tables from the tree-sitter-toml grammar:
+//! Named tables and keys from the tree-sitter-toml grammar:
 //!
 //! - `table` — `[foo]` / `[foo.bar]`
 //! - `table_array_element` — `[[foo]]`
+//! - `pair` — `key = value` (named by key, so two sides adding different
+//!   keys in one table compose; spec §5.2 rule 1)
 //!
-//! `pair` is not a definition: [`LangAdapter::is_definition`] sees only the
-//! kind, so every key would qualify. Inline tables are anonymous. String
-//! contents omitted by the grammar are interned as `_content` (not a
+//! Inline tables are anonymous containers; their inner `pair`s still name.
+//! String contents omitted by the grammar are interned as `_content` (not a
 //! definition).
 
 #![forbid(unsafe_code)]
@@ -66,7 +67,7 @@ impl LangAdapter for TomlAdapter {
     }
 
     fn is_definition(&self, kind: &NodeKind) -> bool {
-        matches!(kind.as_str(), "table" | "table_array_element")
+        matches!(kind.as_str(), "table" | "table_array_element" | "pair")
     }
 }
 
@@ -168,19 +169,20 @@ mod tests {
     }
 
     #[test]
-    fn is_definition_named_tables_only() {
+    fn is_definition_tables_and_pairs() {
         let bytes = fs::read(testdata_dir().join("nested_tables.toml")).unwrap();
         let tree = parse_ok(&bytes);
         let kinds = kinds_in(&tree);
         let a = adapter();
         assert!(kinds.contains("table"), "fixture missing table");
+        assert!(kinds.contains("pair"), "fixture missing pair");
         assert!(a.is_definition(&NodeKind::new("table")));
         assert!(a.is_definition(&NodeKind::new("table_array_element")));
+        assert!(a.is_definition(&NodeKind::new("pair")));
 
         let arrays = parse_ok(&fs::read(testdata_dir().join("arrays_of_tables.toml")).unwrap());
         assert!(kinds_in(&arrays).contains("table_array_element"));
 
-        assert!(!a.is_definition(&NodeKind::new("pair")));
         assert!(!a.is_definition(&NodeKind::new("document")));
         assert!(!a.is_definition(&NodeKind::new("inline_table")));
         assert!(!a.is_definition(&NodeKind::new("bare_key")));

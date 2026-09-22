@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -161,15 +162,33 @@ fn eval_merges() -> Result<(u64, u64, u64, u64)> {
     let mut auto = 0u64;
     let mut matched = 0u64;
     let mut unparseable = 0u64;
+    let mut hard_reasons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut buckets = [0u64; 5];
     for (i, case) in cases.iter().enumerate() {
         match eval_one_merge(case) {
-            Ok(MergeOut::Match) => {
+            Ok(MergeOut::Match { kind }) => {
                 auto += 1;
-                matched += 1;
+                let idx = match kind {
+                    LabelMatch::Byte => 0,
+                    LabelMatch::Stripped => 1,
+                    LabelMatch::Norms => 2,
+                    LabelMatch::NamesOnly => 3,
+                    LabelMatch::Miss => 4,
+                };
+                buckets[idx] += 1;
+                // Name presence is reported, not scored. Spec §12 wants the
+                // labeled resolution: same bytes, same trivia-stripped tree,
+                // or the same definition bodies (`normalized`).
+                if matches!(
+                    kind,
+                    LabelMatch::Byte | LabelMatch::Stripped | LabelMatch::Norms
+                ) {
+                    matched += 1;
+                }
             }
             Ok(MergeOut::Mismatch) => {
                 auto += 1;
-                if auto.saturating_sub(matched) <= 10 {
+                if auto.saturating_sub(matched) <= 5 {
                     eprintln!("[merges] mismatch {}", case.display());
                 }
             }
@@ -177,6 +196,8 @@ fn eval_merges() -> Result<(u64, u64, u64, u64)> {
                 if reason.contains("unparseable") {
                     unparseable += 1;
                 }
+                let bucket = hard_reason_bucket(&reason);
+                *hard_reasons.entry(bucket).or_default() += 1;
             }
             Err(err) => bail!("{}: {err:#}", case.display()),
         }
@@ -184,17 +205,47 @@ fn eval_merges() -> Result<(u64, u64, u64, u64)> {
             eprintln!("[merges] {}/{}", i + 1, cases.len());
         }
     }
+    if !hard_reasons.is_empty() {
+        let summary: Vec<String> = hard_reasons
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect();
+        eprintln!("[merges] hard {}", summary.join(" "));
+    }
     eprintln!(
-        "[merges] auto {auto}/{} match {matched}/{auto} unparseable {unparseable}",
-        cases.len()
+        "[merges] auto {auto}/{} match {matched}/{auto} unparseable {unparseable} (byte {} stripped {} norms {} names-only {} other {})",
+        cases.len(),
+        buckets[0],
+        buckets[1],
+        buckets[2],
+        buckets[3],
+        buckets[4],
     );
     Ok((cases.len() as u64, auto, matched, unparseable))
 }
 
 enum MergeOut {
-    Match,
+    Match { kind: LabelMatch },
     Mismatch,
     Hard { reason: String },
+}
+
+fn hard_reason_bucket(reason: &str) -> String {
+    if reason.contains("unparseable") {
+        "unparseable".into()
+    } else if reason.contains("different normalized") {
+        "same-node-replace".into()
+    } else if reason.contains("Delete vs") {
+        "delete-vs-other".into()
+    } else if reason.contains("apply") {
+        "apply".into()
+    } else if reason.contains("silent base") {
+        "silent-base".into()
+    } else if reason.contains("blob") {
+        "blob".into()
+    } else {
+        "other".into()
+    }
 }
 
 fn eval_one_merge(dir: &Path) -> Result<MergeOut> {
@@ -227,11 +278,9 @@ fn eval_merge_pair<A: LangAdapter>(
     match merge(adapter, &base, &ours, &theirs) {
         Ok(merged) => {
             let got = adapter.project(&merged.tree.tree);
-            if got.as_slice() == want {
-                Ok(MergeOut::Match)
-            } else {
-                Ok(MergeOut::Mismatch)
-            }
+            Ok(MergeOut::Match {
+                kind: classify_label(adapter, got.as_slice(), want),
+            })
         }
         Err(c) => Ok(MergeOut::Hard { reason: c.reason }),
     }
@@ -239,9 +288,92 @@ fn eval_merge_pair<A: LangAdapter>(
 
 type CaseFiles = (&'static str, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
+/// How an auto-resolution lines up with the merge-commit label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LabelMatch {
+    /// Projected bytes equal the label.
+    Byte,
+    /// Trivia-stripped roots are equal.
+    Stripped,
+    /// Same set of definition `normalized` hashes (bodies, not just names).
+    Norms,
+    /// Label names are present, but at least one body differs.
+    NamesOnly,
+    /// Not a match under any of the above.
+    Miss,
+}
+
+fn classify_label<A: LangAdapter>(adapter: &A, got: &[u8], want: &[u8]) -> LabelMatch {
+    if got == want {
+        return LabelMatch::Byte;
+    }
+    let Ok(got_tree) = adapter.parse(got) else {
+        return LabelMatch::Miss;
+    };
+    let Ok(want_tree) = adapter.parse(want) else {
+        return LabelMatch::Miss;
+    };
+    let (Some(g), Some(w)) = (got_tree.root(), want_tree.root()) else {
+        return LabelMatch::Miss;
+    };
+    if got_tree.stripped(g) == want_tree.stripped(w) {
+        return LabelMatch::Stripped;
+    }
+    if def_norms(adapter, &got_tree) == def_norms(adapter, &want_tree) {
+        return LabelMatch::Norms;
+    }
+    let got_n = def_names_of(adapter, got);
+    let want_n = def_names_of(adapter, want);
+    if !want_n.is_empty() && want_n.is_subset(&got_n) {
+        return LabelMatch::NamesOnly;
+    }
+    LabelMatch::Miss
+}
+
+fn def_names_of<A: LangAdapter>(adapter: &A, src: &[u8]) -> std::collections::BTreeSet<String> {
+    let Ok(tree) = adapter.parse(src) else {
+        return Default::default();
+    };
+    tree.iter()
+        .filter(|(_, node)| adapter.is_definition(&node.kind))
+        .filter(|(_, node)| {
+            !matches!(
+                node.kind.as_str(),
+                "field_declaration"
+                    | "enum_variant"
+                    | "inner_attribute_item"
+                    | "use_declaration"
+                    | "extern_crate_declaration"
+                    | "associated_type"
+            )
+        })
+        .filter_map(|(_, node)| {
+            let name = node.name.as_ref()?.as_str();
+            // Impl blocks and trait impls change identity with type parameters;
+            // match on the types/functions they contain instead (ADR 0005).
+            if name.starts_with("impl ") || name.contains(" for ") {
+                return None;
+            }
+            Some(name.to_owned())
+        })
+        .collect()
+}
+
+fn def_norms<A: LangAdapter>(
+    adapter: &A,
+    tree: &hord_lang::NodeTree,
+) -> std::collections::BTreeSet<hord_core::ObjectId> {
+    tree.iter()
+        .filter(|(_, node)| adapter.is_definition(&node.kind))
+        .map(|(_, node)| node.normalized)
+        .collect()
+}
+
 fn eval_blob_merge(base: &[u8], ours: &[u8], theirs: &[u8], want: &[u8]) -> Result<MergeOut> {
     match merge_blob(base, ours, theirs) {
-        Ok(got) if got.as_slice() == want => Ok(MergeOut::Match),
+        Ok(got) if got.as_slice() == want => Ok(MergeOut::Match {
+            kind: LabelMatch::Byte,
+        }),
         Ok(_) => Ok(MergeOut::Mismatch),
         Err(c) => Ok(MergeOut::Hard { reason: c.reason }),
     }

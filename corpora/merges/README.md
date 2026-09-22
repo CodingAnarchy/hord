@@ -28,5 +28,6 @@ cargo run -p hord-eval-m1 --release -- --merges-only
 ```
 
 Targets: auto-resolve ≥ 70% of Git-conflicted cases; 100% of auto-resolutions
-parse; ≥ 95% of auto-resolutions match `result`. Mismatches are reviewed
-against the label or the merge rules (ADR).
+parse; ≥ 95% of auto-resolutions match `result` (byte-equal, trivia-stripped
+equal, or the same definition `normalized` set). Name presence alone does
+not count (ADR 0005).

@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 
-use hord_core::{LangId, NodeKind, ObjectId};
+use hord_core::{LangId, NodeKind, ObjectId, QualifiedName};
 use hord_lang::{AttachedSpan, NodeTree, ParseError, TokenSpan, attach_trivia_spans};
 
 fn is_structural(node: tree_sitter::Node<'_>) -> bool {
@@ -88,8 +88,146 @@ fn intern(
         NodeKind::new(node.kind()),
         *lang,
         children,
-        None,
+        def_name(node, source),
     )?))
+}
+
+fn def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<QualifiedName> {
+    let local = local_def_name(node, source)?;
+    let mut parts = Vec::new();
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if matches!(
+            p.kind(),
+            "mod_item"
+                | "impl_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "union_item"
+                | "enum_variant"
+                | "foreign_mod_item"
+        ) && let Some(m) = local_def_name(p, source)
+        {
+            parts.push(m);
+        }
+        parent = p.parent();
+    }
+    parts.reverse();
+    parts.push(local);
+    Some(QualifiedName::new(parts.join("::")))
+}
+
+fn local_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "function_item"
+        | "function_signature_item"
+        | "struct_item"
+        | "enum_item"
+        | "trait_item"
+        | "mod_item"
+        | "const_item"
+        | "static_item"
+        | "macro_definition"
+        | "type_item"
+        | "associated_type"
+        | "union_item"
+        | "enum_variant"
+        | "field_declaration" => named_field(node, source),
+        "impl_item" => {
+            let ty = node
+                .child_by_field_name("type")?
+                .utf8_text(source)
+                .ok()?
+                .trim();
+            Some(match node.child_by_field_name("trait") {
+                Some(tr) => format!("{} for {}", tr.utf8_text(source).ok()?.trim(), ty),
+                None => format!("impl {ty}"),
+            })
+        }
+        "use_declaration" => use_clause_name(node, source),
+        "extern_crate_declaration" => {
+            named_field(node, source).or_else(|| first_identifier(node, source))
+        }
+        "inner_attribute_item" => {
+            let text = node.utf8_text(source).ok()?.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_owned())
+            }
+        }
+        "foreign_mod_item" => {
+            let abi = first_child_kind(node, "string_literal")
+                .and_then(|n| n.utf8_text(source).ok().map(|s| s.trim().to_owned()))
+                .unwrap_or_else(|| "\"C\"".to_owned());
+            Some(format!("extern {abi}"))
+        }
+        _ => None,
+    }
+}
+
+fn named_field(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    let text = name.utf8_text(source).ok()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+fn first_identifier(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    first_child_kind(node, "identifier").and_then(|n| {
+        let text = n.utf8_text(source).ok()?.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_owned())
+        }
+    })
+}
+
+fn first_child_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        if cursor.node().kind() == kind {
+            return Some(cursor.node());
+        }
+        if !cursor.goto_next_sibling() {
+            return None;
+        }
+    }
+}
+
+fn use_clause_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut bits = Vec::new();
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            "visibility_modifier" | "use" | ";" => {}
+            _ => {
+                if let Ok(text) = child.utf8_text(source) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        bits.push(text.to_owned());
+                    }
+                }
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    let name = bits.join(" ");
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn with_parser<T>(f: impl FnOnce(&mut tree_sitter::Parser) -> T) -> Result<T, ParseError> {

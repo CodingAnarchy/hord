@@ -17,7 +17,7 @@
 //! file root is not a definition. Ops that need a parent for a file-level
 //! definition use [`file_parent`] ([`hord_core::NodeId::nil`]). A
 //! [`hord_core::Op::Replace`] of that id swaps the whole file
-//! (non-definition glue such as `use` items).
+//! (file-level non-definition glue).
 //!
 //! # Granularity
 //!
@@ -32,6 +32,7 @@
 
 mod apply;
 mod blob;
+mod cst_merge;
 mod defs;
 mod diff;
 mod error;
