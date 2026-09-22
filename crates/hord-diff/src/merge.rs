@@ -1,6 +1,6 @@
 //! Structural 3-way merge (spec §5.2).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hord_core::{NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree};
@@ -29,6 +29,8 @@ pub struct Conflict {
     pub kind: ConflictKind,
     /// Why the merge did not (or did, for soft) compose cleanly.
     pub reason: String,
+    /// Spec §5.2 rule 3. Must not fall through to an auto-merge.
+    pub(crate) delete_vs: bool,
 }
 
 impl Conflict {
@@ -37,6 +39,16 @@ impl Conflict {
             nodes,
             kind: ConflictKind::Hard,
             reason: reason.into(),
+            delete_vs: false,
+        }
+    }
+
+    fn delete_vs(nodes: Vec<NodeId>, reason: impl Into<String>) -> Self {
+        Self {
+            nodes,
+            kind: ConflictKind::Hard,
+            reason: reason.into(),
+            delete_vs: true,
         }
     }
 
@@ -45,6 +57,7 @@ impl Conflict {
             nodes,
             kind: ConflictKind::Soft,
             reason: reason.into(),
+            delete_vs: false,
         }
     }
 }
@@ -89,7 +102,7 @@ pub fn merge<A: LangAdapter + ?Sized>(
     store = union_trees(&store, &theirs.tree)
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
     match merge_ops(adapter, base, &ours_ops, &theirs_ops, &store) {
-        Err(conflict) if conflict.reason.contains("Delete vs") => Err(conflict),
+        Err(conflict) if conflict.delete_vs => Err(conflict),
         Ok(ok) => {
             let projected = adapter.project(&ok.tree.tree);
             // A line in none of the three inputs was invented by the merge
@@ -401,7 +414,7 @@ fn resolve_same_node(
         return Ok(vec![ours[0].clone()]);
     }
     if o_del || t_del {
-        return Err(Conflict::hard(
+        return Err(Conflict::delete_vs(
             vec![nid],
             "Delete vs any other op on the same NodeId (spec §5.2 rule 3)",
         ));
@@ -574,11 +587,10 @@ fn compose_move_rename(nid: NodeId, ours: &[Op], theirs: &[Op]) -> Result<Vec<Op
 }
 
 fn dedup_tail(ops: Vec<Op>) -> Vec<Op> {
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for op in ops {
-        let key = format!("{op:?}");
-        if seen.insert(key) {
+        if seen.insert(op.clone()) {
             out.push(op);
         }
     }

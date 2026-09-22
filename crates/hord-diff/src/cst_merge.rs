@@ -216,7 +216,7 @@ fn apply_diff3(
     ht: &[Hunk],
 ) -> Result<Vec<ObjectId>, ()> {
     let mut out = Vec::new();
-    let mut pos = Pos { a: 0, io: 0, it: 0 };
+    let mut pos = Pos { a: 0 };
     let mut o_i = 0usize;
     let mut t_i = 0usize;
 
@@ -234,10 +234,7 @@ fn apply_diff3(
             (None, None) => unreachable!(),
         };
         if pos.a < next_a {
-            let span = next_a - pos.a;
             out.extend_from_slice(&sides.base[pos.a..next_a]);
-            pos.io += span;
-            pos.it += span;
             pos.a = next_a;
             continue;
         }
@@ -261,10 +258,7 @@ fn apply_diff3(
                     skip_consumed(ht, &mut t_i, pos.a);
                 } else {
                     out.extend_from_slice(&sides.ours[oh.s0..oh.s1]);
-                    let span = oh.a1 - oh.a0;
                     pos.a = oh.a1;
-                    pos.io = oh.s1;
-                    pos.it += span;
                     o_i += 1;
                 }
             }
@@ -277,10 +271,7 @@ fn apply_diff3(
                     skip_consumed(ht, &mut t_i, pos.a);
                 } else {
                     out.extend_from_slice(&sides.theirs[th.s0..th.s1]);
-                    let span = th.a1 - th.a0;
                     pos.a = th.a1;
-                    pos.it = th.s1;
-                    pos.io += span;
                     t_i += 1;
                 }
             }
@@ -292,8 +283,6 @@ fn apply_diff3(
 
 struct Pos {
     a: usize,
-    io: usize,
-    it: usize,
 }
 
 fn skip_consumed(hunks: &[Hunk], i: &mut usize, a: usize) {
@@ -320,8 +309,6 @@ fn take_overlap(
         &sides.theirs[th.s0..th.s1],
     )?);
     pos.a = oh.a1;
-    pos.io = oh.s1;
-    pos.it = th.s1;
     Ok(())
 }
 
@@ -356,9 +343,6 @@ fn merge_gap(
             out.push(merge_cst(store, base[i], ours[i], theirs[i])?);
         }
         return Ok(out);
-    }
-    if ours.len() == 1 && theirs.len() == 1 && base.len() == 1 {
-        return Ok(vec![merge_cst(store, base[0], ours[0], theirs[0])?]);
     }
     Err(())
 }

@@ -128,10 +128,6 @@ pub(crate) fn diff_structural(
         if covered(*node, &result_by_id, &replace_cover) {
             continue;
         }
-        if born.contains(to_parent) {
-            // Destination arrives as a grafted Insert; still emit Move so
-            // apply removes the node from the old parent.
-        }
         if covered(*to_parent, &result_by_id, &replace_cover)
             || covered(move_from_parent(mv), &base_by_id, &replace_cover)
         {

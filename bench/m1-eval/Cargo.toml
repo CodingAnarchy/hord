@@ -21,4 +21,3 @@ hord-diff.workspace = true
 hord-lang.workspace = true
 hord-lang-rust.workspace = true
 hord-lang-toml.workspace = true
-serde_json.workspace = true

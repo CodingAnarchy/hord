@@ -1,6 +1,6 @@
 //! Interned lossless CSTs (spec §3.3).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use hord_core::{Bytes, LangId, Node, NodeKind, ObjectId, QualifiedName};
 
@@ -70,7 +70,8 @@ fn find_in_raw(raw: &[u8], stripped: &[u8]) -> Option<(u32, u32)> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeTree {
     root: Option<ObjectId>,
-    entries: HashMap<ObjectId, Entry>,
+    /// Keyed by content id. Iteration order is that key, not insertion order.
+    entries: BTreeMap<ObjectId, Entry>,
 }
 
 impl NodeTree {

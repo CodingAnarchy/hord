@@ -25,18 +25,6 @@ impl WorkspaceId {
     pub fn generate() -> Self {
         Self(Ulid::generate())
     }
-
-    /// Wrap a ULID.
-    #[must_use]
-    pub const fn from_ulid(ulid: Ulid) -> Self {
-        Self(ulid)
-    }
-
-    /// The inner ULID.
-    #[must_use]
-    pub const fn as_ulid(self) -> Ulid {
-        self.0
-    }
 }
 
 impl fmt::Debug for WorkspaceId {
