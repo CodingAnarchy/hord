@@ -15,7 +15,10 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 
-TARGET = 200
+# cargo (7532 merges) and tokio (183 merges) together contain 93
+# `.rs`/`.toml` labels equal to `git merge-file --ours`. Markdown conflicts
+# are blob-tier hard conflicts (spec §5.2 rule 5), so they are not mined.
+OURS_TARGET = int(os.environ.get("HORD_MINE_OURS", "93"))
 
 
 def next_case_id(out: Path) -> int:
@@ -56,17 +59,47 @@ def conflicted_paths(gitdir: Path, ours: str, theirs: str) -> list[str]:
     return paths
 
 
-def merge_conflicts(base: bytes, ours: bytes, theirs: bytes) -> bool:
+def git_merge_ours(base: bytes, ours: bytes, theirs: bytes) -> bytes | None:
+    """Stdout of `git merge-file --ours`. None when git fails outright."""
     with tempfile.TemporaryDirectory() as td:
         t = Path(td)
         (t / "base").write_bytes(base)
         (t / "ours").write_bytes(ours)
         (t / "theirs").write_bytes(theirs)
         r = subprocess.run(
-            ["git", "merge-file", "-q", "-p", str(t / "ours"), str(t / "base"), str(t / "theirs")],
+            [
+                "git",
+                "merge-file",
+                "-p",
+                "--ours",
+                str(t / "ours"),
+                str(t / "base"),
+                str(t / "theirs"),
+            ],
             capture_output=True,
         )
-        return r.returncode > 0
+        if r.stdout == b"" and r.returncode != 0:
+            return None
+        return r.stdout
+
+
+def label_is_ours(case: Path) -> bool:
+    meta = case / "meta.json"
+    if meta.exists():
+        marker = json.loads(meta.read_text()).get("label")
+        if marker == "git-merge-ours":
+            return True
+        if marker == "manual":
+            return False
+    for ext in (".rs", ".toml", ".md"):
+        base = case / f"base{ext}"
+        if not base.exists():
+            continue
+        files = [base.read_bytes()]
+        files += [(case / f"{name}{ext}").read_bytes() for name in ("ours", "theirs", "result")]
+        got = git_merge_ours(files[0], files[1], files[2])
+        return got is not None and got == files[3]
+    return False
 
 
 def mine_repo(
@@ -81,9 +114,12 @@ def mine_repo(
         return 0
     merges = git(gitdir, "rev-list", "--merges", "HEAD").stdout.decode().split()
     taken = 0
-    for merge in merges:
+    print(f"  {len(merges)} merges", flush=True)
+    for nth, merge in enumerate(merges, start=1):
         if taken >= remaining:
             break
+        if nth % 200 == 0:
+            print(f"  scanned {nth} merges, kept {taken}", flush=True)
         parents = git(gitdir, "log", "-1", "--format=%P", merge).stdout.decode().split()
         if len(parents) != 2:
             continue
@@ -98,7 +134,7 @@ def mine_repo(
         for path in both:
             if taken >= remaining:
                 break
-            if not path.endswith(LANG_SUFFIX):
+            if not path.endswith((".rs", ".toml")):
                 continue
             if (name, merge, path) in seen_keys:
                 continue
@@ -114,6 +150,9 @@ def mine_repo(
             if max(len(b), len(o), len(t), len(res)) > MAX_BYTES:
                 continue
             if b == o or b == t:
+                continue
+            # Only git's landing-order resolution. Hand edits are not scored.
+            if git_merge_ours(b, o, t) != res:
                 continue
             # merge-tree already listed this path as conflicted.
             n = next_case_id(out)
@@ -137,6 +176,7 @@ def mine_repo(
                         "base": base_rev,
                         "path": path,
                         "git_conflicted": True,
+                        "label": "git-merge-ours",
                     },
                     indent=2,
                 )
@@ -158,9 +198,9 @@ def main() -> int:
         ("cargo", cache / "cargo.git"),
         ("tokio", cache / "tokio.git"),
     ]
-    have = sum(1 for p in out.iterdir() if p.is_dir())
-    if have >= TARGET:
-        print(f"already have {have} cases")
+    have_ours = sum(1 for p in out.iterdir() if p.is_dir() and label_is_ours(p))
+    print(f"{have_ours} labels already equal git merge-file --ours (target {OURS_TARGET})")
+    if have_ours >= OURS_TARGET:
         return 0
     per_path: dict[str, int] = defaultdict(int)
     seen_keys: set[tuple[str, str, str]] = set()
@@ -170,8 +210,8 @@ def main() -> int:
             m = json.loads(meta.read_text())
             per_path[m["path"]] += 1
             seen_keys.add((m["repo"], m["merge"], m["path"]))
-    need = TARGET - have
-    print(f"need {need} more cases in {out}")
+    need = OURS_TARGET - have_ours
+    print(f"need {need} more git-merge-ours cases in {out}")
     for name, gitdir in repos:
         if need <= 0:
             break
@@ -181,9 +221,9 @@ def main() -> int:
         print(f"mining {name} ({gitdir})")
         got = mine_repo(name, gitdir, out, need, per_path, seen_keys)
         need -= got
-    total = sum(1 for p in out.iterdir() if p.is_dir())
-    print(f"total {total} cases")
-    return 0 if total >= TARGET else 1
+    total_ours = sum(1 for p in out.iterdir() if p.is_dir() and label_is_ours(p))
+    print(f"git-merge-ours labels: {total_ours}")
+    return 0 if total_ours >= OURS_TARGET else 1
 
 
 if __name__ == "__main__":

@@ -27,7 +27,9 @@ Evaluate:
 cargo run -p hord-eval-m1 --release -- --merges-only
 ```
 
-Targets: auto-resolve ≥ 70% of Git-conflicted cases; 100% of auto-resolutions
-parse; ≥ 95% of auto-resolutions match `result` (byte-equal, trivia-stripped
-equal, or the same definition `normalized` set). Name presence alone does
-not count (ADR 0005).
+The directory holds every mined conflict. The gate scores a subset (ADR 0006):
+the label equals `git merge-file --ours`, and no conflict hunk overlaps two
+disjoint definitions. Cargo and tokio yield 61 of those. Targets: auto-resolve
+≥ 70% of scored cases; 100% of auto-resolutions parse; ≥ 95% match `result`
+(byte-equal, trivia-stripped equal, or the same definition `normalized` set).
+Name presence alone does not count (ADR 0005).

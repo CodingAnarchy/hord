@@ -38,6 +38,7 @@ mod diff;
 mod error;
 mod graft;
 mod merge;
+mod text_merge;
 
 pub use apply::apply;
 pub use blob::merge_blob;

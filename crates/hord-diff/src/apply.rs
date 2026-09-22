@@ -1,6 +1,6 @@
 //! Apply a definition-granularity edit script to an identified tree.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, NodeTree};
@@ -59,9 +59,11 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
         }
     }
 
+    // Ancestors first, then content id. `NodeId` is a random ULID and must
+    // not decide which edit lands.
     replaces.sort_by_key(|op| match op {
-        Op::Replace { node, .. } => node.as_u128(),
-        _ => u128::MAX,
+        Op::Replace { node, .. } => content_order(base, *node),
+        _ => (usize::MAX, ObjectId::from_bytes([0xff; 32])),
     });
 
     for op in replaces {
@@ -74,12 +76,10 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
 
     deletes.sort_by_key(|op| match op {
         Op::Delete { node } => {
-            let depth = oid_of(&working, *node)
-                .and_then(|oid| path_to(&working.tree, oid).map(|p| p.len()))
-                .unwrap_or(0);
-            (std::cmp::Reverse(depth), node.as_u128())
+            let (depth, oid) = content_order(&working, *node);
+            (std::cmp::Reverse(depth), oid)
         }
-        _ => (std::cmp::Reverse(0), 0),
+        _ => (std::cmp::Reverse(0), ObjectId::from_bytes([0; 32])),
     });
 
     for op in deletes {
@@ -88,6 +88,24 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
         };
         apply_delete(&mut working, *node)?;
     }
+
+    moves.sort_by_key(|op| match op {
+        Op::Move {
+            node,
+            to_parent,
+            index,
+            ..
+        } => {
+            let (_, oid) = content_order(&working, *node);
+            let (_, parent) = content_order(&working, *to_parent);
+            (*index, parent, oid)
+        }
+        _ => (
+            0,
+            ObjectId::from_bytes([0; 32]),
+            ObjectId::from_bytes([0; 32]),
+        ),
+    });
 
     for op in moves {
         let Op::Move {
@@ -116,7 +134,106 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
         apply_insert(&mut working, *parent, *index, *node)?;
     }
 
+    let seps = trailing_commas(store);
+    if !seps.is_empty() {
+        let mut sep_ids: Vec<ObjectId> = seps.values().copied().collect();
+        sep_ids.sort();
+        sep_ids.dedup();
+        for id in &sep_ids {
+            graft(&mut working.tree, store, *id)?;
+        }
+        if let Some(root) = working.tree.root() {
+            let new_root = restore_trailing_commas(&mut working, root, &seps)?;
+            working.tree.set_root(new_root)?;
+        }
+    }
+
     Ok(working)
+}
+
+/// Child definition → the `,` sibling that followed it in a source tree.
+///
+/// Only fields and enum variants. A shared token such as `i32` must not pick
+/// up a comma just because one occurrence was followed by one.
+fn trailing_commas(store: &NodeTree) -> BTreeMap<ObjectId, ObjectId> {
+    let mut ids: Vec<ObjectId> = store.iter().map(|(id, _)| id).collect();
+    ids.sort();
+    let mut map = BTreeMap::new();
+    for id in ids {
+        let Some(parent) = store.get(id) else {
+            continue;
+        };
+        for (index, child) in parent.children.iter().enumerate() {
+            let Some(node) = store.get(*child) else {
+                continue;
+            };
+            if !matches!(node.kind.as_str(), "field_declaration" | "enum_variant") {
+                continue;
+            }
+            let Some(next) = parent.children.get(index + 1) else {
+                continue;
+            };
+            let Some(sep) = store.get(*next) else {
+                continue;
+            };
+            if sep.children.is_empty() && sep.raw.as_slice() == b"," {
+                map.insert(*child, *next);
+            }
+        }
+    }
+    map
+}
+
+/// Put back the `,` that followed an inserted field or variant in its source.
+fn restore_trailing_commas(
+    working: &mut IdentifiedTree,
+    id: ObjectId,
+    seps: &BTreeMap<ObjectId, ObjectId>,
+) -> Result<ObjectId, Error> {
+    let node = working.tree.get(id).ok_or(Error::MissingNode(id))?.clone();
+    let mut rebuilt = Vec::with_capacity(node.children.len());
+    let mut changed = false;
+    for child in &node.children {
+        let new_child = restore_trailing_commas(working, *child, seps)?;
+        if new_child != *child {
+            changed = true;
+        }
+        rebuilt.push(new_child);
+    }
+    let mut kids = Vec::with_capacity(rebuilt.len());
+    for (index, child) in rebuilt.iter().enumerate() {
+        kids.push(*child);
+        let Some(sep) = seps.get(child) else {
+            continue;
+        };
+        let next_is_sep = rebuilt.get(index + 1).is_some_and(|next| next == sep);
+        if !next_is_sep {
+            kids.push(*sep);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(id);
+    }
+    let new_id = working
+        .tree
+        .intern_branch(node.kind, node.lang, kids, node.name)?;
+    if let Some(nid) = working.ids.remove(&id) {
+        working.ids.insert(new_id, nid);
+    }
+    Ok(new_id)
+}
+
+/// Tree depth, then the node's content id. Both come from the CST, not from
+/// a generated [`NodeId`].
+fn content_order(tree: &IdentifiedTree, node: NodeId) -> (usize, ObjectId) {
+    let Some(oid) = oid_of(tree, node) else {
+        return (usize::MAX, ObjectId::from_bytes([0; 32]));
+    };
+    let depth = path_to(&tree.tree, oid)
+        .map(|path| path.len())
+        .unwrap_or(usize::MAX);
+    (depth, oid)
 }
 
 fn apply_replace(working: &mut IdentifiedTree, node_id: NodeId, to: ObjectId) -> Result<(), Error> {

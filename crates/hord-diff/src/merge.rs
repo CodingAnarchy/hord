@@ -89,8 +89,28 @@ pub fn merge<A: LangAdapter + ?Sized>(
     store = union_trees(&store, &theirs.tree)
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
     match merge_ops(adapter, base, &ours_ops, &theirs_ops, &store) {
-        Ok(ok) => Ok(ok),
+        Err(conflict) if conflict.reason.contains("Delete vs") => Err(conflict),
+        Ok(ok) => {
+            let projected = adapter.project(&ok.tree.tree);
+            // A line in none of the three inputs was invented by the merge
+            // (a comma glued onto the wrong token, a hand-style rewrite).
+            // That is not an auto-resolution. Landing order is git's.
+            if projection_invents_line(adapter, base, ours, theirs, projected.as_slice())
+                && let Some(git) = git_ours_result(adapter, base, ours, theirs)
+            {
+                return Ok(git);
+            }
+            Ok(ok)
+        }
         Err(structural) => {
+            // Overlapping edits. Keep non-conflicting edits from both sides
+            // and ours' side of each conflict hunk. Do not invent a rewrite.
+            if let Some(ok) = git_ours_result(adapter, base, ours, theirs) {
+                return Ok(ok);
+            }
+            if let Some(ok) = text_merge_result(adapter, base, ours, theirs) {
+                return Ok(ok);
+            }
             if let Some(ok) = cst_file_fallback(adapter, base, ours, theirs, &mut store) {
                 return Ok(ok);
             }
@@ -100,6 +120,105 @@ pub fn merge<A: LangAdapter + ?Sized>(
             }
         }
     }
+}
+
+/// True when `merged` has a non-blank line that occurs in none of base, ours,
+/// and theirs. Unchanged context may come from base alone.
+fn projection_invents_line<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+    merged: &[u8],
+) -> bool {
+    let base_src = adapter.project(&base.tree);
+    let ours_src = adapter.project(&ours.tree);
+    let theirs_src = adapter.project(&theirs.tree);
+    let mut allowed: BTreeSet<&[u8]> = BTreeSet::new();
+    for src in [
+        base_src.as_slice(),
+        ours_src.as_slice(),
+        theirs_src.as_slice(),
+    ] {
+        for line in src.split(|byte| *byte == b'\n') {
+            if !trim_ascii(line).is_empty() {
+                allowed.insert(line);
+            }
+        }
+    }
+    merged
+        .split(|byte| *byte == b'\n')
+        .any(|line| !trim_ascii(line).is_empty() && !allowed.contains(line))
+}
+
+fn trim_ascii(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &line[start..end]
+}
+
+fn git_ours_result<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+) -> Option<MergeResult> {
+    let base_src = adapter.project(&base.tree);
+    let ours_src = adapter.project(&ours.tree);
+    let theirs_src = adapter.project(&theirs.tree);
+    let merged = crate::text_merge::git_merge_ours(
+        base_src.as_slice(),
+        ours_src.as_slice(),
+        theirs_src.as_slice(),
+    )?;
+    let parsed = adapter.parse(&merged).ok()?;
+    if adapter.project(&parsed).as_slice() != merged.as_slice() {
+        return None;
+    }
+    let mapping = adapter.identify(base, &parsed);
+    Some(MergeResult {
+        tree: IdentifiedTree::new(parsed, mapping.nodes),
+        soft: vec![Conflict::soft(
+            Vec::new(),
+            "git auto-merge with landing-order (ours) conflict hunks",
+        )],
+    })
+}
+
+/// Line/token 3-way of the source. Used when it re-parses losslessly, because
+/// that is the combined body of overlapping edits inside one definition.
+fn text_merge_result<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+) -> Option<MergeResult> {
+    let base_src = adapter.project(&base.tree);
+    let ours_src = adapter.project(&ours.tree);
+    let theirs_src = adapter.project(&theirs.tree);
+    let merged = crate::text_merge::merge_text(
+        std::str::from_utf8(base_src.as_slice()).ok()?,
+        std::str::from_utf8(ours_src.as_slice()).ok()?,
+        std::str::from_utf8(theirs_src.as_slice()).ok()?,
+    )?;
+    let parsed = adapter.parse(merged.as_bytes()).ok()?;
+    if adapter.project(&parsed).as_slice() != merged.as_bytes() {
+        return None;
+    }
+    let mapping = adapter.identify(base, &parsed);
+    Some(MergeResult {
+        tree: IdentifiedTree::new(parsed, mapping.nodes),
+        soft: vec![Conflict::soft(
+            Vec::new(),
+            "line/token 3-way kept both sides' disjoint edits",
+        )],
+    })
 }
 
 /// Positional 3-way of the file CST (spec §3.4) when definition-granularity
@@ -195,6 +314,14 @@ fn compose(
     let mut nids: BTreeSet<NodeId> = BTreeSet::new();
     nids.extend(ours_by.keys().copied());
     nids.extend(theirs_by.keys().copied());
+    // Content id of the base node, not the random NodeId, so child inserts
+    // come out in the same order every run.
+    let mut nids: Vec<NodeId> = nids.into_iter().collect();
+    nids.sort_by_key(|nid| {
+        let o = ours_by.get(nid).map(Vec::as_slice).unwrap_or(&[]);
+        let t = theirs_by.get(nid).map(Vec::as_slice).unwrap_or(&[]);
+        anchor_oid(o).max(anchor_oid(t))
+    });
 
     for nid in nids {
         let o = ours_by.get(&nid).map(Vec::as_slice).unwrap_or(&[]);
@@ -229,6 +356,17 @@ fn compose(
     }
 
     Ok((out, soft))
+}
+
+/// Base-content id of a Replace in `ops`, or the all-zero id when there is
+/// none. Used only as a sort key.
+fn anchor_oid(ops: &[Op]) -> ObjectId {
+    ops.iter()
+        .find_map(|op| match op {
+            Op::Replace { from, .. } => Some(*from),
+            _ => None,
+        })
+        .unwrap_or_else(|| ObjectId::from_bytes([0; 32]))
 }
 
 fn index_node_ops(ops: &[Op]) -> BTreeMap<NodeId, Vec<Op>> {

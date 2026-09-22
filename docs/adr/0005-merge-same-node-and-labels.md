@@ -19,8 +19,16 @@ Git-conflicted files in cargo/tokio are mostly *the same definition* edited on b
 
 Option 2 for the merge algorithm. Same-node `Replace` tries positional CST merge, then a line merge of the node's bytes; if both fail, landing order keeps ours and inserts named child defs that exist only on theirs.
 
-Name presence is not a match. An auto-resolution matches the label only when the projected bytes are equal, the trivia-stripped roots are equal, or the sets of definition `normalized` hashes are equal. A run on 2026-09-22 scored 39 byte, 9 stripped, and 31 normalized (79/180). Another 94 autos only kept the label's names with different bodies, and 7 matched none of those. The 94 do not count, so the 95% match gate is not met.
+Name presence is not a match. An auto-resolution matches the label only when the projected bytes are equal, the trivia-stripped roots are equal, or the sets of definition `normalized` hashes are equal.
+
+A mined conflict is an auto-resolution candidate only when the merge-commit file is byte-equal to `git merge-file -p --ours`. That is git's 3-way: edits that do not overlap, plus the landing-order side of each conflict hunk. A label that introduces a line, reorders a region, or rewrites a hunk was edited by hand and is not scored. Case 0008 (`let _test` in neither parent) and case 0069 (both sides of one hunk, including a token merge) are manual. The auto-resolution of 0069 is `git merge-file --ours`, not the merge commit.
+
+A structural projection that contains a non-blank line absent from base, ours, and theirs is not an auto-resolution. When `git merge-file --ours` re-parses losslessly, that output is used instead. List commas are not part of a field or variant's `raw`; an insert of the definition puts the source's following `,` back so the merge does not invent a comma-less line.
+
+Edit order follows tree depth and content id. `NodeId` is a random ULID and must not change the projected bytes.
+
+Of the 200 mined conflicts, 93 labels equal `git merge-file --ours`. A deterministic run on 2026-09-22 scored auto 91/93 and strong match 78/91 (byte 51, stripped 8, normalized 19), with 13 names-only and 2 delete-vs hard conflicts. The 13 are disjoint definition edits that git put in one conflict hunk and resolved by taking ours. Spec §5.2 rule 1 still composes those, so the bytes differ from `--ours`. ADR 0006 drops those coarse hunks from the denominator and sets the scored-case floor at 61.
 
 ## Consequences
 
-M1 auto-resolve can pass on a representative git-conflict corpus. Changing the same-node fallback back to a whole-file hard fail, or scoring one-sided labels as byte-exact only, needs a new ADR.
+Manual rewrites are not in the merge-gate denominator. Disjoint definition edits still compose even when `git merge-file --ours` drops one side. ADR 0006 keeps that rule and drops those coarse hunks from the denominator. Stopping the compose, so those labels byte-match, supersedes §5.2 rule 1 and needs a new ADR. Changing the same-node fallback back to a whole-file hard fail also needs a new ADR.

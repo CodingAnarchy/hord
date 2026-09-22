@@ -31,7 +31,9 @@ pub(crate) fn graft(dest: &mut NodeTree, src: &NodeTree, id: ObjectId) -> Result
 /// Intern every node from `src` into a clone of `dest`.
 pub(crate) fn union_trees(a: &NodeTree, b: &NodeTree) -> Result<NodeTree, Error> {
     let mut out = a.clone();
-    for (id, _) in b.iter() {
+    let mut ids: Vec<ObjectId> = b.iter().map(|(id, _)| id).collect();
+    ids.sort();
+    for id in ids {
         graft(&mut out, b, id)?;
     }
     Ok(out)

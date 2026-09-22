@@ -71,8 +71,11 @@ pub(crate) fn diff_structural(
     let mut replace_cover: BTreeSet<NodeId> = BTreeSet::new();
     let mut replaces = Vec::new();
 
-    for (nid, r) in &result_by_id {
-        let Some(b) = base_by_id.get(nid) else {
+    // Preorder, not NodeId order. NodeIds are random ULIDs, and `covered`
+    // keeps a parent Replace from also emitting child Replaces. Walking in
+    // id order made that set depend on the process.
+    for r in &result_sites {
+        let Some(b) = base_by_id.get(&r.node_id) else {
             continue;
         };
         if b.object_id == r.object_id {
@@ -84,15 +87,15 @@ pub(crate) fn diff_structural(
             // Container header/braces unchanged: child def ops carry the edit.
             continue;
         }
-        if covered(*nid, &result_by_id, &replace_cover) {
+        if covered(r.node_id, &result_by_id, &replace_cover) {
             continue;
         }
         replaces.push(Op::Replace {
-            node: *nid,
+            node: r.node_id,
             from: b.object_id,
             to: r.object_id,
         });
-        replace_cover.insert(*nid);
+        replace_cover.insert(r.node_id);
     }
 
     let mut ops = Vec::new();

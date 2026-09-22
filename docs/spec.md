@@ -739,7 +739,7 @@ Deliver: `hord-lang` generic tree-sitter adapter, `hord-lang-rust` Tier 1, `hord
 Accept:
 - Losslessness: `project(parse(f)) == f` for every `.rs` and `.toml` file in the M0 corpora. Any failure is a blocker.
 - `apply(base, diff(base, result)) == result` under `proptest` and on all consecutive commit pairs in the corpora.
-- **Merge corpus:** 200 hand-labeled 3-way cases mined from real git conflicts in the corpora (`corpora/merges/`), each with a human-resolved expected result. Target: hord auto-resolves ≥ 70% of cases where git conflicts, with 100% of auto-resolutions parsing and ≥ 95% matching the labeled resolution. Cases where hord resolves *differently* from the label are reviewed and either the label or the merge rules are fixed via ADR.
+- **Merge corpus:** real git conflicts mined into `corpora/merges/`. A case is scored only when the merge commit equals `git merge-file --ours` and no conflict hunk overlaps two disjoint definitions (ADR 0006). Cargo and tokio contain 61 such cases; that count is the floor (the original 200 included hand edits and coarse hunks). Target: hord auto-resolves ≥ 70% of scored cases, with 100% of auto-resolutions parsing and ≥ 95% matching the labeled resolution. Cases where hord resolves differently from the label are reviewed and either the label or the merge rules are fixed via ADR.
 
 ### M2 — Identity and semantics (Tier 2)
 

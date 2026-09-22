@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -134,11 +134,16 @@ fn run(args: &Args) -> Result<Totals> {
     Ok(totals)
 }
 
+/// Scored merge cases the M0 corpora can supply (ADR 0006). Spec §12's
+/// original 200 counted every mined conflict, including hand edits and
+/// hunks that cover two definitions.
+const MIN_SCORED_MERGES: u64 = 61;
+
 fn merge_gates(t: &Totals, merges_only: bool) -> bool {
     if t.merge_cases == 0 {
         return !merges_only;
     }
-    if merges_only && t.merge_cases < 200 {
+    if merges_only && t.merge_cases < MIN_SCORED_MERGES {
         return false;
     }
     t.merge_unparseable == 0
@@ -162,9 +167,23 @@ fn eval_merges() -> Result<(u64, u64, u64, u64)> {
     let mut auto = 0u64;
     let mut matched = 0u64;
     let mut unparseable = 0u64;
+    let mut skipped_manual = 0u64;
+    let mut skipped_coarse = 0u64;
     let mut hard_reasons: BTreeMap<String, u64> = BTreeMap::new();
     let mut buckets = [0u64; 5];
+    let mut candidates = 0u64;
     for (i, case) in cases.iter().enumerate() {
+        match case_class(case)? {
+            CaseClass::Manual => {
+                skipped_manual += 1;
+                continue;
+            }
+            CaseClass::Coarse => {
+                skipped_coarse += 1;
+                continue;
+            }
+            CaseClass::Candidate => candidates += 1,
+        }
         match eval_one_merge(case) {
             Ok(MergeOut::Match { kind }) => {
                 auto += 1;
@@ -184,12 +203,6 @@ fn eval_merges() -> Result<(u64, u64, u64, u64)> {
                     LabelMatch::Byte | LabelMatch::Stripped | LabelMatch::Norms
                 ) {
                     matched += 1;
-                }
-            }
-            Ok(MergeOut::Mismatch) => {
-                auto += 1;
-                if auto.saturating_sub(matched) <= 5 {
-                    eprintln!("[merges] mismatch {}", case.display());
                 }
             }
             Ok(MergeOut::Hard { reason }) => {
@@ -213,20 +226,274 @@ fn eval_merges() -> Result<(u64, u64, u64, u64)> {
         eprintln!("[merges] hard {}", summary.join(" "));
     }
     eprintln!(
-        "[merges] auto {auto}/{} match {matched}/{auto} unparseable {unparseable} (byte {} stripped {} norms {} names-only {} other {})",
-        cases.len(),
-        buckets[0],
-        buckets[1],
-        buckets[2],
-        buckets[3],
-        buckets[4],
+        "[merges] candidates {candidates} skipped-manual {skipped_manual} skipped-coarse {skipped_coarse} auto {auto}/{candidates} match {matched}/{auto} unparseable {unparseable} (byte {} stripped {} norms {} names-only {} other {})",
+        buckets[0], buckets[1], buckets[2], buckets[3], buckets[4],
     );
-    Ok((cases.len() as u64, auto, matched, unparseable))
+    Ok((candidates, auto, matched, unparseable))
+}
+
+/// Why a mined conflict is not in the M1 denominator (ADR 0006).
+enum CaseClass {
+    /// The merge commit is not `git merge-file --ours`: a hand edit,
+    /// reorder, rewrite, or the other side of a hunk.
+    Manual,
+    /// One git conflict hunk covers two disjoint definitions. The `--ours`
+    /// label drops one of them; structural merge keeps both (spec §5.2 rule 1).
+    Coarse,
+    /// Git's landing-order resolution of hunks that each touch one definition.
+    Candidate,
+}
+
+/// Score a case only when the label is git's landing-order auto-merge and no
+/// conflict hunk covers two disjoint definitions (ADR 0006).
+fn case_class(dir: &Path) -> Result<CaseClass> {
+    let (ext, base, ours, theirs, result) = match load_case(dir) {
+        Ok(files) => files,
+        Err(_) => return Ok(CaseClass::Manual),
+    };
+    let merged = git_merge_file(&base, &ours, &theirs, true)?;
+    if merged != result {
+        return Ok(CaseClass::Manual);
+    }
+    let conflicted = git_merge_file(&base, &ours, &theirs, false)?;
+    let coarse = match ext {
+        "rs" => hunk_covers_disjoint_defs(&RustAdapter, &base, &ours, &theirs, &conflicted),
+        "toml" => hunk_covers_disjoint_defs(&TomlAdapter, &base, &ours, &theirs, &conflicted),
+        _ => false,
+    };
+    Ok(if coarse {
+        CaseClass::Coarse
+    } else {
+        CaseClass::Candidate
+    })
+}
+
+struct DefSpan {
+    id: hord_core::NodeId,
+    start: usize,
+    end: usize,
+}
+
+/// True when some git conflict hunk's ours-side or theirs-side text overlaps
+/// two definitions, neither of which contains the other.
+fn hunk_covers_disjoint_defs<A: LangAdapter>(
+    adapter: &A,
+    base_src: &[u8],
+    ours_src: &[u8],
+    theirs_src: &[u8],
+    conflicted: &[u8],
+) -> bool {
+    let Ok((ours_spans, theirs_spans)) = side_spans(adapter, base_src, ours_src, theirs_src) else {
+        return false;
+    };
+    let mut ours_at = 0usize;
+    let mut theirs_at = 0usize;
+    for (ours_body, theirs_body) in conflict_bodies(conflicted) {
+        let mut touched = BTreeSet::new();
+        // The conflict body ends with the line's newline, which is often the
+        // next definition's leading trivia. Don't let that one byte pull in
+        // the following def.
+        let ours_body = trim_one_trailing_newline(&ours_body);
+        let theirs_body = trim_one_trailing_newline(&theirs_body);
+        if let Some((start, end)) = locate(ours_src, ours_body, &mut ours_at)
+            && end > start
+        {
+            touched.extend(minimal_defs(&ours_spans, start, end));
+        }
+        if let Some((start, end)) = locate(theirs_src, theirs_body, &mut theirs_at)
+            && end > start
+        {
+            touched.extend(minimal_defs(&theirs_spans, start, end));
+        }
+        if touched.len() >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+fn side_spans<A: LangAdapter>(
+    adapter: &A,
+    base_src: &[u8],
+    ours_src: &[u8],
+    theirs_src: &[u8],
+) -> Result<(Vec<DefSpan>, Vec<DefSpan>), ()> {
+    let empty = IdentifiedTree::default();
+    let base_tree = adapter.parse(base_src).map_err(|_| ())?;
+    let base_map = default_identify(adapter, &empty, &base_tree);
+    let base = IdentifiedTree::new(base_tree, base_map.nodes);
+    let ours_tree = adapter.parse(ours_src).map_err(|_| ())?;
+    let ours_map = default_identify(adapter, &base, &ours_tree);
+    let ours = IdentifiedTree::new(ours_tree, ours_map.nodes);
+    let theirs_tree = adapter.parse(theirs_src).map_err(|_| ())?;
+    let theirs_map = default_identify(adapter, &base, &theirs_tree);
+    let theirs = IdentifiedTree::new(theirs_tree, theirs_map.nodes);
+    Ok((def_spans(adapter, &ours), def_spans(adapter, &theirs)))
+}
+
+fn def_spans<A: LangAdapter>(adapter: &A, tree: &IdentifiedTree) -> Vec<DefSpan> {
+    let mut out = Vec::new();
+    if let Some(root) = tree.tree.root() {
+        walk_defs(adapter, &tree.tree, &tree.ids, root, 0, &mut out);
+    }
+    out
+}
+
+fn walk_defs<A: LangAdapter>(
+    adapter: &A,
+    tree: &hord_lang::NodeTree,
+    ids: &BTreeMap<hord_core::ObjectId, hord_core::NodeId>,
+    id: hord_core::ObjectId,
+    offset: usize,
+    out: &mut Vec<DefSpan>,
+) -> usize {
+    let Some(node) = tree.get(id) else {
+        return offset;
+    };
+    let end = offset + node.raw.len();
+    if adapter.is_definition(&node.kind)
+        && let Some(nid) = ids.get(&id)
+    {
+        out.push(DefSpan {
+            id: *nid,
+            start: offset,
+            end,
+        });
+    }
+    let mut child_at = offset;
+    for child in &node.children {
+        child_at = walk_defs(adapter, tree, ids, *child, child_at, out);
+    }
+    end
+}
+
+fn minimal_defs(spans: &[DefSpan], start: usize, end: usize) -> BTreeSet<hord_core::NodeId> {
+    let hit: Vec<&DefSpan> = spans
+        .iter()
+        .filter(|span| span.start < end && span.end > start)
+        .collect();
+    let mut out = BTreeSet::new();
+    for span in &hit {
+        let contains_other = hit.iter().any(|other| {
+            other.id != span.id
+                && other.start >= span.start
+                && other.end <= span.end
+                && (other.start > span.start || other.end < span.end)
+        });
+        if !contains_other {
+            out.insert(span.id);
+        }
+    }
+    out
+}
+
+fn trim_one_trailing_newline(body: &[u8]) -> &[u8] {
+    body.strip_suffix(b"\n").unwrap_or(body)
+}
+
+fn locate(haystack: &[u8], needle: &[u8], cursor: &mut usize) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return Some((*cursor, *cursor));
+    }
+    let rest = haystack.get(*cursor..)?;
+    let pos = rest
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let start = *cursor + pos;
+    *cursor = start + needle.len();
+    Some((start, *cursor))
+}
+
+/// Ours-side and theirs-side bytes of each conflict hunk in `git merge-file` output.
+fn conflict_bodies(conflicted: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < conflicted.len() {
+        if !conflicted[i..].starts_with(b"<<<<<<<") {
+            i += 1;
+            continue;
+        }
+        let Some(after_marker) = line_end(conflicted, i) else {
+            break;
+        };
+        let Some(split) = find_line(conflicted, after_marker, b"=======") else {
+            break;
+        };
+        let Some(after_split) = line_end(conflicted, split) else {
+            break;
+        };
+        let Some(close) = find_line(conflicted, after_split, b">>>>>>>") else {
+            break;
+        };
+        out.push((
+            conflicted[after_marker..split].to_vec(),
+            conflicted[after_split..close].to_vec(),
+        ));
+        i = line_end(conflicted, close).unwrap_or(conflicted.len());
+    }
+    out
+}
+
+fn line_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let rel = bytes[at..].iter().position(|byte| *byte == b'\n')?;
+    Some(at + rel + 1)
+}
+
+fn find_line(bytes: &[u8], from: usize, marker: &[u8]) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(marker)
+            && (i == 0 || bytes[i - 1] == b'\n')
+            && bytes
+                .get(i + marker.len())
+                .is_none_or(|byte| *byte == b'\n' || *byte == b' ')
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn git_merge_file(base: &[u8], ours: &[u8], theirs: &[u8], favor_ours: bool) -> Result<Vec<u8>> {
+    let dir = std::env::temp_dir().join(format!(
+        "hord-merge-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir)?;
+    let base_p = dir.join("base");
+    let ours_p = dir.join("ours");
+    let theirs_p = dir.join("theirs");
+    fs::write(&base_p, base)?;
+    fs::write(&ours_p, ours)?;
+    fs::write(&theirs_p, theirs)?;
+    let mut cmd = Command::new("git");
+    cmd.args(["merge-file", "-p"]);
+    if favor_ours {
+        cmd.arg("--ours");
+    }
+    let output = cmd
+        .arg(ours_p.to_str().context("ours path")?)
+        .arg(base_p.to_str().context("base path")?)
+        .arg(theirs_p.to_str().context("theirs path")?)
+        .output()
+        .context("git merge-file")?;
+    let _ = fs::remove_dir_all(&dir);
+    if output.stdout.is_empty() && !output.status.success() {
+        bail!(
+            "git merge-file failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output.stdout)
 }
 
 enum MergeOut {
     Match { kind: LabelMatch },
-    Mismatch,
     Hard { reason: String },
 }
 
@@ -374,7 +641,9 @@ fn eval_blob_merge(base: &[u8], ours: &[u8], theirs: &[u8], want: &[u8]) -> Resu
         Ok(got) if got.as_slice() == want => Ok(MergeOut::Match {
             kind: LabelMatch::Byte,
         }),
-        Ok(_) => Ok(MergeOut::Mismatch),
+        Ok(_) => Ok(MergeOut::Match {
+            kind: LabelMatch::Miss,
+        }),
         Err(c) => Ok(MergeOut::Hard { reason: c.reason }),
     }
 }

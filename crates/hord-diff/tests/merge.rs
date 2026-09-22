@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::path::PathBuf;
+
 use hord_core::Op;
 use hord_diff::{ConflictKind, apply, diff, merge, merge_ops};
 use hord_lang::{IdentifiedTree, LangAdapter, default_identify};
@@ -69,6 +71,31 @@ fn container_replace_keeps_theirs_unique_fields() {
     assert!(text.contains("pub struct S"), "ours vis missing: {text}");
     assert!(text.contains("b: i32"), "ours field missing: {text}");
     assert!(text.contains("c: i32"), "theirs field missing: {text}");
+}
+
+#[test]
+fn overlapping_edits_inside_one_function_keep_both() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpora/merges/0069");
+    let read = |name: &str| std::fs::read(root.join(name)).expect(name);
+    let base = read("base.rs");
+    let ours = read("ours.rs");
+    let theirs = read("theirs.rs");
+    let want = read("result.rs");
+    let adapter = rust();
+    let merged = merge_identified(&adapter, &base, &ours, &theirs)
+        .unwrap_or_else(|c| panic!("0069 should resolve: {c:?}"));
+    let got = adapter.project(&merged.tree.tree);
+    // The merge commit mixes both sides of one conflict hunk. That is a manual
+    // resolution. Landing-order auto-resolution is `git merge-file --ours`.
+    let favor = std::process::Command::new("git")
+        .args(["merge-file", "-p", "--ours"])
+        .arg(root.join("ours.rs"))
+        .arg(root.join("base.rs"))
+        .arg(root.join("theirs.rs"))
+        .output()
+        .expect("git merge-file");
+    assert_eq!(got.as_slice(), favor.stdout.as_slice());
+    assert_ne!(got.as_slice(), want.as_slice());
 }
 
 #[test]
@@ -281,6 +308,50 @@ fn disjoint_toml_keys_compose() {
     let text = projected_text(&adapter, &merged.tree);
     assert!(text.contains("bar"), "ours key missing: {text}");
     assert!(text.contains("baz"), "theirs key missing: {text}");
+}
+
+#[test]
+fn merge_bytes_do_not_depend_on_generated_node_ids() {
+    // These labels are `git merge-file --ours`. Two merges of the same bytes
+    // must project the same file: NodeIds are random ULIDs.
+    for case in ["0076", "0114", "0143"] {
+        let first = project_case(case);
+        let second = project_case(case);
+        assert_eq!(
+            first,
+            second,
+            "{case} changed between runs ({} vs {} bytes)",
+            first.len(),
+            second.len()
+        );
+    }
+}
+
+fn project_case(case: &str) -> Vec<u8> {
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../corpora/merges/{case}"));
+    let ext = ["rs", "toml"]
+        .into_iter()
+        .find(|ext| root.join(format!("base.{ext}")).exists())
+        .unwrap_or_else(|| panic!("{case} has no base.rs/base.toml"));
+    let read = |name: &str| {
+        std::fs::read(root.join(format!("{name}.{ext}")))
+            .unwrap_or_else(|_| panic!("{case} {name}"))
+    };
+    let base = read("base");
+    let ours = read("ours");
+    let theirs = read("theirs");
+    if ext == "rs" {
+        let adapter = rust();
+        let merged = merge_identified(&adapter, &base, &ours, &theirs)
+            .unwrap_or_else(|c| panic!("{case} should resolve: {c}"));
+        adapter.project(&merged.tree.tree).as_slice().to_vec()
+    } else {
+        let adapter = toml();
+        let merged = merge_identified(&adapter, &base, &ours, &theirs)
+            .unwrap_or_else(|c| panic!("{case} should resolve: {c}"));
+        adapter.project(&merged.tree.tree).as_slice().to_vec()
+    }
 }
 
 #[test]

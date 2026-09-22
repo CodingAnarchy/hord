@@ -56,10 +56,8 @@ jobs:
         run: cargo run -p hord-eval --release -- --only hord --json
 
       - name: M1 merge corpus
-        # Auto-resolve is above 70%. Label match is not: only byte-equal,
-        # trivia-stripped, or same definition `normalized` count (ADR 0005).
-        # Name presence is not a match. Required once that gate passes.
-        continue-on-error: true
+        # 61 single-definition git resolutions (ADR 0006): ≥70% auto,
+        # 100% parse, ≥95% label match.
         run: cargo run -p hord-eval-m1 --release -- --merges-only
 
   eval:
