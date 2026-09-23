@@ -52,7 +52,7 @@ impl fmt::Debug for GitOid {
 
 impl fmt::Display for GitOid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
+        fmt::Display::fmt(&self.0.to_hex(), f)
     }
 }
 

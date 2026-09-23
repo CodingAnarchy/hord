@@ -128,6 +128,10 @@ impl ResolveCtx {
         self.definitions.len()
     }
 
+    fn bump(&mut self) {
+        self.stamp = fresh_stamp();
+    }
+
     /// Record a definition.
     ///
     /// `module` is the module that contains the item (`crate::foo`).
@@ -151,7 +155,7 @@ impl ResolveCtx {
         is_test: bool,
         cfg_test: bool,
     ) {
-        self.stamp = fresh_stamp();
+        self.bump();
         self.definitions.push(Definition {
             node_id,
             object_id,
@@ -175,7 +179,7 @@ impl ResolveCtx {
         path: impl Into<QualifiedName>,
         glob: bool,
     ) {
-        self.stamp = fresh_stamp();
+        self.bump();
         self.imports.push(Import {
             module: module.into(),
             local: local.into(),
@@ -186,7 +190,7 @@ impl ResolveCtx {
 
     /// Record a file root's module, for nodes that are not themselves definitions.
     pub fn add_file(&mut self, object_id: ObjectId, module: impl Into<QualifiedName>) {
-        self.stamp = fresh_stamp();
+        self.bump();
         self.files.push(FileRoot {
             object_id,
             module: module.into(),
@@ -253,7 +257,7 @@ impl ResolveCtx {
         name: impl Into<QualifiedName>,
         target: impl Into<QualifiedName>,
     ) {
-        self.stamp = fresh_stamp();
+        self.bump();
         self.links.push(Link {
             from: from.into(),
             name: name.into(),

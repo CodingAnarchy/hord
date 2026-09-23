@@ -6,8 +6,8 @@ use std::fs;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use hord_core::{ChangeId, ObjectId, SnapshotId};
 use redb::{Database, Durability, ReadableTable, TableDefinition, WriteTransaction};
@@ -110,8 +110,9 @@ pub struct Store {
     /// Objects this process has stored or fetched. Duplicate `put`s hit this
     /// instead of rewriting the loose file.
     resident: Mutex<HashMap<ObjectId, Resident>>,
-    /// Open pack files for positional reads. Pack ids are append-only.
-    pack_files: Mutex<HashMap<u64, File>>,
+    /// Open pack files for positional reads. Pack ids are append-only. Reads
+    /// clone the handle and release the lock before touching the file.
+    pack_files: Mutex<HashMap<u64, Arc<File>>>,
     landing_log: Mutex<LandingLog>,
     /// Edge keys inserted by this process. Duplicate `put_edge` skips the write.
     seen_edges: Mutex<HashSet<[u8; index::EDGE_KEY_LEN]>>,
@@ -223,17 +224,20 @@ impl Store {
                 if let Some(bytes) = self.read_loose(id)? {
                     return ensure_id(id, bytes);
                 }
+                // Packed since we last saw it. The loose file is gone, so go
+                // straight to the pack index.
                 self.forget(id);
             }
             Some(Resident::Packed(loc)) => {
                 return ensure_id(id, self.read_pack_bytes(&loc)?);
             }
-            None => {}
-        }
-        if let Some(bytes) = self.read_loose(id)? {
-            let bytes = ensure_id(id, bytes)?;
-            self.remember(id, Resident::Loose);
-            return Ok(bytes);
+            None => {
+                if let Some(bytes) = self.read_loose(id)? {
+                    let bytes = ensure_id(id, bytes)?;
+                    self.remember(id, Resident::Loose);
+                    return Ok(bytes);
+                }
+            }
         }
         if self.has_packs.load(Ordering::Relaxed)
             && let Some(loc) = self.packed_location(id)?
@@ -458,7 +462,9 @@ impl Store {
         let mut locations: Vec<(ObjectId, PackedLocation)> = Vec::with_capacity(loose.len());
         let mut packed_paths: Vec<PathBuf> = Vec::with_capacity(loose.len());
         for (id, path) in loose {
-            let bytes = fs::read(&path)?;
+            // A pack is immutable and replaces the loose file, so never pack
+            // bytes that do not hash to their name (e.g. a torn write).
+            let bytes = ensure_id(id, fs::read(&path)?)?;
             let loc = writer.add(id, &bytes)?;
             locations.push((id, loc));
             packed_paths.push(path);
@@ -491,8 +497,9 @@ impl Store {
             }
         }
         for path in packed_paths {
-            if path.exists() {
-                fs::remove_file(path)?;
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
             }
         }
         Ok(n)
@@ -534,12 +541,18 @@ impl Store {
     }
 
     fn read_pack_bytes(&self, loc: &PackedLocation) -> Result<Vec<u8>> {
-        let mut files = lock(&self.pack_files);
-        let file = match files.entry(loc.pack) {
-            Entry::Vacant(slot) => slot.insert(File::open(pack_path(&self.pack_dir(), loc.pack))?),
-            Entry::Occupied(slot) => slot.into_mut(),
+        let file = {
+            let mut files = lock(&self.pack_files);
+            match files.entry(loc.pack) {
+                Entry::Vacant(slot) => Arc::clone(
+                    slot.insert(Arc::new(File::open(pack_path(&self.pack_dir(), loc.pack))?)),
+                ),
+                Entry::Occupied(slot) => Arc::clone(slot.get()),
+            }
         };
-        pack::read_packed_file(file, loc)
+        // Positional reads do not share a cursor, so concurrent readers of the
+        // same pack need no lock while they read and decompress.
+        pack::read_packed_file(&file, loc)
     }
 
     fn read_persisted_log(&self) -> Result<Vec<ChangeId>> {

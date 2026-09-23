@@ -45,16 +45,8 @@ pub(crate) fn merge_cst(
 
     match merge_seq(store, &b.children, &o.children, &t.children) {
         Ok(kids) => {
-            let kind = if o.kind == t.kind || o.kind != b.kind {
-                o.kind
-            } else {
-                t.kind
-            };
-            let name = if o.name == t.name || o.name != b.name {
-                o.name.clone()
-            } else {
-                t.name.clone()
-            };
+            let kind = *take_edited(&b.kind, &o.kind, &t.kind);
+            let name = take_edited(&b.name, &o.name, &t.name).clone();
             store
                 .intern_branch(kind, o.lang, kids, name)
                 .map_err(|_| ())
@@ -75,6 +67,15 @@ fn prefer_unchanged<'a, T: PartialEq + ?Sized>(
         Some(theirs)
     } else {
         None
+    }
+}
+
+/// Ours, unless only theirs changed.
+fn take_edited<'a, T: PartialEq + ?Sized>(base: &'a T, ours: &'a T, theirs: &'a T) -> &'a T {
+    if ours == base && theirs != base {
+        theirs
+    } else {
+        ours
     }
 }
 
@@ -151,19 +152,15 @@ fn apply_diff3(
     ht: &[Span],
 ) -> Result<Vec<ObjectId>, ()> {
     let mut out = Vec::new();
-    let mut walk = Walk {
-        ho,
-        ht,
-        o_i: 0,
-        t_i: 0,
-        pos: Pos { a: 0 },
-    };
+    let mut o_i = 0usize;
+    let mut t_i = 0usize;
+    let mut a = 0usize;
 
     loop {
-        let o_h = walk.ho.get(walk.o_i).copied();
-        let t_h = walk.ht.get(walk.t_i).copied();
+        let o_h = ho.get(o_i).copied();
+        let t_h = ht.get(t_i).copied();
         if o_h.is_none() && t_h.is_none() {
-            out.extend_from_slice(&sides.base[walk.pos.a..]);
+            out.extend_from_slice(&sides.base[a..]);
             break;
         }
         let next_a = match (o_h, t_h) {
@@ -172,66 +169,41 @@ fn apply_diff3(
             (None, Some(t)) => t.a0,
             (None, None) => unreachable!(),
         };
-        if walk.pos.a < next_a {
-            out.extend_from_slice(&sides.base[walk.pos.a..next_a]);
-            walk.pos.a = next_a;
+        if a < next_a {
+            out.extend_from_slice(&sides.base[a..next_a]);
+            a = next_a;
             continue;
         }
 
-        let o_here = o_h.filter(|h| h.a0 == walk.pos.a);
-        let t_here = t_h.filter(|h| h.a0 == walk.pos.a);
-        match (o_here, t_here) {
-            (Some(oh), Some(th)) => consume_overlap(store, sides, &mut out, &mut walk, oh, th)?,
-            (Some(oh), None) => {
-                if let Some(th) = t_h.filter(|th| th.a0 < oh.a1) {
-                    consume_overlap(store, sides, &mut out, &mut walk, oh, th)?;
-                } else {
+        let (oh, th) = match (o_h.filter(|h| h.a0 == a), t_h.filter(|h| h.a0 == a)) {
+            (Some(oh), Some(th)) => (oh, th),
+            (Some(oh), None) => match t_h.filter(|th| th.a0 < oh.a1) {
+                Some(th) => (oh, th),
+                None => {
                     out.extend_from_slice(&sides.ours[oh.b0..oh.b1]);
-                    walk.pos.a = oh.a1;
-                    walk.o_i += 1;
+                    a = oh.a1;
+                    o_i += 1;
+                    continue;
                 }
-            }
-            (None, Some(th)) => {
-                if let Some(oh) = o_h.filter(|oh| oh.a0 < th.a1) {
-                    consume_overlap(store, sides, &mut out, &mut walk, oh, th)?;
-                } else {
+            },
+            (None, Some(th)) => match o_h.filter(|oh| oh.a0 < th.a1) {
+                Some(oh) => (oh, th),
+                None => {
                     out.extend_from_slice(&sides.theirs[th.b0..th.b1]);
-                    walk.pos.a = th.a1;
-                    walk.t_i += 1;
+                    a = th.a1;
+                    t_i += 1;
+                    continue;
                 }
-            }
+            },
             (None, None) => return Err(()),
-        }
+        };
+        take_overlap(store, sides, &mut out, oh, th, &mut a)?;
+        o_i += 1;
+        t_i += 1;
+        skip_consumed(ho, &mut o_i, a);
+        skip_consumed(ht, &mut t_i, a);
     }
     Ok(out)
-}
-
-struct Pos {
-    a: usize,
-}
-
-struct Walk<'a> {
-    ho: &'a [Span],
-    ht: &'a [Span],
-    o_i: usize,
-    t_i: usize,
-    pos: Pos,
-}
-
-fn consume_overlap(
-    store: &mut NodeTree,
-    sides: Sides<'_>,
-    out: &mut Vec<ObjectId>,
-    walk: &mut Walk<'_>,
-    oh: Span,
-    th: Span,
-) -> Result<(), ()> {
-    take_overlap(store, sides, out, oh, th, &mut walk.pos)?;
-    walk.o_i += 1;
-    walk.t_i += 1;
-    skip_consumed(walk.ho, &mut walk.o_i, walk.pos.a);
-    skip_consumed(walk.ht, &mut walk.t_i, walk.pos.a);
-    Ok(())
 }
 
 fn skip_consumed(hunks: &[Span], i: &mut usize, a: usize) {
@@ -246,7 +218,7 @@ fn take_overlap(
     out: &mut Vec<ObjectId>,
     oh: Span,
     th: Span,
-    pos: &mut Pos,
+    a: &mut usize,
 ) -> Result<(), ()> {
     if oh.a0 != th.a0 || oh.a1 != th.a1 {
         return Err(());
@@ -257,7 +229,7 @@ fn take_overlap(
         &sides.ours[oh.b0..oh.b1],
         &sides.theirs[th.b0..th.b1],
     )?);
-    pos.a = oh.a1;
+    *a = oh.a1;
     Ok(())
 }
 

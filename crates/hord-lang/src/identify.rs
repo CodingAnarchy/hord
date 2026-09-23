@@ -93,15 +93,7 @@ pub fn default_identify<A: LangAdapter + ?Sized>(
     result: &NodeTree,
 ) -> IdentityMapping {
     let mut base_defs = collect_base_defs(adapter, base);
-    let result_defs = match result.root() {
-        Some(root) => {
-            let mut out = Vec::new();
-            let mut ancestors = Vec::new();
-            collect_result_defs(adapter, result, root, &mut ancestors, None, 0, &mut out);
-            out
-        }
-        None => Vec::new(),
-    };
+    let result_defs = collect_result_defs(adapter, result);
 
     let mut mapping = IdentityMapping::default();
 
@@ -236,6 +228,13 @@ fn match_pass(
     progress
 }
 
+struct RenameCandidate {
+    base_id: NodeId,
+    preorder: usize,
+    result_oid: ObjectId,
+    slack: usize,
+}
+
 fn rename_pass(
     base_tree: &NodeTree,
     result_tree: &NodeTree,
@@ -243,19 +242,31 @@ fn rename_pass(
     base_defs: &mut [BaseDef],
     result_defs: &[ResultDef],
 ) {
-    struct Candidate {
-        base_id: NodeId,
-        preorder: usize,
-        result_oid: ObjectId,
-        slack: usize,
-    }
+    let mut candidates = rename_candidates(base_tree, result_tree, mapping, base_defs, result_defs);
+    // Highest slack, then stable ids, then preorder (ADR 0007 tie-break).
+    candidates.sort_by(|left, right| {
+        right
+            .slack
+            .cmp(&left.slack)
+            .then(left.base_id.as_u128().cmp(&right.base_id.as_u128()))
+            .then(left.preorder.cmp(&right.preorder))
+    });
+    assign_renames(mapping, base_defs, result_defs, &candidates);
+}
 
+fn rename_candidates(
+    base_tree: &NodeTree,
+    result_tree: &NodeTree,
+    mapping: &IdentityMapping,
+    base_defs: &[BaseDef],
+    result_defs: &[ResultDef],
+) -> Vec<RenameCandidate> {
     let mut candidates = Vec::new();
     for (preorder, result_def) in result_defs.iter().enumerate() {
         if mapping.nodes.contains_key(&result_def.object_id) {
             continue;
         }
-        for base_def in base_defs.iter() {
+        for base_def in base_defs {
             if base_def.used || base_def.kind != result_def.kind {
                 continue;
             }
@@ -267,7 +278,7 @@ fn rename_pass(
             ) else {
                 continue;
             };
-            candidates.push(Candidate {
+            candidates.push(RenameCandidate {
                 base_id: base_def.node_id,
                 preorder,
                 result_oid: result_def.object_id,
@@ -275,14 +286,15 @@ fn rename_pass(
             });
         }
     }
-    candidates.sort_by(|left, right| {
-        right
-            .slack
-            .cmp(&left.slack)
-            .then(left.base_id.as_u128().cmp(&right.base_id.as_u128()))
-            .then(left.preorder.cmp(&right.preorder))
-    });
+    candidates
+}
 
+fn assign_renames(
+    mapping: &mut IdentityMapping,
+    base_defs: &mut [BaseDef],
+    result_defs: &[ResultDef],
+    candidates: &[RenameCandidate],
+) {
     let mut taken_result = BTreeSet::new();
     let mut taken_base = BTreeSet::new();
     for candidate in candidates {
@@ -335,81 +347,89 @@ fn names_conflict(a: &Option<QualifiedName>, b: &Option<QualifiedName>) -> bool 
     }
 }
 
+/// Preorder. `visit` returns the parent state seen by this node's children.
+fn walk_defs<T: Copy>(
+    tree: &NodeTree,
+    oid: ObjectId,
+    ancestors: &mut Vec<ObjectId>,
+    index: u32,
+    state: T,
+    visit: &mut impl FnMut(&Node, ObjectId, &[ObjectId], u32, T) -> T,
+) {
+    let Some(node) = tree.get(oid) else {
+        return;
+    };
+    let child_state = visit(node, oid, ancestors, index, state);
+    ancestors.push(oid);
+    for (i, child) in node.children.iter().enumerate() {
+        let child_index = u32::try_from(i).unwrap_or(u32::MAX);
+        walk_defs(tree, *child, ancestors, child_index, child_state, visit);
+    }
+    ancestors.pop();
+}
+
 fn collect_base_defs<A: LangAdapter + ?Sized>(adapter: &A, base: &IdentifiedTree) -> Vec<BaseDef> {
     let Some(root) = base.tree.root() else {
         return Vec::new();
     };
     let mut out = Vec::new();
     let mut ancestors = Vec::new();
-    collect_base_walk(adapter, base, root, &mut ancestors, None, &mut out);
+    walk_defs(
+        &base.tree,
+        root,
+        &mut ancestors,
+        0,
+        None,
+        &mut |node, oid, ancestors, _index, parent: Option<NodeId>| {
+            if !(adapter.is_definition(&node.kind)) {
+                return parent;
+            }
+            let Some(&node_id) = base.ids.get(&oid) else {
+                return parent;
+            };
+            out.push(BaseDef {
+                object_id: oid,
+                node_id,
+                parent_id: parent,
+                kind: node.kind,
+                normalized: node.normalized,
+                name: def_name(adapter, &base.tree, ancestors, node),
+                used: false,
+            });
+            Some(node_id)
+        },
+    );
     out
 }
 
-fn collect_base_walk<A: LangAdapter + ?Sized>(
-    adapter: &A,
-    base: &IdentifiedTree,
-    oid: ObjectId,
-    ancestor_ids: &mut Vec<ObjectId>,
-    nearest_def_id: Option<NodeId>,
-    out: &mut Vec<BaseDef>,
-) {
-    let Some(node) = base.tree.get(oid) else {
-        return;
+fn collect_result_defs<A: LangAdapter + ?Sized>(adapter: &A, tree: &NodeTree) -> Vec<ResultDef> {
+    let Some(root) = tree.root() else {
+        return Vec::new();
     };
-    let mut child_parent = nearest_def_id;
-    if adapter.is_definition(&node.kind)
-        && let Some(&node_id) = base.ids.get(&oid)
-    {
-        let name = def_name(adapter, &base.tree, ancestor_ids, node);
-        out.push(BaseDef {
-            object_id: oid,
-            node_id,
-            parent_id: nearest_def_id,
-            kind: node.kind,
-            normalized: node.normalized,
-            name,
-            used: false,
-        });
-        child_parent = Some(node_id);
-    }
-    ancestor_ids.push(oid);
-    for child in &node.children {
-        collect_base_walk(adapter, base, *child, ancestor_ids, child_parent, out);
-    }
-    ancestor_ids.pop();
-}
-
-fn collect_result_defs<A: LangAdapter + ?Sized>(
-    adapter: &A,
-    tree: &NodeTree,
-    oid: ObjectId,
-    ancestor_ids: &mut Vec<ObjectId>,
-    nearest_def: Option<ObjectId>,
-    index: u32,
-    out: &mut Vec<ResultDef>,
-) {
-    let Some(node) = tree.get(oid) else {
-        return;
-    };
-    let mut child_parent = nearest_def;
-    if adapter.is_definition(&node.kind) {
-        let name = def_name(adapter, tree, ancestor_ids, node);
-        out.push(ResultDef {
-            object_id: oid,
-            parent_def_oid: nearest_def,
-            index,
-            kind: node.kind,
-            normalized: node.normalized,
-            name,
-        });
-        child_parent = Some(oid);
-    }
-    ancestor_ids.push(oid);
-    for (i, child) in node.children.iter().enumerate() {
-        let idx = u32::try_from(i).unwrap_or(u32::MAX);
-        collect_result_defs(adapter, tree, *child, ancestor_ids, child_parent, idx, out);
-    }
-    ancestor_ids.pop();
+    let mut out = Vec::new();
+    let mut ancestors = Vec::new();
+    walk_defs(
+        tree,
+        root,
+        &mut ancestors,
+        0,
+        None,
+        &mut |node, oid, ancestors, index, parent: Option<ObjectId>| {
+            if !adapter.is_definition(&node.kind) {
+                return parent;
+            }
+            out.push(ResultDef {
+                object_id: oid,
+                parent_def_oid: parent,
+                index,
+                kind: node.kind,
+                normalized: node.normalized,
+                name: def_name(adapter, tree, ancestors, node),
+            });
+            Some(oid)
+        },
+    );
+    out
 }
 
 fn def_name<A: LangAdapter + ?Sized>(

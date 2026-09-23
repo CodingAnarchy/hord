@@ -102,32 +102,49 @@ pub fn merge<A: LangAdapter + ?Sized>(
     store = union_trees(&store, &theirs.tree)
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
     match merge_ops(adapter, base, &ours_ops, &theirs_ops, &store) {
+        // Delete vs anything else must not fall through to an auto-merge.
         Err(conflict) if conflict.delete_vs => Err(conflict),
-        Ok(ok) => {
-            let projected = adapter.project(&ok.tree.tree);
-            let src = sources(adapter, base, ours, theirs);
-            // A line in none of the three inputs was invented by the merge
-            // (a comma glued onto the wrong token, a hand-style rewrite).
-            // That is not an auto-resolution. Landing order is git's.
-            if projection_invents_line(&src, projected.as_slice())
-                && let Some(git) = git_ours_result(adapter, base, &src)
-            {
-                return Ok(git);
-            }
-            Ok(ok)
-        }
+        Ok(ok) => accept_composed(adapter, base, ours, theirs, ok),
         Err(structural) => {
-            // Overlapping edits. Keep non-conflicting edits from both sides
-            // and ours' side of each conflict hunk. Do not invent a rewrite.
-            // Delete vs anything else never reaches here.
-            let src = sources(adapter, base, ours, theirs);
-            git_ours_result(adapter, base, &src)
-                .or_else(|| text_merge_result(adapter, base, &src))
-                .or_else(|| cst_file_fallback(adapter, base, ours, theirs, &mut store))
-                .or_else(|| blob_file_fallback(adapter, base, &src))
-                .ok_or(structural)
+            overlap_fallback(adapter, base, ours, theirs, &mut store).ok_or(structural)
         }
     }
+}
+
+/// Keep a structural compose unless it invented a line. Landing order is git's.
+fn accept_composed<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+    ok: MergeResult,
+) -> Result<MergeResult, Conflict> {
+    let projected = adapter.project(&ok.tree.tree);
+    let src = sources(adapter, base, ours, theirs);
+    // A line in none of the three inputs was invented by the merge
+    // (a comma glued onto the wrong token, a hand-style rewrite).
+    if projection_invents_line(&src, projected.as_slice())
+        && let Some(git) = git_ours_result(adapter, base, &src)
+    {
+        return Ok(git);
+    }
+    Ok(ok)
+}
+
+/// Overlapping edits. Keep non-conflicting edits from both sides and ours'
+/// side of each conflict hunk.
+fn overlap_fallback<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+    store: &mut NodeTree,
+) -> Option<MergeResult> {
+    let src = sources(adapter, base, ours, theirs);
+    git_ours_result(adapter, base, &src)
+        .or_else(|| text_merge_result(adapter, base, &src))
+        .or_else(|| cst_file_fallback(adapter, base, ours, theirs, store))
+        .or_else(|| blob_file_fallback(adapter, base, &src))
 }
 
 struct Sources {
@@ -159,26 +176,14 @@ fn projection_invents_line(src: &Sources, merged: &[u8]) -> bool {
         src.theirs.as_slice(),
     ] {
         for line in side.split(|byte| *byte == b'\n') {
-            if !trim_ascii(line).is_empty() {
+            if !line.trim_ascii().is_empty() {
                 allowed.insert(line);
             }
         }
     }
     merged
         .split(|byte| *byte == b'\n')
-        .any(|line| !trim_ascii(line).is_empty() && !allowed.contains(line))
-}
-
-fn trim_ascii(line: &[u8]) -> &[u8] {
-    let start = line
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(line.len());
-    let end = line
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &line[start..end]
+        .any(|line| !line.trim_ascii().is_empty() && !allowed.contains(line))
 }
 
 fn git_ours_result<A: LangAdapter + ?Sized>(
@@ -327,6 +332,17 @@ fn compose(
     theirs: &[Op],
     store: &mut NodeTree,
 ) -> Result<(Vec<Op>, Vec<Conflict>), Conflict> {
+    if ours
+        .iter()
+        .chain(theirs)
+        .any(|op| matches!(op, Op::Blob { .. } | Op::Tree { .. }))
+    {
+        return Err(Conflict::hard(
+            Vec::new(),
+            "blob/tree ops are merged via merge_blob, not structural merge",
+        ));
+    }
+
     let mut soft = Vec::new();
     let mut out = Vec::new();
 
@@ -359,18 +375,6 @@ fn compose(
     let (inserts, insert_soft) = compose_inserts(ours, theirs, store);
     soft.extend(insert_soft);
     out.extend(inserts);
-
-    if ours
-        .iter()
-        .chain(theirs)
-        .any(|op| matches!(op, Op::Blob { .. } | Op::Tree { .. }))
-    {
-        return Err(Conflict::hard(
-            Vec::new(),
-            "blob/tree ops are merged via merge_blob, not structural merge",
-        ));
-    }
-
     Ok((out, soft))
 }
 
@@ -480,35 +484,33 @@ fn child_inserts_only_in(parent: NodeId, ours: &Op, theirs: &Op, store: &NodeTre
 
 fn named_children(store: &NodeTree, root: ObjectId) -> BTreeMap<String, (ObjectId, u32)> {
     let mut out = BTreeMap::new();
-    collect_named(store, root, root, &mut out);
+    let Some(node) = store.get(root) else {
+        return out;
+    };
+    for (i, child) in node.children.iter().enumerate() {
+        let index = u32::try_from(i).unwrap_or(u32::MAX);
+        record_named(store, *child, index, &mut out);
+    }
     out
 }
 
-fn collect_named(
+/// A named node is recorded and not descended into. Direct children keep
+/// their CST index; a name under an unnamed child is recorded at index 0.
+fn record_named(
     store: &NodeTree,
     oid: ObjectId,
-    root: ObjectId,
+    index: u32,
     out: &mut BTreeMap<String, (ObjectId, u32)>,
 ) {
     let Some(node) = store.get(oid) else {
         return;
     };
-    if oid != root
-        && let Some(name) = &node.name
-    {
-        out.entry(name.as_str().to_owned()).or_insert((oid, 0));
+    if let Some(name) = &node.name {
+        out.entry(name.as_str().to_owned()).or_insert((oid, index));
         return;
     }
-    for (i, child) in node.children.iter().enumerate() {
-        if oid == root
-            && let Some(n) = store.get(*child)
-            && let Some(name) = &n.name
-        {
-            let idx = u32::try_from(i).unwrap_or(u32::MAX);
-            out.entry(name.as_str().to_owned()).or_insert((*child, idx));
-            continue;
-        }
-        collect_named(store, *child, root, out);
+    for child in &node.children {
+        record_named(store, *child, 0, out);
     }
 }
 
@@ -661,23 +663,24 @@ fn same_inserted_definition(store: &NodeTree, ours: &[InsertAt], theirs: &Insert
     let Some(theirs_node) = store.get(theirs.node) else {
         return false;
     };
-    let Some(theirs_name) = theirs_node.name.as_ref() else {
+    let Some(name) = theirs_node
+        .name
+        .as_ref()
+        .filter(|name| !name.as_str().is_empty())
+    else {
         return false;
     };
-    if theirs_name.as_str().is_empty() {
-        return false;
-    }
     ours.iter().any(|ins| {
-        ins.parent == theirs.parent && {
-            let Some(ours_node) = store.get(ins.node) else {
-                return false;
-            };
-            let Some(ours_name) = ours_node.name.as_ref() else {
-                return false;
-            };
-            ours_name.as_str() == theirs_name.as_str()
-                && same_after_leading_attrs(ours_node.raw.as_slice(), theirs_node.raw.as_slice())
-        }
+        ins.parent == theirs.parent
+            && store.get(ins.node).is_some_and(|ours_node| {
+                ours_node.name.as_ref().is_some_and(|ours_name| {
+                    ours_name.as_str() == name.as_str()
+                        && same_after_leading_attrs(
+                            ours_node.raw.as_slice(),
+                            theirs_node.raw.as_slice(),
+                        )
+                })
+            })
     })
 }
 

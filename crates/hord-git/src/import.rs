@@ -409,7 +409,9 @@ fn entry_name(name: &gix::bstr::BStr) -> Result<String, Error> {
 }
 
 fn timestamp_from_git(seconds: i64) -> Timestamp {
-    let ms = seconds.max(0) as u64 * 1000;
+    // Pre-epoch clamps to 0; an absurd far-future date saturates instead of
+    // overflowing.
+    let ms = seconds.max(0).unsigned_abs().saturating_mul(1000);
     Timestamp::from_millis(ms)
 }
 

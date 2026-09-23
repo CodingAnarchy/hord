@@ -134,6 +134,7 @@ fn takes_outer_attributes(kind: &str) -> bool {
             | "field_declaration"
             | "use_declaration"
             | "extern_crate_declaration"
+            | "foreign_mod_item"
     )
 }
 

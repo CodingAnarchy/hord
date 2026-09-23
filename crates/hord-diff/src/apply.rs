@@ -137,10 +137,7 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
 /// up a comma just because one occurrence was followed by one.
 fn trailing_commas(store: &NodeTree) -> BTreeMap<ObjectId, ObjectId> {
     let mut map = BTreeMap::new();
-    for (id, _) in store.iter() {
-        let Some(parent) = store.get(id) else {
-            continue;
-        };
+    for (_, parent) in store.iter() {
         for (index, child) in parent.children.iter().enumerate() {
             let Some(node) = store.get(*child) else {
                 continue;
@@ -173,9 +170,7 @@ fn restore_trailing_commas(
     let mut changed = false;
     for child in &node.children {
         let new_child = restore_trailing_commas(working, *child, seps)?;
-        if new_child != *child {
-            changed = true;
-        }
+        changed |= new_child != *child;
         rebuilt.push(new_child);
     }
     let mut kids = Vec::with_capacity(rebuilt.len());
@@ -184,11 +179,11 @@ fn restore_trailing_commas(
         let Some(sep) = seps.get(child) else {
             continue;
         };
-        let next_is_sep = rebuilt.get(index + 1).is_some_and(|next| next == sep);
-        if !next_is_sep {
-            kids.push(*sep);
-            changed = true;
+        if rebuilt.get(index + 1).is_some_and(|next| next == sep) {
+            continue;
         }
+        kids.push(*sep);
+        changed = true;
     }
     if !changed {
         return Ok(id);
@@ -411,14 +406,8 @@ fn remove_oid(working: &mut IdentifiedTree, oid: ObjectId) -> Result<(), Error> 
     } else {
         kids.remove(index);
     }
-    let new_parent = intern_children(working, parent, kids)?;
     let parent_path = &path[..path.len() - 1];
-    if parent_path.is_empty() {
-        working.tree.set_root(new_parent)?;
-        Ok(())
-    } else {
-        splice_up(working, parent_path, new_parent)
-    }
+    replace_children(working, parent, parent_path, kids)
 }
 
 fn insert_oid(
@@ -436,12 +425,21 @@ fn insert_oid(
         .clone();
     let at = index.min(kids.len());
     kids.insert(at, node);
-    let new_container = intern_children(working, container, kids)?;
-    if path.is_empty() {
-        working.tree.set_root(new_container)?;
+    replace_children(working, container, path, kids)
+}
+
+fn replace_children(
+    working: &mut IdentifiedTree,
+    parent: ObjectId,
+    path_to_parent: &[(ObjectId, usize)],
+    kids: Vec<ObjectId>,
+) -> Result<(), Error> {
+    let new_parent = intern_children(working, parent, kids)?;
+    if path_to_parent.is_empty() {
+        working.tree.set_root(new_parent)?;
         Ok(())
     } else {
-        splice_up(working, path, new_container)
+        splice_up(working, path_to_parent, new_parent)
     }
 }
 

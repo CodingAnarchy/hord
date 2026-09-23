@@ -28,15 +28,21 @@ struct Entry {
     stripped: Stripped,
 }
 
+impl Stripped {
+    fn bytes<'a>(&'a self, raw: &'a [u8]) -> &'a [u8] {
+        match self {
+            Self::InRaw { lead, text } => {
+                let start = *lead as usize;
+                &raw[start..start + *text as usize]
+            }
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
 impl Entry {
     fn stripped_slice(&self) -> &[u8] {
-        match self.stripped {
-            Stripped::InRaw { lead, text } => {
-                let start = lead as usize;
-                &self.node.raw[start..start + text as usize]
-            }
-            Stripped::Owned(ref bytes) => bytes.as_slice(),
-        }
+        self.stripped.bytes(self.node.raw.as_slice())
     }
 }
 
@@ -99,31 +105,16 @@ impl NodeTree {
         name: Option<QualifiedName>,
     ) -> Result<ObjectId, ParseError> {
         if !children.is_empty() {
-            let mut concat_len = 0usize;
-            for id in &children {
-                let child = self.entries.get(id).ok_or(ParseError::MissingNode(*id))?;
-                concat_len += child.node.raw.len();
-            }
-            if concat_len != raw.len() {
-                return Err(ParseError::ConcatInvariant {
-                    kind,
-                    raw_len: raw.len(),
-                    children_raw_len: concat_len,
-                });
-            }
-            let mut off = 0usize;
-            for id in &children {
-                let child = self.entries.get(id).ok_or(ParseError::MissingNode(*id))?;
-                let slice = child.node.raw.as_slice();
-                if raw.get(off..off + slice.len()) != Some(slice) {
-                    return Err(ParseError::ConcatInvariant {
-                        kind,
-                        raw_len: raw.len(),
-                        children_raw_len: concat_len,
-                    });
-                }
-                off += slice.len();
-            }
+            check_concat_slices(
+                kind,
+                raw.as_slice(),
+                children.iter().map(|id| {
+                    self.entries
+                        .get(id)
+                        .map(|child| child.node.raw.as_slice())
+                        .ok_or(ParseError::MissingNode(*id))
+                }),
+            )?;
         }
 
         let form = stripped_form(&raw, &stripped, children.is_empty());
@@ -140,13 +131,7 @@ impl NodeTree {
         name: Option<QualifiedName>,
     ) -> Result<ObjectId, ParseError> {
         let normalized = if children.is_empty() {
-            match &stripped {
-                Stripped::InRaw { lead, text } => {
-                    let start = *lead as usize;
-                    normalized_hash(&raw[start..start + *text as usize])?
-                }
-                Stripped::Owned(bytes) => normalized_hash(bytes.as_slice())?,
-            }
+            normalized_hash(stripped.bytes(raw.as_slice()))?
         } else {
             let mut child_norm = Vec::with_capacity(children.len());
             for id in &children {
@@ -380,20 +365,51 @@ impl NodeTree {
             if entry.node.children.is_empty() {
                 continue;
             }
-            let mut concat = Vec::new();
-            for id in &entry.node.children {
-                let child = self.entries.get(id).ok_or(ParseError::MissingNode(*id))?;
-                concat.extend_from_slice(child.node.raw.as_slice());
-            }
-            if concat.as_slice() != entry.node.raw.as_slice() {
-                return Err(ParseError::ConcatInvariant {
-                    kind: entry.node.kind,
-                    raw_len: entry.node.raw.len(),
-                    children_raw_len: concat.len(),
-                });
-            }
+            let kind = entry.node.kind;
+            let raw = entry.node.raw.as_slice();
+            check_concat_slices(
+                kind,
+                raw,
+                entry.node.children.iter().map(|id| {
+                    self.entries
+                        .get(id)
+                        .map(|child| child.node.raw.as_slice())
+                        .ok_or(ParseError::MissingNode(*id))
+                }),
+            )?;
         }
         Ok(())
+    }
+}
+
+/// `concat(children) == raw`. `children_raw_len` stays the sum of every child
+/// when an earlier slice already disagrees with `raw`.
+fn check_concat_slices<'a>(
+    kind: NodeKind,
+    raw: &[u8],
+    children: impl Iterator<Item = Result<&'a [u8], ParseError>>,
+) -> Result<(), ParseError> {
+    let mut concat_len = 0usize;
+    let mut off = 0usize;
+    let mut bytes_match = true;
+    for child in children {
+        let slice = child?;
+        if bytes_match {
+            match raw.get(off..off + slice.len()) {
+                Some(got) if got == slice => off += slice.len(),
+                _ => bytes_match = false,
+            }
+        }
+        concat_len += slice.len();
+    }
+    if bytes_match && concat_len == raw.len() {
+        Ok(())
+    } else {
+        Err(ParseError::ConcatInvariant {
+            kind,
+            raw_len: raw.len(),
+            children_raw_len: concat_len,
+        })
     }
 }
 

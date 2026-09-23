@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use hord_core::{
     ChangeId, ChangeRecord, IdentityDelta, IdentityMap, NodeId, NodePath, ObjectId, Op, SnapshotId,
 };
-use redb::{Database, ReadableTable, Table, TableDefinition, WriteTransaction};
+use redb::{Database, Table, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use super::Store;
@@ -271,13 +271,14 @@ impl Store {
     pub fn index_change(&self, change: ChangeId) -> Result<()> {
         let _guard = self.lock_index();
         self.flush()?;
-        let log = self.ensure_landing_log()?;
-        if !log.first_pos.contains_key(&change) {
+        if !self.ensure_landing_log()?.first_pos.contains_key(&change) {
             return Err(Error::NotInLog(change));
         }
+        // Read the record without the landing-log lock held; `append_log`
+        // needs that lock. The log is append-only, so `change` stays in it.
         let bytes = self.get(change)?;
         let record: ChangeRecord = hord_encoding::decode(&bytes)?;
-        self.insert_history(&log.first_pos, change, &touched_nodes(&record))
+        self.insert_history(change, &touched_nodes(&record))
     }
 
     /// Replace `node_history`, `edges`, and `identity` from stored objects.
@@ -340,19 +341,17 @@ impl Store {
         Ok(())
     }
 
-    fn insert_history(
-        &self,
-        pos_of: &HashMap<ChangeId, usize>,
-        change: ChangeId,
-        nodes: &BTreeSet<NodeId>,
-    ) -> Result<()> {
+    fn insert_history(&self, change: ChangeId, nodes: &BTreeSet<NodeId>) -> Result<()> {
         if nodes.is_empty() {
             return Ok(());
         }
         // `index_change` holds `index_lock`, so these rows cannot change before
-        // the write below. A no-op reindex then skips the durable commit.
+        // the write below. A no-op reindex then skips the durable commit. The
+        // landing-log lock covers only the planning, not the commit.
         let mut updates = Vec::new();
         {
+            let log = self.ensure_landing_log()?;
+            let pos_of = &log.first_pos;
             let txn = self.db.begin_read().map_err(Error::index)?;
             let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
             for node in nodes {
@@ -627,23 +626,11 @@ fn remove_snapshot_identity(
     snapshot: SnapshotId,
 ) -> Result<()> {
     let prefix = *snapshot.as_bytes();
-    let end = prefix_successor(&prefix);
-    let mut keys = Vec::new();
-    {
-        let range = match &end {
-            Some(end) => table
-                .range(prefix.as_slice()..end.as_slice())
-                .map_err(Error::index)?,
-            None => table.range(prefix.as_slice()..).map_err(Error::index)?,
-        };
-        for entry in range {
-            let (key, _) = entry.map_err(Error::index)?;
-            keys.push(key.value().to_vec());
-        }
+    match prefix_successor(&prefix) {
+        Some(end) => table.retain_in(prefix.as_slice()..end.as_slice(), |_, _| false),
+        None => table.retain_in(prefix.as_slice().., |_, _| false),
     }
-    for key in keys {
-        table.remove(key.as_slice()).map_err(Error::index)?;
-    }
+    .map_err(Error::index)?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hord_core::{IdentityDelta, NodeId, ObjectId, Op};
+use hord_core::{IdentityDelta, Node, NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree};
 
 /// Parent [`NodeId`] of file-level definitions.
@@ -78,32 +78,19 @@ pub(crate) fn root_glue(tree: &NodeTree, def_oids: &BTreeSet<ObjectId>) -> Vec<O
         return Vec::new();
     };
     let mut out = Vec::new();
-    glue_walk(tree, root, def_oids, true, &mut out);
-    out
-}
-
-fn glue_walk(
-    tree: &NodeTree,
-    oid: ObjectId,
-    def_oids: &BTreeSet<ObjectId>,
-    at_root: bool,
-    out: &mut Vec<ObjectId>,
-) {
-    if !at_root && def_oids.contains(&oid) {
-        return;
-    }
-    let Some(node) = tree.get(oid) else {
-        return;
-    };
-    if node.children.is_empty() {
-        if !at_root || !def_oids.contains(&oid) {
+    walk_outside_defs(
+        tree,
+        root,
+        true,
+        &|oid| def_oids.contains(&oid),
+        &mut |at_start, oid, _node| {
+            if at_start && def_oids.contains(&oid) {
+                return;
+            }
             out.push(oid);
-        }
-        return;
-    }
-    for child in &node.children {
-        glue_walk(tree, *child, def_oids, false, out);
-    }
+        },
+    );
+    out
 }
 
 /// Non-definition leaves of a definition, using `normalized` so trivia-only
@@ -119,36 +106,48 @@ pub(crate) fn local_glue(
     def_ids: &BTreeMap<ObjectId, NodeId>,
 ) -> Vec<ObjectId> {
     let mut out = Vec::new();
-    glue_skel(tree, start, start, def_ids, &mut out);
+    walk_outside_defs(
+        tree,
+        start,
+        true,
+        &|oid| def_ids.contains_key(&oid),
+        &mut |_at_start, _oid, node| {
+            // List separators sit between child definitions (`struct { a, b }`,
+            // `enum { A, B }`). They are not container header glue; skipping
+            // them lets adding a field/variant be a child Insert instead of
+            // Replace on the parent.
+            if matches!(node.kind.as_str(), "," | ";") {
+                return;
+            }
+            out.push(node.normalized);
+        },
+    );
     out
 }
 
-fn glue_skel(
+/// Preorder leaves that are not inside a nested definition.
+///
+/// `at_start` is true only for `oid` itself, so the starting node is visited
+/// even when it is a definition. Nested definitions are skipped entirely.
+fn walk_outside_defs(
     tree: &NodeTree,
     oid: ObjectId,
-    start: ObjectId,
-    def_ids: &BTreeMap<ObjectId, NodeId>,
-    out: &mut Vec<ObjectId>,
+    at_start: bool,
+    is_def: &impl Fn(ObjectId) -> bool,
+    on_leaf: &mut impl FnMut(bool, ObjectId, &Node),
 ) {
-    if oid != start && def_ids.contains_key(&oid) {
+    if !at_start && is_def(oid) {
         return;
     }
     let Some(node) = tree.get(oid) else {
         return;
     };
     if node.children.is_empty() {
-        // List separators sit between child definitions (`struct { a, b }`,
-        // `enum { A, B }`). They are not container header glue; skipping
-        // them lets adding a field/variant be a child Insert instead of
-        // Replace on the parent.
-        if matches!(node.kind.as_str(), "," | ";") {
-            return;
-        }
-        out.push(node.normalized);
+        on_leaf(at_start, oid, node);
         return;
     }
     for child in &node.children {
-        glue_skel(tree, *child, start, def_ids, out);
+        walk_outside_defs(tree, *child, false, is_def, on_leaf);
     }
 }
 

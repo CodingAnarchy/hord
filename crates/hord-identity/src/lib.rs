@@ -6,9 +6,10 @@
 //! per-snapshot [`hord_core::IdentityMap`]: each id located by file and a
 //! child-index path from that file's root.
 //!
-//! Rename similarity (spec §3.4 step 4, §14 item 1) is not implemented. The
-//! metric and threshold are open; this crate does not choose one.
-//! [`hord_lang::default_identify`] skips that step, and so does [`carry`].
+//! Rename similarity is [`hord_lang::default_identify`] (ADR 0007). This crate
+//! does not choose a different metric or threshold. Fresh birth ids are derived
+//! from the definition content id so they do not follow ULID randomness or the
+//! source order of unrelated nodes.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
