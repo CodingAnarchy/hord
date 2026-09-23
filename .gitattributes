@@ -1,0 +1,2 @@
+# Lockfiles are byte-exact fixtures and Cargo always writes LF; never convert line endings.
+*.lock -text
