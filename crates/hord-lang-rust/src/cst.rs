@@ -50,6 +50,7 @@ fn intern(
     tokens: &[AttachedSpan],
     token_i: &mut usize,
     tree: &mut NodeTree,
+    leading: Vec<ObjectId>,
 ) -> Result<Option<ObjectId>, ParseError> {
     if !is_structural(node) {
         return Ok(None);
@@ -66,21 +67,41 @@ fn intern(
         return Ok(Some(tree.intern_source_token(*lang, source, token, None)?));
     }
 
-    let mut children = Vec::new();
+    let mut children = leading;
+    let mut pending_attrs = Vec::new();
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            if is_structural(child)
-                && let Some(id) = intern(child, lang, source, tokens, token_i, tree)?
-            {
-                children.push(id);
+            if is_structural(child) {
+                if child.kind() == "attribute_item" {
+                    if let Some(id) =
+                        intern(child, lang, source, tokens, token_i, tree, Vec::new())?
+                    {
+                        pending_attrs.push(id);
+                    }
+                } else if !pending_attrs.is_empty() && takes_outer_attributes(child.kind()) {
+                    let leading_attrs = std::mem::take(&mut pending_attrs);
+                    if let Some(id) =
+                        intern(child, lang, source, tokens, token_i, tree, leading_attrs)?
+                    {
+                        children.push(id);
+                    }
+                } else {
+                    children.append(&mut pending_attrs);
+                    if let Some(id) =
+                        intern(child, lang, source, tokens, token_i, tree, Vec::new())?
+                    {
+                        children.push(id);
+                    }
+                }
             }
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
     }
+    children.append(&mut pending_attrs);
     if children.is_empty() {
         return Ok(None);
     }
@@ -90,6 +111,30 @@ fn intern(
         children,
         def_name(node, source),
     )?))
+}
+
+/// An outer attribute immediately before one of these belongs to it (ADR 0011).
+fn takes_outer_attributes(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_item"
+            | "function_signature_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "impl_item"
+            | "mod_item"
+            | "const_item"
+            | "static_item"
+            | "macro_definition"
+            | "type_item"
+            | "associated_type"
+            | "union_item"
+            | "enum_variant"
+            | "field_declaration"
+            | "use_declaration"
+            | "extern_crate_declaration"
+    )
 }
 
 /// Kinds whose local name is a prefix of nested definitions (spec §3.4).
@@ -342,8 +387,16 @@ pub(crate) fn parse(source: &[u8], lang: &LangId) -> Result<NodeTree, ParseError
     let attached = attach_trivia_spans(source, tokens);
     let mut tree = NodeTree::new();
     let mut token_i = 0;
-    let root_id = intern(root, lang, source, &attached, &mut token_i, &mut tree)?
-        .ok_or_else(|| ParseError::failed("intern did not produce a root node"))?;
+    let root_id = intern(
+        root,
+        lang,
+        source,
+        &attached,
+        &mut token_i,
+        &mut tree,
+        Vec::new(),
+    )?
+    .ok_or_else(|| ParseError::failed("intern did not produce a root node"))?;
     if token_i != attached.len() {
         return Err(ParseError::failed(format!(
             "intern consumed {token_i} tokens but trivia attachment produced {}",

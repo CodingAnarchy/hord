@@ -1,8 +1,8 @@
-//! Clap surface for M0 commands (spec §10.2).
+//! Clap surface for the CLI (spec §10.2).
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Semantic VCS.
 #[derive(Debug, Parser)]
@@ -21,7 +21,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// M0 subcommands.
+/// Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create a repository (optionally importing git history).
@@ -42,7 +42,35 @@ pub enum Command {
         workspace: Option<String>,
     },
     /// Show the landed change log.
-    Log,
+    Log {
+        /// NodeId (ULID or 32-digit hex) or qualified name.
+        #[arg(long, value_name = "NODE")]
+        node: Option<String>,
+        /// Repository path. Keeps changes whose write set touches it.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Actor id (`Actor::Human` or `Actor::Agent` id).
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+        /// Unix time in milliseconds. Keeps changes created at or after this instant.
+        #[arg(long, value_name = "MS")]
+        since: Option<u64>,
+    },
+    /// Semantic blame for a definition: change, intent, actor, evidence ids.
+    Blame {
+        /// Qualified name, `path:line` (1-based), or NodeId (ULID or 32-digit hex).
+        #[arg(value_name = "NAME|PATH:LINE")]
+        target: String,
+    },
+    /// Targets of one edge kind leaving a node, in the latest snapshot.
+    Query {
+        /// `references`, `dependents`, or `tests-of`.
+        #[arg(value_name = "EDGE")]
+        edge: QueryEdge,
+        /// Source NodeId (ULID or 32-digit hex).
+        #[arg(value_name = "NODE")]
+        node: String,
+    },
     /// Git import/export.
     Git {
         #[command(subcommand)]
@@ -59,6 +87,21 @@ pub enum WsCommand {
         #[arg(long, value_name = "SNAP|REF")]
         base: Option<String>,
     },
+}
+
+/// Edge kind for `hord query` (spec §3.8, §10.2).
+///
+/// `dependents` is [`hord_store::EdgeKind::Depends`] and `tests-of` is
+/// [`hord_store::EdgeKind::Tests`]. The node argument is the source; the
+/// command prints targets.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum QueryEdge {
+    /// [`hord_store::EdgeKind::References`].
+    References,
+    /// [`hord_store::EdgeKind::Depends`].
+    Dependents,
+    /// [`hord_store::EdgeKind::Tests`].
+    TestsOf,
 }
 
 /// `hord git` subcommands.

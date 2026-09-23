@@ -1,6 +1,7 @@
 //! Hord command-line interface (`hord`).
 //!
-//! M0 commands: `init`, `ws new`, `status`, `log`, `git import`, `git export`.
+//! Commands: `init`, `ws new`, `status`, `log`, `blame`, `query`,
+//! `git import`, `git export`.
 //! `--json` is the canonical agent output; human-oriented text is secondary.
 
 #![forbid(unsafe_code)]
@@ -10,6 +11,7 @@ mod cmd;
 mod git_bridge;
 mod output;
 mod repo;
+mod resolve;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -39,7 +41,14 @@ fn run_blocking(cli: Cli) -> Result<()> {
             WsCommand::New { base } => cmd::ws::run_new(cli.json, base),
         },
         Command::Status { workspace } => cmd::status::run(cli.json, workspace),
-        Command::Log => cmd::log::run(cli.json),
+        Command::Log {
+            node,
+            path,
+            actor,
+            since,
+        } => cmd::log::run(cli.json, node, path, actor, since),
+        Command::Blame { target } => cmd::blame::run(cli.json, target),
+        Command::Query { edge, node } => cmd::query::run(cli.json, edge, node),
         Command::Git { command } => match command {
             GitCommand::Import { git_ref } => cmd::git::run_import(cli.json, git_ref),
             GitCommand::Export { hord_ref } => cmd::git::run_export(cli.json, hord_ref),

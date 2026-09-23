@@ -78,7 +78,7 @@ fn help_lists_m0_commands() {
     let out = hord_bin().arg("--help").output().unwrap();
     assert_ok(&out, &["--help"]);
     let text = stdout(&out);
-    for cmd in ["init", "ws", "status", "log", "git"] {
+    for cmd in ["init", "ws", "status", "log", "blame", "query", "git"] {
         assert!(text.contains(cmd), "help missing {cmd}: {text}");
     }
 }
