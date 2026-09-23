@@ -9,9 +9,9 @@
 //! `concat(children.raw) == raw` is the lossless invariant parse/project must
 //! hold.
 //!
-//! [`normalized_hash`] documents the trivia strip and hashes the stripped
-//! bytes via [`hord_core::ObjectId::of`] (canonical CBOR of a
-//! [`hord_core::Bytes`] payload).
+//! [`normalized_hash`] documents the leaf trivia strip and hashes that text
+//! via [`hord_core::ObjectId::of`]. An internal node's `normalized` id hashes
+//! its children's `normalized` ids instead (ADR 0008).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

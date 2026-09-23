@@ -38,7 +38,28 @@ fn sample_blob() -> Blob {
     Blob::new(Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]))
 }
 
+#[derive(Serialize)]
+struct LeafWire {
+    kind: NodeKind,
+    lang: LangId,
+    raw: Bytes,
+    normalized: ObjectId,
+    children: Vec<ObjectId>,
+    name: Option<QualifiedName>,
+}
+
 fn sample_node() -> Node {
+    Node {
+        kind: NodeKind::new("identifier"),
+        lang: LangId::new("rust"),
+        raw: Bytes::from(b"fn".as_slice()),
+        normalized: oid(0x01),
+        children: Vec::new(),
+        name: None,
+    }
+}
+
+fn sample_internal_node() -> Node {
     Node {
         kind: NodeKind::new("fn_item"),
         lang: LangId::new("rust"),
@@ -207,6 +228,34 @@ fn blob_round_trip_and_stable_id() {
 #[test]
 fn node_round_trip_and_stable_id() {
     assert_round_trip(&sample_node());
+    let leaf = sample_node();
+    let leaf_mirror = LeafWire {
+        kind: leaf.kind,
+        lang: leaf.lang,
+        raw: leaf.raw.clone(),
+        normalized: leaf.normalized,
+        children: leaf.children.clone(),
+        name: leaf.name.clone(),
+    };
+    assert_eq!(
+        encode(&leaf).unwrap(),
+        encode(&leaf_mirror).unwrap(),
+        "leaf ObjectId preimage must stay the derived Node encoding"
+    );
+    let internal = sample_internal_node();
+    let encoded = encode(&internal).expect("encode internal");
+    let back: Node = decode(&encoded).expect("decode internal");
+    assert!(back.raw.is_empty(), "stored internal node has no raw");
+    assert_eq!(back.children, internal.children);
+    assert_eq!(back.normalized, internal.normalized);
+    assert_eq!(
+        ObjectId::of(&internal).unwrap(),
+        ObjectId::from_canonical(&encoded)
+    );
+    assert_eq!(
+        ObjectId::of(&internal).unwrap(),
+        ObjectId::of(&back).unwrap()
+    );
 }
 
 #[test]
