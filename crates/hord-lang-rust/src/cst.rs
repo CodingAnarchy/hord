@@ -92,22 +92,28 @@ fn intern(
     )?))
 }
 
-fn def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<QualifiedName> {
+/// Kinds whose local name is a prefix of nested definitions (spec §3.4).
+pub(crate) fn is_name_container(kind: &str) -> bool {
+    matches!(
+        kind,
+        "mod_item"
+            | "impl_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "union_item"
+            | "enum_variant"
+            | "foreign_mod_item"
+    )
+}
+
+pub(crate) fn def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<QualifiedName> {
     let local = local_def_name(node, source)?;
     let mut parts = Vec::new();
     let mut parent = node.parent();
     while let Some(p) = parent {
-        if matches!(
-            p.kind(),
-            "mod_item"
-                | "impl_item"
-                | "struct_item"
-                | "enum_item"
-                | "trait_item"
-                | "union_item"
-                | "enum_variant"
-                | "foreign_mod_item"
-        ) && let Some(m) = local_def_name(p, source)
+        if is_name_container(p.kind())
+            && let Some(m) = local_def_name(p, source)
         {
             parts.push(m);
         }
@@ -118,7 +124,7 @@ fn def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<QualifiedName>
     Some(QualifiedName::new(parts.join("::")))
 }
 
-fn local_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+pub(crate) fn local_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     match node.kind() {
         "function_item"
         | "function_signature_item"
@@ -230,7 +236,9 @@ fn use_clause_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String>
     if name.is_empty() { None } else { Some(name) }
 }
 
-fn with_parser<T>(f: impl FnOnce(&mut tree_sitter::Parser) -> T) -> Result<T, ParseError> {
+pub(crate) fn with_parser<T>(
+    f: impl FnOnce(&mut tree_sitter::Parser) -> T,
+) -> Result<T, ParseError> {
     thread_local! {
         static PARSER: RefCell<Option<tree_sitter::Parser>> = const { RefCell::new(None) };
     }
@@ -258,6 +266,52 @@ fn ensure_lossless(source: &[u8], tree: &NodeTree) -> Result<(), ParseError> {
             source.len()
         ))),
         None => Err(ParseError::failed("parse produced an empty tree")),
+    }
+}
+
+/// Local name of one definition, parsed from its own source bytes.
+///
+/// `raw` is the node's exact subtree (trivia included). Field and enum-variant
+/// fragments are wrapped so tree-sitter can see them as items.
+pub(crate) fn local_name_from_raw(kind: &str, raw: &[u8]) -> Option<String> {
+    let wrapped;
+    let source: &[u8] = match kind {
+        "field_declaration" => {
+            let text = std::str::from_utf8(raw).ok()?;
+            wrapped = format!("struct __HordWrap {{\n{text}\n}}");
+            wrapped.as_bytes()
+        }
+        "enum_variant" => {
+            let text = std::str::from_utf8(raw).ok()?;
+            wrapped = format!("enum __HordWrap {{\n{text},\n}}");
+            wrapped.as_bytes()
+        }
+        _ => raw,
+    };
+    with_parser(|parser| {
+        let tree = parser.parse(source, None)?;
+        let found = find_kind(tree.root_node(), kind)?;
+        local_def_name(found, source)
+    })
+    .ok()
+    .flatten()
+}
+
+fn find_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        if let Some(found) = find_kind(cursor.node(), kind) {
+            return Some(found);
+        }
+        if !cursor.goto_next_sibling() {
+            return None;
+        }
     }
 }
 

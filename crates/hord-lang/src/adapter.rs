@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, QualifiedName, RepoPath};
+use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
 
 use crate::ParseError;
 use crate::identify::{IdentifiedTree, IdentityMapping, default_identify};
@@ -34,34 +34,224 @@ impl Tier {
     }
 }
 
-/// Snapshot-scoped context for Tier 2 name resolution.
+/// One definition in a [`ResolveCtx`] snapshot.
 ///
-/// M1 leaves this empty. M2 fills it with identity and edge data.
+/// Language adapters fill these through [`ResolveCtx::add_definition`].
+/// `parent` is adapter-defined linkage (for example an impl or enum) and is
+/// empty for names in the module's own namespace.
+#[derive(Clone, Debug)]
+struct Definition {
+    node_id: NodeId,
+    object_id: Option<ObjectId>,
+    kind: NodeKind,
+    module: QualifiedName,
+    simple: QualifiedName,
+    parent: QualifiedName,
+    is_test: bool,
+    cfg_test: bool,
+}
+
+/// A `use` (or glob) recorded in the module that contains it.
+#[derive(Clone, Debug)]
+struct Import {
+    module: QualifiedName,
+    /// Binding name, or `*` for a glob.
+    local: QualifiedName,
+    /// Path as written (`crate::foo::Bar`, `super::baz`).
+    path: QualifiedName,
+    glob: bool,
+}
+
+/// A parsed file root, so a whole-file node can be placed in a module.
+#[derive(Clone, Debug)]
+struct FileRoot {
+    object_id: ObjectId,
+    module: QualifiedName,
+}
+
+/// Snapshot-scoped context for Tier 2 name resolution (spec §4.3).
+///
+/// Holds the definitions, imports, and file modules a [`LangAdapter`] needs
+/// to resolve names. An empty context (from [`ResolveCtx::new`]) resolves
+/// nothing. Adapters fill it for one snapshot; the Rust adapter's entry
+/// point is `RustAdapter::resolve_context`.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
-pub struct ResolveCtx {}
+pub struct ResolveCtx {
+    definitions: Vec<Definition>,
+    imports: Vec<Import>,
+    files: Vec<FileRoot>,
+}
 
 impl ResolveCtx {
     /// An empty resolution context.
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self::default()
+    }
+
+    /// Number of definitions in this snapshot.
+    #[must_use]
+    pub fn definition_count(&self) -> usize {
+        self.definitions.len()
+    }
+
+    /// Record a definition.
+    ///
+    /// `module` is the module that contains the item (`crate::foo`).
+    /// `simple` is its identifier (`bar`), not a path.
+    /// `parent` is empty when `simple` is a name in that module's namespace;
+    /// otherwise it is adapter-defined (an impl, a struct field, a `use`).
+    /// `is_test` is `#[test]`; `cfg_test` is `#[cfg(test)]` on the item or
+    /// an enclosing module.
+    ///
+    /// `node_id` may be [`NodeId::nil`] when the snapshot has not assigned
+    /// identity yet. [`LangAdapter::resolve`] then skips that definition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_definition(
+        &mut self,
+        node_id: NodeId,
+        object_id: Option<ObjectId>,
+        kind: NodeKind,
+        module: impl Into<QualifiedName>,
+        simple: impl Into<QualifiedName>,
+        parent: impl Into<QualifiedName>,
+        is_test: bool,
+        cfg_test: bool,
+    ) {
+        self.definitions.push(Definition {
+            node_id,
+            object_id,
+            kind,
+            module: module.into(),
+            simple: simple.into(),
+            parent: parent.into(),
+            is_test,
+            cfg_test,
+        });
+    }
+
+    /// Record a `use` binding in `module`.
+    ///
+    /// `local` is the name brought into scope, or `*` when `glob` is set.
+    /// `path` is the path as written.
+    pub fn add_import(
+        &mut self,
+        module: impl Into<QualifiedName>,
+        local: impl Into<QualifiedName>,
+        path: impl Into<QualifiedName>,
+        glob: bool,
+    ) {
+        self.imports.push(Import {
+            module: module.into(),
+            local: local.into(),
+            path: path.into(),
+            glob,
+        });
+    }
+
+    /// Record a file root's module, for nodes that are not themselves definitions.
+    pub fn add_file(&mut self, object_id: ObjectId, module: impl Into<QualifiedName>) {
+        self.files.push(FileRoot {
+            object_id,
+            module: module.into(),
+        });
+    }
+
+    /// Visit every definition in insertion order.
+    ///
+    /// Arguments are `node_id`, `object_id`, `kind`, `module`, `simple`,
+    /// `parent`, `is_test`, `cfg_test`.
+    pub fn for_each_definition(
+        &self,
+        mut visit: impl FnMut(
+            NodeId,
+            Option<ObjectId>,
+            &NodeKind,
+            &QualifiedName,
+            &QualifiedName,
+            &QualifiedName,
+            bool,
+            bool,
+        ),
+    ) {
+        for d in &self.definitions {
+            visit(
+                d.node_id,
+                d.object_id,
+                &d.kind,
+                &d.module,
+                &d.simple,
+                &d.parent,
+                d.is_test,
+                d.cfg_test,
+            );
+        }
+    }
+
+    /// Visit every import in insertion order.
+    ///
+    /// Arguments are `module`, `local`, `path`, `glob`.
+    pub fn for_each_import(
+        &self,
+        mut visit: impl FnMut(&QualifiedName, &QualifiedName, &QualifiedName, bool),
+    ) {
+        for i in &self.imports {
+            visit(&i.module, &i.local, &i.path, i.glob);
+        }
+    }
+
+    /// Visit every file root in insertion order (`object_id`, `module`).
+    pub fn for_each_file(&self, mut visit: impl FnMut(ObjectId, &QualifiedName)) {
+        for f in &self.files {
+            visit(f.object_id, &f.module);
+        }
     }
 }
 
-/// An unresolved name mentioned in a node's body (spec §4.3).
+/// A name mentioned in a node's body (spec §4.3).
+///
+/// `name` is the path as written. `scope` is the module that contains the
+/// mention, when the adapter knows it. `resolved` is one candidate
+/// definition: [`LangAdapter::references`] sets it so an over-approximated
+/// name can produce one edge per candidate. [`LangAdapter::resolve`] returns
+/// `resolved` when it is set, and otherwise looks `name` up in `scope`.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub struct NameRef {
-    /// The name as written, not yet resolved to a [`NodeId`].
+    /// The name as written, not yet necessarily resolved to a [`NodeId`].
     pub name: QualifiedName,
+    /// Module in which `name` was written (`crate::foo`). `None` if unknown.
+    pub scope: Option<QualifiedName>,
+    /// One candidate definition. `None` when the name is unresolved or not
+    /// yet expanded into candidates.
+    pub resolved: Option<NodeId>,
 }
 
 impl NameRef {
-    /// Wrap a qualified name.
+    /// A name with unknown scope and no candidate.
     #[must_use]
     pub fn new(name: impl Into<QualifiedName>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            scope: None,
+            resolved: None,
+        }
+    }
+
+    /// A name written in `scope`, bound to `resolved` when the adapter has
+    /// already picked a candidate.
+    #[must_use]
+    pub fn at(
+        name: impl Into<QualifiedName>,
+        scope: Option<QualifiedName>,
+        resolved: Option<NodeId>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            scope,
+            resolved,
+        }
     }
 }
 
@@ -70,7 +260,7 @@ impl NameRef {
 /// Tier 1 methods (`parse`, `project`, `is_definition`) are required.
 /// `project(parse(bytes))` must equal `bytes`. Tier 2 methods default to
 /// empty/`None`. [`identify`](Self::identify) defaults to
-/// [`default_identify`] (spec §3.4 steps 1–3; rename is M2).
+/// [`default_identify`] (spec §3.4, ADR 0007).
 ///
 /// Tree-sitter is **not** used here; language crates own grammars.
 pub trait LangAdapter: Send + Sync {

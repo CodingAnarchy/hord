@@ -11,8 +11,8 @@ use crate::defs::{
 
 /// Diff `base` → `result` at definition granularity.
 ///
-/// Matching uses [`IdentityMapping`] (exact / named / moved; rename
-/// similarity is M2). Sub-definition edits collapse to [`Op::Replace`] on
+/// Matching uses [`IdentityMapping`] (exact, named, moved, and rename by
+/// tree-edit distance, ADR 0007). Sub-definition edits collapse to [`Op::Replace`] on
 /// the enclosing definition (ADR 0002). File-level non-definition glue
 /// (`use` items, …) collapses to [`Op::Replace`] on [`file_parent`].
 ///
