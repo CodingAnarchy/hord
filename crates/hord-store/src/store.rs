@@ -8,6 +8,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use hord_core::{ChangeId, ObjectId, SnapshotId};
 use redb::{Database, Durability, ReadableTable, TableDefinition, WriteTransaction};
@@ -20,6 +21,8 @@ use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
 
 #[path = "index.rs"]
 mod index;
+#[path = "lock.rs"]
+mod lock;
 #[path = "queue.rs"]
 mod queue;
 
@@ -138,7 +141,8 @@ impl std::fmt::Debug for Store {
 impl Store {
     /// Create `<repo>/.hord/` and an empty store.
     ///
-    /// Fails if `.hord/` already exists.
+    /// Fails if `.hord/` already exists. Waits for the index lock as
+    /// [`Store::open`] does.
     pub fn create(repo_root: impl AsRef<Path>) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let hord_dir = repo_root.join(HORD_DIR);
@@ -149,7 +153,10 @@ impl Store {
         let objects_dir = hord_dir.join("objects");
         create_shard_dirs(&objects_dir)?;
         fs::create_dir_all(hord_dir.join("ws"))?;
-        let db = Database::create(hord_dir.join("index.redb")).map_err(Error::index)?;
+        let index = hord_dir.join("index.redb");
+        let db = lock::acquire(&hord_dir, &index, lock::timeout_from_env()?, || {
+            Database::create(&index)
+        })?;
         init_tables(&db)?;
         Ok(Self {
             repo_root,
@@ -170,14 +177,24 @@ impl Store {
     }
 
     /// Open an existing store at `<repo>/.hord/`.
+    ///
+    /// One process at a time can hold a store (ADR 0021). If another process
+    /// holds it, this retries with backoff for `HORD_LOCK_TIMEOUT` seconds
+    /// (default 30; `0` fails at once), then returns [`Error::Locked`].
     pub fn open(repo_root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_lock_timeout(repo_root, lock::timeout_from_env()?)
+    }
+
+    /// [`Store::open`], waiting at most `timeout` for another process to
+    /// release the store instead of reading `HORD_LOCK_TIMEOUT`.
+    pub fn open_with_lock_timeout(repo_root: impl AsRef<Path>, timeout: Duration) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let hord_dir = repo_root.join(HORD_DIR);
         let index = hord_dir.join("index.redb");
         if !hord_dir.is_dir() || !index.is_file() {
             return Err(Error::MissingStore(hord_dir));
         }
-        let db = Database::open(index).map_err(Error::index)?;
+        let db = lock::acquire(&hord_dir, &index, timeout, || Database::open(&index))?;
         index::ensure_tables(&db)?;
         queue::ensure_tables(&db)?;
         let objects_dir = hord_dir.join("objects");
@@ -794,6 +811,8 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         let _ = self.flush();
+        // Before `db` closes, so no later holder has written its pid yet.
+        lock::release(&self.hord_dir);
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use hord_core::ObjectId;
 use thiserror::Error;
@@ -16,6 +17,25 @@ pub enum Error {
     /// [`crate::Store::open`] was called on a path with no `.hord/` store.
     #[error("no hord store at {}", .0.display())]
     MissingStore(PathBuf),
+    /// Another process held the store's index lock for the whole lock
+    /// timeout (`HORD_LOCK_TIMEOUT`, ADR 0021).
+    #[error(
+        "hord store is locked by {}: {} (waited {:.1}s; set HORD_LOCK_TIMEOUT to wait longer)",
+        holder_name(*.holder),
+        .lock.display(),
+        .waited.as_secs_f64()
+    )]
+    Locked {
+        /// The locked index file.
+        lock: PathBuf,
+        /// Pid of the process holding it, when known and still running.
+        holder: Option<u32>,
+        /// How long the open waited before giving up.
+        waited: Duration,
+    },
+    /// `HORD_LOCK_TIMEOUT` was not a non-negative number of seconds.
+    #[error("invalid HORD_LOCK_TIMEOUT {0:?}: expected seconds, such as 30 or 0")]
+    LockTimeout(String),
     /// No object with this id is in the store.
     #[error("object {0} not found")]
     MissingObject(ObjectId),
@@ -58,6 +78,10 @@ pub enum Error {
     /// A pack file or its sidecar index was unreadable.
     #[error("invalid pack {}", .0.display())]
     InvalidPack(PathBuf),
+}
+
+fn holder_name(holder: Option<u32>) -> String {
+    holder.map_or_else(|| "another process".to_owned(), |pid| format!("pid {pid}"))
 }
 
 impl Error {
