@@ -26,5 +26,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 hord-core.workspace = true
+hord-identity.workspace = true
+hord-lang.workspace = true
+hord-lang-rust.workspace = true
 hord-store.workspace = true
+serde.workspace = true
 serde_json.workspace = true

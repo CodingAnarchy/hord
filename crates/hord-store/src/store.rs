@@ -95,8 +95,9 @@ impl LandingLog {
 /// Local content-addressed object store (spec §8.1).
 ///
 /// Layout under `<repo>/.hord/`:
-/// - `index.redb` — log, refs, workspaces, packed-object locations, and the
-///   rebuildable `node_history` / `edges` / `identity` caches
+/// - `index.redb` — format version, log, refs, workspaces, packed-object
+///   locations, and the rebuildable `node_history` / `edges` / `rebased`
+///   indexes
 /// - `objects/<ab>/<rest>` — uncompressed loose objects
 /// - `objects/pack/pack-<id>.pack` + `.idx` — zstd-compressed packs
 /// - `ws/<ulid>/` — workspace materialization directories
@@ -115,7 +116,7 @@ pub struct Store {
     /// Landed changes not yet written to the redb `log` table.
     pending_log: Mutex<Vec<ChangeId>>,
     has_packs: AtomicBool,
-    /// Serializes index updates so an identity supersede chain cannot fork.
+    /// Serializes index updates (edges, history, landings, rebuilds).
     index_lock: Mutex<()>,
     /// Objects this process has stored or fetched. Duplicate `put`s hit this
     /// instead of rewriting the loose file.
@@ -848,6 +849,7 @@ fn init_tables(db: &Database) -> Result<()> {
     txn.open_table(META).map_err(Error::index)?;
     txn.open_table(EVIDENCE_BY_SNAPSHOT).map_err(Error::index)?;
     index::open_tables(&txn)?;
+    index::write_format(&txn)?;
     queue::open_tables(&txn)?;
     queue::mark_names_indexed(&txn)?;
     txn.commit().map_err(Error::index)?;

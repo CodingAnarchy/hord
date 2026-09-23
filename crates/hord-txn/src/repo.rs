@@ -1,20 +1,20 @@
 //! [`Repo`]: the shared handle every workspace and the lander hang off.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_core::{
-    Actor, ChangeId, ChangeRecord, Intent, LangId, ObjectId, Op, Provenance, RepoPath, SnapshotId,
-    Timestamp, Tree, TreeOpKind,
+    Actor, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
+    RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
 };
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
 
 use crate::lander::{QueueEntry, Verdict, Verifier, VerifyFuture, VerifyRequest};
 use crate::materialize::MaterializeMode;
-use crate::semantic::{IdentityIndex, RustCtx};
+use crate::semantic::RustCtx;
 use crate::workspace::{Materialization, Workspace};
 use crate::{Error, Result};
 
@@ -29,6 +29,12 @@ use crate::{Error, Result};
 const MAX_CACHED_TREE_BYTES: usize = 1536 << 20;
 /// Cap on cached per-snapshot Rust resolution contexts.
 const MAX_CACHED_CTX: usize = 8;
+/// Cap on cached footprints of landed changes and on the ids of records
+/// this process proposed. The lander needs the footprints of the changes
+/// landed after a queued change's base; a miss recomputes one from its
+/// record. Beyond this many, the least recently used are dropped (they grew
+/// by one per landing forever before).
+pub(crate) const MAX_TRACKED_CHANGES: usize = 16_384;
 
 /// Repository-wide settings for the lander (spec §6.3, §7.2).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -126,7 +132,7 @@ pub fn default_adapters() -> AdapterRegistry {
 /// Where a new workspace starts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Base {
-    /// The result snapshot of the current `head` (or the empty tree).
+    /// The result snapshot of the current `head` (or the empty snapshot).
     #[default]
     Head,
     /// The result snapshot of a landed change. That change becomes the
@@ -165,7 +171,7 @@ impl BeginOptions {
 pub struct Head {
     /// Latest landed change; `None` before anything lands.
     pub change: Option<ChangeId>,
-    /// Its result snapshot, or the empty tree.
+    /// Its result snapshot, or the empty snapshot ([`Snapshot::empty`]).
     pub snapshot: SnapshotId,
 }
 
@@ -194,16 +200,23 @@ pub(crate) struct Inner {
     pub config: RepoConfig,
     pub verifier: Arc<dyn Verifier>,
     pub toolchain: ObjectId,
+    /// Root [`Tree`] with no entries.
     pub empty_tree: ObjectId,
+    /// [`Snapshot::empty`]: the base before anything lands.
+    pub empty_snapshot: SnapshotId,
     pub head: Mutex<Option<Head>>,
     pub trees: Mutex<HashMap<ObjectId, Arc<Tree>>>,
+    pub snapshots: Mutex<HashMap<SnapshotId, Arc<Snapshot>>>,
+    pub identity_trees: Mutex<HashMap<ObjectId, Arc<IdentityTree>>>,
     pub parsed: Mutex<WeightedLru<(ObjectId, LangId), Arc<NodeTree>>>,
     pub identified: Mutex<IdentifiedCache>,
-    pub indexes: Mutex<HashMap<SnapshotId, Arc<IdentityIndex>>>,
     pub rust_ctx: Mutex<CtxCache>,
-    pub footprints: Mutex<HashMap<ChangeId, Arc<crate::conflict::Footprint>>>,
-    /// Records built by this process's `propose`, whose ops were checked then.
-    pub proposed: Mutex<HashSet<ChangeId>>,
+    /// Footprints of landed changes, least recently used evicted.
+    pub footprints: Mutex<WeightedLru<ChangeId, Arc<crate::conflict::Footprint>>>,
+    /// Records built by this process's `propose`, whose ops were checked
+    /// then (least recently proposed evicted; `submit` also records the
+    /// check in the store).
+    pub proposed: Mutex<WeightedLru<ChangeId, ()>>,
     /// Serializes the lander (spec §6.7: one lander per repository).
     pub lander: tokio::sync::Mutex<crate::lander::LanderState>,
 }
@@ -334,6 +347,8 @@ impl Inner {
             grammars: ["tree-sitter-rust 0.24", "tree-sitter-toml-ng 0.7"],
         })?;
         let empty_tree = store.put_object(&Tree::default())?;
+        store.put_object(&IdentityTree::default())?;
+        let empty_snapshot = store.put_object(&Snapshot::empty())?;
         Ok(Self {
             store,
             adapters: options.adapters.unwrap_or_else(default_adapters),
@@ -343,14 +358,16 @@ impl Inner {
                 .unwrap_or_else(|| Arc::new(FailClosedVerifier)),
             toolchain,
             empty_tree,
+            empty_snapshot,
             head: Mutex::new(None),
             trees: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
+            identity_trees: Mutex::new(HashMap::new()),
             parsed: Mutex::new(WeightedLru::new(MAX_CACHED_TREE_BYTES)),
             identified: Mutex::new(WeightedLru::new(MAX_CACHED_TREE_BYTES)),
-            indexes: Mutex::new(HashMap::new()),
             rust_ctx: Mutex::new(CtxCache::default()),
-            footprints: Mutex::new(HashMap::new()),
-            proposed: Mutex::new(HashSet::new()),
+            footprints: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
+            proposed: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
         })
     }
@@ -366,7 +383,7 @@ impl Inner {
             },
             None => Head {
                 change: None,
-                snapshot: self.empty_tree,
+                snapshot: self.empty_snapshot,
             },
         };
         *lock(&self.head) = Some(head);
@@ -424,6 +441,16 @@ impl Inner {
         lock(&self.rust_ctx).latest = Some(ctx);
     }
 
+    /// Record that this process proposed `change` and checked its ops.
+    pub(crate) fn note_proposed(&self, change: ChangeId) {
+        lock(&self.proposed).insert(change, (), 1);
+    }
+
+    /// Whether this process proposed `change` (and checked its ops).
+    pub(crate) fn was_proposed(&self, change: ChangeId) -> bool {
+        lock(&self.proposed).get(&change).is_some()
+    }
+
     /// Land `files` as the first change (Tier 0 ops, fresh identity).
     fn bootstrap(
         &self,
@@ -449,9 +476,11 @@ impl Inner {
             });
             changes.insert(path, Some(blob));
         }
-        let result = self.update_tree(self.empty_tree, &changes)?;
+        // Tier 0: every file is a fresh assignment, so the identity tree is
+        // empty (ADR 0017).
+        let result = self.commit_snapshot(self.empty_snapshot, &changes, &BTreeMap::new())?;
         let record = ChangeRecord {
-            base: self.empty_tree,
+            base: self.empty_snapshot,
             result,
             parents: Vec::new(),
             ops,
@@ -468,11 +497,9 @@ impl Inner {
             identity_deltas: Vec::new(),
             evidence: Vec::new(),
             signature: None,
+            rebased_from: None,
         };
         let change = self.store.put_object(&record)?;
-        // Tier 0: every file is a fresh assignment. Recorded so the pointer
-        // is durable with `set_head` below.
-        self.put_identity_index(result, crate::semantic::IdentityIndex::empty(result))?;
         self.store.append_log(change)?;
         self.store.set_head(change)?;
         self.store.index_change(change)?;
@@ -833,5 +860,65 @@ mod lru_tests {
         assert_eq!(cache.len(), 1, "the newest entry is kept even over budget");
         assert_eq!(cache.get(&"b"), Some(3));
         assert_eq!(cache.weight(), 500);
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use std::sync::Arc;
+
+    use hord_core::{ChangeRecord, ObjectId};
+
+    use super::{MAX_TRACKED_CHANGES, Repo, lock};
+    use crate::conflict::Footprint;
+
+    fn id(n: usize) -> ObjectId {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        ObjectId::from_bytes(bytes)
+    }
+
+    /// The per-landing footprint cache and the proposed-change set are
+    /// bounded (perf review #7 leftover): past the cap the least recently
+    /// used go, and a recent one is still there. Both grew by one entry per
+    /// change forever before.
+    #[tokio::test]
+    async fn footprints_and_proposed_stay_bounded() {
+        let dir = std::env::temp_dir().join(format!("hord-txn-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repo::create(&dir).await.unwrap();
+        let inner = &repo.inner;
+        let record: ChangeRecord = {
+            let mut ws = repo
+                .begin(crate::BeginOptions::at_head(hord_core::Actor::Human {
+                    id: "t".into(),
+                }))
+                .await
+                .unwrap();
+            ws.write_file(&"a.txt".parse().unwrap(), "a\n")
+                .await
+                .unwrap();
+            ws.preview(hord_core::Intent {
+                summary: "s".into(),
+                body: String::new(),
+                refs: Vec::new(),
+                acceptance: Vec::new(),
+            })
+            .await
+            .unwrap()
+            .record
+        };
+        let footprint = Arc::new(Footprint::of(id(0), &record, &[]));
+        let total = MAX_TRACKED_CHANGES + 100;
+        for n in 0..total {
+            lock(&inner.footprints).insert(id(n), Arc::clone(&footprint), 1);
+            inner.note_proposed(id(n));
+        }
+        assert_eq!(lock(&inner.footprints).len(), MAX_TRACKED_CHANGES);
+        assert_eq!(lock(&inner.proposed).len(), MAX_TRACKED_CHANGES);
+        assert!(inner.was_proposed(id(total - 1)), "the newest stays");
+        assert!(!inner.was_proposed(id(0)), "the oldest went");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

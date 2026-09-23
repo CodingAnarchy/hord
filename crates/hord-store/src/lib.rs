@@ -11,18 +11,21 @@
 //! [`Store::pack`], [`Store::flush`], or drop. Ingest batches skip fsync;
 //! those flush points use a durable commit.
 //!
-//! `node_history`, `edges`, and `identity` cache facts that also live in
+//! `node_history`, `edges`, and `rebased` index facts that also live in
 //! stored objects (spec §8.1). [`Store::rebuild_index`] reconstructs them.
-//! `evidence_by_snapshot` is created empty.
+//! `evidence_by_snapshot` is created empty. NodeIds are not indexed here: a
+//! snapshot's identity is part of its [`hord_core::Snapshot`] object
+//! (ADR 0017).
+//!
+//! The index records a format version ([`Store::create`]); opening a store
+//! of another format fails with [`Error::StoreFormat`].
 //!
 //! `hord-txn` keeps more tables here: the persistent lander queue
 //! ([`Store::queue_push`]) with an index from change ids to its entries
-//! ([`Store::queue_named`]), the changes whose ops were checked
-//! ([`Store::mark_checked`]), and a per-snapshot identity index pointer
-//! ([`Store::set_identity_index`]). The store does not interpret a queue
-//! entry or an identity index. [`Store::land`] writes one landing (queue
-//! entry, log, `head`, identity pointer, `node_history`) in one durable
-//! commit.
+//! ([`Store::queue_named`]) and the changes whose ops were checked
+//! ([`Store::mark_checked`]). The store does not interpret a queue entry.
+//! [`Store::land`] writes one landing (queue entry, log, `head`,
+//! `node_history`, `rebased`) in one durable commit.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

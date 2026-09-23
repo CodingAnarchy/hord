@@ -11,13 +11,25 @@
 //! a result that does not parse. A `Blob` op whose file root no structural
 //! op names is a coarse (whole-file) write.
 //!
+//! # File moves (ADR 0020)
+//!
+//! A parsed file the change deletes is paired with a file it creates, by
+//! blob equality first and then by definition overlap at ADR 0007's 0.8.
+//! Identity carries from the old file to the new one; the ops are
+//! `Op::Tree { path: old, kind: Rename { to: new } }`, a `Move` of each
+//! carried top-level definition from the old file root to the new one, and
+//! the structural diff of the old content to the new. Births in the new
+//! file are derived from its path.
+//!
 //! # Sets
 //!
-//! `write_set` is every definition the ops touch (the file root for a glue
-//! edit), plus births, deaths, and derivations, and the path id
-//! ([`crate::path_node_id`], equal to the file root id) for created files,
-//! blob-tier and coarse writes, with every base definition of a coarsely
-//! written parsed file.
+//! `write_set` and `identity_deltas` come from comparing the base and result
+//! snapshots ([`crate::sets::sets_between`], shared with the lander's rebased
+//! records): every definition whose own content or parent changed, births,
+//! deaths, derivations, moved definitions, and the path id
+//! ([`crate::path_node_id`], equal to the file root id) for created,
+//! deleted, moved, blob-tier, and coarsely written files and for glue
+//! edits.
 //!
 //! `read_set` follows ADR 0012: the access log (definitions, and path ids of
 //! files read), one hop of outgoing `References` from every written
@@ -27,15 +39,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hord_core::{
-    Actor, Bytes, ChangeId, ChangeRecord, IdentityDelta, Intent, NodeId, ObjectId, Op, Provenance,
-    RepoPath, SnapshotId, TreeOpKind,
+    Actor, Bytes, ChangeId, ChangeRecord, IdentityDelta, Intent, LangId, NodeId, ObjectId, Op,
+    Provenance, RepoPath, SnapshotId, TreeOpKind,
 };
-use hord_lang::{Anchor, IdentifiedTree, IdentityMapping};
+use hord_lang::{Anchor, IdentifiedTree, NodeTree, Site};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::path_node_id;
-use crate::repo::{Inner, lock, now};
-use crate::semantic::{RustCtx, by_node, definitions, enclosing, result_anchor};
+use crate::repo::{Inner, now};
+use crate::semantic::{FileView, Parsed, RustCtx, definitions, enclosing, result_anchor};
+use crate::sets::sets_between;
+use crate::snapshot::IdentityEdits;
 use crate::workspace::{AccessLog, Proposal};
 use crate::{Error, Result};
 
@@ -69,147 +83,87 @@ struct Written {
     rust: bool,
     base: Option<Arc<IdentifiedTree>>,
     result: Option<Arc<IdentifiedTree>>,
-    nodes: BTreeSet<NodeId>,
+}
+
+/// One changed path: its base view and new content.
+struct Edit {
+    path: RepoPath,
+    base: Option<FileView>,
+    result: Option<Bytes>,
+    blob: Option<ObjectId>,
+}
+
+impl Edit {
+    fn base_blob(&self) -> Option<ObjectId> {
+        self.base.as_ref().map(|v| v.blob)
+    }
+
+    fn base_parsed(&self) -> Option<&Parsed> {
+        self.base.as_ref().and_then(|v| v.parsed.as_ref())
+    }
+}
+
+/// Everything `propose` accumulates across files.
+#[derive(Default)]
+struct Build {
+    ops: Vec<Op>,
+    /// Derivations carrying recorded (births and deaths come from
+    /// [`sets_between`]).
+    declared: Vec<IdentityDelta>,
+    tree: BTreeMap<RepoPath, Option<ObjectId>>,
+    identity: IdentityEdits,
+    written: Vec<Written>,
 }
 
 /// Build the record. With `store`, store it and remember it as checked;
-/// without, return the id it would have (blobs, trees, and identity objects
-/// are still written: they are content-addressed).
+/// without, return the id it would have (blobs, trees, snapshots, and
+/// identity objects are still written: they are content-addressed).
 pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result<Proposal> {
     let base = input.base;
-    let mut ops = Vec::new();
-    let mut write_set = BTreeSet::new();
-    let mut deltas = Vec::new();
-    let mut tree_changes = BTreeMap::new();
-    let mut index = (*inner.identity_index(base)?).clone();
-    let mut written = Vec::new();
-    let mut read_set = BTreeSet::new();
-
+    let mut edits = Vec::new();
     for (path, result) in &input.changes {
         let base_view = inner.file_view(base, path)?;
-        let base_blob = base_view.as_ref().map(|v| v.blob);
-        let result_blob = match result {
+        let blob = match result {
             Some(bytes) => Some(inner.put_blob(bytes.as_slice())?),
             None => None,
         };
-        if base_blob == result_blob {
+        if base_view.as_ref().map(|v| v.blob) == blob {
             continue;
         }
-        tree_changes.insert(path.clone(), result_blob);
-        if base_blob.is_none() {
-            // Creating a file writes its path (the file root, ADR 0015): a
-            // read of the missing path, or another creation of it, overlaps.
-            write_set.insert(path_node_id(path));
-        }
-        // Op::Blob only for new or deleted content and for files without a
-        // structural diff (ADR 0015); a parsed edit is its structural ops.
-        let blob_op = Op::Blob {
+        edits.push(Edit {
             path: path.clone(),
-            from: base_blob,
-            to: result_blob,
-        };
-        if base_blob.is_none() {
-            ops.push(Op::Tree {
-                path: path.clone(),
-                kind: TreeOpKind::CreateFile,
-            });
-            ops.push(blob_op.clone());
-        } else if result_blob.is_none() {
-            ops.push(blob_op.clone());
-        }
-        let base_parsed = base_view.as_ref().and_then(|v| v.parsed.clone());
-        let head = match (result, &base_view) {
-            (Some(bytes), _) => bytes.clone(),
-            (None, Some(view)) => view.bytes.clone(),
-            (None, None) => Bytes::default(),
-        };
-        let adapter = inner.adapter(path, head.as_slice());
-        // A parsed base must parse for a structural diff; a new file needs none.
-        let structural = match (adapter, result, result_blob) {
-            (Some(adapter), Some(bytes), Some(blob))
-                if base_view.is_none() || base_parsed.is_some() =>
-            {
-                inner
-                    .parse(adapter, blob, bytes.as_slice())
-                    .map(|tree| (adapter, tree, bytes, blob))
-            }
-            _ => None,
-        };
-        match structural {
-            Some((adapter, result_tree, bytes, blob)) => {
-                let empty = IdentifiedTree::default();
-                let base_tree = base_parsed.as_ref().map(|p| Arc::clone(&p.tree));
-                let base_ref = base_tree.as_deref().unwrap_or(&empty);
-                let mapping = hord_identity::carry_in(adapter, path, base_ref, &result_tree, &[])
-                    .map_err(|source| Error::Identity {
-                    path: path.clone(),
-                    source,
-                })?;
-                let file_ops = hord_diff::diff(path, base_ref, &result_tree, &mapping);
-                check_reproduces(adapter, path, base_ref, &file_ops, &result_tree, bytes)?;
-                deltas.extend(mapping.deltas.iter().cloned());
-                ops.extend(file_ops);
-                let result_tree = Arc::new(IdentifiedTree::new(
-                    (*result_tree).clone(),
-                    mapping.nodes.clone(),
-                ));
-                let nodes = written_nodes(base_ref, &result_tree, &mapping, path_node_id(path));
-                write_set.extend(nodes.iter().copied());
-                let identity = inner.put_file_identity(path, blob, &result_tree)?;
-                index.set(path, Some(identity));
-                written.push(Written {
-                    path: path.clone(),
-                    rust: adapter.lang().as_str() == hord_lang_rust::LANG,
-                    base: base_tree,
-                    result: Some(result_tree),
-                    nodes,
-                });
-            }
-            None => {
-                if base_blob.is_some() && result_blob.is_some() {
-                    ops.push(blob_op);
-                }
-                write_set.insert(path_node_id(path));
-                index.set(path, None);
-                if let Some(parsed) = &base_parsed {
-                    let nodes: BTreeSet<NodeId> = parsed.tree.ids.values().copied().collect();
-                    write_set.extend(nodes.iter().copied());
-                    deltas.extend(
-                        nodes
-                            .iter()
-                            .map(|node| IdentityDelta::Death { node: *node }),
-                    );
-                    written.push(Written {
-                        path: path.clone(),
-                        rust: parsed.lang.as_str() == hord_lang_rust::LANG,
-                        base: Some(Arc::clone(&parsed.tree)),
-                        result: None,
-                        nodes,
-                    });
-                }
-            }
-        }
-        if result_blob.is_none() {
-            ops.push(Op::Tree {
-                path: path.clone(),
-                kind: TreeOpKind::Delete,
-            });
-        }
+            base: base_view,
+            result: result.clone(),
+            blob,
+        });
     }
-    if tree_changes.is_empty() {
+    if edits.is_empty() {
         return Err(Error::NothingToPropose);
     }
-    for delta in &deltas {
-        write_set.extend(delta_nodes(delta));
+    let moves = pair_moves(inner, &edits)?;
+    let mut build = Build::default();
+    for (i, edit) in edits.iter().enumerate() {
+        match moves.get(&i) {
+            Some(Pairing::From) => {}
+            Some(Pairing::To(from)) => propose_move(inner, base, &edits[*from], edit, &mut build)?,
+            None => propose_file(inner, base, edit, &mut build)?,
+        }
     }
-    write_set.remove(&NodeId::nil());
+    // A moved file's source is deleted by the rename.
+    for (i, pairing) in &moves {
+        if matches!(pairing, Pairing::From) {
+            build.tree.insert(edits[*i].path.clone(), None);
+            build.identity.insert(edits[*i].path.clone(), None);
+        }
+    }
 
-    let result = inner.update_tree(base, &tree_changes)?;
-    inner.put_identity_index(result, index)?;
+    let result = inner.commit_snapshot(base, &build.tree, &build.identity)?;
+    let (write_set, deltas) = sets_between(inner, base, result, &build.ops, &build.declared)?;
 
+    let mut read_set = BTreeSet::new();
     read_set.extend(input.access.reads.iter().copied());
     read_set.extend(input.access.read_paths.iter().map(path_node_id));
-    references(inner, base, &written, &mut read_set)?;
+    references(inner, base, &build.written, &write_set, &mut read_set)?;
     declarations(inner, base, result, &input.declared, &mut read_set)?;
     read_set.remove(&NodeId::nil());
 
@@ -217,7 +171,7 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
         base,
         result,
         parents: input.parents,
-        ops,
+        ops: build.ops,
         intent: input.intent,
         provenance: Provenance {
             actor: input.actor,
@@ -231,15 +185,301 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
         identity_deltas: deltas,
         evidence: Vec::new(),
         signature: None,
+        rebased_from: None,
     };
     let change = if store {
         let change = inner.store.put_object(&record)?;
-        lock(&inner.proposed).insert(change);
+        inner.note_proposed(change);
         change
     } else {
         ObjectId::of(&record)?
     };
     Ok(Proposal { change, record })
+}
+
+/// One changed file that is not part of a move.
+fn propose_file(inner: &Inner, base: SnapshotId, edit: &Edit, build: &mut Build) -> Result<()> {
+    let path = &edit.path;
+    let (base_blob, result_blob) = (edit.base_blob(), edit.blob);
+    build.tree.insert(path.clone(), result_blob);
+    // Op::Blob only for new or deleted content and for files without a
+    // structural diff (ADR 0015); a parsed edit is its structural ops.
+    let blob_op = Op::Blob {
+        path: path.clone(),
+        from: base_blob,
+        to: result_blob,
+    };
+    if base_blob.is_none() {
+        build.ops.push(Op::Tree {
+            path: path.clone(),
+            kind: TreeOpKind::CreateFile,
+        });
+        build.ops.push(blob_op.clone());
+    } else if result_blob.is_none() {
+        build.ops.push(blob_op.clone());
+    }
+    let base_parsed = edit.base_parsed();
+    let head = match (&edit.result, &edit.base) {
+        (Some(bytes), _) => bytes.clone(),
+        (None, Some(view)) => view.bytes.clone(),
+        (None, None) => Bytes::default(),
+    };
+    let adapter = inner.adapter(path, head.as_slice());
+    // A parsed base must parse for a structural diff; a new file needs none.
+    let structural = match (adapter, &edit.result, result_blob) {
+        (Some(adapter), Some(bytes), Some(blob))
+            if edit.base.is_none() || base_parsed.is_some() =>
+        {
+            inner
+                .parse(adapter, blob, bytes.as_slice())
+                .map(|tree| (adapter, tree, bytes, blob))
+        }
+        _ => None,
+    };
+    match structural {
+        Some((adapter, result_tree, bytes, blob)) => {
+            let empty = IdentifiedTree::default();
+            let base_tree = base_parsed.map(|p| Arc::clone(&p.tree));
+            let base_ref = base_tree.as_deref().unwrap_or(&empty);
+            let mapping =
+                hord_identity::carry_in(adapter, path, Some(base), base_ref, &result_tree, &[])
+                    .map_err(|source| Error::Identity {
+                        path: path.clone(),
+                        source,
+                    })?;
+            let file_ops = hord_diff::diff(path, base_ref, &result_tree, &mapping);
+            check_reproduces(adapter, path, base_ref, &file_ops, &result_tree, bytes)?;
+            build.declared.extend(declared(&mapping.deltas));
+            build.ops.extend(file_ops);
+            let result_tree = Arc::new(IdentifiedTree::new(
+                (*result_tree).clone(),
+                mapping.nodes.clone(),
+            ));
+            let identity = inner.put_file_identity(adapter, path, blob, &result_tree)?;
+            build.identity.insert(path.clone(), identity);
+            build.written.push(Written {
+                path: path.clone(),
+                rust: adapter.lang().as_str() == hord_lang_rust::LANG,
+                base: base_tree,
+                result: Some(result_tree),
+            });
+        }
+        None => {
+            if base_blob.is_some() && result_blob.is_some() {
+                build.ops.push(blob_op);
+            }
+            build.identity.insert(path.clone(), None);
+            if let Some(parsed) = base_parsed {
+                build.written.push(Written {
+                    path: path.clone(),
+                    rust: parsed.lang.as_str() == hord_lang_rust::LANG,
+                    base: Some(Arc::clone(&parsed.tree)),
+                    result: None,
+                });
+            }
+        }
+    }
+    if result_blob.is_none() {
+        build.ops.push(Op::Tree {
+            path: path.clone(),
+            kind: TreeOpKind::Delete,
+        });
+    }
+    Ok(())
+}
+
+/// A deleted file paired with a created one (ADR 0020): identity carries
+/// from the old file's definitions, the path moves with `Op::Tree`
+/// `Rename`, and each carried top-level definition `Move`s from the old
+/// file root to the new one. The remaining ops are the structural diff of
+/// the old file's content to the new file's.
+fn propose_move(
+    inner: &Inner,
+    base: SnapshotId,
+    from: &Edit,
+    to: &Edit,
+    build: &mut Build,
+) -> Result<()> {
+    let (Some(old), Some(bytes), Some(blob)) = (from.base_parsed(), &to.result, to.blob) else {
+        return Err(Error::NotParsed(to.path.clone()));
+    };
+    let path = &to.path;
+    let adapter = inner
+        .adapter_for(&from.path, old.lang)
+        .ok_or_else(|| Error::NotParsed(from.path.clone()))?;
+    let result_tree = inner
+        .parse(adapter, blob, bytes.as_slice())
+        .ok_or_else(|| Error::NotParsed(path.clone()))?;
+    let mapping = hord_identity::carry_in(adapter, path, Some(base), &old.tree, &result_tree, &[])
+        .map_err(|source| Error::Identity {
+            path: path.clone(),
+            source,
+        })?;
+    let file_ops = hord_diff::diff(path, &old.tree, &result_tree, &mapping);
+    check_reproduces(adapter, path, &old.tree, &file_ops, &result_tree, bytes)?;
+    let (old_root, new_root) = (path_node_id(&from.path), path_node_id(path));
+    build.ops.push(Op::Tree {
+        path: from.path.clone(),
+        kind: TreeOpKind::Rename { to: path.clone() },
+    });
+    let result_tree = Arc::new(IdentifiedTree::new(
+        (*result_tree).clone(),
+        mapping.nodes.clone(),
+    ));
+    let carried: BTreeSet<NodeId> = old.tree.ids.values().copied().collect();
+    let parents = enclosing(&result_tree);
+    for (site, node) in &result_tree.ids {
+        if parents.contains_key(site) || !carried.contains(node) {
+            continue;
+        }
+        build.ops.push(Op::Move {
+            node: *node,
+            from_parent: old_root,
+            to_parent: new_root,
+            index: site.last().copied().unwrap_or(0),
+        });
+    }
+    build.ops.extend(file_ops);
+    build.declared.extend(declared(&mapping.deltas));
+    build.tree.insert(path.clone(), Some(blob));
+    let identity = inner.put_file_identity(adapter, path, blob, &result_tree)?;
+    build.identity.insert(path.clone(), identity);
+    build.written.push(Written {
+        path: path.clone(),
+        rust: adapter.lang().as_str() == hord_lang_rust::LANG,
+        base: Some(Arc::clone(&old.tree)),
+        result: Some(result_tree),
+    });
+    Ok(())
+}
+
+/// Deltas carrying recorded besides births and deaths.
+fn declared(deltas: &[IdentityDelta]) -> impl Iterator<Item = IdentityDelta> + '_ {
+    deltas
+        .iter()
+        .filter(|d| !matches!(d, IdentityDelta::Birth { .. } | IdentityDelta::Death { .. }))
+        .cloned()
+}
+
+/// Which side of a file move an edit is.
+enum Pairing {
+    /// The deleted source.
+    From,
+    /// The created target, with the index of its source.
+    To(usize),
+}
+
+/// Pair the parsed files this change deletes with the files it creates
+/// (ADR 0020): by blob equality first, then, among files still unpaired, by
+/// the Dice overlap of their definitions' `normalized` hashes, best pair
+/// first, at or above ADR 0007's 0.8. Both files must be parsed by the same
+/// language.
+fn pair_moves(inner: &Inner, edits: &[Edit]) -> Result<BTreeMap<usize, Pairing>> {
+    let deleted: Vec<usize> = (0..edits.len())
+        .filter(|i| edits[*i].blob.is_none() && edits[*i].base_parsed().is_some())
+        .collect();
+    let created: Vec<usize> = (0..edits.len())
+        .filter(|i| edits[*i].base.is_none() && edits[*i].blob.is_some())
+        .collect();
+    let mut out = BTreeMap::new();
+    if deleted.is_empty() || created.is_empty() {
+        return Ok(out);
+    }
+    // Normalized hashes of each created file's definitions, if it parses in
+    // the deleted file's language.
+    let mut created_defs: BTreeMap<usize, (LangId, Vec<ObjectId>)> = BTreeMap::new();
+    for &i in &created {
+        let (Some(bytes), Some(blob)) = (&edits[i].result, edits[i].blob) else {
+            continue;
+        };
+        let Some(adapter) = inner.adapter(&edits[i].path, bytes.as_slice()) else {
+            continue;
+        };
+        let Some(tree) = inner.parse(adapter, blob, bytes.as_slice()) else {
+            continue;
+        };
+        let fresh = hord_identity::assign_in(adapter, &edits[i].path, None, &tree);
+        created_defs.insert(i, (adapter.lang(), normalized(&tree, fresh.nodes.keys())));
+    }
+    let mut taken: BTreeSet<usize> = BTreeSet::new();
+    let pair = |out: &mut BTreeMap<usize, Pairing>, from: usize, to: usize| {
+        out.insert(from, Pairing::From);
+        out.insert(to, Pairing::To(from));
+    };
+    for &d in &deleted {
+        let old = edits[d].base_parsed().map(|p| p.lang);
+        let same = created.iter().copied().find(|c| {
+            !taken.contains(c)
+                && edits[*c].blob == edits[d].base_blob()
+                && created_defs.get(c).map(|(lang, _)| Some(*lang)) == Some(old)
+        });
+        if let Some(c) = same {
+            taken.insert(c);
+            taken.insert(d);
+            pair(&mut out, d, c);
+        }
+    }
+    let mut scored = Vec::new();
+    for &d in deleted.iter().filter(|d| !taken.contains(d)) {
+        let Some(old) = edits[d].base_parsed() else {
+            continue;
+        };
+        let old_defs = normalized(&old.tree.tree, old.tree.ids.keys());
+        for (&c, (lang, new_defs)) in &created_defs {
+            if taken.contains(&c) || *lang != old.lang {
+                continue;
+            }
+            if let Some(score) = dice(&old_defs, new_defs) {
+                scored.push((score, d, c));
+            }
+        }
+    }
+    // Best first; ties by path order of the source, then the target.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    for (score, d, c) in scored {
+        if score < MOVE_THRESHOLD_PER_MILLE || taken.contains(&d) || taken.contains(&c) {
+            continue;
+        }
+        taken.insert(d);
+        taken.insert(c);
+        pair(&mut out, d, c);
+    }
+    Ok(out)
+}
+
+/// ADR 0007's similarity threshold, 0.8, in thousandths.
+const MOVE_THRESHOLD_PER_MILLE: u32 = 800;
+
+/// The `normalized` hash of the node at each site, sorted.
+fn normalized<'a>(tree: &NodeTree, sites: impl Iterator<Item = &'a Site>) -> Vec<ObjectId> {
+    let mut out: Vec<ObjectId> = sites
+        .filter_map(|site| tree.get(hord_lang::oid_at(tree, site)?))
+        .map(|node| node.normalized)
+        .collect();
+    out.sort();
+    out
+}
+
+/// Dice similarity of two sorted multisets, in thousandths. `None` when
+/// both are empty.
+fn dice(a: &[ObjectId], b: &[ObjectId]) -> Option<u32> {
+    let total = a.len() + b.len();
+    if total == 0 {
+        return None;
+    }
+    let (mut i, mut j, mut common) = (0, 0, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                common += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    u32::try_from(2000 * common / total).ok()
 }
 
 /// `apply(base, ops)` must project to exactly `bytes` (spec §3.5, §5.1).
@@ -265,142 +505,13 @@ pub(crate) fn check_reproduces(
     Ok(())
 }
 
-/// Definitions a file's change writes (ADR 0015 amendment: write sets do
-/// not come from ops). A carried definition is written when its own
-/// content (the leaves outside nested definitions) or its parent changed.
-/// Births, deaths, and derivations are writes, and so is the file root
-/// (`root`) when the file's glue changed.
-pub(crate) fn written_nodes(
-    base: &IdentifiedTree,
-    result: &IdentifiedTree,
-    mapping: &IdentityMapping,
-    root: NodeId,
-) -> BTreeSet<NodeId> {
-    let before = own_contents(base);
-    let after = own_contents(result);
-    let mut out = BTreeSet::new();
-    for (node, content) in &after {
-        if before.get(node).is_some_and(|was| was != content) {
-            out.insert(*node);
-        }
-    }
-    if root_glue(base) != root_glue(result) {
-        out.insert(root);
-    }
-    for delta in &mapping.deltas {
-        out.extend(delta_nodes(delta));
-    }
-    out.remove(&NodeId::nil());
-    out
-}
-
-/// Each definition's own content (leaf content ids outside nested
-/// definitions, list separators skipped) and its parent's id.
-fn own_contents(tree: &IdentifiedTree) -> BTreeMap<NodeId, (Vec<ObjectId>, Option<NodeId>)> {
-    let parents = enclosing(tree);
-    tree.ids
-        .iter()
-        .map(|(site, id)| {
-            let parent = parents.get(site).and_then(|p| tree.ids.get(p).copied());
-            (*id, (own_leaves(tree, site), parent))
-        })
-        .collect()
-}
-
-/// Leaves of the file root outside every definition.
-fn root_glue(tree: &IdentifiedTree) -> Vec<ObjectId> {
-    if tree.tree.root().is_none() {
-        return Vec::new();
-    }
-    own_leaves(tree, &[])
-}
-
-/// Leaf content ids under `site`, skipping nested definition sites and the
-/// `,`/`;` separators between child definitions (adding a field is a birth,
-/// not a write of the struct). A skipped separator that carries a comment
-/// still counts: the comment is content of the enclosing definition.
-fn own_leaves(tree: &IdentifiedTree, site: &[u32]) -> Vec<ObjectId> {
-    fn walk(
-        tree: &IdentifiedTree,
-        oid: ObjectId,
-        site: &mut Vec<u32>,
-        top: bool,
-        separator: bool,
-        out: &mut Vec<ObjectId>,
-    ) {
-        if !top && tree.ids.contains_key(site.as_slice()) {
-            return;
-        }
-        let Some(node) = tree.tree.get(oid) else {
-            return;
-        };
-        if node.children.is_empty() {
-            if !separator || has_comment(&node.raw) {
-                out.push(oid);
-            }
-            return;
-        }
-        for (i, child) in node.children.iter().enumerate() {
-            let separator = is_separator(tree, &node.children, site, i);
-            site.push(u32::try_from(i).unwrap_or(u32::MAX));
-            walk(tree, *child, site, false, separator, out);
-            site.pop();
-        }
-    }
-    /// Child `i` of the node at `site` is a `,`/`;` leaf next to a child
-    /// definition.
-    fn is_separator(tree: &IdentifiedTree, children: &[ObjectId], site: &[u32], i: usize) -> bool {
-        let Some(child) = tree.tree.get(children[i]) else {
-            return false;
-        };
-        if !child.children.is_empty() || !matches!(child.kind.as_str(), "," | ";") {
-            return false;
-        }
-        let is_def = |j: usize| {
-            let mut at = site.to_vec();
-            at.push(u32::try_from(j).unwrap_or(u32::MAX));
-            tree.ids.contains_key(at.as_slice())
-        };
-        (i > 0 && is_def(i - 1)) || (i + 1 < children.len() && is_def(i + 1))
-    }
-    /// A separator's raw bytes hold more than the token and whitespace.
-    fn has_comment(raw: &hord_core::Bytes) -> bool {
-        raw.as_slice()
-            .iter()
-            .filter(|b| !b.is_ascii_whitespace())
-            .nth(1)
-            .is_some()
-    }
-    let mut out = Vec::new();
-    if let Some(oid) = tree.oid_at(site) {
-        walk(tree, oid, &mut site.to_vec(), true, false, &mut out);
-    }
-    out
-}
-
-pub(crate) fn delta_nodes(delta: &IdentityDelta) -> Vec<NodeId> {
-    match delta {
-        IdentityDelta::Birth { node } | IdentityDelta::Death { node } => vec![*node],
-        IdentityDelta::DerivedFrom { node, from } => vec![*node, *from],
-        IdentityDelta::SplitInto { node, into } => {
-            let mut out = vec![*node];
-            out.extend(into.iter().copied());
-            out
-        }
-        IdentityDelta::MergedFrom { node, from } => {
-            let mut out = vec![*node];
-            out.extend(from.iter().copied());
-            out
-        }
-    }
-}
-
 /// One hop of outgoing `References` from written Rust definitions, in the
 /// base and in the result (ADR 0012).
 fn references(
     inner: &Inner,
     base: SnapshotId,
     written: &[Written],
+    writes: &BTreeSet<NodeId>,
     out: &mut BTreeSet<NodeId>,
 ) -> Result<()> {
     let mut ctx: Option<Arc<RustCtx>> = None;
@@ -414,23 +525,17 @@ fn references(
             }
         };
         if let Some(base_tree) = &file.base {
-            let by = by_node(base_tree);
-            for node_id in &file.nodes {
-                if let Some(site) = by.get(node_id)
-                    && let Some(node) = base_tree.node_at(site)
-                {
+            for (site, node_id) in base_tree.ids.iter().filter(|(_, id)| writes.contains(id)) {
+                if let Some(node) = base_tree.node_at(site) {
                     let anchor = Anchor::Definition(*node_id);
                     inner.rust_references(&ctx, base, *node_id, &anchor, node, out)?;
                 }
             }
         }
         if let Some(result_tree) = &file.result {
-            let by = by_node(result_tree);
             let parents = enclosing(result_tree);
-            for node_id in &file.nodes {
-                if let Some(site) = by.get(node_id)
-                    && let Some(node) = result_tree.node_at(site)
-                {
+            for (site, node_id) in result_tree.ids.iter().filter(|(_, id)| writes.contains(id)) {
+                if let Some(node) = result_tree.node_at(site) {
                     let anchor = result_anchor(
                         file.base.as_deref(),
                         result_tree,

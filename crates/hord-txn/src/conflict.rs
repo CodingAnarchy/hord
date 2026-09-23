@@ -289,6 +289,7 @@ mod tests {
             identity_deltas: Vec::new(),
             evidence: Vec::new(),
             signature: None,
+            rebased_from: None,
         }
     }
 

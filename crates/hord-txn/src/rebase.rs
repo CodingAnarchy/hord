@@ -3,23 +3,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hord_core::{Bytes, ChangeRecord, NodeId, ObjectId, Op, RepoPath, SnapshotId};
-use hord_lang::{IdentifiedTree, Site};
+use hord_core::{Bytes, ChangeRecord, IdentityDelta, NodeId, ObjectId, Op, RepoPath, SnapshotId};
+use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree, Site};
 
 use crate::conflict::{AdapterMerge, MergeConflict, MergeSeverity};
 use crate::files::{FileChange, file_changes};
 use crate::ids::path_node_id;
 use crate::propose::check_reproduces;
 use crate::repo::Inner;
-use crate::semantic::IdentityIndex;
+use crate::snapshot::IdentityEdits;
 use crate::{Error, Result};
 
 /// A rebase that produced a tree (possibly with soft conflicts).
 #[derive(Debug)]
 pub(crate) struct Rebased {
+    /// The result snapshot, stored (its identity tree included).
     pub result: SnapshotId,
     pub ops: Vec<Op>,
-    pub index: IdentityIndex,
     pub soft: Vec<MergeConflict>,
     /// Files whose landed ops were checked to reproduce their result from
     /// head during the rebase; landing validation need not re-apply them.
@@ -51,29 +51,40 @@ fn adapter_merge(
 }
 
 /// Re-apply `record` on `head`. A file `head` has not changed since the
-/// base takes the change's file and its ops unchanged; a file both sides
-/// changed is merged 3-way and its ops are diffed from `head`. `Err` carries
-/// the merge outcomes when any is hard.
+/// base takes the change's file, its ops, and its identity unchanged; a file
+/// both sides changed is merged 3-way and its ops are diffed from `head`.
+/// `Err` carries the merge outcomes when any is hard.
+///
+/// Identity in a merged file is carried from `head`. A definition the change
+/// gave birth to keeps its birth id unless a landed change wrote that id (a
+/// concurrent identical birth, ADR 0019); then it is re-derived with the
+/// head snapshot.
 pub(crate) fn rebase(
     inner: &Inner,
     record: &ChangeRecord,
     head: SnapshotId,
     landed_writes: &BTreeSet<NodeId>,
 ) -> Result<std::result::Result<Rebased, Vec<MergeConflict>>> {
-    let mut index = (*inner.identity_index(head)?).clone();
-    let theirs_index = inner.identity_index(record.result)?;
+    let mut identity = IdentityEdits::new();
     let mut changes = BTreeMap::new();
     let mut ops = Vec::new();
     let mut outcomes = Vec::new();
     let mut hard = false;
     let mut checked = BTreeSet::new();
     let mut adapter_merged = Vec::new();
-    let proposed_here = {
-        let proposed = crate::repo::lock(&inner.proposed);
-        let id = hord_core::ObjectId::of(record)?;
-        proposed.contains(&id)
+    let proposed_here = inner.was_proposed(hord_core::ObjectId::of(record)?);
+    let own = Own {
+        births: record
+            .identity_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                IdentityDelta::Birth { node } => Some(*node),
+                _ => None,
+            })
+            .collect(),
+        landed: landed_writes,
     };
-    let base_index = inner.identity_index(record.base)?;
+    let own = &own;
     let files = file_changes(inner, record)?;
     let ours_of = files
         .iter()
@@ -94,9 +105,9 @@ pub(crate) fn rebase(
                     // Spec §6.3: ops on definitions no landed change wrote
                     // re-apply on head. Only a file whose ops name something
                     // `L` wrote (or replace its glue) needs the 3-way merge.
-                    match reapply(inner, record, head, file, landed_writes)? {
+                    match reapply(inner, record, head, file, own)? {
                         Some(merged) => Ok(merged),
-                        None => merge_file(inner, record, head, file, ours),
+                        None => merge_file(inner, record, head, file, ours, own),
                     }
                 };
                 (i, scope.spawn(job))
@@ -122,15 +133,18 @@ pub(crate) fn rebase(
             continue;
         }
         if ours == file.from {
-            // The file is as the change found it: its ops apply unchanged.
-            let identity = match (file.to, file.has_structural()) {
-                (Some(to), true) => Some(theirs_identity(inner, record, &theirs_index, path, to)?),
-                _ => None,
+            // The file is as the change found it: its ops and its ids apply
+            // unchanged.
+            let theirs = match file.to {
+                Some(_) => inner.file_identity(record.result, path)?,
+                None => None,
             };
-            index.set(path, identity);
+            identity.insert(path.clone(), theirs);
             changes.insert(path.clone(), file.to);
             // Checked at propose against the same bytes and the same ids.
-            if proposed_here && base_index.get(path) == index_before(inner, head, path)? {
+            if proposed_here
+                && inner.file_identity(record.base, path)? == inner.file_identity(head, path)?
+            {
                 checked.insert(path.clone());
             }
             ops.extend(file.ops);
@@ -143,7 +157,7 @@ pub(crate) fn rebase(
             Merged::Clean {
                 blob,
                 ops: file_ops,
-                identity,
+                identity: file_identity,
                 soft,
                 adapter_merged: by_adapter,
             } => {
@@ -154,7 +168,7 @@ pub(crate) fn rebase(
                 if Some(blob) == ours {
                     continue;
                 }
-                index.set(path, identity);
+                identity.insert(path.clone(), file_identity);
                 changes.insert(path.clone(), Some(blob));
                 if file_ops.is_empty() {
                     // Blob tier: the merged bytes are the op.
@@ -179,20 +193,21 @@ pub(crate) fn rebase(
     if hard {
         return Ok(Err(outcomes));
     }
-    let result = inner.update_tree(head, &changes)?;
+    let result = inner.commit_snapshot(head, &changes, &identity)?;
     Ok(Ok(Rebased {
         result,
         ops,
-        index,
         soft: outcomes,
         checked,
         adapter_merged,
     }))
 }
 
-/// The identity object `head` records for `path`, if any.
-fn index_before(inner: &Inner, head: SnapshotId, path: &RepoPath) -> Result<Option<ObjectId>> {
-    Ok(inner.identity_index(head)?.get(path))
+/// The change's own births, and what `L` wrote: a birth `L` also wrote was
+/// born concurrently from the same inputs (ADR 0019).
+struct Own<'a> {
+    births: BTreeSet<NodeId>,
+    landed: &'a BTreeSet<NodeId>,
 }
 
 /// Re-apply the change's ops for `file` on head's version of it (spec §6.3
@@ -204,8 +219,9 @@ fn reapply(
     record: &ChangeRecord,
     head: SnapshotId,
     file: &FileChange,
-    landed_writes: &BTreeSet<NodeId>,
+    own: &Own<'_>,
 ) -> Result<Option<Merged>> {
+    let landed_writes = own.landed;
     let path = &file.path;
     let root = hord_diff::file_parent(path);
     let ops: Vec<Op> = file.structural().cloned().collect();
@@ -257,6 +273,7 @@ fn reapply(
     };
     if let Some(ids) = unioned {
         let identity = inner.put_file_identity(
+            adapter,
             path,
             blob,
             &Arc::new(IdentifiedTree::new((*parsed).clone(), ids)),
@@ -264,12 +281,13 @@ fn reapply(
         return Ok(Some(Merged::Clean {
             blob,
             ops,
-            identity: Some(identity),
+            identity,
             soft: Vec::new(),
             adapter_merged: false,
         }));
     }
-    match finish_parsed(inner, head, path, bytes, Vec::new())? {
+    let theirs = Some(&*theirs.tree);
+    match finish_parsed(inner, head, path, bytes, Vec::new(), theirs, own)? {
         Merged::Hard(_) => Ok(None),
         clean => Ok(Some(clean)),
     }
@@ -400,39 +418,6 @@ fn copy_subtree(
     }
 }
 
-/// The stored identity of `path` in the change's result, or carry it from
-/// the base now (a record proposed elsewhere may not have one).
-fn theirs_identity(
-    inner: &Inner,
-    record: &ChangeRecord,
-    theirs_index: &IdentityIndex,
-    path: &RepoPath,
-    to: ObjectId,
-) -> Result<ObjectId> {
-    if let Some(id) = theirs_index.get(path) {
-        return Ok(id);
-    }
-    let bytes = inner.blob_bytes(to)?;
-    let adapter = inner
-        .adapter(path, bytes.as_slice())
-        .ok_or_else(|| Error::NotParsed(path.clone()))?;
-    let tree = inner
-        .parse(adapter, to, bytes.as_slice())
-        .ok_or_else(|| Error::NotParsed(path.clone()))?;
-    let base = parsed_or_empty(inner, record.base, path)?;
-    let mapping = hord_identity::carry_in(adapter, path, &base, &tree, &[]).map_err(|source| {
-        Error::Identity {
-            path: path.clone(),
-            source,
-        }
-    })?;
-    inner.put_file_identity(
-        path,
-        to,
-        &Arc::new(IdentifiedTree::new((*tree).clone(), mapping.nodes)),
-    )
-}
-
 fn parsed_or_empty(
     inner: &Inner,
     snapshot: SnapshotId,
@@ -449,6 +434,7 @@ enum Merged {
     Clean {
         blob: ObjectId,
         ops: Vec<Op>,
+        /// The file's identity entry (`None`: the fresh assignment).
         identity: Option<ObjectId>,
         soft: Vec<MergeConflict>,
         /// Resolved by the file's purpose-built adapter merge with no
@@ -474,6 +460,7 @@ fn merge_file(
     head: SnapshotId,
     file: &FileChange,
     ours: Option<ObjectId>,
+    own: &Own<'_>,
 ) -> Result<Merged> {
     let path = &file.path;
     let (Some(ours), Some(theirs)) = (ours, file.to) else {
@@ -492,23 +479,34 @@ fn merge_file(
 
     if hord_lang_rust::is_cargo_lock(path) {
         // ADR 0013: the lockfile merge, not the generic structural one.
+        let theirs_tree = parsed_or_empty(inner, record.result, path)?;
         return match hord_lang_rust::merge_cargo_lock(&base_bytes, &ours_bytes, &theirs_bytes) {
-            Ok(bytes) => Ok(match finish_parsed(inner, head, path, bytes, Vec::new())? {
-                Merged::Clean {
-                    blob,
-                    ops,
-                    identity,
-                    soft,
-                    ..
-                } => Merged::Clean {
-                    adapter_merged: soft.is_empty(),
-                    blob,
-                    ops,
-                    identity,
-                    soft,
+            Ok(bytes) => Ok(
+                match finish_parsed(
+                    inner,
+                    head,
+                    path,
+                    bytes,
+                    Vec::new(),
+                    Some(&theirs_tree),
+                    own,
+                )? {
+                    Merged::Clean {
+                        blob,
+                        ops,
+                        identity,
+                        soft,
+                        ..
+                    } => Merged::Clean {
+                        adapter_merged: soft.is_empty(),
+                        blob,
+                        ops,
+                        identity,
+                        soft,
+                    },
+                    hard => hard,
                 },
-                hard => hard,
-            }),
+            ),
             Err(hord_lang_rust::CargoLockMergeError::Unsupported { .. }) => {
                 finish_blob(inner, path, &base_bytes, &ours_bytes, &theirs_bytes)
             }
@@ -552,7 +550,7 @@ fn merge_file(
                 })
                 .collect();
             let bytes = adapter.project(&merged.tree.tree).into_vec();
-            finish_parsed(inner, head, path, bytes, soft)
+            finish_parsed(inner, head, path, bytes, soft, Some(&theirs_tree), own)
         }
         Err(conflict) => Ok(hard(path, conflict.nodes.clone(), conflict.reason.clone())),
     }
@@ -580,13 +578,17 @@ fn finish_blob(
     }
 }
 
-/// Store merged parsed bytes: ids carried from `head`, ops diffed from it.
+/// Store merged parsed bytes: ids carried from `head` (births derived with
+/// the head snapshot), except that a birth the change made keeps its id when
+/// no landed change wrote it ([`keep_own_births`]); ops diffed from `head`.
 fn finish_parsed(
     inner: &Inner,
     head: SnapshotId,
     path: &RepoPath,
     bytes: Vec<u8>,
     soft: Vec<MergeConflict>,
+    theirs: Option<&IdentifiedTree>,
+    own: &Own<'_>,
 ) -> Result<Merged> {
     let blob = inner.put_blob(&bytes)?;
     let bytes = Bytes::new(bytes);
@@ -607,15 +609,18 @@ fn finish_parsed(
         ));
     };
     let ours = parsed_or_empty(inner, head, path)?;
-    let mapping = hord_identity::carry_in(adapter, path, &ours, &tree, &[]).map_err(|source| {
-        Error::Identity {
+    let mut mapping = hord_identity::carry_in(adapter, path, Some(head), &ours, &tree, &[])
+        .map_err(|source| Error::Identity {
             path: path.clone(),
             source,
-        }
-    })?;
+        })?;
+    if let Some(theirs) = theirs {
+        keep_own_births(&mut mapping, &tree, theirs, own);
+    }
     let ops = hord_diff::diff(path, &ours, &tree, &mapping);
     check_reproduces(adapter, path, &ours, &ops, &tree, &bytes)?;
     let identity = inner.put_file_identity(
+        adapter,
         path,
         blob,
         &Arc::new(IdentifiedTree::new((*tree).clone(), mapping.nodes)),
@@ -623,8 +628,69 @@ fn finish_parsed(
     Ok(Merged::Clean {
         blob,
         ops,
-        identity: Some(identity),
+        identity,
         soft,
         adapter_merged: false,
     })
+}
+
+/// Give each definition born in the merge (relative to `head`) the id the
+/// change gave it at birth, when the change's result has a definition with
+/// the same content and that id is one of the change's births that no
+/// landed change wrote. Paired in preorder. A birth `L` also wrote was a
+/// concurrent identical birth (ADR 0019) and keeps its head-derived id.
+fn keep_own_births(
+    mapping: &mut IdentityMapping,
+    tree: &NodeTree,
+    theirs: &IdentifiedTree,
+    own: &Own<'_>,
+) {
+    let born: BTreeSet<NodeId> = mapping
+        .deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            IdentityDelta::Birth { node } => Some(*node),
+            _ => None,
+        })
+        .collect();
+    if born.is_empty() || own.births.is_empty() {
+        return;
+    }
+    let mut free: BTreeMap<ObjectId, Vec<NodeId>> = BTreeMap::new();
+    for (site, id) in &theirs.ids {
+        if own.births.contains(id)
+            && !own.landed.contains(id)
+            && let Some(oid) = theirs.oid_at(site)
+        {
+            free.entry(oid).or_default().push(*id);
+        }
+    }
+    let used: BTreeSet<NodeId> = mapping.nodes.values().copied().collect();
+    let mut replace: BTreeMap<NodeId, NodeId> = BTreeMap::new();
+    for (site, id) in &mapping.nodes {
+        if !born.contains(id) {
+            continue;
+        }
+        let Some(oid) = hord_lang::oid_at(tree, site) else {
+            continue;
+        };
+        let Some(ids) = free.get_mut(&oid) else {
+            continue;
+        };
+        if let Some(pos) = ids.iter().position(|own| !used.contains(own)) {
+            replace.insert(*id, ids.remove(pos));
+        }
+    }
+    for id in mapping.nodes.values_mut() {
+        if let Some(own) = replace.get(id) {
+            *id = *own;
+        }
+    }
+    for delta in &mut mapping.deltas {
+        if let IdentityDelta::Birth { node } = delta
+            && let Some(own) = replace.get(node)
+        {
+            *node = *own;
+        }
+    }
 }

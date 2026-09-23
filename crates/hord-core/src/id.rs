@@ -10,7 +10,10 @@ use ulid::Ulid;
 use crate::ObjectId;
 use crate::error::Error;
 
-/// A snapshot is identified by the [`ObjectId`] of its root tree object.
+/// A snapshot is identified by the [`ObjectId`] of its [`crate::Snapshot`]
+/// object, which names the root tree and the identity tree (ADR 0017,
+/// superseding spec §3.1's root-tree id). "Same content" is equal
+/// [`crate::Snapshot::tree`]s.
 pub type SnapshotId = ObjectId;
 
 /// A change record is identified by its own [`ObjectId`].
@@ -18,8 +21,11 @@ pub type ChangeId = ObjectId;
 
 /// Stable identity of a code node across edits.
 ///
-/// Assigned once and carried forward. Encoded as a ULID (26-character Crockford
-/// Base32). The timestamp component is informational only (spec §3.1).
+/// Assigned once and carried forward. A birth id is derived from the
+/// definition's content, file, site, and the base snapshot of the change that
+/// creates it (ADR 0019, superseding spec §3.1's random ULID), so it has no
+/// timestamp component. It is displayed and encoded in ULID text
+/// (26-character Crockford Base32).
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NodeId(u128);
 

@@ -60,3 +60,38 @@ pub enum IdentityDelta {
         from: Vec<NodeId>,
     },
 }
+
+/// One directory of a snapshot's identity (ADR 0017): name → subdirectory or
+/// [`FileIdentity`].
+///
+/// Merkle-shaped like [`crate::Tree`], so unchanged subtrees share objects
+/// between snapshots. A parsed file whose ids equal the fresh deterministic
+/// assignment (ADR 0019) has no entry; readers fall back to that
+/// assignment. Directories with no entries are omitted, except the root.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct IdentityTree {
+    /// Child entries, keyed by basename. Encoded as a CBOR map.
+    pub entries: BTreeMap<String, IdentityEntry>,
+}
+
+/// One child of an [`IdentityTree`].
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum IdentityEntry {
+    /// Nested [`IdentityTree`] object.
+    Dir(crate::ObjectId),
+    /// [`FileIdentity`] object of the file with this name.
+    File(crate::ObjectId),
+}
+
+/// The [`NodeId`]s of one parsed file (ADR 0017).
+///
+/// Bound to the blob they were computed for: a reader whose tree has a
+/// different blob at the path must not use them.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct FileIdentity {
+    /// [`crate::Blob`] the ids describe.
+    pub blob: crate::ObjectId,
+    /// Definition site (the child-index walk from the file's root node) →
+    /// identity, sorted by site.
+    pub nodes: Vec<(Vec<u32>, NodeId)>,
+}

@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gix::bstr::{BString, ByteSlice};
 use gix::objs::tree::EntryKind;
-use hord_core::{ChangeRecord, IntentRef};
+use hord_core::{ChangeRecord, IdentityTree, IntentRef, Snapshot};
 use hord_git::{
     ExportCache, MemoryStore, Store, export_change, export_tree, git_tree_sha, import_git,
-    import_git_window,
+    import_git_window, snapshot_root,
 };
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -227,6 +227,21 @@ fn import_export_reproduces_every_tree_sha() {
             expected.2,
             git_sha
         );
+        // ADR 0017: base and result are Snapshot objects; the git tree is
+        // the projection of the content root. A Tier 0 import carries no
+        // identity, so every imported snapshot's identity tree is empty.
+        for end in [change.base, change.result] {
+            let snapshot: Snapshot = store.get_object(end).unwrap();
+            let identity: IdentityTree = store.get_object(snapshot.identity().unwrap()).unwrap();
+            assert!(identity.entries.is_empty());
+        }
+        let snapshot: Snapshot = store.get_object(change.result).unwrap();
+        assert_eq!(snapshot_root(&store, change.result).unwrap(), snapshot.tree);
+        assert_eq!(
+            export_tree(&store, snapshot.tree, dest.path()).unwrap(),
+            exported,
+            "the root tree id exports the same git tree"
+        );
     }
 
     let hash = fx.repo.object_hash();
@@ -341,6 +356,7 @@ fn export_change_handles_a_long_linear_history() {
             identity_deltas: Vec::new(),
             evidence: Vec::new(),
             signature: None,
+            rebased_from: None,
         };
         parent = Some(store.put_object(&change).unwrap());
     }

@@ -1,4 +1,4 @@
-//! Edge, identity, and node-history index (spec §3.8, §8.1).
+//! Edge and node-history index (spec §3.8, §8.1).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hord_core::{
-    Actor, Blob, ChangeRecord, IdentityDelta, IdentityMap, Intent, NodeId, NodePath, ObjectId, Op,
-    Provenance, RepoPath, SnapshotId, Timestamp,
+    Actor, Blob, ChangeRecord, IdentityDelta, Intent, NodeId, ObjectId, Op, Provenance, RepoPath,
+    SnapshotId, Timestamp,
 };
 use hord_store::{EdgeKind, Error, Store};
 use proptest::prelude::*;
@@ -46,13 +46,6 @@ fn nid(n: u128) -> NodeId {
     NodeId::from_u128(n)
 }
 
-fn path(file: &str, pointer: &[u32]) -> NodePath {
-    NodePath {
-        file: file.parse::<RepoPath>().unwrap(),
-        pointer: pointer.to_vec(),
-    }
-}
-
 fn record(
     write: impl IntoIterator<Item = NodeId>,
     read: impl IntoIterator<Item = NodeId>,
@@ -84,6 +77,7 @@ fn record(
         identity_deltas: deltas,
         evidence: Vec::new(),
         signature: None,
+        rebased_from: None,
     }
 }
 
@@ -183,62 +177,6 @@ fn edges_survive_reopen_pack_and_rebuild() {
         store.edges(snap(1), source, EdgeKind::Depends).unwrap(),
         vec![target]
     );
-}
-
-#[test]
-fn identity_records_the_node_id_a_definition_had() {
-    let (_g, store) = store();
-    let lib = path("src/lib.rs", &[0, 1]);
-    let main = path("src/main.rs", &[]);
-    let n_lib = nid(4);
-    let n_main = nid(5);
-    let mut map = IdentityMap::default();
-    map.nodes.insert(n_lib, lib.clone());
-    map.nodes.insert(n_main, main.clone());
-    map.deltas.push(IdentityDelta::Birth { node: n_lib });
-    let id = store.put_identity(snap(1), &map).unwrap();
-    let stored: IdentityMap = store.get_object(id).unwrap();
-    assert_eq!(stored, map);
-    assert_eq!(store.identity_map(snap(1)).unwrap().unwrap(), map);
-    assert_eq!(store.identity_at(snap(1), &lib).unwrap(), Some(n_lib));
-    assert_eq!(store.identity_at(snap(1), &main).unwrap(), Some(n_main));
-    assert!(store.identity_at(snap(2), &lib).unwrap().is_none());
-    assert!(store.identity_map(snap(2)).unwrap().is_none());
-
-    let mut replaced = IdentityMap::default();
-    replaced.nodes.insert(nid(6), lib.clone());
-    replaced.deltas.push(IdentityDelta::Death { node: n_main });
-    let id2 = store.put_identity(snap(1), &replaced).unwrap();
-    assert_ne!(id, id2);
-    assert!(store.contains(id).unwrap());
-    assert_eq!(store.identity_at(snap(1), &lib).unwrap(), Some(nid(6)));
-    assert!(store.identity_at(snap(1), &main).unwrap().is_none());
-    assert_eq!(store.identity_map(snap(1)).unwrap().unwrap(), replaced);
-
-    let mut other = IdentityMap::default();
-    other.nodes.insert(nid(1), main.clone());
-    store.put_identity(snap(2), &other).unwrap();
-    assert_eq!(store.identity_at(snap(2), &main).unwrap(), Some(nid(1)));
-    assert_eq!(store.identity_at(snap(1), &lib).unwrap(), Some(nid(6)));
-
-    store.pack().unwrap();
-    store.rebuild_index().unwrap();
-    assert_eq!(store.identity_map(snap(1)).unwrap().unwrap(), replaced);
-    assert_eq!(store.identity_at(snap(1), &lib).unwrap(), Some(nid(6)));
-    assert!(store.identity_at(snap(1), &main).unwrap().is_none());
-    assert_eq!(store.identity_at(snap(2), &main).unwrap(), Some(nid(1)));
-}
-
-#[test]
-fn duplicate_identity_paths_are_rejected() {
-    let (_g, store) = store();
-    let place = path("src/lib.rs", &[]);
-    let mut map = IdentityMap::default();
-    map.nodes.insert(nid(1), place.clone());
-    map.nodes.insert(nid(2), place);
-    let err = store.put_identity(snap(1), &map).unwrap_err();
-    assert!(matches!(err, Error::DuplicateIdentity));
-    assert!(store.identity_map(snap(1)).unwrap().is_none());
 }
 
 #[test]

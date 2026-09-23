@@ -8,9 +8,11 @@
 //! path-derived id [`file_root_id`] (ADR 0015), located at an empty path.
 //!
 //! Rename similarity is [`hord_lang::default_identify`] (ADR 0007). This crate
-//! does not choose a different metric or threshold. Fresh birth ids are derived
-//! from the definition content id so they do not follow ULID randomness or the
-//! source order of unrelated nodes.
+//! does not choose a different metric or threshold. Birth ids are derived
+//! (ADR 0019, [`birth_id`]) from the definition's content id, its file's root
+//! id, its site, and the base snapshot of the change that creates it, so they
+//! are deterministic, and a definition that dies and is re-added later gets a
+//! new id.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -22,7 +24,7 @@ mod error;
 mod map;
 mod root;
 
-pub use assign::{assign, assign_in};
+pub use assign::{assign, assign_in, birth_id};
 pub use carry::{Declaration, carry, carry_in};
 pub use error::Error;
 pub use map::{SnapshotFile, identity_map};

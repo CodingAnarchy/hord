@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hord_core::{IdentityDelta, NodeId, ObjectId, Op, RepoPath};
+use hord_core::{IdentityDelta, NodeId, ObjectId, Op, RepoPath, SnapshotId};
 use hord_lang::{
     IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, default_identify, oid_at,
 };
@@ -44,7 +44,7 @@ pub enum Declaration {
 ///
 /// Steps 1–3 and unmatched births and deaths come from [`default_identify`],
 /// including rename similarity (ADR 0007). Birth ids are then replaced with
-/// ids derived from the definition content hash. `declarations` (step 5) then
+/// ids derived per ADR 0019 ([`carry_in`]). `declarations` (step 5) then
 /// override those heuristic results. Anything still unmatched stays a birth
 /// or a death (step 6).
 ///
@@ -89,40 +89,38 @@ pub fn carry<A: LangAdapter + ?Sized>(
     result: &NodeTree,
     declarations: &[Declaration],
 ) -> Result<IdentityMapping> {
-    carry_with_scope(adapter, base, result, declarations, 0)
-}
-
-/// [`carry`] for the file at `path`: birth ids also depend on the path, so
-/// identical definitions born in two files of one snapshot get different
-/// ids (see [`crate::assign_in`]).
-pub fn carry_in<A: LangAdapter + ?Sized>(
-    adapter: &A,
-    path: &RepoPath,
-    base: &IdentifiedTree,
-    result: &NodeTree,
-    declarations: &[Declaration],
-) -> Result<IdentityMapping> {
-    carry_with_scope(
+    carry_in(
         adapter,
+        &RepoPath::default(),
+        None,
         base,
         result,
         declarations,
-        crate::assign::path_salt(path),
     )
 }
 
-fn carry_with_scope<A: LangAdapter + ?Sized>(
+/// [`carry`] for the file at `path`, in a change whose base snapshot is
+/// `snapshot` (ADR 0019): birth ids are derived from the definition's
+/// content, `path`'s file root, its site, and `snapshot` (see
+/// [`crate::assign_in`]). A definition deleted and later re-added is born
+/// on a later base, so it gets a new id.
+pub fn carry_in<A: LangAdapter + ?Sized>(
     adapter: &A,
+    path: &RepoPath,
+    snapshot: Option<SnapshotId>,
     base: &IdentifiedTree,
     result: &NodeTree,
     declarations: &[Declaration],
-    scope: u128,
 ) -> Result<IdentityMapping> {
     let mut mapping = default_identify(adapter, base, result);
     // Births from `default_identify` are random ULIDs. Replace them before
     // declarations so a copy of a birth, and every other new id, stays a
-    // function of that definition's content.
-    crate::assign::stabilize_births(&mut mapping, result, scope);
+    // function of the change's inputs.
+    crate::assign::stabilize_births(
+        &mut mapping,
+        result,
+        &crate::assign::BirthScope { path, snapshot },
+    );
     if !declarations.is_empty() {
         check_unique_targets(declarations)?;
         apply_declarations(&mut mapping, result, declarations)?;

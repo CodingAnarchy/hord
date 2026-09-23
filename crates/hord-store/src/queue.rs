@@ -1,11 +1,9 @@
 //! Tables for `hord-txn` (spec §6.1, §6.7): the lander queue, an index from
-//! change ids to the queue entries that name them, the changes whose ops
-//! were checked, and the per-snapshot identity index pointer. The pointer's
-//! methods live in `index.rs`, next to the content-addressed fact that makes
-//! it rebuildable.
+//! change ids to the queue entries that name them, and the changes whose ops
+//! were checked.
 //!
-//! The store does not interpret a queue entry or an identity index object.
-//! `hord-txn` owns their encoding and says which ids name an entry.
+//! The store does not interpret a queue entry. `hord-txn` owns its encoding
+//! and says which ids name an entry.
 //!
 //! [`Store::land`] writes everything one landing changes in one durable
 //! commit.
@@ -13,14 +11,12 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
-use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, SnapshotId};
+use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId};
 use redb::{
     Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction,
 };
 
-use super::index::{
-    insert_identity_index_row, plan_history_rows, touched_nodes, write_history_rows,
-};
+use super::index::{REBASED, plan_history_rows, touched_nodes, write_history_rows};
 use super::{
     META, META_HEAD, Store, lock, lock_map, lock_vec, write_pending_log, write_pending_refs,
 };
@@ -33,8 +29,6 @@ const QUEUE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("lander_queu
 const QUEUE_NAMES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("lander_queue_names");
 /// Changes whose ops are known to reproduce their result (spec §3.5).
 const CHECKED: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("checked_changes");
-pub(super) const IDENTITY_INDEX: TableDefinition<'_, &[u8], &[u8]> =
-    TableDefinition::new("identity_index");
 /// `META` key present once `lander_queue_names` covers every queue entry.
 const META_QUEUE_NAMES: &str = "lander_queue_names";
 
@@ -42,7 +36,6 @@ pub(super) fn open_tables(txn: &WriteTransaction) -> Result<()> {
     txn.open_table(QUEUE).map_err(Error::index)?;
     txn.open_table(QUEUE_NAMES).map_err(Error::index)?;
     txn.open_table(CHECKED).map_err(Error::index)?;
-    txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
     Ok(())
 }
 
@@ -77,15 +70,13 @@ pub(super) fn mark_names_indexed(txn: &WriteTransaction) -> Result<()> {
 pub struct Landing<'a> {
     /// The id the change lands under; appended to the log and made `head`.
     pub change: ChangeId,
-    /// Its stored record, for the `node_history` rows.
+    /// Its record, for the `node_history` rows and the `rebased` index
+    /// ([`Store::rebased_to`]). It must already be stored.
     pub record: &'a ChangeRecord,
     /// The queue entry to replace, with its new value.
     pub entry: (u64, &'a [u8]),
     /// Ids that name the entry, besides those it was pushed with.
     pub names: &'a [ObjectId],
-    /// `hord-txn`'s identity index object for `record.result`, if any
-    /// ([`Store::set_identity_index`]).
-    pub identity_index: Option<(SnapshotId, ObjectId)>,
 }
 
 impl Store {
@@ -225,22 +216,16 @@ impl Store {
             .is_some())
     }
 
-    /// Land a change: in one durable redb commit, point `record.result` at
-    /// its identity index, replace the queue entry, index its new names,
-    /// append `change` to the log (after any buffered entries), move `head`
-    /// to it, and add its `node_history` rows. Buffered refs are flushed in
-    /// the same commit.
+    /// Land a change: in one durable redb commit, replace the queue entry,
+    /// index its new names, append `change` to the log (after any buffered
+    /// entries), move `head` to it, and add its `node_history` rows and, for
+    /// a rebased record, its `rebased` row. Buffered refs are flushed in the
+    /// same commit.
     ///
     /// Either all of it is durable or none of it is. Objects the rows name
-    /// (the record, the identity index object) must already be stored.
+    /// (the record and its result snapshot) must already be stored.
     pub fn land(&self, landing: &Landing<'_>) -> Result<()> {
         let _guard = self.lock_index();
-        let binding = match landing.identity_index {
-            Some((snapshot, index)) => {
-                Some((snapshot, self.identity_index_binding(snapshot, index)?))
-            }
-            None => None,
-        };
         let nodes: BTreeSet<NodeId> = touched_nodes(landing.record);
         // Load the log before taking `pending_log`; loading takes it too.
         drop(self.ensure_landing_log()?);
@@ -250,8 +235,14 @@ impl Store {
         let mut pending = lock_vec(&self.pending_log);
         let mut txn = self.db.begin_write().map_err(Error::index)?;
         txn.set_durability(Durability::Immediate);
-        if let Some((snapshot, row)) = &binding {
-            insert_identity_index_row(&txn, *snapshot, row)?;
+        if let Some(submitted) = landing.record.rebased_from {
+            let mut table = txn.open_table(REBASED).map_err(Error::index)?;
+            table
+                .insert(
+                    submitted.as_bytes().as_slice(),
+                    landing.change.as_bytes().as_slice(),
+                )
+                .map_err(Error::index)?;
         }
         let (seq, entry) = landing.entry;
         set_entry(&txn, seq, entry)?;

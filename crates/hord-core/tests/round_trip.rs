@@ -4,10 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{
     Acceptance, Actor, Blob, Bytes, ChangeRecord, Evidence, EvidenceKind, EvidenceResult,
-    IdentityDelta, IdentityMap, IndexPointers, Intent, IntentRef, LandPolicy, LangId, Node,
-    NodeFile, NodeId, NodeKind, NodePath, ObjectId, Op, Policy, PolicyRule, PolicyWhen, Provenance,
-    QualifiedName, RepoPath, Signature, Snapshot, SnapshotMetadata, Timestamp, Tree, TreeEntry,
-    TreeOpKind,
+    FileIdentity, IdentityDelta, IdentityEntry, IdentityMap, IdentityTree, IndexPointers, Intent,
+    IntentRef, LandPolicy, LangId, Node, NodeFile, NodeId, NodeKind, NodePath, ObjectId, Op,
+    Policy, PolicyRule, PolicyWhen, Provenance, QualifiedName, RepoPath, Signature, Snapshot,
+    SnapshotMetadata, Timestamp, Tree, TreeEntry, TreeOpKind,
 };
 use hord_encoding::{decode, encode};
 use serde::Serialize;
@@ -161,6 +161,7 @@ fn sample_change() -> ChangeRecord {
             key_id: "k1".into(),
             bytes: Bytes::from(vec![0u8; 64]),
         }),
+        rebased_from: None,
     }
 }
 
@@ -278,6 +279,73 @@ fn snapshot_round_trip_and_stable_id() {
 #[test]
 fn change_record_round_trip() {
     assert_round_trip(&sample_change());
+    let rebased = ChangeRecord {
+        rebased_from: Some(oid(0xdd)),
+        signature: None,
+        ..sample_change()
+    };
+    assert_round_trip(&rebased);
+}
+
+/// ADR 0018: `rebased_from` is omitted when `None`, so a record that was not
+/// rebased encodes (and hashes) exactly as before the field existed.
+#[test]
+fn rebased_from_is_omitted_when_none() {
+    let plain = encode(&sample_change()).unwrap();
+    assert!(
+        !plain
+            .windows(b"rebased_from".len())
+            .any(|w| w == b"rebased_from"),
+        "a record that was not rebased must not name the field"
+    );
+    let rebased = ChangeRecord {
+        rebased_from: Some(oid(0xdd)),
+        ..sample_change()
+    };
+    let bytes = encode(&rebased).unwrap();
+    assert!(
+        bytes
+            .windows(b"rebased_from".len())
+            .any(|w| w == b"rebased_from")
+    );
+    assert_ne!(
+        ObjectId::of(&rebased).unwrap(),
+        ObjectId::of(&sample_change()).unwrap()
+    );
+}
+
+/// ADR 0017: the identity tree and file identity objects round-trip, and
+/// the empty snapshot names the empty tree and the empty identity tree.
+#[test]
+fn identity_tree_and_snapshot_round_trip() {
+    let file = FileIdentity {
+        blob: oid(0x10),
+        nodes: vec![
+            (vec![0], nid("01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+            (vec![2, 1], nid("01BX5ZZKBKACTAV9WEVGEMMVRZ")),
+        ],
+    };
+    assert_round_trip(&file);
+    let mut tree = IdentityTree::default();
+    tree.entries
+        .insert("src".into(), IdentityEntry::Dir(oid(0x11)));
+    tree.entries.insert(
+        "lib.rs".into(),
+        IdentityEntry::File(ObjectId::of(&file).unwrap()),
+    );
+    assert_round_trip(&tree);
+    let empty = Snapshot::empty();
+    assert_eq!(empty.root(), ObjectId::of(&Tree::default()).unwrap());
+    assert_eq!(
+        empty.identity(),
+        Some(ObjectId::of(&IdentityTree::default()).unwrap())
+    );
+    assert_round_trip(&Snapshot::new(oid(1), oid(2)));
+    assert_ne!(
+        ObjectId::of(&Snapshot::new(oid(1), oid(2))).unwrap(),
+        ObjectId::of(&Snapshot::new(oid(1), oid(3))).unwrap(),
+        "same content, different identity: different snapshots"
+    );
 }
 
 #[test]

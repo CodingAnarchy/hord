@@ -27,5 +27,9 @@ Option 1. `propose` pairs the files a change deleted with the files it created, 
 
 - **`git mv`** keeps every NodeId. A rename that also edits the file keeps the ids of the definitions §3.4 still matches.
 - **Conflict checks** see both the old and new path ids (ADR 0015). A concurrent edit to the old path conflicts with the move.
-- **Git import** gets the same pairing for free, since it proposes through the same path.
 - Carrying definitions between existing files without a declaration needs a new ADR.
+
+## Amendments (2026-09-23, from implementation)
+
+- **Git import stays Tier 0.** Import writes blob-only changes without parsing or carrying identity (ADR 0015 amendment), and the M0 throughput gate depends on that. A `git mv` in imported history therefore restarts identity at the new path. Carrying identity through imported history is a separate pass, to be decided with M6's `git sync`.
+- **Pairing details.** Definition overlap is the Dice coefficient over the multisets of the two files' definition `normalized` hashes, accepted at ≥ 0.8. Pairs are chosen best first, with ties broken by source path, then target path. Only files with a language adapter take part: a blob-tier move stays a delete plus a create.

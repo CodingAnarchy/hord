@@ -6,8 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use hord_core::{
-    Actor, ChangeRecord, IdentityMap, Intent, Node, NodeId, NodePath, ObjectId, Provenance,
-    RepoPath, Timestamp,
+    Actor, ChangeRecord, Intent, Node, NodeId, ObjectId, Provenance, RepoPath, Timestamp,
 };
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree, default_identify};
 use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
@@ -267,24 +266,18 @@ pub(crate) fn blame(files: &[&FileSnap]) -> Result<BlameReport> {
     std::fs::create_dir_all(&dir).context("blame temp dir")?;
     let store = Store::create(&dir).context("create store")?;
     let snapshot = ObjectId::from_bytes([2; 32]);
-    let mut map = IdentityMap::default();
+    // One write per definition site; the history index is what is measured
+    // (NodeIds live in snapshot objects since ADR 0017, not in the index).
+    let mut seen = std::collections::BTreeSet::new();
     let mut write_set = std::collections::BTreeSet::new();
     for file in files {
         for (site, node_id) in &file.ids {
-            let pointer = site.clone();
-            let path = NodePath {
-                file: file.path.clone(),
-                pointer,
-            };
-            if map.nodes.values().any(|existing| existing == &path) {
-                continue;
+            if seen.insert((file.path.clone(), site.clone())) {
+                write_set.insert(*node_id);
             }
-            map.nodes.insert(*node_id, path);
-            write_set.insert(*node_id);
         }
     }
     let defs = write_set.len();
-    store.put_identity(snapshot, &map).context("put identity")?;
     let record = ChangeRecord {
         base: ObjectId::from_bytes([1; 32]),
         result: snapshot,
@@ -310,6 +303,7 @@ pub(crate) fn blame(files: &[&FileSnap]) -> Result<BlameReport> {
         identity_deltas: Vec::new(),
         evidence: Vec::new(),
         signature: None,
+        rebased_from: None,
     };
     let change = store.put_object(&record).context("put change")?;
     store.append_log(change).context("append log")?;

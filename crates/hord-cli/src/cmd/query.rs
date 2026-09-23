@@ -1,10 +1,11 @@
 //! `hord query <edge> <node>`
 //!
-//! Prints target [`hord_core::NodeId`]s from [`hord_store::Store::edges`] for
-//! the result snapshot of the newest change in the log. The node argument is
-//! the source. `references`, `dependents`, and `tests-of` map to
-//! [`hord_store::EdgeKind::References`], [`hord_store::EdgeKind::Depends`],
-//! and [`hord_store::EdgeKind::Tests`].
+//! Prints target [`hord_core::NodeId`]s from [`hord_txn::Query::edges`] for
+//! `head`'s result snapshot. The node argument is the source.
+//! `references`, `dependents`, and `tests-of` map to
+//! [`hord_store::EdgeKind::References`] (resolved over the snapshot, plus
+//! recorded edges), [`hord_store::EdgeKind::Depends`], and
+//! [`hord_store::EdgeKind::Tests`] (recorded edges).
 
 use anyhow::{Result, anyhow};
 use hord_store::EdgeKind;
@@ -12,8 +13,8 @@ use serde::Serialize;
 
 use crate::cli::QueryEdge;
 use crate::output;
-use crate::repo;
 use crate::resolve;
+use crate::txn::{self, block_on};
 
 #[derive(Debug, Serialize)]
 struct QueryResult {
@@ -24,10 +25,15 @@ struct QueryResult {
 }
 
 pub fn run(json: bool, edge: QueryEdge, node: String) -> Result<()> {
-    let store = repo::discover()?;
+    let repo = txn::open()?;
     let node = resolve::parse_node_id(&node).ok_or_else(|| anyhow!("invalid NodeId {node:?}"))?;
-    let snapshot = resolve::latest_result_snapshot(&store)?;
-    let targets = store.edges(snapshot, node, edge_kind(edge))?;
+    let head = block_on(repo.head())?;
+    if head.change.is_none() {
+        return Err(anyhow!("cannot resolve a snapshot: nothing has landed"));
+    }
+    let snapshot = head.snapshot;
+    let query = repo.query();
+    let targets = block_on(query.edges(snapshot, node, edge_kind(edge)))?;
     let result = QueryResult {
         snapshot: snapshot.to_hex(),
         edge: edge_name(edge),

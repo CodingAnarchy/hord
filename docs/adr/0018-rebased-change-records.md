@@ -32,3 +32,7 @@ Option 1. A landed record that was rebased recomputes `ops`, `write_set`, and `i
 - A record whose `rebased_from` names a missing object fails validation.
 - **The rebased record is stored only when it lands** (after verification), so a failed verification leaves no orphan record.
 - Recomputing the read set at landing, or re-signing as the author, needs a new ADR.
+
+## Amendments (2026-09-23, from implementation)
+
+- **The attestation names only the submitted record.** `Rebase { submitted, landed }` would be a hash cycle: the landed record's id covers `evidence`, which would hold an attestation that names that id. The attestation is `Evidence { kind: Rebase { submitted }, snapshot: <landed result> }`, and the landed record lists it in `evidence`. The landed record's own id and `rebased_from` link both records.

@@ -1,16 +1,18 @@
 //! `hord blame <name|path:line>`
 //!
-//! History comes from [`hord_store::Store::node_history`]. A NodeId argument
-//! does not scan the log or the identity maps; `path:line` reads one file in
-//! the newest identity snapshot. Evidence is the change's object ids only.
+//! Resolution and history come from [`hord_txn::Query`], which reads NodeIds
+//! from the snapshots' identity (ADR 0017), so changes landed with `hord
+//! land --local` resolve. A NodeId argument does not scan anything;
+//! `path:line` reads one file at `head`. Evidence is the change's object ids
+//! only.
 
 use anyhow::{Context, Result};
 use hord_core::ChangeRecord;
 use serde::Serialize;
 
 use crate::output;
-use crate::repo;
 use crate::resolve;
+use crate::txn::{self, block_on};
 
 #[derive(Debug, Serialize)]
 struct BlameResult {
@@ -27,14 +29,14 @@ struct BlameEntry {
 }
 
 pub fn run(json: bool, target: String) -> Result<()> {
-    let store = repo::discover()?;
-    let node = resolve::resolve_blame_target(&store, &target)?;
-    let history = store.node_history(node)?;
+    let repo = txn::open()?;
+    let query = repo.query();
+    let node = resolve::resolve_blame_target(&query, &target)?;
+    let history = block_on(query.node_history(node))?;
     let mut entries = Vec::with_capacity(history.len());
     for id in history {
-        let change = store
-            .get_object::<ChangeRecord>(id)
-            .with_context(|| format!("change {id} in node history"))?;
+        let change: ChangeRecord =
+            block_on(repo.change(id)).with_context(|| format!("change {id} in node history"))?;
         entries.push(BlameEntry {
             change: id.to_hex(),
             intent: change.intent.summary,

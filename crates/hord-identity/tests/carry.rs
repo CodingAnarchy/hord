@@ -679,8 +679,11 @@ fn second_continuation_of_the_same_id_is_claimed() {
     assert!(matches!(err, Error::Claimed(id) if id == nid(1)));
 }
 
+/// ADR 0019: births are a function of content, file, site, and base
+/// snapshot. A definition appended after `foo` does not move it, so `foo`
+/// keeps its id; the same inputs give the same ids on every call.
 #[test]
-fn birth_ids_are_stable_and_ignore_unrelated_nodes() {
+fn birth_ids_are_stable_and_ignore_nodes_after_them() {
     let adapter = TestAdapter;
     let (tree, foo) = fn_file("foo_body", "foo");
     let once = assign(&adapter, &tree);
@@ -689,9 +692,9 @@ fn birth_ids_are_stable_and_ignore_unrelated_nodes() {
     let foo_id = once.nodes.get(&site(&tree, foo)).copied().unwrap();
 
     let mut with_extra = NodeTree::new();
-    let extra = leaf(&mut with_extra, "fn", "zzz_body", Some("zzz"));
     let foo2 = leaf(&mut with_extra, "fn", "foo_body", Some("foo"));
-    finish(&mut with_extra, vec![extra, foo2]);
+    let extra = leaf(&mut with_extra, "fn", "zzz_body", Some("zzz"));
+    finish(&mut with_extra, vec![foo2, extra]);
     let mapping = assign(&adapter, &with_extra);
     assert_eq!(
         mapping.nodes.get(&site(&with_extra, foo2)).copied(),
@@ -701,6 +704,54 @@ fn birth_ids_are_stable_and_ignore_unrelated_nodes() {
         mapping.nodes.get(&site(&with_extra, extra)).copied(),
         Some(foo_id)
     );
+}
+
+/// ADR 0019: the base snapshot is an input. A definition deleted on one
+/// base and re-added on a later one is a new lifetime, and a fresh
+/// assignment (no snapshot) differs from both.
+#[test]
+fn birth_ids_depend_on_the_base_snapshot() {
+    let adapter = TestAdapter;
+    let (tree, foo) = fn_file("foo_body", "foo");
+    let path = RepoPath::from_str("src/a.t").unwrap();
+    let first = ObjectId::from_bytes([1; 32]);
+    let later = ObjectId::from_bytes([2; 32]);
+    let empty = IdentifiedTree::default();
+    let born = |snapshot| {
+        let mapping =
+            hord_identity::carry_in(&adapter, &path, snapshot, &empty, &tree, &[]).unwrap();
+        mapping.nodes.get(&site(&tree, foo)).copied().unwrap()
+    };
+    assert_eq!(born(Some(first)), born(Some(first)));
+    assert_ne!(born(Some(first)), born(Some(later)));
+    assert_ne!(born(Some(first)), born(None));
+    let fresh = hord_identity::assign_in(&adapter, &path, None, &tree);
+    assert_eq!(
+        fresh.nodes.get(&site(&tree, foo)).copied(),
+        Some(born(None))
+    );
+    // Derived as the ADR says: content, file root, site, snapshot.
+    let expected = hord_identity::birth_id(
+        foo,
+        hord_identity::file_root_id(&path),
+        &site(&tree, foo),
+        Some(first),
+        0,
+    );
+    assert_eq!(born(Some(first)), expected);
+}
+
+/// Two identical definitions at two sites of one file get distinct ids.
+#[test]
+fn identical_births_at_two_sites_differ() {
+    let adapter = TestAdapter;
+    let mut tree = NodeTree::new();
+    let a = leaf(&mut tree, "fn", "same_body", Some("same"));
+    finish(&mut tree, vec![a, a]);
+    let mapping = assign(&adapter, &tree);
+    let ids: Vec<_> = mapping.nodes.values().copied().collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
 }
 
 #[test]
@@ -770,18 +821,18 @@ fn assign_in_keeps_identical_files_apart() {
     let a = RepoPath::from_str("src/a.t").unwrap();
     let b = RepoPath::from_str("src/b.t").unwrap();
     assert_eq!(assign(&adapter, &tree).nodes, assign(&adapter, &tree).nodes);
-    let in_a = hord_identity::assign_in(&adapter, &a, &tree);
-    let in_b = hord_identity::assign_in(&adapter, &b, &tree);
+    let in_a = hord_identity::assign_in(&adapter, &a, None, &tree);
+    let in_b = hord_identity::assign_in(&adapter, &b, None, &tree);
     assert_eq!(
         in_a.nodes,
-        hord_identity::assign_in(&adapter, &a, &tree).nodes
+        hord_identity::assign_in(&adapter, &a, None, &tree).nodes
     );
     let ids = |m: &hord_lang::IdentityMapping| m.nodes.values().copied().collect::<Vec<_>>();
     assert!(ids(&in_a).iter().all(|id| !ids(&in_b).contains(id)));
 
     let empty = IdentifiedTree::default();
-    let born_a = hord_identity::carry_in(&adapter, &a, &empty, &tree, &[]).unwrap();
-    let born_b = hord_identity::carry_in(&adapter, &b, &empty, &tree, &[]).unwrap();
+    let born_a = hord_identity::carry_in(&adapter, &a, None, &empty, &tree, &[]).unwrap();
+    let born_b = hord_identity::carry_in(&adapter, &b, None, &empty, &tree, &[]).unwrap();
     assert_eq!(born_a.nodes, in_a.nodes);
     assert_ne!(born_a.nodes, born_b.nodes);
 }

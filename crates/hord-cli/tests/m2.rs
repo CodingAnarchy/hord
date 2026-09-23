@@ -6,11 +6,14 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::BTreeMap;
+
 use hord_core::{
-    Actor, AdapterId, Blob, Bytes, ChangeRecord, IdentityMap, Intent, LangId, Node, NodeFile,
-    NodeId, NodeKind, NodePath, ObjectId, Op, Provenance, QualifiedName, Timestamp, Tree,
-    TreeEntry,
+    Actor, Blob, Bytes, ChangeRecord, FileIdentity, IdentityEntry, IdentityTree, Intent, NodeId,
+    ObjectId, Op, Provenance, RepoPath, Snapshot, Timestamp, Tree, TreeEntry,
 };
+use hord_lang::LangAdapter;
+use hord_lang_rust::RustAdapter;
 use hord_store::{EdgeKind, Store};
 
 const ADA: &str = "Ada <ada@example.com>";
@@ -160,11 +163,8 @@ fn seed() -> Seed {
     let decoy = NodeId::from_u128(4);
 
     let store = Store::create(dir.path()).unwrap();
-    let snapshot = sample_tree(&store, alpha, beta);
-    let empty_tree = store.put_object(&Tree::default()).unwrap();
-    store
-        .put_identity(empty_tree, &IdentityMap::default())
-        .unwrap();
+    let snapshot = snapshot(&store, &[("src/lib.rs", LIB_SRC, &[alpha, beta])]);
+    let empty_tree = empty_snapshot(&store);
     store
         .put_edge(empty_tree, EdgeKind::References, alpha, decoy)
         .unwrap();
@@ -237,76 +237,89 @@ fn seed() -> Seed {
     }
 }
 
-fn sample_tree(store: &Store, alpha: NodeId, beta: NodeId) -> ObjectId {
-    let a0 = store.put_object(&leaf("fn alpha() {\n", 1)).unwrap();
-    let a1 = store.put_object(&leaf("    1\n", 2)).unwrap();
-    let a2 = store.put_object(&leaf("}\n", 3)).unwrap();
-    let alpha_node = store
-        .put_object(&defn(vec![a0, a1, a2], Some("crate::alpha"), 4))
-        .unwrap();
-    let b0 = store.put_object(&leaf("fn beta() {\n", 5)).unwrap();
-    let b1 = store.put_object(&leaf("    2\n", 6)).unwrap();
-    let b2 = store.put_object(&leaf("}\n", 7)).unwrap();
-    let beta_node = store
-        .put_object(&defn(vec![b0, b1, b2], Some("crate::beta"), 8))
-        .unwrap();
-    let root = store
-        .put_object(&defn(vec![alpha_node, beta_node], None, 9))
-        .unwrap();
-    let file = store.put_object(&node_file(root)).unwrap();
-    let src = store
-        .put_object(&dir("lib.rs", TreeEntry::NodeFile(file)))
-        .unwrap();
-    let snapshot = store.put_object(&dir("src", TreeEntry::Tree(src))).unwrap();
-    let mut map = IdentityMap::default();
-    map.nodes.insert(alpha, place("src/lib.rs", &[0]));
-    map.nodes.insert(beta, place("src/lib.rs", &[1]));
-    store.put_identity(snapshot, &map).unwrap();
-    snapshot
-}
+/// `alpha` covers lines 1-3 and `beta` lines 4-6.
+const LIB_SRC: &str = "fn alpha() {\n    1\n}\nfn beta() {\n    2\n}\n";
 
-fn leaf(raw: &str, n: u8) -> Node {
-    Node {
-        kind: NodeKind::new("token"),
-        lang: LangId::new("rust"),
-        raw: Bytes::new(raw.as_bytes().to_vec()),
-        normalized: mark(n),
-        children: Vec::new(),
-        name: None,
+/// A snapshot of Rust `files` (ADR 0017): the content tree, and an identity
+/// tree whose [`FileIdentity`] gives each file's definitions `ids` in
+/// preorder (the rest keep the fresh assignment).
+fn snapshot(store: &Store, files: &[(&str, &str, &[NodeId])]) -> ObjectId {
+    let mut content = Vec::new();
+    let mut identity = Vec::new();
+    for (path, source, ids) in files {
+        let path: RepoPath = path.parse().unwrap();
+        let blob = store
+            .put_object(&Blob::new(source.as_bytes().to_vec()))
+            .unwrap();
+        let tree = RustAdapter.parse(source.as_bytes()).unwrap();
+        let fresh = hord_identity::assign_in(&RustAdapter, &path, None, &tree);
+        let mut nodes: Vec<(Vec<u32>, NodeId)> = fresh.nodes.into_iter().collect();
+        assert!(
+            nodes.len() >= ids.len(),
+            "{path} has {} definitions",
+            nodes.len()
+        );
+        for (slot, id) in nodes.iter_mut().zip(ids.iter()) {
+            slot.1 = *id;
+        }
+        let file = store.put_object(&FileIdentity { blob, nodes }).unwrap();
+        content.push((path.components().to_vec(), blob));
+        identity.push((path.components().to_vec(), file));
     }
+    let tree = put_dir(
+        store,
+        &content,
+        TreeEntry::Blob,
+        TreeEntry::Tree,
+        Tree::default(),
+        |t: &mut Tree| &mut t.entries,
+    );
+    let ids = put_dir(
+        store,
+        &identity,
+        IdentityEntry::File,
+        IdentityEntry::Dir,
+        IdentityTree::default(),
+        |t: &mut IdentityTree| &mut t.entries,
+    );
+    store.put_object(&Snapshot::new(tree, ids)).unwrap()
 }
 
-fn defn(children: Vec<ObjectId>, name: Option<&str>, n: u8) -> Node {
-    Node {
-        kind: NodeKind::new("fn_item"),
-        lang: LangId::new("rust"),
-        raw: Bytes::default(),
-        normalized: mark(n),
-        children,
-        name: name.map(QualifiedName::new),
+/// Store a directory (content or identity) of `files` and return its id.
+fn put_dir<T: serde::Serialize + Clone, E>(
+    store: &Store,
+    files: &[(Vec<String>, ObjectId)],
+    leaf: fn(ObjectId) -> E,
+    dir: fn(ObjectId) -> E,
+    empty: T,
+    entries: fn(&mut T) -> &mut BTreeMap<String, E>,
+) -> ObjectId {
+    let mut out = empty.clone();
+    let mut nested: BTreeMap<String, Vec<(Vec<String>, ObjectId)>> = BTreeMap::new();
+    for (path, id) in files {
+        match path.as_slice() {
+            [name] => {
+                entries(&mut out).insert(name.clone(), leaf(*id));
+            }
+            [first, rest @ ..] => nested
+                .entry(first.clone())
+                .or_default()
+                .push((rest.to_vec(), *id)),
+            [] => {}
+        }
     }
-}
-
-fn node_file(root: ObjectId) -> NodeFile {
-    NodeFile {
-        adapter: AdapterId::new("rust"),
-        lang: LangId::new("rust"),
-        root,
-        raw_hash: mark(200),
+    for (name, sub) in nested {
+        let id = put_dir(store, &sub, leaf, dir, empty.clone(), entries);
+        entries(&mut out).insert(name, dir(id));
     }
+    store.put_object(&out).unwrap()
 }
 
-fn dir(name: &str, entry: TreeEntry) -> Tree {
-    let mut tree = Tree::default();
-    tree.entries.insert(name.to_owned(), entry);
-    tree
-}
-
-fn place(file: &str, pointer: &[u32]) -> NodePath {
-    NodePath {
-        file: file.parse().unwrap(),
-        pointer: pointer.to_vec(),
-    }
+/// [`Snapshot::empty`], stored with the objects it names.
+fn empty_snapshot(store: &Store) -> ObjectId {
+    store.put_object(&Tree::default()).unwrap();
+    store.put_object(&IdentityTree::default()).unwrap();
+    store.put_object(&Snapshot::empty()).unwrap()
 }
 
 fn mark(n: u8) -> ObjectId {
@@ -399,6 +412,7 @@ impl Draft {
             identity_deltas: Vec::new(),
             evidence: self.evidence,
             signature: None,
+            rebased_from: None,
         }
     }
 }
@@ -468,7 +482,7 @@ fn log_filters_by_node_path_actor_and_since() {
             &node_hex(seed.alpha).to_ascii_uppercase(),
         ],
     );
-    let by_name = hord_in(dir, &["log", "--json", "--node", "crate::alpha"]);
+    let by_name = hord_in(dir, &["log", "--json", "--node", "alpha"]);
     let expected = id_list(&[&seed.add_alpha, &seed.rewrite, &seed.edit_both]);
     for (out, args) in [
         (&by_ulid, "--node ulid"),
@@ -544,7 +558,7 @@ fn log_filters_by_node_path_actor_and_since() {
             "log",
             "--json",
             "--node",
-            "crate::alpha",
+            "alpha",
             "--path",
             "src/lib.rs",
             "--actor",
@@ -581,8 +595,8 @@ fn log_rejects_a_bad_path_and_an_unknown_name() {
 fn blame_prints_history_from_the_index() {
     let seed = seed();
     let dir = seed.dir.path();
-    let by_name = hord_in(dir, &["blame", "--json", "crate::alpha"]);
-    let value = json_stdout(&by_name, &["blame", "crate::alpha"]);
+    let by_name = hord_in(dir, &["blame", "--json", "alpha"]);
+    let value = json_stdout(&by_name, &["blame", "alpha"]);
     assert_no_secrets(&value, &stdout(&by_name));
     let alpha = seed.alpha.to_string();
     let add_alpha = seed.add_alpha.to_string();
@@ -630,8 +644,8 @@ fn blame_prints_history_from_the_index() {
         vec!["edit both", "edit beta", "delete beta"]
     );
 
-    let human = hord_in(dir, &["blame", "crate::beta"]);
-    assert_ok(&human, &["blame", "crate::beta"]);
+    let human = hord_in(dir, &["blame", "beta"]);
+    assert_ok(&human, &["blame", "beta"]);
     let text = stdout(&human);
     let edit_beta = seed.edit_beta.to_string();
     assert!(text.contains(&beta), "{text}");
@@ -647,8 +661,8 @@ fn blame_prints_history_from_the_index() {
         err.contains("outside") || err.contains("no definition"),
         "{err}"
     );
-    let short = hord_in(dir, &["blame", "--json", "alpha"]);
-    let err = json_error(&short, &["blame", "alpha"]);
+    let unknown = hord_in(dir, &["blame", "--json", "missing"]);
+    let err = json_error(&unknown, &["blame", "missing"]);
     assert!(err.contains("cannot resolve node"), "{err}");
 }
 
@@ -708,14 +722,10 @@ fn query_prefers_the_newest_result_over_an_older_identity_snapshot() {
     let source = NodeId::from_u128(1);
     let older_target = NodeId::from_u128(2);
     let newer_target = NodeId::from_u128(3);
-    let old = ObjectId::from_bytes([1; 32]);
-    let new = ObjectId::from_bytes([2; 32]);
-    let new_hex = new.to_hex();
-    {
+    let new_hex = {
         let store = Store::create(dir.path()).unwrap();
-        let mut map = IdentityMap::default();
-        map.nodes.insert(source, place("a.rs", &[]));
-        store.put_identity(old, &map).unwrap();
+        let old = snapshot(&store, &[("a.rs", "fn source() {}\n", &[source])]);
+        let new = snapshot(&store, &[("a.rs", "fn source() { }\n", &[source])]);
         store
             .put_edge(old, EdgeKind::References, source, older_target)
             .unwrap();
@@ -723,9 +733,10 @@ fn query_prefers_the_newest_result_over_an_older_identity_snapshot() {
             .put_edge(new, EdgeKind::References, source, newer_target)
             .unwrap();
         append_change(&store, &plain_change(old, source, "old"));
-        append_change(&store, &plain_change(new, source, "new"));
-        store.flush().unwrap();
-    }
+        let head = append_change(&store, &plain_change(new, source, "new"));
+        store.set_head(head).unwrap();
+        new.to_hex()
+    };
     let out = hord_in(
         dir.path(),
         &["query", "--json", "references", &source.to_string()],
@@ -742,15 +753,21 @@ fn qualified_name_uses_the_newest_identity_snapshot() {
     let new_node = NodeId::from_u128(2);
     let (c_old, c_new) = {
         let store = Store::create(dir.path()).unwrap();
-        let old = named_snapshot(&store, "crate::alpha", old_node);
-        let new = named_snapshot(&store, "crate::alpha", new_node);
+        let old = snapshot(
+            &store,
+            &[("lib.rs", "fn alpha() { /* 1 */ }\n", &[old_node])],
+        );
+        let new = snapshot(
+            &store,
+            &[("lib.rs", "fn alpha() { /* 2 */ }\n", &[new_node])],
+        );
         let c_old = append_change(&store, &plain_change(old, old_node, "old alpha"));
         let c_new = append_change(&store, &plain_change(new, new_node, "new alpha"));
-        store.flush().unwrap();
+        store.set_head(c_new).unwrap();
         (c_old, c_new)
     };
-    let out = hord_in(dir.path(), &["log", "--json", "--node", "crate::alpha"]);
-    let value = json_stdout(&out, &["log", "--node", "crate::alpha"]);
+    let out = hord_in(dir.path(), &["log", "--json", "--node", "alpha"]);
+    let value = json_stdout(&out, &["log", "--node", "alpha"]);
     assert_eq!(strings(&value, "log"), vec![c_new.to_string()]);
     let by_old = hord_in(
         dir.path(),
@@ -767,30 +784,15 @@ fn ambiguous_qualified_name_fails() {
         let store = Store::create(tmp.path()).unwrap();
         let left = NodeId::from_u128(1);
         let right = NodeId::from_u128(2);
-        let a = store.put_object(&leaf("fn a() {}\n", 1)).unwrap();
-        let b = store.put_object(&leaf("fn b() {}\n", 2)).unwrap();
-        let left_node = store
-            .put_object(&defn(vec![a], Some("crate::alpha"), 3))
-            .unwrap();
-        let right_node = store
-            .put_object(&defn(vec![b], Some("crate::alpha"), 4))
-            .unwrap();
-        let root = store
-            .put_object(&defn(vec![left_node, right_node], None, 5))
-            .unwrap();
-        let file = store.put_object(&node_file(root)).unwrap();
-        let snapshot = store
-            .put_object(&dir("lib.rs", TreeEntry::NodeFile(file)))
-            .unwrap();
-        let mut map = IdentityMap::default();
-        map.nodes.insert(left, place("lib.rs", &[0]));
-        map.nodes.insert(right, place("lib.rs", &[1]));
-        store.put_identity(snapshot, &map).unwrap();
-        append_change(&store, &plain_change(snapshot, left, "two alphas"));
-        store.flush().unwrap();
+        let snapshot = snapshot(
+            &store,
+            &[("lib.rs", "fn alpha() {}\nfn alpha() { }\n", &[left, right])],
+        );
+        let head = append_change(&store, &plain_change(snapshot, left, "two alphas"));
+        store.set_head(head).unwrap();
     }
-    let out = hord_in(tmp.path(), &["log", "--json", "--node", "crate::alpha"]);
-    let err = json_error(&out, &["log", "--node", "crate::alpha"]);
+    let out = hord_in(tmp.path(), &["log", "--json", "--node", "alpha"]);
+    let err = json_error(&out, &["log", "--node", "alpha"]);
     assert!(err.contains("multiple"), "{err}");
 }
 
@@ -798,31 +800,24 @@ fn ambiguous_qualified_name_fails() {
 fn log_path_uses_the_result_location_when_the_node_moved() {
     let dir = TempDir::new("hord-m2-moved-path");
     let alpha = NodeId::from_u128(1);
-    let old = ObjectId::from_bytes([1; 32]);
-    let new = ObjectId::from_bytes([2; 32]);
-    let empty = ObjectId::from_bytes([3; 32]);
     let moved = {
         let store = Store::create(dir.path()).unwrap();
-        let mut at_old = IdentityMap::default();
-        at_old.nodes.insert(alpha, place("src/old.rs", &[0]));
-        store.put_identity(old, &at_old).unwrap();
-        let mut at_new = IdentityMap::default();
-        at_new.nodes.insert(alpha, place("src/new.rs", &[0]));
-        store.put_identity(new, &at_new).unwrap();
-        store.put_identity(empty, &IdentityMap::default()).unwrap();
+        let old = snapshot(&store, &[("src/old.rs", "fn alpha() {}\n", &[alpha])]);
+        let new = snapshot(&store, &[("src/new.rs", "fn alpha() {}\n", &[alpha])]);
+        let empty = empty_snapshot(&store);
         let moved = append_change(
             &store,
             &Draft::new("move alpha", ada(), 1, old, new)
                 .write([alpha])
                 .build(),
         );
-        append_change(
+        let dropped = append_change(
             &store,
             &Draft::new("drop alpha", ada(), 2, new, empty)
                 .write([alpha])
                 .build(),
         );
-        store.flush().unwrap();
+        store.set_head(dropped).unwrap();
         moved
     };
 
@@ -886,21 +881,4 @@ fn plain_change(result: ObjectId, write: NodeId, summary: &'static str) -> Chang
     Draft::new(summary, ada(), 1, result, result)
         .write([write])
         .build()
-}
-
-fn named_snapshot(store: &Store, name: &str, node: NodeId) -> ObjectId {
-    let raw = format!("fn {name}() {{ /* {} */ }}\n", node.as_u128());
-    let leaf_id = store.put_object(&leaf(&raw, 1)).unwrap();
-    let def_id = store
-        .put_object(&defn(vec![leaf_id], Some(name), 2))
-        .unwrap();
-    let root = store.put_object(&defn(vec![def_id], None, 3)).unwrap();
-    let file = store.put_object(&node_file(root)).unwrap();
-    let snapshot = store
-        .put_object(&dir("lib.rs", TreeEntry::NodeFile(file)))
-        .unwrap();
-    let mut map = IdentityMap::default();
-    map.nodes.insert(node, place("lib.rs", &[0]));
-    store.put_identity(snapshot, &map).unwrap();
-    snapshot
 }

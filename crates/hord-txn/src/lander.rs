@@ -8,9 +8,16 @@
 //! replay, M5). Set overlaps that rebase cleanly land with the report
 //! attached, flagged for the verifier (§6.4).
 //!
-//! A change that lands on a head other than its base is stored again with
-//! `base`, `result`, `parents`, and `ops` rewritten for that head; it lands
-//! under that record's id. The queue entry keeps both ids.
+//! A change that lands on a head other than its base lands as a new record
+//! (ADR 0018): `base`, `result`, `parents`, `ops`, `write_set`, and
+//! `identity_deltas` are recomputed for that head (the sets exactly as
+//! `propose` computes them), `read_set`, `intent`, `provenance`, and
+//! `evidence` are kept, `signature` is cleared, `rebased_from` names the
+//! submitted record, and the lander's `Rebase { submitted }` attestation is
+//! appended to `evidence`. The rebased record and its attestation are
+//! stored only when it lands. The
+//! queue entry keeps both ids, and the store's `rebased` index maps the
+//! submitted id to the landed one.
 //!
 //! A failure that is about the change (its record, a merge, identity, or
 //! reproduction error) parks it as [`QueueStatus::Rejected`] with its
@@ -19,9 +26,10 @@
 //! appends nothing to the log, and submitting a landed change again returns
 //! its entry.
 //!
-//! A landing is one durable commit ([`hord_store::Store::land`]): the
-//! identity index pointer, the queue entry, the log append, `head`, and the
-//! history index move together or not at all. On the first run, an entry
+//! A landing is one durable commit ([`hord_store::Store::land`]): the queue
+//! entry, the log append, `head`, and the history index move together or not
+//! at all. The result snapshot, its identity tree, and the record are
+//! content-addressed objects stored before it. On the first run, an entry
 //! marked landed whose change is not in the log (a store written before
 //! landings were atomic, or forged) is queued again. The in-process head
 //! follows the commit before anything else can fail.
@@ -36,14 +44,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use hord_core::{ChangeId, ChangeRecord, SnapshotId, Timestamp};
+use hord_core::{
+    Actor, Bytes, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IdentityDelta,
+    ObjectId, SnapshotId, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::conflict::{ConflictReport, Footprint, check};
 use crate::files::{validate, validate_except};
 use crate::rebase::rebase;
 use crate::repo::{Head, Inner, Repo, blocking, lock, now};
-use crate::semantic::IdentityIndex;
+use crate::sets::sets_between;
 use crate::{Error, Result};
 
 /// Where a submitted change is in the lander (spec §6.2, §6.7).
@@ -201,7 +212,8 @@ struct Candidate {
     landed_id: ChangeId,
     landed: ChangeRecord,
     report: ConflictReport,
-    index: IdentityIndex,
+    /// The rebase attestation, stored with a rebased record.
+    attestation: Option<Evidence>,
 }
 
 enum Step {
@@ -222,7 +234,7 @@ struct Ready {
     landed_id: ChangeId,
     landed: ChangeRecord,
     report: ConflictReport,
-    index: IdentityIndex,
+    attestation: Option<Evidence>,
 }
 
 /// Whether `err` is about the store or the machine rather than about the
@@ -316,7 +328,7 @@ impl Inner {
             report: None,
         };
         // `propose` checked the ops; record that for a lander in any process.
-        let checked: &[ChangeId] = if lock(&self.proposed).contains(&change) {
+        let checked: &[ChangeId] = if self.was_proposed(change) {
             &[change]
         } else {
             &[]
@@ -368,7 +380,7 @@ impl Inner {
     /// Whether `change`'s ops are known to reproduce its result: this
     /// process proposed it, or a check was recorded.
     fn ops_checked(&self, change: ChangeId) -> Result<bool> {
-        Ok(lock(&self.proposed).contains(&change) || self.store.is_checked(change)?)
+        Ok(self.was_proposed(change) || self.store.is_checked(change)?)
     }
 
     /// Validate `change` and record the outcome if it passes.
@@ -475,14 +487,14 @@ impl Inner {
                     landed_id,
                     landed,
                     report,
-                    index,
+                    attestation,
                 } = *ready;
                 Ok(Step::Candidate(Box::new(Candidate {
                     entry,
                     landed_id,
                     landed,
                     report,
-                    index,
+                    attestation,
                 })))
             }
             Err(err) if is_transient(&err) => Err(err),
@@ -540,24 +552,38 @@ impl Inner {
             return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
         }
         let checked_files = rebased.checked;
-        // The rebased result's NodeIds are the rebase's. Validation reads
-        // that snapshot, so stage them in this process; `finish` stores them
-        // only if the change lands.
-        if rebased.result != record.result {
-            self.stage_identity_index(rebased.result, rebased.index.clone());
-        }
-        let (landed_id, landed) = if rebased.result == record.result && record.base == head.snapshot
+        let (landed_id, landed, attestation) = if rebased.result == record.result
+            && record.base == head.snapshot
         {
-            (entry.change, record)
+            (entry.change, record, None)
         } else {
+            // ADR 0018: recompute what the landed record says it did from
+            // head → result; keep what the author depended on and why.
+            let declared: Vec<IdentityDelta> = record
+                .identity_deltas
+                .iter()
+                .filter(|d| !matches!(d, IdentityDelta::Birth { .. } | IdentityDelta::Death { .. }))
+                .cloned()
+                .collect();
+            let (write_set, identity_deltas) =
+                sets_between(self, head.snapshot, rebased.result, &rebased.ops, &declared)?;
+            let attestation = self.rebase_attestation(entry.change, &record, rebased.result);
+            let mut evidence = record.evidence.clone();
+            evidence.push(ObjectId::of(&attestation)?);
             let landed = ChangeRecord {
                 base: head.snapshot,
                 result: rebased.result,
                 parents: head.change.into_iter().collect(),
                 ops: rebased.ops,
+                write_set,
+                identity_deltas,
+                evidence,
+                signature: None,
+                rebased_from: Some(entry.change),
                 ..record
             };
-            (self.store.put_object(&landed)?, landed)
+            // Stored only when it lands (`finish`).
+            (ObjectId::of(&landed)?, landed, Some(attestation))
         };
         // Spec §3.5: the record that lands must reproduce its result. The
         // submitted record was checked above; a rebased record has rewritten
@@ -574,8 +600,37 @@ impl Inner {
             landed_id,
             landed,
             report: report.clone(),
-            index: rebased.index,
+            attestation,
         })))
+    }
+
+    /// The lander's `Rebase` attestation for `submitted` landing as
+    /// `result` (ADR 0018 amendment). A pure function of the two records,
+    /// so the same landing gives the same landed id anywhere: its time is
+    /// the submitted record's `created_at`. Unsigned until M5.
+    fn rebase_attestation(
+        &self,
+        submitted: ChangeId,
+        record: &ChangeRecord,
+        result: SnapshotId,
+    ) -> Evidence {
+        Evidence {
+            kind: EvidenceKind::Rebase { submitted },
+            snapshot: result,
+            toolchain: self.toolchain,
+            command: "hord lander: structural rebase (spec §6.4 rung 1)".into(),
+            scope: None,
+            result: EvidenceResult::Pass,
+            log: None,
+            cost_ms: 0,
+            produced_by: Actor::Agent {
+                id: "hord-lander".into(),
+                model: String::new(),
+                model_hash: Bytes::default(),
+                harness: "hord-txn".into(),
+            },
+            produced_at: record.provenance.created_at,
+        }
     }
 
     /// The id `change` landed under, if it is in the log (as submitted, or
@@ -603,14 +658,18 @@ impl Inner {
             landed_id,
             landed,
             mut report,
-            mut index,
+            attestation,
         } = candidate;
         if let Verdict::Fail { reason } = verdict {
             report.verification = Some(reason);
             return self.park(entry, QueueStatus::Conflicted, Some(report));
         }
-        index.snapshot = landed.result;
-        let index_id = self.store.put_object(&index)?;
+        if let Some(attestation) = &attestation {
+            self.store.put_object(attestation)?;
+        }
+        if landed_id != entry.change {
+            self.store.put_object(&landed)?;
+        }
         entry.status = QueueStatus::Landed { landed: landed_id };
         entry.report = Some(report);
         entry.updated_at = now();
@@ -625,7 +684,6 @@ impl Inner {
             record: &landed,
             entry: (entry.seq, &bytes),
             names,
-            identity_index: Some((landed.result, index_id)),
         })?;
         // Head is durable: the cache must follow before anything else can
         // fail, or the next landing would rebase onto the old head.
@@ -633,10 +691,9 @@ impl Inner {
             change: Some(landed_id),
             snapshot: landed.result,
         });
-        self.stage_identity_index(landed.result, index);
         // The footprint is a cache (`footprint` recomputes it on a miss).
         if let Ok(footprint) = self.footprint_of(landed_id, &landed) {
-            lock(&self.footprints).insert(landed_id, Arc::new(footprint));
+            lock(&self.footprints).insert(landed_id, Arc::new(footprint), 1);
         }
         Ok(entry)
     }
@@ -697,11 +754,11 @@ impl Inner {
 
     fn footprint(&self, change: ChangeId) -> Result<Arc<Footprint>> {
         if let Some(found) = lock(&self.footprints).get(&change) {
-            return Ok(Arc::clone(found));
+            return Ok(found);
         }
         let record = self.change_record(change)?;
         let footprint = Arc::new(self.footprint_of(change, &record)?);
-        lock(&self.footprints).insert(change, Arc::clone(&footprint));
+        lock(&self.footprints).insert(change, Arc::clone(&footprint), 1);
         Ok(footprint)
     }
 

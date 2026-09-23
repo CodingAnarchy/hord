@@ -32,8 +32,21 @@ pub struct ChangeRecord {
     pub identity_deltas: Vec<IdentityDelta>,
     /// [`crate::Evidence`] object ids attached to this change.
     pub evidence: Vec<ObjectId>,
-    /// Optional signature over the change (spec §10.5.4).
+    /// Signature over the change (spec §10.5.4). An author signs the
+    /// record they submit; a record the lander rebased carries none
+    /// (ADR 0018).
     pub signature: Option<Signature>,
+    /// The submitted record this one was rebased from (ADR 0018).
+    ///
+    /// `Some` when the lander landed the change on a head other than its
+    /// base: `base`, `result`, `parents`, `ops`, `write_set`, and
+    /// `identity_deltas` were recomputed for that head, while `read_set`,
+    /// `intent`, `provenance`, and `evidence` are the submitted record's.
+    /// The author's signature stays valid on the submitted record, which
+    /// must be stored. Omitted from the encoding when `None`, so records
+    /// that were not rebased keep their ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebased_from: Option<ChangeId>,
 }
 
 /// One semantic operation derived by the diff engine (spec §3.5).

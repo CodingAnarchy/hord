@@ -6,7 +6,7 @@ use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use hord_core::{ChangeRecord, ObjectId, SnapshotId, Tree};
+use hord_core::{ChangeRecord, IdentityTree, ObjectId, Snapshot, SnapshotId, Tree};
 use hord_store::{Store, WorkspaceId, WorkspaceMeta};
 
 const CURRENT_WORKSPACE: &str = "current-workspace";
@@ -31,15 +31,16 @@ pub fn discover() -> Result<Store> {
     }
 }
 
-/// Resolve `--base <snap|ref>` to a snapshot id (root tree [`ObjectId`]).
+/// Resolve `--base <snap|ref>` to a snapshot id (a [`Snapshot`] object's
+/// id, ADR 0017).
 ///
-/// With no spec (or `head`), uses the result snapshot of `head`, or an empty
-/// tree if nothing has landed.
+/// With no spec (or `head`), uses the result snapshot of `head`, or the
+/// empty snapshot if nothing has landed.
 pub fn resolve_base(store: &Store, spec: Option<&str>) -> Result<SnapshotId> {
     match spec {
         None | Some("head") | Some("HEAD") => match store.head()? {
             Some(change) => snapshot_of(store, change),
-            None => empty_tree(store),
+            None => empty_snapshot(store),
         },
         Some(spec) => {
             if let Ok(id) = spec.parse::<ObjectId>() {
@@ -117,6 +118,8 @@ fn snapshot_of(store: &Store, id: ObjectId) -> Result<SnapshotId> {
     Ok(try_change(store, id)?.map(|c| c.result).unwrap_or(id))
 }
 
-fn empty_tree(store: &Store) -> Result<SnapshotId> {
-    store.put_object(&Tree::default()).map_err(Into::into)
+fn empty_snapshot(store: &Store) -> Result<SnapshotId> {
+    store.put_object(&Tree::default())?;
+    store.put_object(&IdentityTree::default())?;
+    store.put_object(&Snapshot::empty()).map_err(Into::into)
 }

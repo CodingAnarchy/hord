@@ -50,6 +50,7 @@ fn record(base: SnapshotId, result: SnapshotId, write: NodeId) -> ChangeRecord {
         identity_deltas: Vec::new(),
         evidence: Vec::new(),
         signature: None,
+        rebased_from: None,
     }
 }
 
@@ -60,7 +61,10 @@ fn queue_and_land(store: &Store, rebased: bool) -> (ObjectId, ObjectId, NodeId) 
     let submitted = store.put_object(&record(oid(1), oid(2), node)).unwrap();
     let seq = store.queue_push(b"queued", &[submitted], &[]).unwrap();
     let (landed, landed_record) = if rebased {
-        let r = record(oid(3), oid(4), node);
+        let r = ChangeRecord {
+            rebased_from: Some(submitted),
+            ..record(oid(3), oid(4), node)
+        };
         (store.put_object(&r).unwrap(), r)
     } else {
         (submitted, record(oid(1), oid(2), node))
@@ -72,7 +76,6 @@ fn queue_and_land(store: &Store, rebased: bool) -> (ObjectId, ObjectId, NodeId) 
             record: &landed_record,
             entry: (seq, b"landed"),
             names: &names,
-            identity_index: Some((landed_record.result, oid(7))),
         })
         .unwrap();
     (submitted, landed, node)
@@ -82,7 +85,8 @@ fn assert_landed(store: &Store, submitted: ObjectId, landed: ObjectId, node: Nod
     assert_eq!(store.queue_entry(0).unwrap(), Some(b"landed".to_vec()));
     assert_eq!(store.log().unwrap(), vec![landed]);
     assert_eq!(store.head().unwrap(), Some(landed));
-    assert_eq!(store.identity_index(oid(4)).unwrap(), Some(oid(7)));
+    // ADR 0018: the submitted id resolves to the landed one.
+    assert_eq!(store.rebased_to(submitted).unwrap(), Some(landed));
     assert_eq!(store.node_history(node).unwrap(), vec![landed]);
     assert_eq!(store.queue_named(submitted).unwrap(), vec![0]);
     assert_eq!(store.queue_named(landed).unwrap(), vec![0]);
@@ -90,8 +94,8 @@ fn assert_landed(store: &Store, submitted: ObjectId, landed: ObjectId, node: Nod
 
 /// The whole landing is in the index after `land` returns, with nothing
 /// else flushing it: a process killed right after it loses none of it.
-/// Before, the queue status and identity pointer were separate non-durable
-/// commits and `node_history` a separate durable one after `head`.
+/// Before, the queue status was a separate non-durable commit and
+/// `node_history` a separate durable one after `head`.
 #[test]
 fn a_landing_survives_an_abort_right_after_land() {
     const CHILD: &str = "HORD_STORE_LAND_ABORT_DIR";
@@ -127,7 +131,7 @@ fn a_landing_survives_an_abort_right_after_land() {
 }
 
 #[test]
-fn land_writes_the_entry_log_head_identity_pointer_and_history_together() {
+fn land_writes_the_entry_log_head_and_history_together() {
     let dir = temp_repo("together");
     let store = Store::create(&dir).unwrap();
     // A buffered log entry from before (git import) lands first, in order.
@@ -143,7 +147,6 @@ fn land_writes_the_entry_log_head_identity_pointer_and_history_together() {
                 record: &record(oid(1), oid(2), node),
                 entry: (seq, b"landed"),
                 names: &[],
-                identity_index: Some((oid(2), oid(7))),
             })
             .unwrap();
         (submitted, submitted, node)
@@ -161,7 +164,7 @@ fn land_writes_the_entry_log_head_identity_pointer_and_history_together() {
     let store = Store::open(&dir).unwrap();
     assert_eq!(store.log().unwrap(), vec![earlier, landed]);
     assert_eq!(store.head().unwrap(), Some(landed));
-    assert_eq!(store.identity_index(oid(2)).unwrap(), Some(oid(7)));
+    assert_eq!(store.rebased_to(submitted).unwrap(), None, "not rebased");
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -173,6 +176,9 @@ fn a_rebased_landing_is_found_by_both_ids() {
     let (submitted, landed, node) = queue_and_land(&store, true);
     assert_ne!(submitted, landed);
     assert_landed(&store, submitted, landed, node);
+    // The `rebased` row is derived from the landed record (ADR 0018).
+    store.rebuild_index().unwrap();
+    assert_eq!(store.rebased_to(submitted).unwrap(), Some(landed));
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }

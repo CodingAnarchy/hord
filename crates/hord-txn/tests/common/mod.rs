@@ -203,3 +203,39 @@ pub fn lock_additions() -> (String, String, String) {
         .replacen(STORE_DEPS, &format!("{STORE_DEPS} \"aaa-beta\",\n"), 1);
     (lock, a_lock, b_lock)
 }
+
+/// The [`hord_core::FileIdentity`] object `snapshot`'s identity tree records
+/// for `file`, if any (ADR 0017).
+pub fn file_identity(
+    store: &hord_store::Store,
+    snapshot: hord_core::SnapshotId,
+    file: &str,
+) -> Option<hord_core::ObjectId> {
+    use hord_core::{IdentityEntry, IdentityTree, Snapshot};
+    let snapshot: Snapshot = store.get_object(snapshot).unwrap();
+    let mut tree: IdentityTree = store.get_object(snapshot.identity().unwrap()).unwrap();
+    let path = self::path(file);
+    let (last, dirs) = path.components().split_last().unwrap();
+    for dir in dirs {
+        match tree.entries.get(dir) {
+            Some(IdentityEntry::Dir(id)) => tree = store.get_object(*id).unwrap(),
+            _ => return None,
+        }
+    }
+    match tree.entries.get(last) {
+        Some(IdentityEntry::File(id)) => Some(*id),
+        _ => None,
+    }
+}
+
+/// Delete the loose object `id` from the store at `root` (to simulate a
+/// lost object).
+pub fn remove_loose_object(root: &std::path::Path, id: hord_core::ObjectId) {
+    let hex = id.to_hex();
+    let file = root
+        .join(".hord")
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    fs::remove_file(&file).unwrap_or_else(|err| panic!("remove {}: {err}", file.display()));
+}

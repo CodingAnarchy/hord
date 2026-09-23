@@ -42,10 +42,20 @@ pub enum Error {
     /// [`crate::Store::index_change`] was given a change that is not in the landing log.
     #[error("change {0} is not in the landing log")]
     NotInLog(hord_core::ChangeId),
-    /// [`crate::Store::put_identity`] was given a map that places two
-    /// [`hord_core::NodeId`]s at the same definition path.
-    #[error("identity map assigns two NodeIds to one definition path")]
-    DuplicateIdentity,
+    /// The store was written by an older (or newer) hord whose object
+    /// format differs: ADR 0017 made a snapshot id the id of a `Snapshot`
+    /// object, so older stores are not read. There is no migration.
+    #[error(
+        "hord store has format {}, but this hord reads format {expected}; \
+         re-create it (for example `hord init --from-git`)",
+        .found.map_or_else(|| "1 (unversioned)".to_owned(), |v| v.to_string())
+    )]
+    StoreFormat {
+        /// Format recorded in the store; `None` before formats were recorded.
+        found: Option<u32>,
+        /// Format this build reads and writes.
+        expected: u32,
+    },
     /// A named ref was empty or contained a NUL byte.
     #[error("invalid ref name {0:?}")]
     InvalidRef(String),
