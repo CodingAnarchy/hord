@@ -1,14 +1,15 @@
 //! M2 validation (spec §12).
 //!
 //! - Identity: 500 function pairs from consecutive cargo commits. A pair is
-//!   "the same function" when the qualified name is unchanged, or when a
-//!   token Jaccard of the stripped body (not hord's tree-edit distance) is
-//!   at least 0.7 and uniquely best. Gate: ≥ 97% keep their `NodeId`, and
-//!   ≥ 95% of hord renames are in that labeled set.
-//! - References: 300 functions at cargo HEAD. Expected names are definition
-//!   simple-names that occur as tokens in the body. Gate: hord recall ≥ 95%.
-//!   This oracle is lexical. The spec's rust-analyzer comparison is reported
-//!   separately and does not pass unless that binary runs.
+//!   "the same function" when its qualified name is unchanged. Gate: ≥ 97%
+//!   keep their `NodeId`. Rename precision is separate: ≥ 95% of hord
+//!   function renames still share half their CST-leaf tokens. That labeler
+//!   is not ADR 0007's tree-edit distance.
+//! - References: 300 functions at cargo HEAD. Expected names are unique
+//!   definition simple-names that occur as identifier, type, or field
+//!   leaves in the body. Gate: hord recall ≥ 95%. This is a lexical
+//!   stand-in. The spec's rust-analyzer comparison is reported separately
+//!   and is not measured unless that binary runs.
 //! - Blame: warm `Store::node_history` lookups over cargo's `src/` and
 //!   `crates/` definitions. Gate: under 50 ms.
 //!
@@ -75,7 +76,7 @@ fn run(args: &Args) -> Result<()> {
     let references = snapshot::references(&files, REFERENCE_SAMPLE);
     let lexical_pass = snapshot::references_ok(&references, REFERENCE_SAMPLE);
     println!(
-        "[references] oracle lexical labeled {} recall {}/{} {} (not the spec rust-analyzer gate)",
+        "[references] oracle lexical labeled {} recall {}/{} {} (stand-in for rust-analyzer)",
         references.labeled,
         references.hit,
         references.expected,
@@ -101,7 +102,7 @@ fn run(args: &Args) -> Result<()> {
         pass_fail(blame_pass)
     );
 
-    let ok = identity_pass && blame_pass;
+    let ok = identity_pass && lexical_pass && blame_pass;
     println!("m2 {}", pass_fail(ok));
     if !ok {
         std::process::exit(1);

@@ -5,7 +5,9 @@
 //! stability sample.
 //!
 //! Rename precision uses a different labeler than ADR 0007: a hord rename is
-//! precise when the stripped bodies still share at least half their tokens.
+//! precise when the CST leaves still share at least half their tokens.
+//! Leaves are split one at a time. Concatenating the stripped body first
+//! glues adjacent tokens (`pub` + `fn` becomes `pubfn`) and under-counts.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -18,9 +20,6 @@ use hord_lang_rust::RustAdapter;
 use crate::git;
 
 const MAX_BYTES: usize = 500_000;
-/// Independent of ADR 0007's 0.8 tree-edit ratio. A hord rename counts as
-/// precise when the stripped bodies still share this much token mass.
-const RENAME_JACCARD: f64 = 0.5;
 
 pub(crate) struct IdentityReport {
     pub commits: usize,
@@ -34,7 +33,9 @@ struct Site {
     oid: ObjectId,
     kind: String,
     qname: String,
-    tokens: BTreeSet<String>,
+    /// Alphanumeric runs of each CST leaf, lowercased, excluding the
+    /// function's own simple name.
+    leaves: BTreeSet<String>,
 }
 
 pub(crate) fn measure(git_dir: &Path, sample: usize, max_commits: usize) -> Result<IdentityReport> {
@@ -77,7 +78,15 @@ pub(crate) fn measure(git_dir: &Path, sample: usize, max_commits: usize) -> Resu
             {
                 continue;
             }
-            score_file(&adapter, &old_bytes, &new_bytes, sample, &mut report);
+            score_file(
+                &adapter,
+                &old_path,
+                &new_path,
+                &old_bytes,
+                &new_bytes,
+                sample,
+                &mut report,
+            );
         }
     }
     Ok(report)
@@ -85,6 +94,8 @@ pub(crate) fn measure(git_dir: &Path, sample: usize, max_commits: usize) -> Resu
 
 fn score_file(
     adapter: &RustAdapter,
+    old_path: &str,
+    new_path: &str,
     old_bytes: &[u8],
     new_bytes: &[u8],
     sample: usize,
@@ -138,14 +149,36 @@ fn score_file(
             continue;
         };
         report.hord_renames += 1;
-        if jaccard(&old_site.tokens, &new_site.tokens) >= RENAME_JACCARD {
+        if shares_half(&old_site.leaves, &new_site.leaves) {
             report.precise_renames += 1;
+        } else {
+            let overlap = jaccard(&old_site.leaves, &new_site.leaves);
+            let only_old = preview(old_site.leaves.difference(&new_site.leaves));
+            let only_new = preview(new_site.leaves.difference(&old_site.leaves));
+            eprintln!(
+                "[identity] imprecise rename {old_path} {} -> {new_path} {} overlap {overlap:.2} only-old [{only_old}] only-new [{only_new}]",
+                old_site.qname, new_site.qname
+            );
         }
     }
 }
 
 fn is_function(kind: &str) -> bool {
     kind == "function_item" || kind == "function_signature_item"
+}
+
+fn preview<'a>(tokens: impl Iterator<Item = &'a String>) -> String {
+    tokens
+        .take(8)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `true` when `|intersection| / |union| >= 1/2`. Empty sets do not match.
+fn shares_half(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
+    let union = a.union(b).count();
+    union > 0 && a.intersection(b).count() * 2 >= union
 }
 
 fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
@@ -181,13 +214,11 @@ fn walk(
         && let Some(qname) = qname(adapter, tree, ancestors, node)
     {
         let simple = qname.as_str().rsplit("::").next().unwrap_or(qname.as_str());
-        let stripped = tree.stripped(oid).unwrap_or_default();
-        let text = String::from_utf8_lossy(stripped);
         out.push(Site {
             oid,
             kind: node.kind.as_str().to_string(),
             qname: qname.as_str().to_string(),
-            tokens: tokens(&text, simple),
+            leaves: leaf_tokens(tree, oid, simple),
         });
     }
     ancestors.push(oid);
@@ -215,6 +246,29 @@ fn tokens(text: &str, simple: &str) -> BTreeSet<String> {
         .filter(|tok| tok.len() >= 2 && !tok.eq_ignore_ascii_case(simple))
         .map(|tok| tok.to_ascii_lowercase())
         .collect()
+}
+
+fn leaf_tokens(tree: &NodeTree, oid: ObjectId, simple: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    collect_leaf_tokens(tree, oid, simple, &mut out);
+    out
+}
+
+fn collect_leaf_tokens(tree: &NodeTree, oid: ObjectId, simple: &str, out: &mut BTreeSet<String>) {
+    let Some(node) = tree.get(oid) else {
+        return;
+    };
+    if node.children.is_empty() {
+        if let Some(bytes) = tree.stripped(oid)
+            && let Ok(text) = std::str::from_utf8(bytes)
+        {
+            out.extend(tokens(text, simple));
+        }
+        return;
+    }
+    for child in &node.children {
+        collect_leaf_tokens(tree, *child, simple, out);
+    }
 }
 
 pub(crate) fn identity_ok(report: &IdentityReport, sample: usize) -> bool {

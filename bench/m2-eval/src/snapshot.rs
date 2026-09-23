@@ -96,6 +96,9 @@ pub(crate) fn references(files: &[FileSnap], sample: usize) -> ReferenceReport {
         expected: 0,
         hit: 0,
     };
+    let mut miss_parents = BTreeMap::<String, usize>::new();
+    let mut miss_names = BTreeMap::<String, usize>::new();
+    let mut miss_examples = 0usize;
     for file in files {
         if report.labeled >= sample {
             break;
@@ -110,13 +113,18 @@ pub(crate) fn references(files: &[FileSnap], sample: usize) -> ReferenceReport {
             let Some(node) = file.tree.get(site.oid) else {
                 continue;
             };
-            let stripped = file.tree.stripped(site.oid).unwrap_or_default();
-            let text = String::from_utf8_lossy(stripped);
             let own = site.qname.rsplit("::").next().unwrap_or("");
-            let expected: BTreeSet<&str> = tokens(&text)
-                .into_iter()
-                .filter(|tok| *tok != own && simple_names.contains(*tok))
-                .collect();
+            let leaves = identifier_leaves(&file.tree, site.oid);
+            let mut expected: Vec<(&str, &str)> = Vec::new();
+            let mut seen = BTreeSet::new();
+            for leaf in &leaves {
+                if leaf.text == own || leaf.text.len() < 4 || !simple_names.contains(leaf.text) {
+                    continue;
+                }
+                if seen.insert(leaf.text) {
+                    expected.push((leaf.text, leaf.parent));
+                }
+            }
             if expected.is_empty() {
                 continue;
             }
@@ -125,14 +133,55 @@ pub(crate) fn references(files: &[FileSnap], sample: usize) -> ReferenceReport {
                 .into_iter()
                 .map(|name| name.name.as_str().to_string())
                 .collect();
-            for name in expected {
+            let mut missed_here = Vec::new();
+            for (name, parent) in &expected {
                 report.expected += 1;
                 if covers(&hord, name) {
                     report.hit += 1;
+                } else {
+                    *miss_parents.entry((*parent).to_string()).or_insert(0) += 1;
+                    *miss_names.entry((*name).to_string()).or_insert(0) += 1;
+                    if missed_here.len() < 8 {
+                        missed_here.push((*name, *parent));
+                    }
                 }
+            }
+            if !missed_here.is_empty() && miss_examples < 12 {
+                eprintln!(
+                    "[references] miss {} expected {} hit-gap {} e.g. {}",
+                    site.qname,
+                    expected.len(),
+                    missed_here.len(),
+                    missed_here
+                        .iter()
+                        .map(|(name, parent)| format!("{name}@{parent}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                miss_examples += 1;
             }
             report.labeled += 1;
         }
+    }
+    if !miss_parents.is_empty() {
+        let mut parents: Vec<_> = miss_parents.into_iter().collect();
+        parents.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let shown = parents
+            .iter()
+            .take(12)
+            .map(|(kind, n)| format!("{kind}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("[references] miss parents {shown}");
+        let mut names: Vec<_> = miss_names.into_iter().collect();
+        names.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let shown = names
+            .iter()
+            .take(12)
+            .map(|(name, n)| format!("{name}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("[references] miss names {shown}");
     }
     report
 }
@@ -288,15 +337,49 @@ fn is_named_item(kind: &str) -> bool {
     )
 }
 
-fn tokens(text: &str) -> BTreeSet<&str> {
-    text.split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|tok| tok.len() >= 2)
-        .collect()
+struct IdentLeaf<'a> {
+    text: &'a str,
+    parent: &'a str,
+}
+
+/// Identifier, type, and field leaves under `root`. Strings and comments are
+/// not leaves of these kinds, so they are not expected references.
+fn identifier_leaves<'a>(tree: &'a NodeTree, root: ObjectId) -> Vec<IdentLeaf<'a>> {
+    let mut out = Vec::new();
+    collect_idents(tree, root, "", &mut out);
+    out
+}
+
+fn collect_idents<'a>(
+    tree: &'a NodeTree,
+    oid: ObjectId,
+    parent: &'a str,
+    out: &mut Vec<IdentLeaf<'a>>,
+) {
+    let Some(node) = tree.get(oid) else {
+        return;
+    };
+    let kind = node.kind.as_str();
+    if node.children.is_empty()
+        && matches!(kind, "identifier" | "type_identifier" | "field_identifier")
+        && let Some(bytes) = tree.stripped(oid)
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        out.push(IdentLeaf { text, parent });
+        return;
+    }
+    for child in &node.children {
+        collect_idents(tree, *child, kind, out);
+    }
 }
 
 fn covers(hord: &BTreeSet<String>, simple: &str) -> bool {
-    hord.iter()
-        .any(|name| name == simple || name.rsplit("::").next().is_some_and(|tail| tail == simple))
+    hord.iter().any(|name| {
+        let name = name.strip_prefix('.').unwrap_or(name);
+        // A path reference emits every segment (`Platform::new` references
+        // `Platform`). Method calls are stored as `.name`.
+        name.split("::").any(|segment| segment == simple)
+    })
 }
 
 fn pointer(tree: &NodeTree, target: ObjectId) -> Option<Vec<u32>> {
