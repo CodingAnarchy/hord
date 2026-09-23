@@ -6,6 +6,7 @@
 //!
 //! Tier 2 resolves names with tree-sitter: module tree from `mod` items and
 //! file layout, `use` paths, and reference edges by name inside the crate.
+//! A path dependency whose source is in the snapshot resolves too (ADR 0010).
 //! The resolver does not do trait resolution or type inference. It is sound
 //! for write sets (every definition kind gets a qualified name) and
 //! conservative for read sets (ambiguous names produce one edge per
@@ -16,11 +17,13 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod cst;
+mod manifest;
 mod resolve;
 
 use hord_core::{LangId, Node, NodeId, NodeKind, QualifiedName, RepoPath};
 use hord_lang::{LangAdapter, NameRef, NodeTree, ParseError, ResolveCtx, Tier};
 
+pub use manifest::ManifestFile;
 pub use resolve::RustFile;
 
 /// tree-sitter-rust adapter (spec §4.2). Tier 1 syntax plus Tier 2 names.
@@ -103,9 +106,41 @@ impl RustAdapter {
     /// A single crate root is the Rust path `crate`. Several roots in one
     /// context (lib and bin, integration tests) are disambiguated by
     /// repository path so their modules do not collide.
+    ///
+    /// The name index for a context is built on the first
+    /// [`LangAdapter::references`], [`LangAdapter::resolve`], or
+    /// [`LangAdapter::test_targets`] call and reused until the context
+    /// changes. Repeated calls return the same edges.
     #[must_use]
     pub fn resolve_context(&self, files: &[RustFile<'_>]) -> ResolveCtx {
-        resolve::resolve_context(files)
+        self.resolve_context_with(files, &[])
+    }
+
+    /// Like [`Self::resolve_context`], and also follow path dependencies in
+    /// `manifests` (ADR 0010).
+    #[must_use]
+    pub fn resolve_context_with(
+        &self,
+        files: &[RustFile<'_>],
+        manifests: &[ManifestFile<'_>],
+    ) -> ResolveCtx {
+        resolve::resolve_context_with(files, manifests)
+    }
+
+    /// Module path of each file, aligned with `files`.
+    #[must_use]
+    pub fn file_modules(&self, files: &[RustFile<'_>]) -> Vec<String> {
+        resolve::file_modules(files)
+    }
+
+    /// Path-dependency links `(from crate module, extern name, target module)`.
+    #[must_use]
+    pub fn manifest_links(
+        &self,
+        files: &[RustFile<'_>],
+        manifests: &[ManifestFile<'_>],
+    ) -> Vec<(String, String, String)> {
+        resolve::manifest_links(files, manifests)
     }
 }
 

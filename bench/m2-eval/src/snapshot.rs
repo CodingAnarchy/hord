@@ -10,7 +10,7 @@ use hord_core::{
     RepoPath, Timestamp,
 };
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree, default_identify};
-use hord_lang_rust::{RustAdapter, RustFile};
+use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
 use hord_store::Store;
 
 use crate::git;
@@ -18,15 +18,34 @@ use crate::git;
 const MAX_BYTES: usize = 500_000;
 
 pub(crate) struct FileSnap {
-    path: RepoPath,
-    tree: NodeTree,
-    ids: BTreeMap<ObjectId, NodeId>,
+    pub path: RepoPath,
+    pub tree: NodeTree,
+    pub ids: BTreeMap<ObjectId, NodeId>,
+}
+
+impl FileSnap {
+    /// Under cargo's `src/` or `crates/`, the scope of the §12 samples.
+    pub(crate) fn in_scope(&self) -> bool {
+        matches!(
+            self.path.components().first().map(String::as_str),
+            Some("src" | "crates")
+        )
+    }
 }
 
 pub(crate) struct ReferenceReport {
     pub labeled: usize,
     pub expected: usize,
     pub hit: usize,
+    /// The labeled functions, in sample order.
+    pub sample: Vec<Sampled>,
+}
+
+/// One labeled function definition.
+pub(crate) struct Sampled {
+    pub path: String,
+    pub oid: ObjectId,
+    pub qname: String,
 }
 
 pub(crate) struct BlameReport {
@@ -34,13 +53,13 @@ pub(crate) struct BlameReport {
     pub max_ms: f64,
 }
 
+/// Every `.rs` file at HEAD. Samples use [`FileSnap::in_scope`] files; the
+/// rust-analyzer oracle resolves over all of them, since its references may
+/// sit in `tests/` or other workspace members.
 pub(crate) fn load_head(git_dir: &Path) -> Result<Vec<FileSnap>> {
     let adapter = RustAdapter;
     let mut files = Vec::new();
     for path in git::head_rust_files(git_dir)? {
-        if !(path.starts_with("src/") || path.starts_with("crates/")) {
-            continue;
-        }
         let bytes = git::blob(git_dir, "HEAD", &path).unwrap_or_default();
         if bytes.is_empty() || bytes.len() > MAX_BYTES {
             continue;
@@ -62,7 +81,40 @@ pub(crate) fn load_head(git_dir: &Path) -> Result<Vec<FileSnap>> {
     Ok(files)
 }
 
-pub(crate) fn references(files: &[FileSnap], sample: usize) -> ReferenceReport {
+pub(crate) struct ManifestSnap {
+    pub path: RepoPath,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) fn load_manifests(git_dir: &Path) -> Result<Vec<ManifestSnap>> {
+    let raw = git::git(git_dir, &["ls-tree", "-r", "--name-only", "HEAD"])?;
+    let mut out = Vec::new();
+    for path in String::from_utf8(raw)?.lines() {
+        if !path.ends_with("Cargo.toml") {
+            continue;
+        }
+        let Ok(bytes) = git::blob(git_dir, "HEAD", path) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_BYTES {
+            continue;
+        }
+        let Ok(repo_path) = path.parse::<RepoPath>() else {
+            continue;
+        };
+        out.push(ManifestSnap {
+            path: repo_path,
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) fn references(
+    files: &[&FileSnap],
+    manifests: &[ManifestSnap],
+    sample: usize,
+) -> ReferenceReport {
     let adapter = RustAdapter;
     let views: Vec<RustFile<'_>> = files
         .iter()
@@ -72,7 +124,14 @@ pub(crate) fn references(files: &[FileSnap], sample: usize) -> ReferenceReport {
             ids: &file.ids,
         })
         .collect();
-    let ctx = adapter.resolve_context(&views);
+    let manifest_views: Vec<ManifestFile<'_>> = manifests
+        .iter()
+        .map(|manifest| ManifestFile {
+            path: &manifest.path,
+            bytes: &manifest.bytes,
+        })
+        .collect();
+    let ctx = adapter.resolve_context_with(&views, &manifest_views);
     let mut counts = BTreeMap::<String, usize>::new();
     for file in files {
         for site in defs(&adapter, &file.tree) {
@@ -95,6 +154,7 @@ pub(crate) fn references(files: &[FileSnap], sample: usize) -> ReferenceReport {
         labeled: 0,
         expected: 0,
         hit: 0,
+        sample: Vec::new(),
     };
     let mut miss_parents = BTreeMap::<String, usize>::new();
     let mut miss_names = BTreeMap::<String, usize>::new();
@@ -161,6 +221,11 @@ pub(crate) fn references(files: &[FileSnap], sample: usize) -> ReferenceReport {
                 miss_examples += 1;
             }
             report.labeled += 1;
+            report.sample.push(Sampled {
+                path: file.path.to_string(),
+                oid: site.oid,
+                qname: site.qname.clone(),
+            });
         }
     }
     if !miss_parents.is_empty() {
@@ -190,7 +255,7 @@ pub(crate) fn references_ok(report: &ReferenceReport, sample: usize) -> bool {
     report.labeled >= sample && report.expected > 0 && report.hit * 100 >= report.expected * 95
 }
 
-pub(crate) fn blame(files: &[FileSnap]) -> Result<BlameReport> {
+pub(crate) fn blame(files: &[&FileSnap]) -> Result<BlameReport> {
     let dir = std::env::temp_dir().join(format!("hord-m2-blame-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).context("blame temp dir")?;

@@ -5,23 +5,25 @@
 //!   keep their `NodeId`. Rename precision is separate: ≥ 95% of hord
 //!   function renames still share half their CST-leaf tokens. That labeler
 //!   is not ADR 0007's tree-edit distance.
-//! - References: 300 functions at cargo HEAD. Expected names are unique
-//!   definition simple-names that occur as identifier, type, or field
-//!   leaves in the body. Gate: hord recall ≥ 95%. This is a lexical
-//!   stand-in. The spec's rust-analyzer comparison is reported separately
-//!   and is not measured unless that binary runs.
+//! - References: 300 functions at cargo HEAD (`src/` and `crates/`).
+//!   The spec gate (ADR 0011) is a syntactic name walk: paths, unresolved
+//!   calls and selectors, and attributes on the next definition. Recall of
+//!   those sites is ≥ 95%. rust-analyzer find-references is printed and is
+//!   not the pass/fail bar. A lexical stand-in is also printed.
 //! - Blame: warm `Store::node_history` lookups over cargo's `src/` and
 //!   `crates/` definitions. Gate: under 50 ms.
 //!
 //! ```text
-//! cargo run -p hord-eval-m2 --release --offline -- --skip-rust-analyzer
+//! cargo run -p hord-eval-m2 --release --offline
 //! ```
 
 #![forbid(unsafe_code)]
 
 mod git;
 mod identity;
+mod ra;
 mod snapshot;
+mod syntactic;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,27 +73,60 @@ fn run(args: &Args) -> Result<()> {
         pass_fail(identity_pass)
     );
 
-    eprintln!("[snapshot] parsing cargo src/ and crates/");
-    let files = snapshot::load_head(&git_dir)?;
-    let references = snapshot::references(&files, REFERENCE_SAMPLE);
+    eprintln!("[snapshot] parsing cargo HEAD");
+    let all = snapshot::load_head(&git_dir)?;
+    let files: Vec<&snapshot::FileSnap> = all.iter().filter(|file| file.in_scope()).collect();
+    let manifests = snapshot::load_manifests(&git_dir)?;
+    let references = snapshot::references(&files, &manifests, REFERENCE_SAMPLE);
+    let syntactic = syntactic::measure(&all, &manifests, &references.sample);
+    let syntactic_pass = syntactic::ok(&syntactic, REFERENCE_SAMPLE);
+    println!(
+        "[references] oracle syntactic labeled {} recall {}/{} {}",
+        syntactic.labeled,
+        syntactic.hit,
+        syntactic.expected,
+        pass_fail(syntactic_pass)
+    );
     let lexical_pass = snapshot::references_ok(&references, REFERENCE_SAMPLE);
     println!(
-        "[references] oracle lexical labeled {} recall {}/{} {} (stand-in for rust-analyzer)",
+        "[references] oracle lexical labeled {} recall {}/{} {} (stand-in, not the spec gate)",
         references.labeled,
         references.hit,
         references.expected,
         pass_fail(lexical_pass)
     );
 
-    if args.skip_rust_analyzer || !rust_analyzer_runs() {
+    let ra_pass = if args.skip_rust_analyzer {
+        println!("[references-ra] not measured (skipped); printed only, not the spec gate");
+        None
+    } else if !rust_analyzer_runs() {
         println!(
-            "[references-ra] not measured (spec oracle is rust-analyzer find-references; binary unavailable or skipped)"
+            "[references-ra] not measured (rust-analyzer binary unavailable); printed only, not the spec gate"
         );
+        None
     } else {
+        let report = ra::measure(&git_dir, &all, &manifests, &references.sample)?;
+        for def in &report.unindexed {
+            eprintln!("[references-ra] not indexed {def}");
+        }
+        for miss in &report.misses {
+            eprintln!(
+                "[references-ra] miss {} at {} in {} ({})",
+                miss.def, miss.site, miss.enclosing, miss.reason
+            );
+        }
+        let pass = ra::ok(&report, REFERENCE_SAMPLE);
         println!(
-            "[references-ra] binary present; find-references sample is not wired yet, not a gate"
+            "[references-ra] oracle rust-analyzer defs {} indexed {} recall {}/{} ({:.2}%) {}",
+            report.defs,
+            report.indexed,
+            report.hit,
+            report.sites,
+            percent(report.hit, report.sites),
+            pass_fail(pass)
         );
-    }
+        Some(pass)
+    };
 
     let blame = snapshot::blame(&files)?;
     let blame_pass = snapshot::blame_ok(&blame);
@@ -102,7 +137,8 @@ fn run(args: &Args) -> Result<()> {
         pass_fail(blame_pass)
     );
 
-    let ok = identity_pass && lexical_pass && blame_pass;
+    let ok = identity_pass && syntactic_pass && blame_pass;
+    let _ = (lexical_pass, ra_pass);
     println!("m2 {}", pass_fail(ok));
     if !ok {
         std::process::exit(1);
@@ -115,6 +151,14 @@ fn rust_analyzer_runs() -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn percent(hit: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        hit as f64 * 100.0 / total as f64
+    }
 }
 
 fn pass_fail(ok: bool) -> &'static str {

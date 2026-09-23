@@ -1,6 +1,7 @@
 //! [`LangAdapter`] trait and supporting types (spec §4.3).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
 
@@ -69,6 +70,13 @@ struct FileRoot {
     module: QualifiedName,
 }
 
+#[derive(Clone, Debug)]
+struct Link {
+    from: QualifiedName,
+    name: QualifiedName,
+    target: QualifiedName,
+}
+
 /// Snapshot-scoped context for Tier 2 name resolution (spec §4.3).
 ///
 /// Holds the definitions, imports, and file modules a [`LangAdapter`] needs
@@ -81,13 +89,37 @@ pub struct ResolveCtx {
     definitions: Vec<Definition>,
     imports: Vec<Import>,
     files: Vec<FileRoot>,
+    links: Vec<Link>,
+    /// Changes whenever a definition, import, file, or link is added.
+    ///
+    /// Adapters use this to reuse a name index. Equal stamps mean equal
+    /// contents, including two clones that have not been edited since.
+    stamp: u64,
+}
+
+fn fresh_stamp() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl ResolveCtx {
     /// An empty resolution context.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            stamp: fresh_stamp(),
+            ..Self::default()
+        }
+    }
+
+    /// Identity of this context's contents.
+    ///
+    /// Stable until [`Self::add_definition`], [`Self::add_import`],
+    /// [`Self::add_file`], or [`Self::add_link`]. Adapters may cache an
+    /// index keyed by it.
+    #[must_use]
+    pub fn stamp(&self) -> u64 {
+        self.stamp
     }
 
     /// Number of definitions in this snapshot.
@@ -119,6 +151,7 @@ impl ResolveCtx {
         is_test: bool,
         cfg_test: bool,
     ) {
+        self.stamp = fresh_stamp();
         self.definitions.push(Definition {
             node_id,
             object_id,
@@ -142,6 +175,7 @@ impl ResolveCtx {
         path: impl Into<QualifiedName>,
         glob: bool,
     ) {
+        self.stamp = fresh_stamp();
         self.imports.push(Import {
             module: module.into(),
             local: local.into(),
@@ -152,6 +186,7 @@ impl ResolveCtx {
 
     /// Record a file root's module, for nodes that are not themselves definitions.
     pub fn add_file(&mut self, object_id: ObjectId, module: impl Into<QualifiedName>) {
+        self.stamp = fresh_stamp();
         self.files.push(FileRoot {
             object_id,
             module: module.into(),
@@ -205,6 +240,34 @@ impl ResolveCtx {
     pub fn for_each_file(&self, mut visit: impl FnMut(ObjectId, &QualifiedName)) {
         for f in &self.files {
             visit(f.object_id, &f.module);
+        }
+    }
+
+    /// Record that `name` in the crate `from` denotes the module `target`.
+    ///
+    /// Language adapters use this for a manifest link whose target source is
+    /// in the snapshot (ADR 0010). `from` is that adapter's crate key.
+    pub fn add_link(
+        &mut self,
+        from: impl Into<QualifiedName>,
+        name: impl Into<QualifiedName>,
+        target: impl Into<QualifiedName>,
+    ) {
+        self.stamp = fresh_stamp();
+        self.links.push(Link {
+            from: from.into(),
+            name: name.into(),
+            target: target.into(),
+        });
+    }
+
+    /// Visit every link in insertion order (`from`, `name`, `target`).
+    pub fn for_each_link(
+        &self,
+        mut visit: impl FnMut(&QualifiedName, &QualifiedName, &QualifiedName),
+    ) {
+        for link in &self.links {
+            visit(&link.from, &link.name, &link.target);
         }
     }
 }

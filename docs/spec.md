@@ -246,8 +246,8 @@ So: **yes, Tier 2 is a distinct implementation per language, but it is a thin ad
 ### 4.2 Rust adapter strategy (DECIDED for M1–M2, OPEN beyond)
 
 - **Tier 1:** `tree-sitter-rust`. Lossless CST with trivia attachment per §3.3.
-- **Tier 2:** Start with a tree-sitter-based resolver: module tree from `mod` items and file layout, `use` resolution, definition extraction, reference edges by name resolution within the crate. This is deliberately approximate (no trait resolution, no type inference). It must be **sound for write sets** (every edited definition is identified) and **conservative for read sets** (over-approximate references).
-- **OPEN (M2+):** replace or augment the resolver with `rust-analyzer` crates (`ra_ap_syntax`, `ra_ap_hir`, `ra_ap_ide_db`) for precise references and macro-aware analysis. Evaluate cost: build time, API stability, memory. Decide via ADR after M2 metrics.
+- **Tier 2:** Start with a tree-sitter-based resolver: module tree from `mod` items and file layout, `use` resolution, definition extraction, reference edges by name resolution within the crate. A name whose target package is in the snapshot and linked by a manifest also resolves (ADR 0010). For Rust that link is a path dependency, including one inherited with `workspace = true`, not workspace membership alone. This is deliberately approximate (no trait resolution, no type inference, no feature selection). It must be **sound for write sets** (every edited definition is identified) and **conservative for read sets** (over-approximate references).
+- **Tier 2 backend (ADR 0009, ADR 0011):** do not depend on `ra_ap_syntax`, `ra_ap_hir`, or `ra_ap_ide_db`. The resolver stays tree-sitter. The §12 pass/fail recall check is a syntactic name walk. rust-analyzer find-references may be printed and does not authorize embedding those crates.
 - **Macros:** `macro_rules!` and proc-macro *invocations* are opaque `Node`s at Tier 1/2. Their expansion is not stored. Reference edges from a macro invocation are the identifiers lexically present in the invocation tokens (conservative). `#[test]` and `#[cfg(test)]` are recognized by attribute inspection.
 - **Tier 3:** `cargo check`, `cargo test`, `cargo clippy`, `cargo bench` via `hord-verify-rust`. Test selection uses `cargo test -p <crate> <filter>` initially; finer selection is OPEN.
 
@@ -747,9 +747,9 @@ Deliver: `hord-identity`, Rust Tier 2 adapter (definitions, qualified names, ref
 
 Accept:
 - **Identity stability:** over cargo's history, ≥ 97% of definitions that a human would call "the same function" across consecutive commits keep their `NodeId` (measured on a 500-definition labeled sample). Rename detection precision ≥ 95%.
-- Reference edges: on a labeled sample of 300 definitions, recall ≥ 95% against rust-analyzer's "find references" (precision is secondary; over-approximation is acceptable).
+- Reference edges: on a labeled sample of 300 definitions, recall ≥ 95% against a syntactic name walk (ADR 0011). A site counts when a path, an unresolved call or selector, or an immediately preceding attribute names the definition without types or macro expansion. Precision is secondary; over-approximation is acceptable. rust-analyzer find-references is printed and is not the pass/fail bar.
 - `hord blame` on any definition in cargo answers in < 50 ms from a warm index.
-- ADR: decision on rust-analyzer integration for Tier 2 precision.
+- ADR 0009: do not embed rust-analyzer crates. ADR 0011: the recall gate is the syntactic walk, not find-references.
 
 ### M3 — Transactions and the lander
 
@@ -821,7 +821,7 @@ Each should become an ADR. Listed roughly in the order they will block progress.
 
 1. Identity heuristics: similarity metric and threshold for rename detection (§3.4). Blocks M2.
 2. Diff algorithm choice and cost model (§5.1). Blocks M1.
-3. rust-analyzer as Tier 2 backend: cost/benefit (§4.2). Decide after M2.
+3. rust-analyzer as Tier 2 backend: decided by ADR 0009 (do not embed the crates).
 4. Read-set collection fidelity: how much to trust access logs vs. adapter references vs. declarations; whether to require declarations from agents. Blocks M3.
 5. Test selection for Rust below crate granularity (§4.2). Blocks M4 efficiency target.
 6. Policy language beyond TOML (§7.2). Decide by M5.

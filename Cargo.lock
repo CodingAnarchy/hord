@@ -1686,6 +1686,8 @@ dependencies = [
  "hord-lang",
  "hord-lang-rust",
  "hord-store",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1724,6 +1726,7 @@ version = "0.0.0"
 dependencies = [
  "hord-core",
  "hord-lang",
+ "hord-lang-toml",
  "proptest",
  "tree-sitter",
  "tree-sitter-rust",

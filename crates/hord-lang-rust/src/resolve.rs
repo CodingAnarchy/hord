@@ -1,17 +1,22 @@
 //! Tier 2 Rust name resolution (spec §4.2).
 //!
 //! Tree-sitter only: module tree from `mod` items and file layout, `use`
-//! paths, definition extraction, and reference edges by name inside the
-//! crate. No trait resolution and no type inference.
+//! paths, definition extraction, and reference edges by name. No trait
+//! resolution, no type inference, and no macro expansion.
+//!
+//! A path resolves inside this crate, or across a manifest path dependency
+//! whose target is in the snapshot (ADR 0010). A call with no resolved path,
+//! and any selector, keeps every same-named function or method in this crate
+//! and those linked packages (ADR 0011). An outer attribute is part of the
+//! next definition, so names written on it are references of that definition.
 //!
 //! Write sets: every definition kind [`RustAdapter::is_definition`] accepts
 //! gets a [`QualifiedName`] from its ancestor chain (or from the name stored
-//! at parse). Read sets over-approximate: ambiguous names and method calls
-//! become one edge per candidate. `macro_rules` and proc-macro invocations
-//! are not expanded; edges are the identifiers lexically present.
-//! `#[test]` and `#[cfg(test)]` are read off attributes.
+//! at parse). Read sets over-approximate: ambiguous names become one edge
+//! per candidate. `#[test]` and `#[cfg(test)]` are read off attributes.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use hord_core::{Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
 use hord_lang::{LangAdapter, NameRef, NodeTree, ResolveCtx};
@@ -58,7 +63,35 @@ pub(crate) fn qualified_name(path: &[&Node], node: &Node) -> Option<QualifiedNam
 }
 
 /// Index `files` into a [`ResolveCtx`].
-pub(crate) fn resolve_context(files: &[RustFile<'_>]) -> ResolveCtx {
+pub(crate) fn file_modules(files: &[RustFile<'_>]) -> Vec<String> {
+    assign_modules(files)
+        .into_iter()
+        .map(|module| module.join("::"))
+        .collect()
+}
+
+pub(crate) fn manifest_links(
+    files: &[RustFile<'_>],
+    manifests: &[crate::manifest::ManifestFile<'_>],
+) -> Vec<(String, String, String)> {
+    let modules = assign_modules(files);
+    let mut ctx = ResolveCtx::new();
+    crate::manifest::install_links(files, &modules, manifests, &mut ctx);
+    let mut out = Vec::new();
+    ctx.for_each_link(|from, name, target| {
+        out.push((
+            from.as_str().to_owned(),
+            name.as_str().to_owned(),
+            target.as_str().to_owned(),
+        ));
+    });
+    out
+}
+
+pub(crate) fn resolve_context_with(
+    files: &[RustFile<'_>],
+    manifests: &[crate::manifest::ManifestFile<'_>],
+) -> ResolveCtx {
     let modules = assign_modules(files);
     let mut ctx = ResolveCtx::new();
     for (file, module) in files.iter().zip(modules.iter()) {
@@ -67,40 +100,67 @@ pub(crate) fn resolve_context(files: &[RustFile<'_>]) -> ResolveCtx {
         }
         index_file(file, module, &mut ctx);
     }
+    crate::manifest::install_links(files, &modules, manifests, &mut ctx);
     ctx
 }
 
 pub(crate) fn references(ctx: &ResolveCtx, node: &Node) -> Vec<NameRef> {
-    let idx = Index::build(ctx);
-    refs_from_node(&idx, node)
+    with_index(ctx, |idx| refs_from_node(idx, node))
 }
 
 pub(crate) fn resolve_name(ctx: &ResolveCtx, name: &NameRef) -> Option<NodeId> {
     if let Some(id) = name.resolved {
         return real_id(id);
     }
-    let idx = Index::build(ctx);
-    let scope = name.scope.as_ref().map(QualifiedName::as_str);
-    let hits = idx.lookup(scope, None, name.name.as_str());
-    let mut ids: Vec<NodeId> = hits.finals.into_iter().filter_map(real_id).collect();
-    ids.sort();
-    ids.dedup();
-    if ids.len() == 1 { Some(ids[0]) } else { None }
+    with_index(ctx, |idx| {
+        let scope = name.scope.as_ref().map(QualifiedName::as_str);
+        let hits = idx.lookup(scope, None, name.name.as_str());
+        let mut ids: Vec<NodeId> = hits.finals.into_iter().filter_map(real_id).collect();
+        ids.sort();
+        ids.dedup();
+        if ids.len() == 1 { Some(ids[0]) } else { None }
+    })
 }
 
 pub(crate) fn test_targets(ctx: &ResolveCtx, test: &Node) -> Vec<NodeId> {
-    let idx = Index::build(ctx);
-    let mut ids = Vec::new();
-    if idx.is_test_node(test) {
-        ids.extend(resolved_ids(&refs_from_node(&idx, test)));
-    }
-    ids.extend(inner_test_targets(&idx, test));
-    if let Some(self_id) = idx.node_id_of(test) {
-        ids.retain(|id| *id != self_id);
-    }
-    ids.sort();
-    ids.dedup();
-    ids
+    with_index(ctx, |idx| {
+        let mut ids = Vec::new();
+        if idx.is_test_node(test) {
+            ids.extend(resolved_ids(&refs_from_node(idx, test)));
+        }
+        ids.extend(inner_test_targets(idx, test));
+        if let Some(self_id) = idx.node_id_of(test) {
+            ids.retain(|id| *id != self_id);
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    })
+}
+
+/// One name index per [`ResolveCtx::stamp`]. Building it walks every
+/// definition; reference queries on one snapshot must not repeat that.
+fn with_index<R>(ctx: &ResolveCtx, f: impl FnOnce(&Index) -> R) -> R {
+    static CACHE: Mutex<Option<(u64, Arc<Index>)>> = Mutex::new(None);
+    let stamp = ctx.stamp();
+    let idx = {
+        let mut slot = CACHE.lock().expect("rust name index");
+        if let Some((cached, idx)) = slot.as_ref()
+            && *cached == stamp
+        {
+            Arc::clone(idx)
+        } else {
+            let idx = Arc::new(Index::build(ctx));
+            *slot = Some((stamp, Arc::clone(&idx)));
+            idx
+        }
+    };
+    f(&idx)
+}
+
+#[cfg(test)]
+pub(crate) fn index_builds() -> u64 {
+    INDEX_BUILDS.with(std::cell::Cell::get)
 }
 
 fn real_id(id: NodeId) -> Option<NodeId> {
@@ -1143,9 +1203,13 @@ struct Index {
     direct: HashMap<(String, String), Vec<usize>>,
     /// Simple name → associated definition indices.
     associated: HashMap<String, Vec<usize>>,
+    /// Simple name → function and method indices (bare-call candidates).
+    callables: HashMap<String, Vec<usize>>,
     by_object: HashMap<ObjectId, usize>,
     files: HashMap<ObjectId, String>,
     crate_keys: BTreeSet<String>,
+    /// Crate key → (extern name, target module).
+    externs: HashMap<String, Vec<(String, String)>>,
 }
 
 struct PathHits {
@@ -1177,17 +1241,32 @@ enum Head {
     Missing,
 }
 
+#[cfg(test)]
+thread_local! {
+    static INDEX_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Index {
     fn build(ctx: &ResolveCtx) -> Self {
+        #[cfg(test)]
+        INDEX_BUILDS.with(|n| n.set(n.get() + 1));
         let mut idx = Self {
             defs: Vec::new(),
             imps: Vec::new(),
             direct: HashMap::new(),
             associated: HashMap::new(),
+            callables: HashMap::new(),
             by_object: HashMap::new(),
             files: HashMap::new(),
             crate_keys: BTreeSet::new(),
+            externs: HashMap::new(),
         };
+        ctx.for_each_link(|from, name, target| {
+            idx.externs
+                .entry(from.as_str().to_owned())
+                .or_default()
+                .push((name.as_str().to_owned(), target.as_str().to_owned()));
+        });
         ctx.for_each_definition(
             |node_id, object_id, kind, module, simple, parent, is_test, cfg_test| {
                 let i = idx.defs.len();
@@ -1205,6 +1284,9 @@ impl Index {
                         .push(i);
                 } else if !simple.is_empty() && is_associated_kind(&kind_s) {
                     idx.associated.entry(simple.clone()).or_default().push(i);
+                }
+                if is_fn_kind(&kind_s) && !simple.is_empty() {
+                    idx.callables.entry(simple.clone()).or_default().push(i);
                 }
                 if let Some(oid) = object_id {
                     idx.by_object.insert(oid, i);
@@ -1393,6 +1475,17 @@ impl Index {
             .any(|i| i.glob && !i.done && i.module == module)
         {
             return Head::Pending;
+        }
+        if let Some(links) = self.externs.get(crate_key(module)) {
+            let mut hits = Vec::new();
+            for (extern_name, target) in links {
+                if extern_name == name {
+                    hits.push(self.module_hit(target));
+                }
+            }
+            if !hits.is_empty() {
+                return Head::Ready(hits);
+            }
         }
         if external {
             return Head::Missing;
@@ -1605,7 +1698,7 @@ impl Index {
     fn lookup_in(&self, module: &str, self_ty: Option<&str>, written: &str) -> PathHits {
         let written = written.trim();
         if let Some(name) = written.strip_prefix('.') {
-            let ids = self.method_ids(crate_key(module), name.trim());
+            let ids = self.method_ids(module, name.trim());
             return PathHits {
                 all: ids.clone(),
                 finals: ids,
@@ -1658,19 +1751,55 @@ impl Index {
         }
     }
 
-    fn method_ids(&self, crate_k: &str, name: &str) -> Vec<NodeId> {
+    fn visible_crates(&self, module: &str) -> Vec<String> {
+        let mut keys = vec![crate_key(module).to_owned()];
+        if let Some(links) = self.externs.get(crate_key(module)) {
+            for (_, target) in links {
+                let key = crate_key(target).to_owned();
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys
+    }
+
+    fn method_ids(&self, module: &str, name: &str) -> Vec<NodeId> {
         let Some(ids) = self.associated.get(name) else {
             return Vec::new();
         };
+        let crates = self.visible_crates(module);
         let mut out = Vec::new();
         for &i in ids {
             let def = &self.defs[i];
-            if crate_key(&def.module) != crate_k {
+            if !crates.iter().any(|key| crate_key(&def.module) == key) {
                 continue;
             }
             if is_method_parent(&def.parent)
                 && let Some(id) = real_id(def.node_id)
             {
+                out.push(id);
+            }
+        }
+        dedup_ids(&mut out);
+        out
+    }
+
+    /// Functions and methods named `name` in this crate or a linked package.
+    ///
+    /// A bare call has no type to pick one of them (ADR 0011).
+    fn callable_ids(&self, module: &str, name: &str) -> Vec<NodeId> {
+        let Some(ids) = self.callables.get(name) else {
+            return Vec::new();
+        };
+        let crates = self.visible_crates(module);
+        let mut out = Vec::new();
+        for &i in ids {
+            let def = &self.defs[i];
+            if !crates.iter().any(|key| crate_key(&def.module) == key) {
+                continue;
+            }
+            if let Some(id) = real_id(def.node_id) {
                 out.push(id);
             }
         }
@@ -1938,9 +2067,10 @@ impl RefWalk<'_> {
                 }
             }
             "generic_function" => {
+                // Walk the callee. `path_segments` on a field expression is
+                // empty, which used to drop the receiver (`xs.map(...).collect::<T>()`).
                 if let Some(fun) = node.child_by_field_name("function") {
-                    let segs = path_segments(fun, self.source);
-                    self.emit_path(&segs);
+                    self.walk(fun);
                 }
                 if let Some(args) = node.child_by_field_name("type_arguments") {
                     self.walk(args);
@@ -1978,7 +2108,11 @@ impl RefWalk<'_> {
                     return;
                 }
                 if let Some(name) = node_text(node, self.source) {
-                    self.emit_path(&[name]);
+                    if is_call_callee(node) {
+                        self.emit_call(&name);
+                    } else {
+                        self.emit_path(&[name]);
+                    }
                 }
             }
             _ => {
@@ -2062,12 +2196,29 @@ impl RefWalk<'_> {
             return;
         }
         let written = format!(".{name}");
-        let ids = self.idx.method_ids(crate_key(&self.module), name);
+        let ids = self.idx.method_ids(&self.module, name);
         let hits = PathHits {
             all: ids.clone(),
             finals: ids,
         };
         self.push(&written, &hits);
+    }
+
+    /// A call with no path. Resolved names stay, and every visible same-named
+    /// function or method is included (ADR 0011).
+    fn emit_call(&mut self, name: &str) {
+        if is_skippable_bare(name) {
+            return;
+        }
+        let module = self.module.clone();
+        let self_ty = self.self_ty.clone();
+        let mut hits = self.idx.lookup_in(&module, self_ty.as_deref(), name);
+        let extra = self.idx.callable_ids(&module, name);
+        hits.all.extend(extra.iter().copied());
+        hits.finals.extend(extra);
+        dedup_ids(&mut hits.all);
+        dedup_ids(&mut hits.finals);
+        self.push(name, &hits);
     }
 
     fn push(&mut self, written: &str, hits: &PathHits) {
@@ -2259,6 +2410,19 @@ fn is_declarator(node: tree_sitter::Node<'_>) -> bool {
     })
 }
 
+/// `name` is the callee of `name(...)` or `name::<T>(...)`, not an argument.
+fn is_call_callee(node: tree_sitter::Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(parent.kind(), "call_expression" | "generic_function") {
+        return false;
+    }
+    parent
+        .child_by_field_name("function")
+        .is_some_and(|fun| fun.id() == node.id())
+}
+
 fn is_skippable_bare(name: &str) -> bool {
     name.is_empty() || name == "_" || is_keyword(name) || is_primitive(name)
 }
@@ -2372,4 +2536,41 @@ fn node_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
 fn field_text(node: tree_sitter::Node<'_>, source: &[u8], field: &str) -> Option<String> {
     node.child_by_field_name(field)
         .and_then(|n| node_text(n, source))
+}
+
+#[cfg(test)]
+mod index_cache {
+    use super::{index_builds, references};
+    use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, ObjectId};
+    use hord_lang::ResolveCtx;
+
+    #[test]
+    fn repeated_references_build_the_index_once() {
+        let mut ctx = ResolveCtx::new();
+        let node = Node {
+            kind: NodeKind::new("function_item"),
+            lang: LangId::new("rust"),
+            raw: Bytes::from(b"fn f() {}".as_slice()),
+            normalized: ObjectId::from_bytes([0; 32]),
+            children: Vec::new(),
+            name: None,
+        };
+        let before = index_builds();
+        let first = references(&ctx, &node);
+        let second = references(&ctx, &node);
+        assert_eq!(first, second);
+        assert_eq!(index_builds(), before + 1);
+        ctx.add_definition(
+            NodeId::nil(),
+            None,
+            NodeKind::new("function_item"),
+            "crate",
+            "f",
+            "",
+            false,
+            false,
+        );
+        let _ = references(&ctx, &node);
+        assert_eq!(index_builds(), before + 2);
+    }
 }

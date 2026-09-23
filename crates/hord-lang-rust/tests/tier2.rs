@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use hord_core::{Node, NodeId, ObjectId, RepoPath};
 use hord_lang::{LangAdapter, NameRef, NodeTree};
-use hord_lang_rust::{RustAdapter, RustFile};
+use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
 
 struct Owned {
     path: RepoPath,
@@ -184,6 +184,212 @@ fn check_names(
         check_names(adapter, tree, child, ancestors);
     }
     ancestors.pop();
+}
+
+#[test]
+fn path_dependency_resolves_across_crates() {
+    let lib = parse_one("crates/support/src/lib.rs", "pub fn project() {}\n");
+    let test = parse_one(
+        "tests/testsuite/main.rs",
+        "fn caller() { support::project(); }\n",
+    );
+    let mut files = [lib, test];
+    reassign_ids(&mut files);
+    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest = r#"
+[package]
+name = "app"
+[workspace]
+members = ["crates/support"]
+[workspace.dependencies]
+support = { path = "crates/support" }
+[dev-dependencies]
+support.workspace = true
+"#;
+    let views: Vec<RustFile<'_>> = files
+        .iter()
+        .map(|f| RustFile {
+            path: &f.path,
+            tree: &f.tree,
+            ids: &f.ids,
+        })
+        .collect();
+    let manifests = [ManifestFile {
+        path: &manifest_path,
+        bytes: manifest.as_bytes(),
+    }];
+    let ctx = adapter().resolve_context_with(&views, &manifests);
+    let project = id_of(&files[0], "project");
+    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    let edge = refs
+        .iter()
+        .find(|r| r.name.as_str() == "support::project")
+        .expect("edge");
+    assert_eq!(edge.resolved, Some(project));
+}
+
+#[test]
+fn linked_crate_method_is_a_candidate() {
+    let lib = parse_one(
+        "crates/support/src/lib.rs",
+        "pub struct Foo;\nimpl Foo { pub fn layout(&self) {} }\n",
+    );
+    let test = parse_one(
+        "tests/testsuite/main.rs",
+        "fn caller() { let x = (); x.layout(); }\n",
+    );
+    let mut files = [lib, test];
+    reassign_ids(&mut files);
+    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest = r#"
+[package]
+name = "app"
+[workspace]
+members = ["crates/support"]
+[workspace.dependencies]
+support = { path = "crates/support" }
+[dev-dependencies]
+support.workspace = true
+"#;
+    let views: Vec<RustFile<'_>> = files
+        .iter()
+        .map(|f| RustFile {
+            path: &f.path,
+            tree: &f.tree,
+            ids: &f.ids,
+        })
+        .collect();
+    let ctx = adapter().resolve_context_with(
+        &views,
+        &[ManifestFile {
+            path: &manifest_path,
+            bytes: manifest.as_bytes(),
+        }],
+    );
+    let layout = id_of(&files[0], "impl Foo::layout");
+    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    assert!(refs.iter().any(|r| r.resolved == Some(layout)), "{refs:?}");
+}
+
+#[test]
+fn unresolved_call_includes_linked_crate_functions() {
+    let lib = parse_one("crates/support/src/lib.rs", "pub fn project_layout() {}\n");
+    let test = parse_one(
+        "tests/testsuite/main.rs",
+        "fn caller() { project_layout(); }\n",
+    );
+    let mut files = [lib, test];
+    reassign_ids(&mut files);
+    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest = r#"
+[package]
+name = "app"
+[workspace]
+members = ["crates/support"]
+[workspace.dependencies]
+support = { path = "crates/support" }
+[dev-dependencies]
+support.workspace = true
+"#;
+    let views: Vec<RustFile<'_>> = files
+        .iter()
+        .map(|f| RustFile {
+            path: &f.path,
+            tree: &f.tree,
+            ids: &f.ids,
+        })
+        .collect();
+    let ctx = adapter().resolve_context_with(
+        &views,
+        &[ManifestFile {
+            path: &manifest_path,
+            bytes: manifest.as_bytes(),
+        }],
+    );
+    let project = id_of(&files[0], "project_layout");
+    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    assert!(refs.iter().any(|r| r.resolved == Some(project)), "{refs:?}");
+}
+
+#[test]
+fn nested_function_call_is_a_candidate() {
+    let src = r#"
+#[track_caller]
+pub fn assert_deps() {
+    let deps = (0..1)
+        .map(|_| {
+            let _file_len = read_u64();
+            1
+        })
+        .collect::<Vec<_>>();
+    let _ = deps;
+    fn read_u64() -> u64 {
+        0
+    }
+}
+"#;
+    let mut files = [parse_one("src/lib.rs", src)];
+    reassign_ids(&mut files);
+    let ctx = context(&files);
+    let target = id_of(&files[0], "read_u64");
+    let refs = adapter().references(&ctx, find(&files[0], "assert_deps"));
+    assert!(refs.iter().any(|r| r.resolved == Some(target)), "{refs:?}");
+}
+
+#[test]
+fn unresolved_call_includes_same_crate_functions_outside_the_module() {
+    let src = "mod inner { pub fn project_layout() {} }\nfn caller() { project_layout(); }\n";
+    let mut files = [parse_one("src/lib.rs", src)];
+    reassign_ids(&mut files);
+    let ctx = context(&files);
+    let project = id_of(&files[0], "inner::project_layout");
+    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    assert!(refs.iter().any(|r| r.resolved == Some(project)), "{refs:?}");
+}
+
+#[test]
+fn outer_attribute_belongs_to_the_next_definition() {
+    let files = [parse_one("src/lib.rs", "#[foo::bar]\nfn qux() {}\n")];
+    let node = find(&files[0], "qux");
+    let raw = String::from_utf8_lossy(node.raw.as_slice());
+    assert!(raw.contains("foo"), "{raw}");
+    let ctx = context(&files);
+    let refs = adapter().references(&ctx, node);
+    assert!(
+        refs.iter().any(|r| r.name.as_str() == "foo::bar"),
+        "{refs:?}"
+    );
+}
+
+#[test]
+fn registry_dependency_stays_unresolved() {
+    let lib = parse_one("src/lib.rs", "fn caller() { serde::json(); }\n");
+    let files = [lib];
+    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest = r#"
+[package]
+name = "app"
+[dependencies]
+serde = "1.0"
+"#;
+    let views: Vec<RustFile<'_>> = files
+        .iter()
+        .map(|f| RustFile {
+            path: &f.path,
+            tree: &f.tree,
+            ids: &f.ids,
+        })
+        .collect();
+    let ctx = adapter().resolve_context_with(
+        &views,
+        &[ManifestFile {
+            path: &manifest_path,
+            bytes: manifest.as_bytes(),
+        }],
+    );
+    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let edge = refs.iter().find(|r| r.name.as_str() == "serde::json");
+    assert!(edge.is_none_or(|r| r.resolved.is_none()), "{refs:?}");
 }
 
 #[test]
