@@ -1,7 +1,9 @@
 //! [`Store`]: content-addressed objects, log, refs, and workspaces.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -12,7 +14,7 @@ use redb::{Database, Durability, ReadableTable, TableDefinition, WriteTransactio
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::pack::{PackWriter, PackedLocation, pack_path, read_packed};
+use crate::pack::{self, PackWriter, PackedLocation, pack_path};
 use crate::workspace::WorkspaceRow;
 use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
 
@@ -42,6 +44,44 @@ const EVIDENCE_BY_SNAPSHOT: TableDefinition<'_, &[u8], &[u8]> =
 const META_HEAD: &str = "head";
 const META_NEXT_PACK: &str = "next_pack";
 
+/// Where this process last observed an object. Not stored on disk.
+#[derive(Clone, Copy)]
+enum Resident {
+    Loose,
+    Packed(PackedLocation),
+}
+
+/// In-memory copy of the landing log.
+///
+/// `loaded` is false until the first [`Store::log`] or index read. Appends
+/// update it only after that, under the same lock as `pending_log` (acquire
+/// `pending_log` first). Callers that hold this lock must not take `pending_log`.
+struct LandingLog {
+    loaded: bool,
+    order: Vec<ChangeId>,
+    /// First landing index of each id. A repeated id keeps the earlier index.
+    first_pos: HashMap<ChangeId, usize>,
+}
+
+impl LandingLog {
+    fn empty() -> Self {
+        Self {
+            loaded: false,
+            order: Vec::new(),
+            first_pos: HashMap::new(),
+        }
+    }
+
+    fn note(&mut self, change: ChangeId) {
+        if !self.loaded {
+            return;
+        }
+        let pos = self.order.len();
+        self.first_pos.entry(change).or_insert(pos);
+        self.order.push(change);
+    }
+}
+
 /// Local content-addressed object store (spec §8.1).
 ///
 /// Layout under `<repo>/.hord/`:
@@ -67,6 +107,14 @@ pub struct Store {
     has_packs: AtomicBool,
     /// Serializes index updates so an identity supersede chain cannot fork.
     index_lock: Mutex<()>,
+    /// Objects this process has stored or fetched. Duplicate `put`s hit this
+    /// instead of rewriting the loose file.
+    resident: Mutex<HashMap<ObjectId, Resident>>,
+    /// Open pack files for positional reads. Pack ids are append-only.
+    pack_files: Mutex<HashMap<u64, File>>,
+    landing_log: Mutex<LandingLog>,
+    /// Edge keys inserted by this process. Duplicate `put_edge` skips the write.
+    seen_edges: Mutex<HashSet<[u8; index::EDGE_KEY_LEN]>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -103,6 +151,10 @@ impl Store {
             pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(false),
             index_lock: Mutex::new(()),
+            resident: Mutex::new(HashMap::new()),
+            pack_files: Mutex::new(HashMap::new()),
+            landing_log: Mutex::new(LandingLog::empty()),
+            seen_edges: Mutex::new(HashSet::new()),
         })
     }
 
@@ -128,6 +180,10 @@ impl Store {
             pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(has_packs),
             index_lock: Mutex::new(()),
+            resident: Mutex::new(HashMap::new()),
+            pack_files: Mutex::new(HashMap::new()),
+            landing_log: Mutex::new(LandingLog::empty()),
+            seen_edges: Mutex::new(HashSet::new()),
         })
     }
 
@@ -146,32 +202,54 @@ impl Store {
     /// Store already-canonical CBOR bytes. The [`ObjectId`] is BLAKE3-256 of
     /// `canonical_cbor` (spec §3.1, §3.9).
     ///
-    /// Writes a loose object. Identical bytes are idempotent (the file is
-    /// rewritten with the same content; there is no existence check, since a
-    /// stat costs about as much as the write). Does not pack; call
-    /// [`Store::pack`] (spec §8.1: packing is a background job).
+    /// Writes a loose object. Identical bytes are idempotent. An object this
+    /// process has already stored, loose or packed, is not written again.
+    /// Does not pack; call [`Store::pack`] (spec §8.1: packing is a background
+    /// job).
     pub fn put(&self, canonical_cbor: &[u8]) -> Result<ObjectId> {
         let id = ObjectId::from_canonical(canonical_cbor);
+        if self.remembered(id).is_some() {
+            return Ok(id);
+        }
         self.write_loose(id, canonical_cbor)?;
+        self.remember(id, Resident::Loose);
         Ok(id)
     }
 
     /// Load the canonical bytes for `id`.
     pub fn get(&self, id: ObjectId) -> Result<Vec<u8>> {
+        match self.remembered(id) {
+            Some(Resident::Loose) => {
+                if let Some(bytes) = self.read_loose(id)? {
+                    return ensure_id(id, bytes);
+                }
+                self.forget(id);
+            }
+            Some(Resident::Packed(loc)) => {
+                return ensure_id(id, self.read_pack_bytes(&loc)?);
+            }
+            None => {}
+        }
         if let Some(bytes) = self.read_loose(id)? {
-            return ensure_id(id, bytes);
+            let bytes = ensure_id(id, bytes)?;
+            self.remember(id, Resident::Loose);
+            return Ok(bytes);
         }
         if self.has_packs.load(Ordering::Relaxed)
             && let Some(loc) = self.packed_location(id)?
         {
-            let bytes = read_packed(&pack_path(&self.pack_dir(), loc.pack), &loc)?;
-            return ensure_id(id, bytes);
+            let bytes = ensure_id(id, self.read_pack_bytes(&loc)?)?;
+            self.remember(id, Resident::Packed(loc));
+            return Ok(bytes);
         }
         Err(Error::MissingObject(id))
     }
 
     /// Whether `id` is present as a loose or packed object.
     pub fn contains(&self, id: ObjectId) -> Result<bool> {
+        if self.remembered(id).is_some() {
+            return Ok(true);
+        }
         if self.loose_path(id).is_file() {
             return Ok(true);
         }
@@ -199,6 +277,7 @@ impl Store {
         let flush = {
             let mut log = lock_vec(&self.pending_log);
             log.push(change);
+            lock(&self.landing_log).note(change);
             log.len() >= LOG_FLUSH_BATCH
         };
         if flush {
@@ -209,15 +288,8 @@ impl Store {
 
     /// Landed [`ChangeId`]s in landing order.
     pub fn log(&self) -> Result<Vec<ChangeId>> {
-        let txn = self.db.begin_read().map_err(Error::index)?;
-        let table = txn.open_table(LOG).map_err(Error::index)?;
-        let mut out = Vec::new();
-        for entry in table.iter().map_err(Error::index)? {
-            let (_, v) = entry.map_err(Error::index)?;
-            out.push(object_id_from_value(v.value())?);
-        }
-        out.extend_from_slice(&lock_vec(&self.pending_log));
-        Ok(out)
+        let log = self.ensure_landing_log()?;
+        Ok(log.order.clone())
     }
 
     /// Set `head` to the latest landed change (spec §3.7).
@@ -383,13 +455,13 @@ impl Store {
         let pack_id = self.next_pack_id()?;
         let pack_dir = self.pack_dir();
         let mut writer = PackWriter::create(&pack_dir, pack_id)?;
-        let mut locations: Vec<(ObjectId, PackedLocation)> = Vec::new();
-        let mut packed_paths: Vec<PathBuf> = Vec::new();
-        for (id, path) in &loose {
-            let bytes = fs::read(path)?;
-            let loc = writer.add(*id, &bytes)?;
-            locations.push((*id, loc));
-            packed_paths.push(path.clone());
+        let mut locations: Vec<(ObjectId, PackedLocation)> = Vec::with_capacity(loose.len());
+        let mut packed_paths: Vec<PathBuf> = Vec::with_capacity(loose.len());
+        for (id, path) in loose {
+            let bytes = fs::read(&path)?;
+            let loc = writer.add(id, &bytes)?;
+            locations.push((id, loc));
+            packed_paths.push(path);
         }
         if writer.is_empty() {
             return Ok(0);
@@ -411,12 +483,18 @@ impl Store {
                 .map_err(Error::index)?;
         }
         txn.commit().map_err(Error::index)?;
+        self.has_packs.store(true, Ordering::Relaxed);
+        {
+            let mut resident = lock(&self.resident);
+            for (id, loc) in &locations {
+                resident.insert(*id, Resident::Packed(*loc));
+            }
+        }
         for path in packed_paths {
             if path.exists() {
                 fs::remove_file(path)?;
             }
         }
-        self.has_packs.store(true, Ordering::Relaxed);
         Ok(n)
     }
 
@@ -441,6 +519,64 @@ impl Store {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn remembered(&self, id: ObjectId) -> Option<Resident> {
+        lock(&self.resident).get(&id).copied()
+    }
+
+    fn remember(&self, id: ObjectId, resident: Resident) {
+        lock(&self.resident).insert(id, resident);
+    }
+
+    fn forget(&self, id: ObjectId) {
+        lock(&self.resident).remove(&id);
+    }
+
+    fn read_pack_bytes(&self, loc: &PackedLocation) -> Result<Vec<u8>> {
+        let mut files = lock(&self.pack_files);
+        let file = match files.entry(loc.pack) {
+            Entry::Vacant(slot) => slot.insert(File::open(pack_path(&self.pack_dir(), loc.pack))?),
+            Entry::Occupied(slot) => slot.into_mut(),
+        };
+        pack::read_packed_file(file, loc)
+    }
+
+    fn read_persisted_log(&self) -> Result<Vec<ChangeId>> {
+        let txn = self.db.begin_read().map_err(Error::index)?;
+        let table = txn.open_table(LOG).map_err(Error::index)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(Error::index)? {
+            let (_, value) = entry.map_err(Error::index)?;
+            out.push(object_id_from_value(value.value())?);
+        }
+        Ok(out)
+    }
+
+    fn ensure_landing_log(&self) -> Result<std::sync::MutexGuard<'_, LandingLog>> {
+        {
+            let log = lock(&self.landing_log);
+            if log.loaded {
+                return Ok(log);
+            }
+        }
+        let pending = lock_vec(&self.pending_log);
+        let mut log = lock(&self.landing_log);
+        if !log.loaded {
+            let mut order = self.read_persisted_log()?;
+            order.extend_from_slice(&pending);
+            let mut first_pos = HashMap::with_capacity(order.len());
+            for (index, id) in order.iter().enumerate() {
+                first_pos.entry(*id).or_insert(index);
+            }
+            *log = LandingLog {
+                loaded: true,
+                order,
+                first_pos,
+            };
+        }
+        drop(pending);
+        Ok(log)
     }
 
     fn loose_path(&self, id: ObjectId) -> PathBuf {
@@ -498,24 +634,27 @@ impl Store {
         mut f: impl FnMut(ObjectId, &[u8]) -> Result<()>,
     ) -> Result<()> {
         let mut seen = HashSet::new();
-        for (id, _) in self.list_loose()? {
+        for (id, path) in self.list_loose()? {
             if !seen.insert(id) {
                 continue;
             }
-            let bytes = self.get(id)?;
+            let bytes = ensure_id(id, fs::read(&path)?)?;
+            self.remember(id, Resident::Loose);
             f(id, &bytes)?;
         }
-        for id in self.list_packed_ids()? {
+        // Drop the read transaction before `f` runs so a callback can write.
+        for (id, loc) in self.list_packed_locations()? {
             if !seen.insert(id) {
                 continue;
             }
-            let bytes = self.get(id)?;
+            let bytes = ensure_id(id, self.read_pack_bytes(&loc)?)?;
+            self.remember(id, Resident::Packed(loc));
             f(id, &bytes)?;
         }
         Ok(())
     }
 
-    fn list_packed_ids(&self) -> Result<Vec<ObjectId>> {
+    fn list_packed_locations(&self) -> Result<Vec<(ObjectId, PackedLocation)>> {
         if !self.has_packs.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }
@@ -523,8 +662,10 @@ impl Store {
         let table = txn.open_table(OBJECTS).map_err(Error::index)?;
         let mut out = Vec::new();
         for entry in table.iter().map_err(Error::index)? {
-            let (key, _) = entry.map_err(Error::index)?;
-            out.push(object_id_from_value(key.value())?);
+            let (key, value) = entry.map_err(Error::index)?;
+            let id = object_id_from_value(key.value())?;
+            let loc = hord_encoding::decode(value.value())?;
+            out.push((id, loc));
         }
         Ok(out)
     }
@@ -564,8 +705,7 @@ impl Store {
                 if name_str.starts_with('.') || name_str.ends_with(".tmp") {
                     continue;
                 }
-                let hex = format!("{shard_str}{name_str}");
-                let id: ObjectId = hex.parse()?;
+                let id = object_id_from_loose_name(shard_str, name_str)?;
                 out.push((id, file.path()));
             }
         }
@@ -612,6 +752,25 @@ fn validate_ref_name(name: &str) -> Result<()> {
         return Err(Error::InvalidRef(name.to_owned()));
     }
     Ok(())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn object_id_from_loose_name(shard: &str, name: &str) -> Result<ObjectId> {
+    let shard_bytes = shard.as_bytes();
+    let name_bytes = name.as_bytes();
+    let mut hex = [0u8; ObjectId::LEN * 2];
+    if shard_bytes.len() + name_bytes.len() != hex.len() {
+        let combined = format!("{shard}{name}");
+        return combined.parse().map_err(Error::from);
+    }
+    hex[..shard_bytes.len()].copy_from_slice(shard_bytes);
+    hex[shard_bytes.len()..].copy_from_slice(name_bytes);
+    // Both pieces came from `OsStr::to_str`, so their concatenation is UTF-8.
+    let text = std::str::from_utf8(&hex).expect("loose object name is utf-8");
+    text.parse().map_err(Error::from)
 }
 
 fn lock_map(

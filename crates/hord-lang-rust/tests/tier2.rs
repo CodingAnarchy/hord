@@ -75,12 +75,38 @@ fn find<'a>(file: &'a Owned, qualified: &str) -> &'a Node {
 }
 
 fn id_of(file: &Owned, want: &str) -> NodeId {
-    let node = find(file, want);
+    id_of_kind(file, want, None)
+}
+
+fn id_of_kind(file: &Owned, want: &str, kind: Option<&str>) -> NodeId {
+    let node = file
+        .tree
+        .iter()
+        .map(|(_, node)| node)
+        .find(|node| {
+            node.name.as_ref().is_some_and(|name| name.as_str() == want)
+                && kind.is_none_or(|k| node.kind.as_str() == k)
+        })
+        .unwrap_or_else(|| panic!("no definition {want} kind {kind:?} in {}", file.path));
     let oid = ObjectId::of(node).expect("object id");
     *file
         .ids
         .get(&oid)
         .unwrap_or_else(|| panic!("no id for {want}"))
+}
+
+/// Give every definition in `files` a distinct [`NodeId`].
+///
+/// [`parse_one`] numbers each file from 1, so the same position in two files
+/// shares an id. Cross-file ambiguity checks need ids that do not collide.
+fn reassign_ids(files: &mut [Owned]) {
+    let mut n = 1u128;
+    for file in files {
+        file.ids.clear();
+        if let Some(root) = file.tree.root() {
+            assign_walk(&file.tree, root, &mut file.ids, &mut n);
+        }
+    }
 }
 
 fn resolved(ctx: &hord_lang::ResolveCtx, node: &Node) -> BTreeSet<NodeId> {
@@ -393,4 +419,409 @@ impl B { fn draw(&self) {} }
     let mut name = NameRef::new(".draw");
     name.scope = Some("crate".into());
     assert!(adapter().resolve(&ctx, &name).is_none());
+}
+
+#[test]
+fn method_call_emits_one_edge_per_candidate() {
+    let src = r#"
+struct A;
+struct B;
+impl A { fn draw(&self) {} }
+impl B { fn draw(&self) {} }
+fn paint(a: &A) { a.draw(); }
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let refs = adapter().references(&ctx, find(&files[0], "paint"));
+    let draws: Vec<_> = refs.iter().filter(|r| r.name.as_str() == ".draw").collect();
+    assert_eq!(draws.len(), 2, "one NameRef per candidate: {refs:?}");
+    assert!(draws.iter().all(|r| r.resolved.is_some()));
+    assert_ne!(draws[0].resolved, draws[1].resolved);
+    assert!(
+        draws
+            .iter()
+            .all(|r| r.scope.as_ref().is_some_and(|s| s.as_str() == "crate"))
+    );
+}
+
+#[test]
+fn cfg_any_and_all_include_test_not_does_not() {
+    let src = r#"
+fn target() {}
+#[cfg(any(unix, test))]
+fn via_any() { target(); }
+#[cfg(all(test, debug_assertions))]
+fn via_all() { target(); }
+#[cfg(all(any(test), unix))]
+fn via_nested() { target(); }
+#[cfg(any(not(test), unix))]
+fn via_not_any() { target(); }
+#[cfg(all(not(test), debug_assertions))]
+fn via_not_all() { target(); }
+#[cfg(not(any(test)))]
+fn via_not_group() { target(); }
+#[cfg(feature = "test")]
+fn via_feature() { target(); }
+#[rstest]
+fn via_other_attr() { target(); }
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let target = id_of(&files[0], "target");
+    for name in ["via_any", "via_all", "via_nested"] {
+        let got = adapter().test_targets(&ctx, find(&files[0], name));
+        assert!(
+            got.contains(&target),
+            "{name} should count as a test: {got:?}"
+        );
+    }
+    for name in [
+        "via_not_any",
+        "via_not_all",
+        "via_not_group",
+        "via_feature",
+        "via_other_attr",
+    ] {
+        let got = adapter().test_targets(&ctx, find(&files[0], name));
+        assert!(got.is_empty(), "{name} is not a test: {got:?}");
+    }
+}
+
+#[test]
+fn cfg_test_function_is_a_test_target() {
+    let src = "fn prod() {}\n#[cfg(test)]\nfn helper() { prod(); }\n";
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let got = adapter().test_targets(&ctx, find(&files[0], "helper"));
+    assert!(got.contains(&id_of(&files[0], "prod")), "{got:?}");
+}
+
+#[test]
+fn single_file_uses_the_crate_path() {
+    let files = vec![parse_one(
+        "src/not_a_root.rs",
+        "fn helper() {}\nfn caller() { helper(); }\n",
+    )];
+    let ctx = context(&files);
+    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let helper = refs
+        .iter()
+        .find(|r| r.name.as_str() == "helper")
+        .expect("helper");
+    assert_eq!(helper.scope.as_ref().map(|s| s.as_str()), Some("crate"));
+    assert_eq!(helper.resolved, Some(id_of(&files[0], "helper")));
+}
+
+#[test]
+fn several_crate_roots_are_disambiguated_by_repo_path() {
+    let files = vec![
+        parse_one(
+            "src/lib.rs",
+            "pub fn helper() {}\nfn only_lib() {}\nfn caller() { helper(); only_lib(); }\n",
+        ),
+        parse_one(
+            "src/main.rs",
+            "fn helper() {}\nfn only_bin() {}\nfn caller() { helper(); only_bin(); }\n",
+        ),
+        parse_one("build.rs", "fn helper() {}\n"),
+        parse_one(
+            "tests/api.rs",
+            "fn helper() {}\nfn caller() { helper(); }\n",
+        ),
+    ];
+    let mut files = files;
+    reassign_ids(&mut files);
+    let ctx = context(&files);
+    let lib_helper = id_of(&files[0], "helper");
+    let bin_helper = id_of(&files[1], "helper");
+    let build_helper = id_of(&files[2], "helper");
+    let test_helper = id_of(&files[3], "helper");
+
+    let scope_of = |file: &Owned| {
+        adapter()
+            .references(&ctx, find(file, "caller"))
+            .into_iter()
+            .find(|r| r.name.as_str() == "helper")
+            .and_then(|r| r.scope)
+    };
+    let lib_scope = scope_of(&files[0]).expect("lib scope");
+    let bin_scope = scope_of(&files[1]).expect("bin scope");
+    let test_scope = scope_of(&files[3]).expect("integration scope");
+    assert_ne!(lib_scope, bin_scope);
+    assert_ne!(lib_scope, test_scope);
+    assert_ne!(lib_scope.as_str(), "crate");
+
+    let resolve_in = |scope: &hord_core::QualifiedName, name: &str| {
+        let mut r = NameRef::new(name);
+        r.scope = Some(scope.clone());
+        adapter().resolve(&ctx, &r)
+    };
+    assert_eq!(resolve_in(&lib_scope, "helper"), Some(lib_helper));
+    assert_eq!(resolve_in(&bin_scope, "helper"), Some(bin_helper));
+    assert_eq!(resolve_in(&test_scope, "helper"), Some(test_helper));
+    assert_eq!(
+        resolve_in(&lib_scope, "crate::only_lib"),
+        Some(id_of(&files[0], "only_lib"))
+    );
+    assert_eq!(resolve_in(&bin_scope, "crate::only_lib"), None);
+    assert_eq!(resolve_in(&lib_scope, "only_bin"), None);
+
+    let mut bare = NameRef::new("helper");
+    assert!(
+        adapter().resolve(&ctx, &bare).is_none(),
+        "two helpers, no scope"
+    );
+    bare.name = "only_lib".into();
+    assert_eq!(
+        adapter().resolve(&ctx, &bare),
+        Some(id_of(&files[0], "only_lib"))
+    );
+    bare.name = "only_bin".into();
+    assert_eq!(
+        adapter().resolve(&ctx, &bare),
+        Some(id_of(&files[1], "only_bin"))
+    );
+
+    let lib_edges = resolved(&ctx, find(&files[0], "caller"));
+    assert!(lib_edges.contains(&lib_helper));
+    assert!(!lib_edges.contains(&bin_helper));
+    assert!(!lib_edges.contains(&build_helper));
+    assert!(!lib_edges.contains(&test_helper));
+}
+
+#[test]
+fn qualified_name_stays_file_local() {
+    let files = vec![
+        parse_one("src/lib.rs", "mod foo;\n"),
+        parse_one("src/foo.rs", "pub fn helper() {}\n"),
+    ];
+    let helper = find(&files[1], "helper");
+    assert_eq!(helper.name.as_ref().map(|n| n.as_str()), Some("helper"));
+    let ctx = context(&files);
+    let mut path = NameRef::new("crate::foo::helper");
+    path.scope = Some("crate".into());
+    assert_eq!(
+        adapter().resolve(&ctx, &path),
+        Some(id_of(&files[1], "helper"))
+    );
+}
+
+#[test]
+fn resolve_prefers_a_set_id_else_the_unique_final() {
+    let files = vec![parse_one(
+        "src/lib.rs",
+        "mod foo { pub fn helper() {} }\nfn caller() { foo::helper(); }\n",
+    )];
+    let ctx = context(&files);
+    let helper = id_of(&files[0], "foo::helper");
+    let module = id_of(&files[0], "foo");
+    let mut path = NameRef::new("foo::helper");
+    path.scope = Some("crate".into());
+    assert_eq!(adapter().resolve(&ctx, &path), Some(helper));
+
+    path.resolved = Some(module);
+    assert_eq!(
+        adapter().resolve(&ctx, &path),
+        Some(module),
+        "an already-set candidate wins over lookup"
+    );
+    path.resolved = Some(NodeId::nil());
+    assert_eq!(adapter().resolve(&ctx, &path), None);
+
+    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let finals: Vec<_> = refs
+        .iter()
+        .filter(|r| r.name.as_str() == "foo::helper" && r.resolved == Some(helper))
+        .collect();
+    assert_eq!(finals.len(), 1, "{refs:?}");
+}
+
+#[test]
+fn duplicate_imports_stay_ambiguous() {
+    let src = r#"
+mod a { pub fn f() {} }
+mod b { pub fn f() {} }
+use a::f;
+use b::f;
+fn caller() { f(); }
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let ids: BTreeSet<_> = refs
+        .iter()
+        .filter(|r| r.name.as_str() == "f")
+        .filter_map(|r| r.resolved)
+        .collect();
+    // `use a::f` stores the same file-local name as `mod a`'s function.
+    assert!(ids.contains(&id_of_kind(&files[0], "a::f", Some("function_item"))));
+    assert!(ids.contains(&id_of_kind(&files[0], "b::f", Some("function_item"))));
+    let mut name = NameRef::new("f");
+    name.scope = Some("crate".into());
+    assert!(adapter().resolve(&ctx, &name).is_none());
+}
+
+#[test]
+fn nil_definition_ids_are_skipped() {
+    let mut file = parse_one("src/lib.rs", "fn helper() {}\nfn caller() { helper(); }\n");
+    let helper = find(&file, "helper");
+    let oid = ObjectId::of(helper).expect("object id");
+    file.ids.insert(oid, NodeId::nil());
+    let ctx = context(std::slice::from_ref(&file));
+    let refs = adapter().references(&ctx, find(&file, "caller"));
+    let mention = refs
+        .iter()
+        .find(|r| r.name.as_str() == "helper")
+        .expect("mention");
+    assert!(mention.resolved.is_none(), "{refs:?}");
+    let mut path = NameRef::new("helper");
+    path.scope = Some("crate".into());
+    assert_eq!(adapter().resolve(&ctx, &path), None);
+}
+
+#[test]
+fn macro_token_tree_paths_are_lexical() {
+    let src = r#"
+fn helper() {}
+mod foo { pub fn bar() {} }
+fn caller() { mac!(helper); mac!(foo::bar); }
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let edges = resolved(&ctx, find(&files[0], "caller"));
+    assert!(edges.contains(&id_of(&files[0], "helper")));
+    assert!(edges.contains(&id_of(&files[0], "foo::bar")));
+}
+
+#[test]
+fn enum_variant_paths_resolve() {
+    let src =
+        "enum Kind { A, B { n: i32 } }\nfn f() { let _ = Kind::A; let _ = Kind::B { n: 1 }; }\n";
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let edges = resolved(&ctx, find(&files[0], "f"));
+    assert!(edges.contains(&id_of(&files[0], "Kind::A")), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[0], "Kind::B")), "{edges:?}");
+}
+
+#[test]
+fn super_from_a_child_file() {
+    let files = vec![
+        parse_one("src/lib.rs", "mod foo;\nfn prod() {}\n"),
+        parse_one("src/foo.rs", "pub fn child() { super::prod(); }\n"),
+    ];
+    let ctx = context(&files);
+    let edges = resolved(&ctx, find(&files[1], "child"));
+    assert!(edges.contains(&id_of(&files[0], "prod")), "{edges:?}");
+}
+
+#[test]
+fn pub_use_reexport_resolves() {
+    let src = r#"
+mod foo { pub fn helper() {} }
+mod bar { pub use super::foo::helper; }
+fn caller() { bar::helper(); }
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let edges = resolved(&ctx, find(&files[0], "caller"));
+    assert!(
+        edges.contains(&id_of(&files[0], "foo::helper")),
+        "{edges:?}"
+    );
+}
+
+#[test]
+fn self_inside_a_trait_names_that_trait() {
+    let src = r#"
+trait Trait {
+    fn method(&self);
+    fn caller(&self) { Self::method(); }
+    type Item;
+    type Other = Self::Item;
+}
+struct S;
+impl Trait for S {
+    fn method(&self) {}
+    type Item = ();
+}
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let method = id_of(&files[0], "Trait::method");
+    let item = id_of(&files[0], "Trait::Item");
+    let caller_edges = resolved(&ctx, find(&files[0], "Trait::caller"));
+    assert!(
+        caller_edges.contains(&method),
+        "Self::method in the trait: {caller_edges:?}"
+    );
+    let other_edges = resolved(&ctx, find(&files[0], "Trait::Other"));
+    assert!(
+        other_edges.contains(&item),
+        "Self::Item in the trait: {other_edges:?}"
+    );
+    let trait_edges = resolved(&ctx, find(&files[0], "Trait"));
+    assert!(
+        trait_edges.contains(&method),
+        "walking the trait should see Self::method: {trait_edges:?}"
+    );
+}
+
+#[test]
+fn trait_test_sees_self_paths() {
+    let src = r#"
+trait Trait {
+    fn method(&self) {}
+    #[test]
+    fn t() { Self::method(); }
+}
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let method = id_of(&files[0], "Trait::method");
+    let on_fn = adapter().test_targets(&ctx, find(&files[0], "Trait::t"));
+    assert!(on_fn.contains(&method), "{on_fn:?}");
+    let on_trait = adapter().test_targets(&ctx, find(&files[0], "Trait"));
+    assert!(on_trait.contains(&method), "{on_trait:?}");
+}
+
+#[test]
+fn impl_header_bounds_are_references() {
+    let src = r#"
+trait Bound {}
+trait Other {}
+struct Point<T>(T);
+impl<T: Bound> Point<T>
+where
+    T: Other,
+{
+    fn m() {}
+}
+"#;
+    let files = vec![parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+    let impl_node = find(&files[0], "impl Point<T>");
+    let edges = resolved(&ctx, impl_node);
+    assert!(edges.contains(&id_of(&files[0], "Bound")), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[0], "Other")), "{edges:?}");
+}
+
+#[test]
+fn path_attribute_accepts_raw_and_byte_strings() {
+    let files = vec![
+        parse_one(
+            "src/lib.rs",
+            "#[path = r\"raw_file.rs\"]\nmod raw_mod;\n#[path = r##\"hash_file.rs\"##]\nmod hash_mod;\n#[path = b\"byte_file.rs\"]\nmod byte_mod;\nfn caller() { raw_mod::raw_f(); hash_mod::hash_f(); byte_mod::byte_f(); }\n",
+        ),
+        parse_one("src/raw_file.rs", "pub fn raw_f() {}\n"),
+        parse_one("src/hash_file.rs", "pub fn hash_f() {}\n"),
+        parse_one("src/byte_file.rs", "pub fn byte_f() {}\n"),
+    ];
+    let mut files = files;
+    reassign_ids(&mut files);
+    let ctx = context(&files);
+    let edges = resolved(&ctx, find(&files[0], "caller"));
+    assert!(edges.contains(&id_of(&files[1], "raw_f")), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[2], "hash_f")), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[3], "byte_f")), "{edges:?}");
 }

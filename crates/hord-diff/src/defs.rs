@@ -69,10 +69,6 @@ pub(crate) fn sites_by_id(sites: &[DefSite]) -> BTreeMap<NodeId, DefSite> {
     map
 }
 
-pub(crate) fn result_ids(mapping: &IdentityMapping) -> &BTreeMap<ObjectId, NodeId> {
-    &mapping.nodes
-}
-
 /// Glue leaves of the file root: tokens not inside any definition.
 ///
 /// Equal glue means definition-granularity ops suffice. Unequal glue

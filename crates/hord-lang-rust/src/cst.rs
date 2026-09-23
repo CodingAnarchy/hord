@@ -57,7 +57,7 @@ fn intern(
     if is_true_token(node) {
         let token = tokens.get(*token_i).ok_or_else(|| {
             ParseError::failed(format!(
-                "token underflow at {} byte {}",
+                "intern ran out of tokens at {} (source byte {}, token index {token_i})",
                 node.kind(),
                 node.start_byte()
             ))
@@ -249,7 +249,7 @@ pub(crate) fn with_parser<T>(
             parser
                 .set_language(&tree_sitter_rust::LANGUAGE.into())
                 .map_err(|e| {
-                    ParseError::failed(format!("failed to load tree-sitter-rust grammar: {e}"))
+                    ParseError::failed(format!("tree-sitter-rust grammar failed to load: {e}"))
                 })?;
             *slot = Some(parser);
         }
@@ -260,12 +260,22 @@ pub(crate) fn with_parser<T>(
 fn ensure_lossless(source: &[u8], tree: &NodeTree) -> Result<(), ParseError> {
     match tree.root_bytes() {
         Some(raw) if raw == source => Ok(()),
-        Some(raw) => Err(ParseError::failed(format!(
-            "parse is not lossless: projected {} bytes from {}-byte source",
-            raw.len(),
-            source.len()
-        ))),
-        None => Err(ParseError::failed("parse produced an empty tree")),
+        Some(raw) => {
+            let mismatch = raw
+                .iter()
+                .zip(source.iter())
+                .position(|(a, b)| a != b)
+                .or_else(|| (raw.len() != source.len()).then_some(raw.len().min(source.len())));
+            let at = mismatch.map_or(String::new(), |i| format!(", first mismatch at byte {i}"));
+            Err(ParseError::failed(format!(
+                "parse is not lossless: projected {} bytes from a {}-byte source{at}",
+                raw.len(),
+                source.len()
+            )))
+        }
+        None => Err(ParseError::failed(
+            "parse is not lossless: tree has no root to project",
+        )),
     }
 }
 
@@ -318,7 +328,7 @@ fn find_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter:
 /// Parse `source` with tree-sitter-rust and intern a lossless CST.
 pub(crate) fn parse(source: &[u8], lang: &LangId) -> Result<NodeTree, ParseError> {
     let ts_tree = with_parser(|parser| parser.parse(source, None))?
-        .ok_or_else(|| ParseError::failed("tree-sitter-rust produced no tree"))?;
+        .ok_or_else(|| ParseError::failed("tree-sitter-rust returned no syntax tree"))?;
     let root = ts_tree.root_node();
 
     let mut tokens = Vec::with_capacity(root.descendant_count());
@@ -333,10 +343,10 @@ pub(crate) fn parse(source: &[u8], lang: &LangId) -> Result<NodeTree, ParseError
     let mut tree = NodeTree::new();
     let mut token_i = 0;
     let root_id = intern(root, lang, source, &attached, &mut token_i, &mut tree)?
-        .ok_or_else(|| ParseError::failed("intern produced no root"))?;
+        .ok_or_else(|| ParseError::failed("intern did not produce a root node"))?;
     if token_i != attached.len() {
         return Err(ParseError::failed(format!(
-            "interned {token_i} of {} tokens",
+            "intern consumed {token_i} tokens but trivia attachment produced {}",
             attached.len()
         )));
     }

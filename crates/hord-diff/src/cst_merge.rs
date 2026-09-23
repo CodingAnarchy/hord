@@ -10,6 +10,8 @@
 use hord_core::{Bytes, ObjectId};
 use hord_lang::NodeTree;
 
+use crate::align::{Span, spans};
+
 const MAX_CHILDREN: usize = 2048;
 
 /// 3-way merge of interned CST nodes. Returns the interned result id.
@@ -19,11 +21,8 @@ pub(crate) fn merge_cst(
     ours: ObjectId,
     theirs: ObjectId,
 ) -> Result<ObjectId, ()> {
-    if ours == theirs || theirs == base {
-        return Ok(ours);
-    }
-    if ours == base {
-        return Ok(theirs);
+    if let Some(&kept) = prefer_unchanged(&base, &ours, &theirs) {
+        return Ok(kept);
     }
 
     let (b, o, t) = match (store.get(base), store.get(ours), store.get(theirs)) {
@@ -39,13 +38,8 @@ pub(crate) fn merge_cst(
         return Err(());
     }
 
-    let leaf = o.children.is_empty() && t.children.is_empty() && b.children.is_empty();
-    if leaf {
-        return merge_leaf(store, ours, theirs, &b, &o, &t);
-    }
-
     if o.children.is_empty() || t.children.is_empty() || b.children.is_empty() {
-        // Branch vs leaf: fall back to a line merge of the projected raw.
+        // A leaf, or a branch paired with a leaf, merges as raw text.
         return merge_leaf(store, ours, theirs, &b, &o, &t);
     }
 
@@ -66,6 +60,21 @@ pub(crate) fn merge_cst(
                 .map_err(|_| ())
         }
         Err(()) => merge_leaf(store, ours, theirs, &b, &o, &t),
+    }
+}
+
+/// When one side matches another, the edit (or the shared result) is that side.
+fn prefer_unchanged<'a, T: PartialEq + ?Sized>(
+    base: &'a T,
+    ours: &'a T,
+    theirs: &'a T,
+) -> Option<&'a T> {
+    if ours == theirs || theirs == base {
+        Some(ours)
+    } else if ours == base {
+        Some(theirs)
+    } else {
+        None
     }
 }
 
@@ -116,21 +125,15 @@ fn merge_seq(
     ours: &[ObjectId],
     theirs: &[ObjectId],
 ) -> Result<Vec<ObjectId>, ()> {
-    if ours == theirs {
-        return Ok(ours.to_vec());
-    }
-    if ours == base {
-        return Ok(theirs.to_vec());
-    }
-    if theirs == base {
-        return Ok(ours.to_vec());
+    if let Some(kept) = prefer_unchanged(base, ours, theirs) {
+        return Ok(kept.to_vec());
     }
     if base.len() > MAX_CHILDREN || ours.len() > MAX_CHILDREN || theirs.len() > MAX_CHILDREN {
         return Err(());
     }
 
-    let ho = hunks(base, ours);
-    let ht = hunks(base, theirs);
+    let ho = spans(base, ours);
+    let ht = spans(base, theirs);
     apply_diff3(store, Sides { base, ours, theirs }, &ho, &ht)
 }
 
@@ -141,90 +144,26 @@ struct Sides<'a> {
     theirs: &'a [ObjectId],
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Hunk {
-    a0: usize,
-    a1: usize,
-    s0: usize,
-    s1: usize,
-}
-
-fn hunks(base: &[ObjectId], side: &[ObjectId]) -> Vec<Hunk> {
-    let pairs = lcs_pairs(base, side);
-    let mut out = Vec::new();
-    let mut ai = 0usize;
-    let mut si = 0usize;
-    for &(aj, sj) in &pairs {
-        if aj > ai || sj > si {
-            out.push(Hunk {
-                a0: ai,
-                a1: aj,
-                s0: si,
-                s1: sj,
-            });
-        }
-        ai = aj + 1;
-        si = sj + 1;
-    }
-    if ai < base.len() || si < side.len() {
-        out.push(Hunk {
-            a0: ai,
-            a1: base.len(),
-            s0: si,
-            s1: side.len(),
-        });
-    }
-    out
-}
-
-fn lcs_pairs(a: &[ObjectId], b: &[ObjectId]) -> Vec<(usize, usize)> {
-    let n = a.len();
-    let m = b.len();
-    let mut dp = vec![0u32; (n + 1) * (m + 1)];
-    let idx = |i: usize, j: usize| i * (m + 1) + j;
-    for i in 0..n {
-        for j in 0..m {
-            dp[idx(i + 1, j + 1)] = if a[i] == b[j] {
-                dp[idx(i, j)] + 1
-            } else {
-                dp[idx(i + 1, j)].max(dp[idx(i, j + 1)])
-            };
-        }
-    }
-    let mut pairs = Vec::new();
-    let mut i = n;
-    let mut j = m;
-    while i > 0 && j > 0 {
-        if a[i - 1] == b[j - 1] {
-            pairs.push((i - 1, j - 1));
-            i -= 1;
-            j -= 1;
-        } else if dp[idx(i - 1, j)] >= dp[idx(i, j - 1)] {
-            i -= 1;
-        } else {
-            j -= 1;
-        }
-    }
-    pairs.reverse();
-    pairs
-}
-
 fn apply_diff3(
     store: &mut NodeTree,
     sides: Sides<'_>,
-    ho: &[Hunk],
-    ht: &[Hunk],
+    ho: &[Span],
+    ht: &[Span],
 ) -> Result<Vec<ObjectId>, ()> {
     let mut out = Vec::new();
-    let mut pos = Pos { a: 0 };
-    let mut o_i = 0usize;
-    let mut t_i = 0usize;
+    let mut walk = Walk {
+        ho,
+        ht,
+        o_i: 0,
+        t_i: 0,
+        pos: Pos { a: 0 },
+    };
 
     loop {
-        let o_h = ho.get(o_i).copied();
-        let t_h = ht.get(t_i).copied();
+        let o_h = walk.ho.get(walk.o_i).copied();
+        let t_h = walk.ht.get(walk.t_i).copied();
         if o_h.is_none() && t_h.is_none() {
-            out.extend_from_slice(&sides.base[pos.a..]);
+            out.extend_from_slice(&sides.base[walk.pos.a..]);
             break;
         }
         let next_a = match (o_h, t_h) {
@@ -233,46 +172,32 @@ fn apply_diff3(
             (None, Some(t)) => t.a0,
             (None, None) => unreachable!(),
         };
-        if pos.a < next_a {
-            out.extend_from_slice(&sides.base[pos.a..next_a]);
-            pos.a = next_a;
+        if walk.pos.a < next_a {
+            out.extend_from_slice(&sides.base[walk.pos.a..next_a]);
+            walk.pos.a = next_a;
             continue;
         }
 
-        let o_here = o_h.filter(|h| h.a0 == pos.a);
-        let t_here = t_h.filter(|h| h.a0 == pos.a);
+        let o_here = o_h.filter(|h| h.a0 == walk.pos.a);
+        let t_here = t_h.filter(|h| h.a0 == walk.pos.a);
         match (o_here, t_here) {
-            (Some(oh), Some(th)) => {
-                take_overlap(store, sides, &mut out, oh, th, &mut pos)?;
-                o_i += 1;
-                t_i += 1;
-                skip_consumed(ho, &mut o_i, pos.a);
-                skip_consumed(ht, &mut t_i, pos.a);
-            }
+            (Some(oh), Some(th)) => consume_overlap(store, sides, &mut out, &mut walk, oh, th)?,
             (Some(oh), None) => {
                 if let Some(th) = t_h.filter(|th| th.a0 < oh.a1) {
-                    take_overlap(store, sides, &mut out, oh, th, &mut pos)?;
-                    o_i += 1;
-                    t_i += 1;
-                    skip_consumed(ho, &mut o_i, pos.a);
-                    skip_consumed(ht, &mut t_i, pos.a);
+                    consume_overlap(store, sides, &mut out, &mut walk, oh, th)?;
                 } else {
-                    out.extend_from_slice(&sides.ours[oh.s0..oh.s1]);
-                    pos.a = oh.a1;
-                    o_i += 1;
+                    out.extend_from_slice(&sides.ours[oh.b0..oh.b1]);
+                    walk.pos.a = oh.a1;
+                    walk.o_i += 1;
                 }
             }
             (None, Some(th)) => {
                 if let Some(oh) = o_h.filter(|oh| oh.a0 < th.a1) {
-                    take_overlap(store, sides, &mut out, oh, th, &mut pos)?;
-                    o_i += 1;
-                    t_i += 1;
-                    skip_consumed(ho, &mut o_i, pos.a);
-                    skip_consumed(ht, &mut t_i, pos.a);
+                    consume_overlap(store, sides, &mut out, &mut walk, oh, th)?;
                 } else {
-                    out.extend_from_slice(&sides.theirs[th.s0..th.s1]);
-                    pos.a = th.a1;
-                    t_i += 1;
+                    out.extend_from_slice(&sides.theirs[th.b0..th.b1]);
+                    walk.pos.a = th.a1;
+                    walk.t_i += 1;
                 }
             }
             (None, None) => return Err(()),
@@ -285,7 +210,31 @@ struct Pos {
     a: usize,
 }
 
-fn skip_consumed(hunks: &[Hunk], i: &mut usize, a: usize) {
+struct Walk<'a> {
+    ho: &'a [Span],
+    ht: &'a [Span],
+    o_i: usize,
+    t_i: usize,
+    pos: Pos,
+}
+
+fn consume_overlap(
+    store: &mut NodeTree,
+    sides: Sides<'_>,
+    out: &mut Vec<ObjectId>,
+    walk: &mut Walk<'_>,
+    oh: Span,
+    th: Span,
+) -> Result<(), ()> {
+    take_overlap(store, sides, out, oh, th, &mut walk.pos)?;
+    walk.o_i += 1;
+    walk.t_i += 1;
+    skip_consumed(walk.ho, &mut walk.o_i, walk.pos.a);
+    skip_consumed(walk.ht, &mut walk.t_i, walk.pos.a);
+    Ok(())
+}
+
+fn skip_consumed(hunks: &[Span], i: &mut usize, a: usize) {
     while hunks.get(*i).is_some_and(|h| h.a0 < a) {
         *i += 1;
     }
@@ -295,8 +244,8 @@ fn take_overlap(
     store: &mut NodeTree,
     sides: Sides<'_>,
     out: &mut Vec<ObjectId>,
-    oh: Hunk,
-    th: Hunk,
+    oh: Span,
+    th: Span,
     pos: &mut Pos,
 ) -> Result<(), ()> {
     if oh.a0 != th.a0 || oh.a1 != th.a1 {
@@ -305,8 +254,8 @@ fn take_overlap(
     out.extend(merge_gap(
         store,
         &sides.base[oh.a0..oh.a1.min(sides.base.len())],
-        &sides.ours[oh.s0..oh.s1],
-        &sides.theirs[th.s0..th.s1],
+        &sides.ours[oh.b0..oh.b1],
+        &sides.theirs[th.b0..th.b1],
     )?);
     pos.a = oh.a1;
     Ok(())
@@ -318,14 +267,8 @@ fn merge_gap(
     ours: &[ObjectId],
     theirs: &[ObjectId],
 ) -> Result<Vec<ObjectId>, ()> {
-    if ours == theirs {
-        return Ok(ours.to_vec());
-    }
-    if ours == base {
-        return Ok(theirs.to_vec());
-    }
-    if theirs == base {
-        return Ok(ours.to_vec());
+    if let Some(kept) = prefer_unchanged(base, ours, theirs) {
+        return Ok(kept.to_vec());
     }
     if base.is_empty() {
         // Two inserts at the same place: landing order, ours then theirs.

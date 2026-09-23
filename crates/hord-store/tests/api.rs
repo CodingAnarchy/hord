@@ -142,6 +142,38 @@ fn log_head_and_refs() {
 }
 
 #[test]
+fn log_read_then_append_then_reopen() {
+    let path = temp_repo();
+    let _g = Guard(path.clone());
+    let a;
+    let b;
+    {
+        let store = Store::create(&path).unwrap();
+        assert!(store.log().unwrap().is_empty());
+        a = store.put(b"log-a").unwrap();
+        b = store.put(b"log-b").unwrap();
+        store.append_log(a).unwrap();
+        assert_eq!(store.log().unwrap(), vec![a]);
+        store.append_log(b).unwrap();
+        store.append_log(a).unwrap();
+        assert_eq!(store.log().unwrap(), vec![a, b, a]);
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.log().unwrap(), vec![a, b, a]);
+}
+
+#[test]
+fn duplicate_put_after_pack_stays_readable() {
+    let (_g, store) = store();
+    let bytes = b"packed-then-put-again";
+    let id = store.put(bytes).unwrap();
+    assert_eq!(store.pack().unwrap(), 1);
+    assert_eq!(store.put(bytes).unwrap(), id);
+    assert_eq!(store.get(id).unwrap(), bytes);
+    assert!(store.contains(id).unwrap());
+}
+
+#[test]
 fn invalid_ref_name_is_rejected() {
     let (_g, store) = store();
     let id = store.put(b"x").unwrap();
