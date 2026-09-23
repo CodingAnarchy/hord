@@ -1,17 +1,18 @@
 //! Tables for `hord-txn` (spec §6.1, §6.7): the lander queue and the
-//! per-snapshot identity index pointer.
+//! per-snapshot identity index pointer. The pointer's methods live in
+//! `index.rs`, next to the content-addressed fact that makes it rebuildable.
 //!
 //! The store does not interpret either value. `hord-txn` owns the encoding of
 //! a queue entry and of the identity index object.
 
-use hord_core::{ObjectId, SnapshotId};
 use redb::{Database, Durability, ReadableTable, TableDefinition, WriteTransaction};
 
 use super::Store;
 use crate::{Error, Result};
 
 const QUEUE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("lander_queue");
-const IDENTITY_INDEX: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("identity_index");
+pub(super) const IDENTITY_INDEX: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("identity_index");
 
 pub(super) fn open_tables(txn: &WriteTransaction) -> Result<()> {
     txn.open_table(QUEUE).map_err(Error::index)?;
@@ -86,37 +87,5 @@ impl Store {
             out.push((key.value(), value.value().to_vec()));
         }
         Ok(out)
-    }
-
-    /// Point `snapshot` at its identity index object.
-    ///
-    /// `hord-txn` stores, per snapshot, which files carry [`hord_core::NodeId`]s
-    /// that differ from a fresh assignment. Replaces any previous pointer.
-    /// Like [`Store::queue_set`], the commit is made durable by the next
-    /// durable commit; the lander writes it before [`Store::set_head`].
-    pub fn set_identity_index(&self, snapshot: SnapshotId, index: ObjectId) -> Result<()> {
-        let mut txn = self.db.begin_write().map_err(Error::index)?;
-        txn.set_durability(Durability::None);
-        {
-            let mut table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
-            table
-                .insert(snapshot.as_bytes().as_slice(), index.as_bytes().as_slice())
-                .map_err(Error::index)?;
-        }
-        txn.commit().map_err(Error::index)?;
-        Ok(())
-    }
-
-    /// The identity index object recorded for `snapshot`, if any.
-    pub fn identity_index(&self, snapshot: SnapshotId) -> Result<Option<ObjectId>> {
-        let txn = self.db.begin_read().map_err(Error::index)?;
-        let table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
-        match table
-            .get(snapshot.as_bytes().as_slice())
-            .map_err(Error::index)?
-        {
-            Some(value) => Ok(Some(ObjectId::try_from(value.value())?)),
-            None => Ok(None),
-        }
     }
 }

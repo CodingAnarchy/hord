@@ -96,6 +96,12 @@ pub enum Error {
         /// What was wrong.
         reason: String,
     },
+    /// No identity index is recorded for the snapshot, and it is not the
+    /// result of a Tier 0 change in the log (whose index is derived). Its
+    /// NodeIds are unknown; they are never guessed by a fresh assignment.
+    /// `Store::rebuild_index` restores lost pointers.
+    #[error("no identity index recorded for snapshot {0}")]
+    MissingIdentity(SnapshotId),
     /// A blocking task panicked or was cancelled.
     #[error("background task failed: {0}")]
     Task(String),

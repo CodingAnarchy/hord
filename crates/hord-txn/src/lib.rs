@@ -33,7 +33,9 @@ mod semantic;
 mod snapshot;
 mod workspace;
 
-pub use conflict::{ConflictKind, ConflictReport, MergeConflict, MergeSeverity, SetConflict};
+pub use conflict::{
+    AdapterMerge, ConflictKind, ConflictReport, MergeConflict, MergeSeverity, SetConflict,
+};
 pub use error::{Error, Result};
 pub use hord_store::WorkspaceId;
 #[allow(deprecated)]
@@ -44,6 +46,8 @@ pub use lander::{
 };
 pub use materialize::MaterializeMode;
 pub use propose::ReadDeclaration;
-pub use repo::{Base, BeginOptions, Head, Repo, RepoConfig, RepoOptions, default_adapters};
+pub use repo::{
+    Base, BeginOptions, FailClosedVerifier, Head, Repo, RepoConfig, RepoOptions, default_adapters,
+};
 pub use semantic::DefinitionInfo;
 pub use workspace::{AccessLog, Materialization, Proposal, Workspace};

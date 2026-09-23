@@ -148,7 +148,7 @@ async fn overlapping_writes_are_a_write_write_conflict() {
 
 #[tokio::test]
 async fn reading_what_another_change_wrote_is_a_read_write_conflict() {
-    let t = repo(&fixture()).await;
+    let t = stub_repo(&fixture()).await;
     let mut a = begin(&t.repo, "a").await;
     let mut b = begin(&t.repo, "b").await;
     let delta = def(&mut b, "src/lib.rs", "delta").await;
@@ -241,7 +241,7 @@ async fn write_read_is_reported_only_when_strict() {
 
 #[tokio::test]
 async fn blob_tier_files_conflict_by_path_and_line_merge() {
-    let t = repo(&fixture()).await;
+    let t = stub_repo(&fixture()).await;
     let mut a = begin(&t.repo, "a").await;
     let mut b = begin(&t.repo, "b").await;
     edit(&mut a, "README.md", README, "line one", "line ONE").await;
@@ -553,37 +553,15 @@ async fn rebased_records_carry_structural_ops_and_land_validated() {
 /// `Cargo.lock` both land through the lockfile merge.
 #[tokio::test]
 async fn concurrent_cargo_lock_dependency_additions_both_land() {
-    // Normalized: git may check the fixture out with CRLF (Windows autocrlf).
-    let lock =
-        include_str!("../../hord-lang-rust/testdata/lock/hord-v4.lock").replace("\r\n", "\n");
-    const STORE_DEPS: &str = "name = \"hord-store\"\nversion = \"0.0.0\"\ndependencies = [\n";
-    let package = |name: &str, sum: char| {
-        format!(
-            "[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n\n",
-            sum.to_string().repeat(64)
-        )
-    };
-    // a adds `zz-alpha` (sorts last); b adds `aaa-beta` (sorts first). Both
-    // make hord-store depend on theirs.
-    let a_lock = format!("{lock}\n{}", package("zz-alpha", 'a').trim_end()).replacen(
-        STORE_DEPS,
-        &format!("{STORE_DEPS} \"zz-alpha\",\n"),
-        1,
-    ) + "\n";
-    let a_lock = a_lock.replacen(" \"zz-alpha\",\n \"hord-core\",", " \"hord-core\",", 1);
-    let a_lock = a_lock.replacen(" \"zstd\",\n]", " \"zstd\",\n \"zz-alpha\",\n]", 1);
-    let b_lock = lock
-        .replacen(
-            "[[package]]\n",
-            &format!("{}[[package]]\n", package("aaa-beta", 'b')),
-            1,
-        )
-        .replacen(STORE_DEPS, &format!("{STORE_DEPS} \"aaa-beta\",\n"), 1);
+    let (lock, a_lock, b_lock) = lock_additions();
+    const STORE_DEPS: &str = LOCK_STORE_DEPS;
     assert_ne!(a_lock, lock);
     assert_ne!(b_lock, lock);
 
     let mut files = fixture();
     files.push(("Cargo.lock", &lock));
+    // Write-write on `dependencies`, resolved at rung 1 by the lockfile
+    // merge. It lands under the default verifier (ADR 0013 amendment).
     let t = repo(&files).await;
     let mut a = begin(&t.repo, "a").await;
     let mut b = begin(&t.repo, "b").await;
@@ -613,6 +591,16 @@ async fn concurrent_cargo_lock_dependency_additions_both_land() {
     let report = t.repo.conflicts(pb.change).await.unwrap();
     assert!(report.has(ConflictKind::WriteWrite), "{report:#?}");
     assert!(!report.has_hard(), "{report:#?}");
+    assert_eq!(
+        report
+            .adapter_merged
+            .iter()
+            .map(|m| m.path.clone())
+            .collect::<Vec<_>>(),
+        vec![path("Cargo.lock")],
+        "{report:#?}"
+    );
+    assert!(report.only_adapter_merged() && report.verification.is_none());
 
     let merged = head_file(&t.repo, "Cargo.lock").await;
     assert!(merged.contains("name = \"zz-alpha\"") && merged.contains("name = \"aaa-beta\""));

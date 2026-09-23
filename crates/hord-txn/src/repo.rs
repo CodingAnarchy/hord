@@ -12,7 +12,7 @@ use hord_core::{
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
 
-use crate::lander::{QueueEntry, StubVerifier, Verifier};
+use crate::lander::{QueueEntry, Verdict, Verifier, VerifyFuture, VerifyRequest};
 use crate::materialize::MaterializeMode;
 use crate::semantic::{IdentityIndex, RustCtx};
 use crate::workspace::{Materialization, Workspace};
@@ -38,7 +38,9 @@ pub struct RepoOptions {
     pub config: RepoConfig,
     /// Language adapters. `None` registers [`default_adapters`].
     pub adapters: Option<AdapterRegistry>,
-    /// Verification step run by the lander. `None` uses [`StubVerifier`].
+    /// Verification step run by the lander. `None` uses
+    /// [`FailClosedVerifier`]: until M4's verifier exists, only clean
+    /// changes land. [`crate::StubVerifier`] (land everything) is opt-in.
     pub verifier: Option<Arc<dyn Verifier>>,
 }
 
@@ -52,6 +54,53 @@ impl std::fmt::Debug for RepoOptions {
             )
             .field("verifier", &self.verifier.is_some())
             .finish()
+    }
+}
+
+/// The default verifier until M4 (spec §15: never land an unverified merge).
+///
+/// Passes a change only when its report is clean: no set overlap with a
+/// landed change (spec §6.3) and no soft merge conflict from the structural
+/// rebase (§6.4 rung 1). One exemption (ADR 0013 amendment): overlaps whose
+/// every node and path lies in files a purpose-built adapter merge resolved
+/// with no conflict ([`crate::ConflictReport::only_adapter_merged`]).
+/// Anything else fails, so the lander parks it as
+/// [`crate::QueueStatus::Conflicted`] with the reason in
+/// [`crate::ConflictReport::verification`]. Disjoint, clean changes land
+/// without verification, as in M3.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FailClosedVerifier;
+
+impl Verifier for FailClosedVerifier {
+    fn verify<'a>(&'a self, request: VerifyRequest<'a>) -> VerifyFuture<'a> {
+        let report = request.report;
+        // ADR 0013 amendment: overlaps confined to files an adapter merge
+        // resolved (for example concurrent lockfile additions) land.
+        let verdict = if report.only_adapter_merged() {
+            Verdict::Pass
+        } else {
+            let mut kinds: Vec<&str> = report
+                .conflicts
+                .iter()
+                .map(|c| match c.kind {
+                    crate::ConflictKind::WriteWrite => "write-write",
+                    crate::ConflictKind::ReadWrite => "read-write",
+                    crate::ConflictKind::WriteRead => "write-read",
+                })
+                .collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            Verdict::Fail {
+                reason: format!(
+                    "unverified overlap: {} set conflict(s) [{}] and {} soft merge \
+                     conflict(s); no verifier is configured, so only clean changes land",
+                    report.conflicts.len(),
+                    kinds.join(", "),
+                    report.merge.len(),
+                ),
+            }
+        };
+        Box::pin(async move { verdict })
     }
 }
 
@@ -198,7 +247,9 @@ impl Inner {
             store,
             adapters: options.adapters.unwrap_or_else(default_adapters),
             config: options.config,
-            verifier: options.verifier.unwrap_or_else(|| Arc::new(StubVerifier)),
+            verifier: options
+                .verifier
+                .unwrap_or_else(|| Arc::new(FailClosedVerifier)),
             toolchain,
             empty_tree,
             head: Mutex::new(None),
@@ -326,6 +377,9 @@ impl Inner {
             signature: None,
         };
         let change = self.store.put_object(&record)?;
+        // Tier 0: every file is a fresh assignment. Recorded so the pointer
+        // is durable with `set_head` below.
+        self.put_identity_index(result, crate::semantic::IdentityIndex::empty(result))?;
         self.store.append_log(change)?;
         self.store.set_head(change)?;
         self.store.index_change(change)?;

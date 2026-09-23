@@ -189,12 +189,14 @@ impl Workspace {
     }
 
     /// Current content of `path`, or `None` if it does not exist. Records the
-    /// path and every definition in the file as read.
+    /// path (even when it is missing: its absence was read) and every
+    /// definition in the file as read.
     pub async fn read_file(&mut self, path: &RepoPath) -> Result<Option<Bytes>> {
-        let Some(bytes) = self.current(path).await? else {
+        let current = self.current(path).await?;
+        self.access_log.read_paths.insert(path.clone());
+        let Some(bytes) = current else {
             return Ok(None);
         };
-        self.access_log.read_paths.insert(path.clone());
         if let Some(view) = self.view(path, &bytes).await? {
             self.access_log
                 .reads
@@ -203,19 +205,20 @@ impl Workspace {
         Ok(Some(bytes))
     }
 
-    /// Bytes `range` of `path` (clamped to the file). Records the path and
-    /// every definition whose span overlaps the range.
+    /// Bytes `range` of `path` (clamped to the file). Records the path (even
+    /// when it is missing) and every definition whose span overlaps the range.
     pub async fn read_range(
         &mut self,
         path: &RepoPath,
         range: Range<usize>,
     ) -> Result<Option<Bytes>> {
-        let Some(bytes) = self.current(path).await? else {
+        let current = self.current(path).await?;
+        self.access_log.read_paths.insert(path.clone());
+        let Some(bytes) = current else {
             return Ok(None);
         };
         let end = range.end.min(bytes.len());
         let start = range.start.min(end);
-        self.access_log.read_paths.insert(path.clone());
         if let Some(view) = self.view(path, &bytes).await? {
             self.access_log.reads.extend(
                 view.defs

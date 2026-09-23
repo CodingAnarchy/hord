@@ -56,6 +56,17 @@ pub struct MergeConflict {
     pub reason: String,
 }
 
+/// A file that a purpose-built adapter merge (for example a lockfile merge,
+/// ADR 0013) resolved during the rebase, with no hard or soft conflict.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdapterMerge {
+    /// The merged file.
+    pub path: RepoPath,
+    /// Ids that belong to the file: its root and every definition it has at
+    /// the change's base, at head, or in the change's result.
+    pub nodes: Vec<NodeId>,
+}
+
 /// Machine-readable account of a change's conflicts (`hord conflicts`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConflictReport {
@@ -75,6 +86,10 @@ pub struct ConflictReport {
     pub merge: Vec<MergeConflict>,
     /// Why verification failed, if it did (a semantic conflict, spec §6.5).
     pub verification: Option<String>,
+    /// Files resolved by a purpose-built adapter merge with no conflict.
+    /// Empty for reports recorded before this field existed.
+    #[serde(default)]
+    pub adapter_merged: Vec<AdapterMerge>,
 }
 
 impl ConflictReport {
@@ -98,6 +113,23 @@ impl ConflictReport {
             .flat_map(|c| c.nodes.iter().copied())
             .chain(self.merge.iter().flat_map(|m| m.nodes.iter().copied()))
             .collect()
+    }
+
+    /// Whether every set conflict lies in files an adapter merge resolved
+    /// (each node is one of those files' ids, each path one of those files)
+    /// and no soft merge conflict is outside them (ADR 0013 fail-closed
+    /// exemption). Vacuously true for a clean report.
+    #[must_use]
+    pub fn only_adapter_merged(&self) -> bool {
+        let paths: BTreeSet<&RepoPath> = self.adapter_merged.iter().map(|m| &m.path).collect();
+        let nodes: BTreeSet<NodeId> = self
+            .adapter_merged
+            .iter()
+            .flat_map(|m| m.nodes.iter().copied())
+            .collect();
+        self.conflicts.iter().all(|c| {
+            c.nodes.iter().all(|n| nodes.contains(n)) && c.paths.iter().all(|p| paths.contains(p))
+        }) && self.merge.iter().all(|m| paths.contains(&m.path))
     }
 
     /// Whether any overlap of `kind` was found.

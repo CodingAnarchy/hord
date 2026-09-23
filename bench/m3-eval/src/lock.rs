@@ -143,6 +143,9 @@ async fn case(
     lock: &str,
 ) -> Result<LockCase> {
     let store = hord_store::Store::create(dir.join(label)).context("create store")?;
+    // The product default verifier: both additions write the same
+    // `dependencies` node, which the lockfile merge resolves, so they land
+    // under the adapter-merge exemption (ADR 0013), not the stub.
     let repo = Repo::from_store(store, RepoOptions::default()).await?;
     let lock_path: RepoPath = "Cargo.lock".parse()?;
     repo.bootstrap(

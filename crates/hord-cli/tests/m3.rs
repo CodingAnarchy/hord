@@ -295,9 +295,20 @@ fn read_write_through_references_is_explained() {
     assert_eq!(json(dir, &["conflicts", &second])["clean"], true);
     json(dir, &["submit", &first]);
     json(dir, &["submit", &second]);
-    json(dir, &["land", "--local"]);
+    let landed = json(dir, &["land", "--local"]);
+    // No verifier until M4, so the default fails closed (spec §15): the
+    // overlap parks instead of landing flagged.
+    assert_eq!(landed["head"], first.as_str());
     let report = json(dir, &["conflicts", &second]);
-    assert_eq!(report["status"], "landed");
+    assert_eq!(report["status"], "conflicted");
+    assert_eq!(report["clean"], false);
+    assert!(
+        report["verification"]
+            .as_str()
+            .unwrap()
+            .contains("read-write"),
+        "{report:#}"
+    );
     let rw = &report["conflicts"][0];
     assert_eq!(rw["kind"], "read-write");
     assert!(
@@ -305,10 +316,8 @@ fn read_write_through_references_is_explained() {
         "{rw:#}"
     );
     let text = ok(dir, &["conflicts", &second]);
-    assert!(
-        text.contains("landed, flagged for re-verification"),
-        "{text}"
-    );
+    assert!(text.contains("verification failed: "), "{text}");
+    assert!(text.contains("parked: needs replay"), "{text}");
 }
 
 #[test]
@@ -384,4 +393,69 @@ fn ws_materialize_modes_rm_gc_and_paranoid_status() {
         !run(dir, &["ws", "rm", id]).status.success(),
         "already removed"
     );
+}
+
+/// Two concurrent `Cargo.lock` dependency additions both land under the
+/// default verifier: their overlap (hord-store's `dependencies`) is resolved
+/// by the lockfile merge, which the fail-closed default exempts (ADR 0013).
+#[test]
+fn concurrent_lockfile_additions_land_under_the_default_verifier() {
+    let lock =
+        include_str!("../../hord-lang-rust/testdata/lock/hord-v4.lock").replace("\r\n", "\n");
+    const STORE_DEPS: &str = "name = \"hord-store\"\nversion = \"0.0.0\"\ndependencies = [\n";
+    let package = |name: &str, sum: char| {
+        format!(
+            "[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n\n",
+            sum.to_string().repeat(64)
+        )
+    };
+    // a adds `zz-alpha` (sorts last), b adds `aaa-beta` (sorts first); each
+    // makes hord-store depend on its package, in Cargo's order.
+    let a_lock = format!("{lock}\n{}", package("zz-alpha", 'a').trim_end()).replacen(
+        " \"zstd\",\n]",
+        " \"zstd\",\n \"zz-alpha\",\n]",
+        1,
+    ) + "\n";
+    let b_lock = lock
+        .replacen(
+            "[[package]]\n",
+            &format!("{}[[package]]\n", package("aaa-beta", 'b')),
+            1,
+        )
+        .replacen(STORE_DEPS, &format!("{STORE_DEPS} \"aaa-beta\",\n"), 1);
+    assert!(a_lock.contains(" \"zz-alpha\",\n]") && b_lock.contains(" \"aaa-beta\",\n"));
+
+    let source = TempDir::new("hord-m3-lock-git");
+    fs::write(source.0.join("Cargo.lock"), &lock).unwrap();
+    git(&source.0, &["init", "-q", "-b", "main"]);
+    git(&source.0, &["add", "."]);
+    git(&source.0, &["commit", "-q", "-m", "fixture"]);
+    let repo = TempDir::new("hord-m3-lock-repo");
+    let dir = &repo.0;
+    ok(dir, &["init", "--from-git", source.0.to_str().unwrap()]);
+
+    let (a, ca) = ws_new(dir);
+    let (b, cb) = ws_new(dir);
+    fs::write(ca.join("Cargo.lock"), &a_lock).unwrap();
+    fs::write(cb.join("Cargo.lock"), &b_lock).unwrap();
+    let first = propose(dir, &a, &intent(dir, "a", "add zz-alpha", ""));
+    let second = propose(dir, &b, &intent(dir, "b", "add aaa-beta", ""));
+    json(dir, &["submit", &first]);
+    json(dir, &["submit", &second]);
+    let landed = json(dir, &["land", "--local"]);
+    let statuses: Vec<_> = landed["processed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["status"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(statuses, ["landed", "landed"], "{landed:#}");
+
+    let report = json(dir, &["conflicts", &second]);
+    assert_eq!(report["status"], "landed");
+    assert_eq!(report["conflicts"][0]["kind"], "write-write", "{report:#}");
+    assert_eq!(report["adapter_merged"], serde_json::json!(["Cargo.lock"]));
+    assert!(report.get("verification").is_none(), "{report:#}");
+    let text = ok(dir, &["conflicts", &second]);
+    assert!(text.contains("merged by adapter: Cargo.lock"), "{text}");
 }

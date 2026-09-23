@@ -19,12 +19,13 @@ fn files(helper: &str, a_rest: &str, b_rest: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// Both changes land (stub verifier) so each report can be inspected.
 async fn repo_of(files: &[(String, String)]) -> TempRepo {
     let refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
-    repo(&refs).await
+    stub_repo(&refs).await
 }
 
 async fn id_in(repo: &Repo, file: &str, name: &str) -> NodeId {

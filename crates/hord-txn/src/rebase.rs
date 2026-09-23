@@ -6,8 +6,9 @@ use std::sync::Arc;
 use hord_core::{Bytes, ChangeRecord, NodeId, ObjectId, Op, RepoPath, SnapshotId};
 use hord_lang::{IdentifiedTree, Site};
 
-use crate::conflict::{MergeConflict, MergeSeverity};
+use crate::conflict::{AdapterMerge, MergeConflict, MergeSeverity};
 use crate::files::{FileChange, file_changes};
+use crate::ids::path_node_id;
 use crate::propose::check_reproduces;
 use crate::repo::Inner;
 use crate::semantic::IdentityIndex;
@@ -23,6 +24,30 @@ pub(crate) struct Rebased {
     /// Files whose landed ops were checked to reproduce their result from
     /// head during the rebase; landing validation need not re-apply them.
     pub checked: BTreeSet<RepoPath>,
+    /// Files a purpose-built adapter merge resolved with no conflict.
+    pub adapter_merged: Vec<AdapterMerge>,
+}
+
+/// `path`'s record for [`ConflictReport::adapter_merged`]: the file root and
+/// every definition id the file has at the change's base, at `head`, or in
+/// the change's result. A set conflict between the change and `L` on this
+/// file names only these ids (each side's sets name ids of its own trees).
+fn adapter_merge(
+    inner: &Inner,
+    record: &ChangeRecord,
+    head: SnapshotId,
+    path: &RepoPath,
+) -> Result<AdapterMerge> {
+    let mut nodes = BTreeSet::from([path_node_id(path)]);
+    for snapshot in [record.base, head, record.result] {
+        if let Some(parsed) = inner.file_view(snapshot, path)?.and_then(|v| v.parsed) {
+            nodes.extend(parsed.tree.ids.values().copied());
+        }
+    }
+    Ok(AdapterMerge {
+        path: path.clone(),
+        nodes: nodes.into_iter().collect(),
+    })
 }
 
 /// Re-apply `record` on `head`. A file `head` has not changed since the
@@ -42,6 +67,7 @@ pub(crate) fn rebase(
     let mut outcomes = Vec::new();
     let mut hard = false;
     let mut checked = BTreeSet::new();
+    let mut adapter_merged = Vec::new();
     let proposed_here = {
         let proposed = crate::repo::lock(&inner.proposed);
         let id = hord_core::ObjectId::of(record)?;
@@ -119,7 +145,11 @@ pub(crate) fn rebase(
                 ops: file_ops,
                 identity,
                 soft,
+                adapter_merged: by_adapter,
             } => {
+                if by_adapter {
+                    adapter_merged.push(adapter_merge(inner, record, head, path)?);
+                }
                 outcomes.extend(soft);
                 if Some(blob) == ours {
                     continue;
@@ -156,6 +186,7 @@ pub(crate) fn rebase(
         index,
         soft: outcomes,
         checked,
+        adapter_merged,
     }))
 }
 
@@ -235,6 +266,7 @@ fn reapply(
             ops,
             identity: Some(identity),
             soft: Vec::new(),
+            adapter_merged: false,
         }));
     }
     match finish_parsed(inner, head, path, bytes, Vec::new())? {
@@ -419,6 +451,9 @@ enum Merged {
         ops: Vec<Op>,
         identity: Option<ObjectId>,
         soft: Vec<MergeConflict>,
+        /// Resolved by the file's purpose-built adapter merge with no
+        /// conflict (ADR 0013 fail-closed exemption).
+        adapter_merged: bool,
     },
     Hard(MergeConflict),
 }
@@ -458,7 +493,22 @@ fn merge_file(
     if hord_lang_rust::is_cargo_lock(path) {
         // ADR 0013: the lockfile merge, not the generic structural one.
         return match hord_lang_rust::merge_cargo_lock(&base_bytes, &ours_bytes, &theirs_bytes) {
-            Ok(bytes) => finish_parsed(inner, head, path, bytes, Vec::new()),
+            Ok(bytes) => Ok(match finish_parsed(inner, head, path, bytes, Vec::new())? {
+                Merged::Clean {
+                    blob,
+                    ops,
+                    identity,
+                    soft,
+                    ..
+                } => Merged::Clean {
+                    adapter_merged: soft.is_empty(),
+                    blob,
+                    ops,
+                    identity,
+                    soft,
+                },
+                hard => hard,
+            }),
             Err(hord_lang_rust::CargoLockMergeError::Unsupported { .. }) => {
                 finish_blob(inner, path, &base_bytes, &ours_bytes, &theirs_bytes)
             }
@@ -523,6 +573,7 @@ fn finish_blob(
                 ops: Vec::new(),
                 identity: None,
                 soft: Vec::new(),
+                adapter_merged: false,
             })
         }
         Err(conflict) => Ok(hard(path, Vec::new(), conflict.reason)),
@@ -545,6 +596,7 @@ fn finish_parsed(
             ops: Vec::new(),
             identity: None,
             soft,
+            adapter_merged: false,
         });
     };
     let Some(tree) = inner.parse(adapter, blob, bytes.as_slice()) else {
@@ -573,5 +625,6 @@ fn finish_parsed(
         ops,
         identity: Some(identity),
         soft,
+        adapter_merged: false,
     })
 }

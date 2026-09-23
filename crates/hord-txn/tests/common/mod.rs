@@ -49,6 +49,17 @@ pub async fn repo(files: &[(&str, &str)]) -> TempRepo {
     repo_with(files, RepoOptions::default()).await
 }
 
+/// [`repo`] with the M3 stub verifier: changes whose sets overlap a landed
+/// change still land after a clean rebase (verification stubbed, spec §12
+/// M3). The default verifier parks them.
+pub async fn stub_repo(files: &[(&str, &str)]) -> TempRepo {
+    let options = RepoOptions {
+        verifier: Some(std::sync::Arc::new(hord_txn::StubVerifier)),
+        ..RepoOptions::default()
+    };
+    repo_with(files, options).await
+}
+
 pub fn actor(id: &str) -> Actor {
     Actor::Agent {
         id: id.into(),
@@ -155,4 +166,40 @@ pub async fn submit(repo: &Repo, ws: &mut Workspace, summary: &str) -> hord_core
     let proposal = ws.propose(intent(summary)).await.unwrap();
     repo.submit(proposal.change).await.unwrap();
     proposal.change
+}
+
+/// hord-store's dependency list header in the `hord-v4.lock` fixture.
+pub const LOCK_STORE_DEPS: &str = "name = \"hord-store\"\nversion = \"0.0.0\"\ndependencies = [\n";
+
+/// `(base, a, b)` for `Cargo.lock`: `a` adds `zz-alpha` (sorts last) and `b`
+/// adds `aaa-beta` (sorts first); both make hord-store depend on theirs, so
+/// both write hord-store's `dependencies` node.
+pub fn lock_additions() -> (String, String, String) {
+    // Normalized: git may check the fixture out with CRLF (Windows autocrlf).
+    let lock =
+        include_str!("../../../hord-lang-rust/testdata/lock/hord-v4.lock").replace("\r\n", "\n");
+    const STORE_DEPS: &str = LOCK_STORE_DEPS;
+    let package = |name: &str, sum: char| {
+        format!(
+            "[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n\n",
+            sum.to_string().repeat(64)
+        )
+    };
+    // a adds `zz-alpha` (sorts last); b adds `aaa-beta` (sorts first). Both
+    // make hord-store depend on theirs.
+    let a_lock = format!("{lock}\n{}", package("zz-alpha", 'a').trim_end()).replacen(
+        STORE_DEPS,
+        &format!("{STORE_DEPS} \"zz-alpha\",\n"),
+        1,
+    ) + "\n";
+    let a_lock = a_lock.replacen(" \"zz-alpha\",\n \"hord-core\",", " \"hord-core\",", 1);
+    let a_lock = a_lock.replacen(" \"zstd\",\n]", " \"zstd\",\n \"zz-alpha\",\n]", 1);
+    let b_lock = lock
+        .replacen(
+            "[[package]]\n",
+            &format!("{}[[package]]\n", package("aaa-beta", 'b')),
+            1,
+        )
+        .replacen(STORE_DEPS, &format!("{STORE_DEPS} \"aaa-beta\",\n"), 1);
+    (lock, a_lock, b_lock)
 }

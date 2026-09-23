@@ -40,7 +40,35 @@ pub fn apply(
         ));
     }
     let ops = swap_root(ops, file_parent(path), root_sentinel());
+    check_replace_sources(base, &ops, file_parent(path))?;
     apply_internal(base, &ops, store)
+}
+
+/// Every [`Op::Replace`] must find its `from` at its node in `base`, so a
+/// script never overwrites content it was not diffed from (for example an
+/// edit landed since, in a rebase). An empty base has nothing to check.
+fn check_replace_sources(base: &IdentifiedTree, ops: &[Op], root: NodeId) -> Result<(), Error> {
+    if base.tree.root().is_none() {
+        return Ok(());
+    }
+    for op in ops {
+        if let Op::Replace { node, from, .. } = op
+            && let Some(found) = oid_of(base, *node)
+            && found != *from
+        {
+            let node = if *node == root_sentinel() {
+                root
+            } else {
+                *node
+            };
+            return Err(Error::StaleReplace {
+                node,
+                expected: *from,
+                found,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// [`apply`] with the file root as [`root_sentinel`].

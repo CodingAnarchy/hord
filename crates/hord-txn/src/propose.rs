@@ -15,9 +15,9 @@
 //!
 //! `write_set` is every definition the ops touch (the file root for a glue
 //! edit), plus births, deaths, and derivations, and the path id
-//! ([`crate::path_node_id`], equal to the file root id) for blob-tier and
-//! coarse writes, with every base definition of a coarsely written parsed
-//! file.
+//! ([`crate::path_node_id`], equal to the file root id) for created files,
+//! blob-tier and coarse writes, with every base definition of a coarsely
+//! written parsed file.
 //!
 //! `read_set` follows ADR 0012: the access log (definitions, and path ids of
 //! files read), one hop of outgoing `References` from every written
@@ -96,6 +96,11 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
             continue;
         }
         tree_changes.insert(path.clone(), result_blob);
+        if base_blob.is_none() {
+            // Creating a file writes its path (the file root, ADR 0015): a
+            // read of the missing path, or another creation of it, overlaps.
+            write_set.insert(path_node_id(path));
+        }
         // Op::Blob only for new or deleted content and for files without a
         // structural diff (ADR 0015); a parsed edit is its structural ops.
         let blob_op = Op::Blob {
@@ -312,13 +317,15 @@ fn root_glue(tree: &IdentifiedTree) -> Vec<ObjectId> {
 
 /// Leaf content ids under `site`, skipping nested definition sites and the
 /// `,`/`;` separators between child definitions (adding a field is a birth,
-/// not a write of the struct).
+/// not a write of the struct). A skipped separator that carries a comment
+/// still counts: the comment is content of the enclosing definition.
 fn own_leaves(tree: &IdentifiedTree, site: &[u32]) -> Vec<ObjectId> {
     fn walk(
         tree: &IdentifiedTree,
         oid: ObjectId,
         site: &mut Vec<u32>,
         top: bool,
+        separator: bool,
         out: &mut Vec<ObjectId>,
     ) {
         if !top && tree.ids.contains_key(site.as_slice()) {
@@ -328,20 +335,45 @@ fn own_leaves(tree: &IdentifiedTree, site: &[u32]) -> Vec<ObjectId> {
             return;
         };
         if node.children.is_empty() {
-            if !matches!(node.kind.as_str(), "," | ";") {
+            if !separator || has_comment(&node.raw) {
                 out.push(oid);
             }
             return;
         }
         for (i, child) in node.children.iter().enumerate() {
+            let separator = is_separator(tree, &node.children, site, i);
             site.push(u32::try_from(i).unwrap_or(u32::MAX));
-            walk(tree, *child, site, false, out);
+            walk(tree, *child, site, false, separator, out);
             site.pop();
         }
     }
+    /// Child `i` of the node at `site` is a `,`/`;` leaf next to a child
+    /// definition.
+    fn is_separator(tree: &IdentifiedTree, children: &[ObjectId], site: &[u32], i: usize) -> bool {
+        let Some(child) = tree.tree.get(children[i]) else {
+            return false;
+        };
+        if !child.children.is_empty() || !matches!(child.kind.as_str(), "," | ";") {
+            return false;
+        }
+        let is_def = |j: usize| {
+            let mut at = site.to_vec();
+            at.push(u32::try_from(j).unwrap_or(u32::MAX));
+            tree.ids.contains_key(at.as_slice())
+        };
+        (i > 0 && is_def(i - 1)) || (i + 1 < children.len() && is_def(i + 1))
+    }
+    /// A separator's raw bytes hold more than the token and whitespace.
+    fn has_comment(raw: &hord_core::Bytes) -> bool {
+        raw.as_slice()
+            .iter()
+            .filter(|b| !b.is_ascii_whitespace())
+            .nth(1)
+            .is_some()
+    }
     let mut out = Vec::new();
     if let Some(oid) = tree.oid_at(site) {
-        walk(tree, oid, &mut site.to_vec(), true, &mut out);
+        walk(tree, oid, &mut site.to_vec(), true, false, &mut out);
     }
     out
 }

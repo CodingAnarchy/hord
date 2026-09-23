@@ -11,6 +11,16 @@
 //! it. Unchanged files share objects between snapshots, so an index costs
 //! O(files written so far), not O(definitions).
 //!
+//! NodeIds are a function of stored objects. The index object names its
+//! snapshot, and [`hord_store::Store::set_identity_index`] also stores a
+//! binding object that [`hord_store::Store::rebuild_index`] restores the
+//! pointer from. A snapshot with no pointer is not read as "all fresh": the
+//! empty tree has an empty index, a snapshot produced by a Tier 0 change
+//! (only `Blob`/`Tree` ops and no identity deltas: bootstrap, git import)
+//! gets its base's index minus the files it changed (ADR 0015: a blob-only
+//! write is coarse, so those files are fresh), and anything else is
+//! [`Error::MissingIdentity`].
+//!
 //! # References (ADR 0012)
 //!
 //! The Rust resolver needs a [`ResolveCtx`] over the whole snapshot. One is
@@ -26,8 +36,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use hord_core::{
-    Bytes, IdentityMap, LangId, Node, NodeId, NodeKind, NodePath, ObjectId, QualifiedName,
-    RepoPath, SnapshotId,
+    Bytes, ChangeRecord, IdentityMap, LangId, Node, NodeId, NodeKind, NodePath, ObjectId, Op,
+    QualifiedName, RepoPath, SnapshotId,
 };
 use hord_lang::{Anchor, IdentifiedTree, LangAdapter, NodeTree, ResolveCtx, Site};
 use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
@@ -40,12 +50,24 @@ use crate::{Error, Result};
 /// Files of one snapshot whose [`NodeId`]s differ from a fresh assignment.
 ///
 /// Stored as canonical CBOR; the pairs are sorted by path.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct IdentityIndex {
+    /// Snapshot this index describes. Set by
+    /// [`Inner::put_identity_index`], so an index cloned from another
+    /// snapshot is re-labelled when stored.
+    pub snapshot: SnapshotId,
     pub files: Vec<(RepoPath, ObjectId)>,
 }
 
 impl IdentityIndex {
+    /// No carried files: every file of `snapshot` is a fresh assignment.
+    pub fn empty(snapshot: SnapshotId) -> Self {
+        Self {
+            snapshot,
+            files: Vec::new(),
+        }
+    }
+
     pub fn get(&self, path: &RepoPath) -> Option<ObjectId> {
         self.files
             .binary_search_by(|(p, _)| p.cmp(path))
@@ -145,23 +167,98 @@ impl Inner {
             return Ok(Arc::clone(index));
         }
         let index = match self.store.identity_index(snapshot)? {
-            Some(id) => self.store.get_object::<IdentityIndex>(id)?,
-            None => IdentityIndex::default(),
+            Some(id) => {
+                let index = self.store.get_object::<IdentityIndex>(id)?;
+                if index.snapshot != snapshot {
+                    return Err(Error::Corrupt {
+                        id,
+                        reason: format!(
+                            "identity index for {} is recorded for {snapshot}",
+                            index.snapshot
+                        ),
+                    });
+                }
+                index
+            }
+            None if snapshot == self.empty_tree => IdentityIndex::empty(snapshot),
+            None => return self.derive_tier0_index(snapshot),
         };
         let index = Arc::new(index);
+        self.cache_index(snapshot, Arc::clone(&index));
+        Ok(index)
+    }
+
+    fn cache_index(&self, snapshot: SnapshotId, index: Arc<IdentityIndex>) {
         let mut cache = lock(&self.indexes);
         if cache.len() >= 4096 {
             cache.clear();
         }
-        cache.insert(snapshot, Arc::clone(&index));
-        Ok(index)
+        cache.insert(snapshot, index);
+    }
+
+    /// The index of a snapshot with no pointer, when a chain of Tier 0 changes
+    /// in the log leads to it from a snapshot that has one (or the empty
+    /// tree). Stores the result, so this runs once per snapshot.
+    fn derive_tier0_index(&self, snapshot: SnapshotId) -> Result<Arc<IdentityIndex>> {
+        let log = self.store.log()?;
+        let mut chain = Vec::new();
+        let mut target = snapshot;
+        let mut end = log.len();
+        let start = loop {
+            let found = log[..end]
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, id)| match self.change_record(*id) {
+                    Ok(record) if record.result == target => Some(Ok((i, record))),
+                    Ok(_) | Err(Error::MissingChange(_)) => None,
+                    Err(err) => Some(Err(err)),
+                })
+                .transpose()?;
+            let Some((i, record)) = found else {
+                return Err(Error::MissingIdentity(target));
+            };
+            if !is_tier0(&record) {
+                return Err(Error::MissingIdentity(target));
+            }
+            target = record.base;
+            end = i;
+            chain.push(record);
+            if target == self.empty_tree {
+                break IdentityIndex::empty(target);
+            }
+            if lock(&self.indexes).contains_key(&target)
+                || self.store.identity_index(target)?.is_some()
+            {
+                break (*self.identity_index(target)?).clone();
+            }
+        };
+        let mut index = start;
+        for record in chain.iter().rev() {
+            if !index.files.is_empty() {
+                for delta in self.changed_paths(record.base, record.result)? {
+                    index.set(&delta.path, None);
+                }
+            }
+        }
+        self.put_identity_index(snapshot, index)?;
+        self.identity_index(snapshot)
+    }
+
+    /// Make `index` the identity of `snapshot` for this process without
+    /// storing it: the lander's candidate result, which is validated before
+    /// it lands and stored by [`Self::put_identity_index`] only then.
+    pub(crate) fn stage_identity_index(&self, snapshot: SnapshotId, mut index: IdentityIndex) {
+        index.snapshot = snapshot;
+        self.cache_index(snapshot, Arc::new(index));
     }
 
     pub(crate) fn put_identity_index(
         &self,
         snapshot: SnapshotId,
-        index: IdentityIndex,
+        mut index: IdentityIndex,
     ) -> Result<()> {
+        index.snapshot = snapshot;
         let id = self.store.put_object(&index)?;
         self.store.set_identity_index(snapshot, id)?;
         lock(&self.indexes).insert(snapshot, Arc::new(index));
@@ -315,6 +412,16 @@ impl Inner {
         out.extend(self.store.edges(snapshot, source, EdgeKind::References)?);
         Ok(())
     }
+}
+
+/// A change that carries no identity: only `Blob`/`Tree` ops and no identity
+/// deltas (bootstrap, git import and sync; ADR 0015 amendment).
+fn is_tier0(record: &ChangeRecord) -> bool {
+    record.identity_deltas.is_empty()
+        && record
+            .ops
+            .iter()
+            .all(|op| matches!(op, Op::Blob { .. } | Op::Tree { .. }))
 }
 
 /// [`NodeId`] → location for every identified definition in `tree`. Ids

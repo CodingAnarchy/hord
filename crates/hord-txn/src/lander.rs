@@ -12,9 +12,18 @@
 //! `base`, `result`, `parents`, and `ops` rewritten for that head; it lands
 //! under that record's id. The queue entry keeps both ids.
 //!
+//! A failure that is about the change (its record, a merge, identity, or
+//! reproduction error) parks it as [`QueueStatus::Rejected`] with its
+//! report; only transient store and I/O failures stop the run, so one bad
+//! change never wedges the queue. A change whose effect head already has
+//! appends nothing to the log, and submitting a landed change again returns
+//! its entry.
+//!
 //! Crash recovery: the queue status is written before the durable
 //! `set_head`. On the first run, an entry marked landed whose change is not
-//! in the log is queued again.
+//! in the log is queued again. The in-process head follows `set_head`
+//! before anything else can fail; a failed history-index update is retried
+//! on the next run and does not undo the landing.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -43,7 +52,9 @@ pub enum QueueStatus {
     /// Parked, not landed: a hard merge conflict or a failed verification.
     /// Needs a replay (spec §6.4 rung 2, M5). See the entry's report.
     Conflicted,
-    /// Not a valid change: missing, or its ops do not reproduce its result.
+    /// Not landed and not replayable as is: the record is missing, its ops
+    /// do not reproduce its result, processing it failed deterministically,
+    /// or head already contains its result ("already applied").
     Rejected {
         /// Why.
         reason: String,
@@ -156,6 +167,8 @@ pub(crate) struct LanderState {
     /// Lowest sequence number that may still be queued; `None` before the
     /// first run's recovery.
     cursor: Option<u64>,
+    /// Landed changes whose history-index update failed; retried each run.
+    unindexed: Vec<ChangeId>,
 }
 
 /// A change ready to verify and land.
@@ -172,9 +185,55 @@ enum Step {
     Candidate(Box<Candidate>),
 }
 
+/// Outcome of [`Inner::try_prepare`].
+enum Prepared {
+    /// Not landing now; park the entry with this status.
+    Park(QueueStatus),
+    /// Rebased and validated; verify, then land.
+    Ready(Box<Ready>),
+}
+
+/// A rebased, validated change: what [`Candidate`] needs besides the entry.
+struct Ready {
+    landed_id: ChangeId,
+    landed: ChangeRecord,
+    report: ConflictReport,
+    index: IdentityIndex,
+}
+
+/// Whether `err` is about the store or the machine rather than about the
+/// change: I/O, the redb index, pack files, or a failed task. Those
+/// propagate, and the entry stays queued for the next run. Everything else
+/// (a missing or undecodable object the record names, invalid ops, a
+/// merge, identity, or reproduction failure) is deterministic for the
+/// record and parks it.
+pub(crate) fn is_transient(err: &Error) -> bool {
+    match err {
+        Error::Io(_) | Error::Task(_) => true,
+        Error::Store(store) => matches!(
+            store,
+            hord_store::Error::Io(_)
+                | hord_store::Error::Index(_)
+                | hord_store::Error::CorruptIndex(_)
+                | hord_store::Error::InvalidPack(_)
+        ),
+        _ => false,
+    }
+}
+
 pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
     let mut state = repo.inner.lander.lock().await;
     let mut processed = Vec::new();
+    if !state.unindexed.is_empty() {
+        let pending = std::mem::take(&mut state.unindexed);
+        state.unindexed = blocking(&repo.inner, move |inner| {
+            Ok(pending
+                .into_iter()
+                .filter(|c| inner.store.index_change(*c).is_err())
+                .collect())
+        })
+        .await?;
+    }
     loop {
         let cursor = state.cursor;
         let next = blocking(&repo.inner, move |inner| inner.next_queued(cursor)).await?;
@@ -195,7 +254,12 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                         report: &candidate.report,
                     })
                     .await;
-                blocking(&repo.inner, move |inner| inner.finish(*candidate, verdict)).await?
+                let (entry, indexed) =
+                    blocking(&repo.inner, move |inner| inner.finish(*candidate, verdict)).await?;
+                if !indexed && let QueueStatus::Landed { landed } = entry.status {
+                    state.unindexed.push(landed);
+                }
+                entry
             }
         };
         processed.push(done);
@@ -206,12 +270,10 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
 impl Inner {
     pub(crate) fn submit(&self, change: ChangeId) -> Result<QueueEntry> {
         self.change_record(change)?;
-        if let Some(entry) = self
-            .queue_entries()?
-            .into_iter()
-            .rev()
-            .find(|e| e.change == change && e.status == QueueStatus::Queued)
-        {
+        // Queued already, or landed already: submitting again is a no-op.
+        if let Some(entry) = self.queue_entries()?.into_iter().rev().find(|e| {
+            e.names(change) && matches!(e.status, QueueStatus::Queued | QueueStatus::Landed { .. })
+        }) {
             return Ok(entry);
         }
         let at = now();
@@ -300,44 +362,91 @@ impl Inner {
         Ok(entry)
     }
 
+    /// Check, rebase, and validate `entry`. A failure that is about the
+    /// change (a bad record, a merge or identity error) parks it as
+    /// [`QueueStatus::Rejected`]; only transient store or I/O failures
+    /// propagate, so one bad change cannot wedge the queue ([`is_transient`]).
     fn prepare(&self, entry: QueueEntry) -> Result<Step> {
+        let mut report = None;
+        match self.try_prepare(&entry, &mut report) {
+            Ok(Prepared::Park(status)) => {
+                Ok(Step::Done(Box::new(self.park(entry, status, report)?)))
+            }
+            Ok(Prepared::Ready(ready)) => {
+                let Ready {
+                    landed_id,
+                    landed,
+                    report,
+                    index,
+                } = *ready;
+                Ok(Step::Candidate(Box::new(Candidate {
+                    entry,
+                    landed_id,
+                    landed,
+                    report,
+                    index,
+                })))
+            }
+            Err(err) if is_transient(&err) => Err(err),
+            Err(err) => {
+                let reason = err.to_string();
+                Ok(Step::Done(Box::new(self.park(
+                    entry,
+                    QueueStatus::Rejected { reason },
+                    report,
+                )?)))
+            }
+        }
+    }
+
+    /// [`Self::prepare`] before error classification. `report` is filled
+    /// in as soon as the set check has run, so a later failure keeps it.
+    fn try_prepare(
+        &self,
+        entry: &QueueEntry,
+        report: &mut Option<ConflictReport>,
+    ) -> Result<Prepared> {
         let record = match self.change_record(entry.change) {
             Ok(record) => record,
             Err(Error::MissingChange(id)) => {
                 let reason = format!("no change record {id}");
-                return Ok(Step::Done(Box::new(self.park(
-                    entry,
-                    QueueStatus::Rejected { reason },
-                    None,
-                )?)));
+                return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
             }
             Err(err) => return Err(err),
         };
-        if !lock(&self.proposed).contains(&entry.change)
-            && let Err(err) = validate(self, entry.change, &record)
-        {
-            let reason = err.to_string();
-            return Ok(Step::Done(Box::new(self.park(
-                entry,
-                QueueStatus::Rejected { reason },
-                None,
-            )?)));
+        if !lock(&self.proposed).contains(&entry.change) {
+            validate(self, entry.change, &record)?;
         }
         let head = self.head()?;
-        let (mut report, landed_writes) = self.set_check(entry.change, &record, head)?;
+        let (set_report, landed_writes) = self.set_check(entry.change, &record, head)?;
+        let report = report.insert(set_report);
         let rebased = match rebase(self, &record, head.snapshot, &landed_writes)? {
             Ok(rebased) => rebased,
             Err(merge) => {
                 report.merge = merge;
-                return Ok(Step::Done(Box::new(self.park(
-                    entry,
-                    QueueStatus::Conflicted,
-                    Some(report),
-                )?)));
+                return Ok(Prepared::Park(QueueStatus::Conflicted));
             }
         };
         report.merge = rebased.soft;
+        report.adapter_merged = rebased.adapter_merged;
+        if rebased.result == head.snapshot {
+            // Head already has everything this change does: nothing to append.
+            let reason = match self.landed_as(entry.change)? {
+                Some(landed) => return Ok(Prepared::Park(QueueStatus::Landed { landed })),
+                None => format!(
+                    "already applied: head {} already contains this change's result",
+                    head.change.map_or_else(|| "(empty)".into(), |c| c.to_hex())
+                ),
+            };
+            return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
+        }
         let checked_files = rebased.checked;
+        // The rebased result's NodeIds are the rebase's. Validation reads
+        // that snapshot, so stage them in this process; `finish` stores them
+        // only if the change lands.
+        if rebased.result != record.result {
+            self.stage_identity_index(rebased.result, rebased.index.clone());
+        }
         let (landed_id, landed) = if rebased.result == record.result && record.base == head.snapshot
         {
             (entry.change, record)
@@ -355,29 +464,43 @@ impl Inner {
         // rebased record has rewritten ops, so it is checked even when the
         // submitted one was checked at propose.
         let checked = landed_id == entry.change && lock(&self.proposed).contains(&entry.change);
-        let v = if checked {
-            Ok(())
-        } else {
-            validate_except(self, landed_id, &landed, &checked_files)
-        };
-        if let Err(err) = v {
+        if !checked && let Err(err) = validate_except(self, landed_id, &landed, &checked_files) {
+            if is_transient(&err) {
+                return Err(err);
+            }
             let reason = format!("rebased record does not reproduce its result: {err}");
-            return Ok(Step::Done(Box::new(self.park(
-                entry,
-                QueueStatus::Rejected { reason },
-                Some(report),
-            )?)));
+            return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
         }
-        Ok(Step::Candidate(Box::new(Candidate {
-            entry,
+        Ok(Prepared::Ready(Box::new(Ready {
             landed_id,
             landed,
-            report,
+            report: report.clone(),
             index: rebased.index,
         })))
     }
 
-    fn finish(&self, candidate: Candidate, verdict: Verdict) -> Result<QueueEntry> {
+    /// The id `change` landed under, if it is in the log (as submitted, or
+    /// as its rebased record per a landed queue entry).
+    fn landed_as(&self, change: ChangeId) -> Result<Option<ChangeId>> {
+        let log: std::collections::HashSet<ChangeId> = self.store.log()?.into_iter().collect();
+        if log.contains(&change) {
+            return Ok(Some(change));
+        }
+        Ok(self
+            .queue_entries()?
+            .into_iter()
+            .find_map(|e| match e.status {
+                QueueStatus::Landed { landed } if e.change == change && log.contains(&landed) => {
+                    Some(landed)
+                }
+                _ => None,
+            }))
+    }
+
+    /// Land `candidate` unless the verifier failed it. The second value is
+    /// `false` when the landed change could not be added to the history
+    /// index; the landing stands and the caller retries the index later.
+    fn finish(&self, candidate: Candidate, verdict: Verdict) -> Result<(QueueEntry, bool)> {
         let Candidate {
             mut entry,
             landed_id,
@@ -387,7 +510,10 @@ impl Inner {
         } = candidate;
         if let Verdict::Fail { reason } = verdict {
             report.verification = Some(reason);
-            return self.park(entry, QueueStatus::Conflicted, Some(report));
+            return Ok((
+                self.park(entry, QueueStatus::Conflicted, Some(report))?,
+                true,
+            ));
         }
         self.put_identity_index(landed.result, index)?;
         entry.status = QueueStatus::Landed { landed: landed_id };
@@ -396,14 +522,20 @@ impl Inner {
         self.put_entry(&entry)?;
         self.store.append_log(landed_id)?;
         self.store.set_head(landed_id)?;
-        self.store.index_change(landed_id)?;
-        let footprint = self.footprint_of(landed_id, &landed)?;
-        lock(&self.footprints).insert(landed_id, Arc::new(footprint));
+        // Head is durable: the cache must follow before anything else can
+        // fail, or the next landing would rebase onto the old head.
         self.set_head_cache(Head {
             change: Some(landed_id),
             snapshot: landed.result,
         });
-        Ok(entry)
+        // The footprint is a cache (`footprint` recomputes it on a miss),
+        // and the history index is derived and rebuildable: neither undoes
+        // the landing.
+        if let Ok(footprint) = self.footprint_of(landed_id, &landed) {
+            lock(&self.footprints).insert(landed_id, Arc::new(footprint));
+        }
+        let indexed = self.store.index_change(landed_id).is_ok();
+        Ok((entry, indexed))
     }
 
     /// The §6.3 set check of `record` against everything landed after its
@@ -444,6 +576,7 @@ impl Inner {
             conflicts,
             merge: Vec::new(),
             verification: None,
+            adapter_merged: Vec::new(),
         };
         Ok((report, written))
     }
@@ -515,5 +648,44 @@ impl Inner {
     pub(crate) fn change_for_snapshot(&self, snapshot: SnapshotId) -> Result<Option<ChangeId>> {
         let log = self.store.log()?;
         Ok(self.position_of_snapshot(&log, snapshot)?.map(|i| log[i]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hord_core::{ObjectId, RepoPath};
+
+    use super::*;
+
+    #[test]
+    fn only_store_and_io_failures_are_transient() {
+        let io = || std::io::Error::other("disk");
+        let transient = [
+            Error::Io(io()),
+            Error::Task("cancelled".into()),
+            Error::Store(hord_store::Error::Io(io())),
+            Error::Store(hord_store::Error::Index("redb".into())),
+        ];
+        for err in &transient {
+            assert!(is_transient(err), "{err}");
+        }
+        let id = ObjectId::from_bytes([7; 32]);
+        let path: RepoPath = "src/lib.rs".parse().unwrap();
+        let deterministic = [
+            Error::MissingChange(id),
+            Error::Store(hord_store::Error::MissingObject(id)),
+            Error::Corrupt {
+                id,
+                reason: "wrong snapshot".into(),
+            },
+            Error::OpsDoNotReproduce {
+                path: path.clone(),
+                reason: "stale replace".into(),
+            },
+            Error::NotParsed(path),
+        ];
+        for err in &deterministic {
+            assert!(!is_transient(err), "{err}");
+        }
     }
 }

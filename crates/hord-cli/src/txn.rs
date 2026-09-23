@@ -26,6 +26,8 @@ pub fn open() -> Result<Repo> {
     open_store(repo::discover()?)
 }
 
+/// The default options use `FailClosedVerifier`: until M4 verifies,
+/// `land --local` lands only changes with a clean conflict report.
 pub fn open_store(store: Store) -> Result<Repo> {
     Ok(block_on(Repo::from_store(store, RepoOptions::default()))?)
 }
@@ -302,6 +304,9 @@ pub struct ReportView {
     pub merge: Vec<MergeView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification: Option<String>,
+    /// Files a purpose-built adapter merge resolved with no conflict; set
+    /// overlaps confined to them do not park the change (ADR 0013).
+    pub adapter_merged: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -380,6 +385,11 @@ pub fn report_view(
         conflicts,
         merge,
         verification: report.verification.clone(),
+        adapter_merged: report
+            .adapter_merged
+            .iter()
+            .map(|m| m.path.to_string())
+            .collect(),
     })
 }
 
@@ -417,6 +427,9 @@ pub fn print_report(view: &ReportView) {
             format!(" [{}]", nodes.join(", "))
         };
         println!("merge {} {}: {}{nodes}", m.severity, m.path, m.reason);
+    }
+    if !view.adapter_merged.is_empty() {
+        println!("merged by adapter: {}", view.adapter_merged.join(", "));
     }
     if let Some(reason) = &view.verification {
         println!("verification failed: {reason}");

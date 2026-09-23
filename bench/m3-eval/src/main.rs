@@ -38,12 +38,13 @@ mod sim;
 mod workspaces;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use hord_core::RepoPath;
-use hord_txn::{Repo, RepoConfig, RepoOptions};
+use hord_txn::{Repo, RepoConfig, RepoOptions, StubVerifier};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -161,6 +162,9 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
             config: RepoConfig {
                 strict_reads: args.strict_reads,
             },
+            // Spec §12 M3: verification stubbed. Overlaps that rebase cleanly
+            // land flagged; the product default parks them.
+            verifier: Some(Arc::new(StubVerifier)),
             ..RepoOptions::default()
         },
     )
