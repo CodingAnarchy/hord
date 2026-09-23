@@ -795,6 +795,55 @@ fn ambiguous_qualified_name_fails() {
 }
 
 #[test]
+fn log_path_uses_the_result_location_when_the_node_moved() {
+    let dir = TempDir::new("hord-m2-moved-path");
+    let alpha = NodeId::from_u128(1);
+    let old = ObjectId::from_bytes([1; 32]);
+    let new = ObjectId::from_bytes([2; 32]);
+    let empty = ObjectId::from_bytes([3; 32]);
+    let moved = {
+        let store = Store::create(dir.path()).unwrap();
+        let mut at_old = IdentityMap::default();
+        at_old.nodes.insert(alpha, place("src/old.rs", &[0]));
+        store.put_identity(old, &at_old).unwrap();
+        let mut at_new = IdentityMap::default();
+        at_new.nodes.insert(alpha, place("src/new.rs", &[0]));
+        store.put_identity(new, &at_new).unwrap();
+        store.put_identity(empty, &IdentityMap::default()).unwrap();
+        let moved = append_change(
+            &store,
+            &Draft::new("move alpha", ada(), 1, old, new)
+                .write([alpha])
+                .build(),
+        );
+        append_change(
+            &store,
+            &Draft::new("drop alpha", ada(), 2, new, empty)
+                .write([alpha])
+                .build(),
+        );
+        store.flush().unwrap();
+        moved
+    };
+
+    let at_old = hord_in(dir.path(), &["log", "--json", "--path", "src/old.rs"]);
+    assert_eq!(
+        strings(
+            &json_stdout(&at_old, &["log", "--path", "src/old.rs"]),
+            "log"
+        ),
+        Vec::<String>::new()
+    );
+    let at_new = hord_in(dir.path(), &["log", "--json", "--path", "src/new.rs"]);
+    let ids = strings(
+        &json_stdout(&at_new, &["log", "--path", "src/new.rs"]),
+        "log",
+    );
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_eq!(ids[0], moved.to_string());
+}
+
+#[test]
 fn query_without_a_snapshot_fails() {
     let dir = TempDir::new("hord-m2-empty");
     assert_ok(&hord_in(dir.path(), &["init"]), &["init"]);

@@ -40,8 +40,9 @@ pub enum Declaration {
 
 /// Carry [`NodeId`]s from `base` onto `result` (spec §3.4).
 ///
-/// Steps 1–3 and unmatched births and deaths come from [`default_identify`].
-/// Step 4 (rename similarity) is not applied. `declarations` (step 5) then
+/// Steps 1–3 and unmatched births and deaths come from [`default_identify`],
+/// including rename similarity (ADR 0007). Birth ids are then replaced with
+/// ids derived from the definition content hash. `declarations` (step 5) then
 /// override those heuristic results. Anything still unmatched stays a birth
 /// or a death (step 6).
 ///
@@ -87,6 +88,10 @@ pub fn carry<A: LangAdapter + ?Sized>(
     declarations: &[Declaration],
 ) -> Result<IdentityMapping> {
     let mut mapping = default_identify(adapter, base, result);
+    // Births from `default_identify` are random ULIDs. Replace them before
+    // declarations so a copy of a birth, and every other new id, stays a
+    // function of that definition's content.
+    crate::assign::stabilize_births(&mut mapping);
     if !declarations.is_empty() {
         check_unique_targets(declarations)?;
         apply_declarations(&mut mapping, declarations)?;
@@ -172,13 +177,56 @@ fn apply_derived_from(
     Ok(())
 }
 
+/// A copy id derived from the result content id and the source id.
+///
+/// The value does not use [`NodeId::generate`], so it does not change when an
+/// unrelated definition is inserted or when the process is run again.
+fn unused_copy_id(mapping: &IdentityMapping, result: ObjectId, from: NodeId) -> NodeId {
+    for salt in 0..64u32 {
+        let id = stable_copy_id(result, from, salt);
+        if id != NodeId::nil() && !id_in_use(mapping, id) {
+            return id;
+        }
+    }
+    stable_copy_id(result, from, 64)
+}
+
+fn stable_copy_id(oid: ObjectId, from: NodeId, salt: u32) -> NodeId {
+    let bytes = oid.as_bytes();
+    let hi = u128::from_be_bytes(bytes[..16].try_into().expect("16 bytes"));
+    let lo = u128::from_be_bytes(bytes[16..].try_into().expect("16 bytes"));
+    let mut mixed = hi
+        ^ lo.rotate_left(29)
+        ^ from.as_u128().rotate_left(5)
+        ^ u128::from(salt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed ^= 0xC000_0000_0000_0000;
+    if mixed == 0 || mixed == from.as_u128() {
+        mixed ^= 0x9E37_79B9_7F4A_7C15;
+    }
+    NodeId::from_u128(mixed)
+}
+
+fn id_in_use(mapping: &IdentityMapping, id: NodeId) -> bool {
+    mapping.nodes.values().any(|node| *node == id)
+        || mapping.deltas.iter().any(|delta| delta_mentions(delta, id))
+}
+
+fn delta_mentions(delta: &IdentityDelta, id: NodeId) -> bool {
+    match delta {
+        IdentityDelta::Birth { node } | IdentityDelta::Death { node } => *node == id,
+        IdentityDelta::DerivedFrom { node, from } => *node == id || *from == id,
+        IdentityDelta::SplitInto { node, into } => *node == id || into.contains(&id),
+        IdentityDelta::MergedFrom { node, from } => *node == id || from.contains(&id),
+    }
+}
+
 fn apply_copy(mapping: &mut IdentityMapping, result: ObjectId, current: NodeId, from: NodeId) {
     let was_birth = remove_birth(&mut mapping.deltas, current);
     let copy_id = if was_birth {
         current
     } else {
         release_unmatched(mapping, result, current);
-        NodeId::generate()
+        unused_copy_id(mapping, result, from)
     };
     mapping.nodes.insert(result, copy_id);
     mapping.deltas.push(IdentityDelta::DerivedFrom {

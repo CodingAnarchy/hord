@@ -23,6 +23,10 @@ const COMPRESSION_LEVEL: i32 = 3;
 /// Give up growing the decompress buffer past this. Matches the 4 GiB object cap.
 const MAX_DECOMPRESSED: usize = u32::MAX as usize;
 
+/// Largest frame-header content size allocated up front. A corrupt header
+/// above this falls back to the growing buffer instead of one huge allocation.
+const MAX_TRUSTED_CONTENT_SIZE: usize = 64 * 1024 * 1024;
+
 thread_local! {
     static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
         const { RefCell::new(None) };
@@ -51,8 +55,13 @@ pub(crate) struct PackedLocation {
     pub compressed_len: u32,
 }
 
+/// Compress one object as a standalone zstd frame.
+///
+/// [`PackWriter`] reuses one [`zstd::bulk::Compressor`] instead. Both write the
+/// content size into the frame header, so [`decompress`] allocates once.
+#[cfg(test)]
 pub(crate) fn compress(bytes: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::encode_all(bytes, COMPRESSION_LEVEL)
+    zstd::bulk::compress(bytes, COMPRESSION_LEVEL)
 }
 
 pub(crate) fn decompress(bytes: &[u8]) -> io::Result<Vec<u8>> {
@@ -62,8 +71,15 @@ pub(crate) fn decompress(bytes: &[u8]) -> io::Result<Vec<u8>> {
             *slot = Some(zstd::bulk::Decompressor::new()?);
         }
         let decompressor = slot.as_mut().expect("decompressor was just installed");
-        // Each frame is independent. Guess from the compressed size and grow
-        // until the frame fits, reusing the same zstd context.
+        // Frames written by `PackWriter` record their content size. Older packs
+        // used the streaming encoder, which does not; for those, guess from the
+        // compressed size and grow until the frame fits.
+        if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(bytes)
+            && let Ok(size) = usize::try_from(size)
+            && size <= MAX_TRUSTED_CONTENT_SIZE
+        {
+            return decompressor.decompress(bytes, size);
+        }
         let mut capacity = bytes.len().saturating_mul(3).max(256);
         loop {
             match decompressor.decompress(bytes, capacity) {
@@ -165,6 +181,9 @@ pub(crate) struct PackWriter {
     final_path: PathBuf,
     pack_id: u64,
     entries: Vec<PackEntry>,
+    /// One zstd context for the whole pack. A fresh context per object costs
+    /// more than compressing a small object.
+    compressor: zstd::bulk::Compressor<'static>,
 }
 
 impl PackWriter {
@@ -185,6 +204,7 @@ impl PackWriter {
             final_path,
             pack_id,
             entries: Vec::new(),
+            compressor: zstd::bulk::Compressor::new(COMPRESSION_LEVEL)?,
         })
     }
 
@@ -199,7 +219,7 @@ impl PackWriter {
         id: ObjectId,
         uncompressed: &[u8],
     ) -> Result<PackedLocation, Error> {
-        let compressed = compress(uncompressed)?;
+        let compressed = self.compressor.compress(uncompressed)?;
         let compressed_len = u32::try_from(compressed.len()).map_err(|_| Error::ObjectTooLarge)?;
         let offset = self.offset;
         self.file()?.write_all(&compressed)?;
@@ -276,6 +296,18 @@ mod tests {
 
         let empty = compress(b"").unwrap();
         assert_eq!(decompress(&empty).unwrap(), b"");
+    }
+
+    #[test]
+    fn decompresses_frames_without_a_content_size() {
+        // Packs written before the bulk compressor used the streaming encoder.
+        let zeros = vec![7u8; 300_000];
+        let streamed = zstd::encode_all(zeros.as_slice(), COMPRESSION_LEVEL).unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&streamed).unwrap(),
+            None
+        );
+        assert_eq!(decompress(&streamed).unwrap(), zeros);
     }
 
     #[test]

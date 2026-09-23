@@ -195,29 +195,22 @@ fn tokens(s: &str) -> Vec<&str> {
     let mut rest = s;
     while !rest.is_empty() {
         let ch = rest.chars().next().expect("non-empty");
-        if ch.is_whitespace() {
-            let end = rest
-                .char_indices()
-                .find(|(_, c)| !c.is_whitespace())
-                .map(|(i, _)| i)
-                .unwrap_or(rest.len());
-            out.push(&rest[..end]);
-            rest = &rest[end..];
-            continue;
-        }
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            let end = rest
-                .char_indices()
-                .find(|(_, c)| !c.is_ascii_alphanumeric() && *c != '_')
-                .map(|(i, _)| i)
-                .unwrap_or(rest.len());
-            out.push(&rest[..end]);
-            rest = &rest[end..];
-            continue;
-        }
-        let len = ch.len_utf8();
-        out.push(&rest[..len]);
-        rest = &rest[len..];
+        let end = if ch.is_whitespace() {
+            scan_while(rest, char::is_whitespace)
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            scan_while(rest, |c| c.is_ascii_alphanumeric() || c == '_')
+        } else {
+            ch.len_utf8()
+        };
+        out.push(&rest[..end]);
+        rest = &rest[end..];
     }
     out
+}
+
+fn scan_while(rest: &str, pred: impl Fn(char) -> bool) -> usize {
+    rest.char_indices()
+        .find(|(_, c)| !pred(*c))
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len())
 }

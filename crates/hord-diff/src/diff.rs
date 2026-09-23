@@ -1,11 +1,13 @@
 //! GumTree-style definition-granularity diff (spec §5.1, ADR 0002).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{IdentityDelta, NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree};
 
-use crate::defs::{collect_sites, def_oids, file_parent, local_glue, root_glue, sites_by_id};
+use crate::defs::{
+    DefSite, collect_sites, def_oids, file_parent, local_glue, root_glue, sites_by_id,
+};
 
 /// Diff `base` → `result` at definition granularity.
 ///
@@ -39,156 +41,19 @@ pub(crate) fn diff_structural(
         return deaths_only(mapping);
     }
 
-    let result_ids = &mapping.nodes;
-    let base_sites = collect_sites(&base.tree, &base.ids);
-    let result_sites = collect_sites(result, result_ids);
-    let base_by_id = sites_by_id(&base_sites);
-    let result_by_id = sites_by_id(&result_sites);
-
-    let base_glue = root_glue(&base.tree, &def_oids(&base.ids));
-    let result_glue = root_glue(result, &def_oids(result_ids));
-    let glue_changed = base_glue != result_glue;
-
-    let dead: BTreeSet<NodeId> = mapping
-        .deltas
-        .iter()
-        .filter_map(|d| match d {
-            IdentityDelta::Death { node } => Some(*node),
-            _ => None,
-        })
-        .collect();
-    let born: BTreeSet<NodeId> = mapping
-        .deltas
-        .iter()
-        .filter_map(|d| match d {
-            IdentityDelta::Birth { node } => Some(*node),
-            _ => None,
-        })
-        .collect();
-
-    let mut replace_cover: BTreeSet<NodeId> = BTreeSet::new();
-    let mut replaces = Vec::new();
-
-    // Preorder, not NodeId order. NodeIds are random ULIDs, and `covered`
-    // keeps a parent Replace from also emitting child Replaces. Walking in
-    // id order made that set depend on the process.
-    for r in &result_sites {
-        let Some(b) = base_by_id.get(&r.node_id) else {
-            continue;
-        };
-        if b.object_id == r.object_id {
-            continue;
-        }
-        let base_glue = local_glue(&base.tree, b.object_id, &base.ids);
-        let result_glue = local_glue(result, r.object_id, result_ids);
-        if base_glue == result_glue {
-            // Container header/braces unchanged: child def ops carry the edit.
-            continue;
-        }
-        if covered(r.node_id, &result_by_id, &replace_cover) {
-            continue;
-        }
-        replaces.push(Op::Replace {
-            node: r.node_id,
-            from: b.object_id,
-            to: r.object_id,
-        });
-        replace_cover.insert(r.node_id);
-    }
-
-    let mut ops = Vec::new();
-
-    for site in &base_sites {
-        if !dead.contains(&site.node_id) {
-            continue;
-        }
-        if dead.contains(&site.parent_id) && site.parent_id != file_parent() {
-            continue;
-        }
-        if covered(site.node_id, &base_by_id, &replace_cover) {
-            continue;
-        }
-        ops.push(Op::Delete { node: site.node_id });
-    }
-
+    let ctx = DiffCtx::new(base, result, mapping);
+    let (replaces, replace_cover) = ctx.replaces();
+    let mut ops = ctx.deletes(&replace_cover);
     ops.extend(replaces);
-
-    for mv in &mapping.moves {
-        let Op::Move {
-            node,
-            from_parent,
-            to_parent,
-            ..
-        } = mv
-        else {
-            continue;
-        };
-        if dead.contains(node) || born.contains(node) {
-            continue;
-        }
-        if covered(*node, &result_by_id, &replace_cover) {
-            continue;
-        }
-        if covered(*to_parent, &result_by_id, &replace_cover)
-            || covered(*from_parent, &base_by_id, &replace_cover)
-        {
-            continue;
-        }
-        ops.push(mv.clone());
-    }
-
-    for site in &result_sites {
-        if !born.contains(&site.node_id) {
-            continue;
-        }
-        if born.contains(&site.parent_id) && site.parent_id != file_parent() {
-            continue;
-        }
-        if covered(site.node_id, &result_by_id, &replace_cover) {
-            continue;
-        }
-        if covered(site.parent_id, &result_by_id, &replace_cover) && site.parent_id != file_parent()
-        {
-            continue;
-        }
-        ops.push(Op::Insert {
-            parent: site.parent_id,
-            index: site.cst_index,
-            node: site.object_id,
-        });
-    }
-
-    for (nid, r) in &result_by_id {
-        let Some(b) = base_by_id.get(nid) else {
-            continue;
-        };
-        let Some(base_node) = base.tree.get(b.object_id) else {
-            continue;
-        };
-        let Some(result_node) = result.get(r.object_id) else {
-            continue;
-        };
-        if base_node.name == result_node.name {
-            continue;
-        }
-        let (Some(from), Some(to)) = (base_node.name.clone(), result_node.name.clone()) else {
-            continue;
-        };
-        if covered(*nid, &result_by_id, &replace_cover) {
-            continue;
-        }
-        ops.push(Op::Rename {
-            node: *nid,
-            from,
-            to,
-        });
-    }
+    ops.extend(ctx.moves(&replace_cover));
+    ops.extend(ctx.inserts(&replace_cover));
+    ops.extend(ctx.renames(&replace_cover));
 
     // File-level non-definition glue (comments, leftover tokens) has no
     // NodeId. Represent it as a file-level Replace only when there are no
     // def ops; otherwise keep the def script so merge can compose disjoint
     // definition edits.
-    if glue_changed
+    if ctx.glue_changed
         && ops.is_empty()
         && let (Some(from), Some(to)) = (base.tree.root(), result.root())
     {
@@ -198,8 +63,192 @@ pub(crate) fn diff_structural(
             to,
         }];
     }
-
     ops
+}
+
+struct DiffCtx<'a> {
+    base: &'a IdentifiedTree,
+    result: &'a NodeTree,
+    mapping: &'a IdentityMapping,
+    base_sites: Vec<DefSite>,
+    result_sites: Vec<DefSite>,
+    base_by_id: BTreeMap<NodeId, DefSite>,
+    result_by_id: BTreeMap<NodeId, DefSite>,
+    dead: BTreeSet<NodeId>,
+    born: BTreeSet<NodeId>,
+    glue_changed: bool,
+}
+
+impl<'a> DiffCtx<'a> {
+    fn new(base: &'a IdentifiedTree, result: &'a NodeTree, mapping: &'a IdentityMapping) -> Self {
+        let result_ids = &mapping.nodes;
+        let base_sites = collect_sites(&base.tree, &base.ids);
+        let result_sites = collect_sites(result, result_ids);
+        let glue_changed =
+            root_glue(&base.tree, &def_oids(&base.ids)) != root_glue(result, &def_oids(result_ids));
+        let (dead, born) = delta_sets(mapping);
+        Self {
+            base,
+            result,
+            mapping,
+            base_by_id: sites_by_id(&base_sites),
+            result_by_id: sites_by_id(&result_sites),
+            base_sites,
+            result_sites,
+            dead,
+            born,
+            glue_changed,
+        }
+    }
+
+    /// Preorder, not NodeId order. NodeIds are random ULIDs, and `covered`
+    /// keeps a parent Replace from also emitting child Replaces.
+    fn replaces(&self) -> (Vec<Op>, BTreeSet<NodeId>) {
+        let mut replace_cover = BTreeSet::new();
+        let mut replaces = Vec::new();
+        for site in &self.result_sites {
+            let Some(base_site) = self.base_by_id.get(&site.node_id) else {
+                continue;
+            };
+            if base_site.object_id == site.object_id {
+                continue;
+            }
+            let base_glue = local_glue(&self.base.tree, base_site.object_id, &self.base.ids);
+            let result_glue = local_glue(self.result, site.object_id, &self.mapping.nodes);
+            if base_glue == result_glue {
+                // Container header/braces unchanged: child def ops carry the edit.
+                continue;
+            }
+            if covered(site.node_id, &self.result_by_id, &replace_cover) {
+                continue;
+            }
+            replaces.push(Op::Replace {
+                node: site.node_id,
+                from: base_site.object_id,
+                to: site.object_id,
+            });
+            replace_cover.insert(site.node_id);
+        }
+        (replaces, replace_cover)
+    }
+
+    fn deletes(&self, replace_cover: &BTreeSet<NodeId>) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for site in &self.base_sites {
+            if !self.dead.contains(&site.node_id) {
+                continue;
+            }
+            if self.dead.contains(&site.parent_id) && site.parent_id != file_parent() {
+                continue;
+            }
+            if covered(site.node_id, &self.base_by_id, replace_cover) {
+                continue;
+            }
+            ops.push(Op::Delete { node: site.node_id });
+        }
+        ops
+    }
+
+    fn moves(&self, replace_cover: &BTreeSet<NodeId>) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for mv in &self.mapping.moves {
+            let Op::Move {
+                node,
+                from_parent,
+                to_parent,
+                ..
+            } = mv
+            else {
+                continue;
+            };
+            if self.dead.contains(node) || self.born.contains(node) {
+                continue;
+            }
+            if covered(*node, &self.result_by_id, replace_cover) {
+                continue;
+            }
+            if covered(*to_parent, &self.result_by_id, replace_cover)
+                || covered(*from_parent, &self.base_by_id, replace_cover)
+            {
+                continue;
+            }
+            ops.push(mv.clone());
+        }
+        ops
+    }
+
+    fn inserts(&self, replace_cover: &BTreeSet<NodeId>) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for site in &self.result_sites {
+            if !self.born.contains(&site.node_id) {
+                continue;
+            }
+            if self.born.contains(&site.parent_id) && site.parent_id != file_parent() {
+                continue;
+            }
+            if covered(site.node_id, &self.result_by_id, replace_cover) {
+                continue;
+            }
+            if covered(site.parent_id, &self.result_by_id, replace_cover)
+                && site.parent_id != file_parent()
+            {
+                continue;
+            }
+            ops.push(Op::Insert {
+                parent: site.parent_id,
+                index: site.cst_index,
+                node: site.object_id,
+            });
+        }
+        ops
+    }
+
+    fn renames(&self, replace_cover: &BTreeSet<NodeId>) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for (nid, site) in &self.result_by_id {
+            let Some(base_site) = self.base_by_id.get(nid) else {
+                continue;
+            };
+            let Some(base_node) = self.base.tree.get(base_site.object_id) else {
+                continue;
+            };
+            let Some(result_node) = self.result.get(site.object_id) else {
+                continue;
+            };
+            if base_node.name == result_node.name {
+                continue;
+            }
+            let (Some(from), Some(to)) = (base_node.name.clone(), result_node.name.clone()) else {
+                continue;
+            };
+            if covered(*nid, &self.result_by_id, replace_cover) {
+                continue;
+            }
+            ops.push(Op::Rename {
+                node: *nid,
+                from,
+                to,
+            });
+        }
+        ops
+    }
+}
+
+fn delta_sets(mapping: &IdentityMapping) -> (BTreeSet<NodeId>, BTreeSet<NodeId>) {
+    let mut dead = BTreeSet::new();
+    let mut born = BTreeSet::new();
+    for delta in &mapping.deltas {
+        match delta {
+            IdentityDelta::Death { node } => {
+                dead.insert(*node);
+            }
+            IdentityDelta::Birth { node } => {
+                born.insert(*node);
+            }
+            _ => {}
+        }
+    }
+    (dead, born)
 }
 
 /// If the script does not reconstruct `result`'s root, fall back to a file-level

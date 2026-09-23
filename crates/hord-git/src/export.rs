@@ -1,6 +1,6 @@
 //! Project Hord snapshots to git trees and landed changes to git commits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Mutex;
@@ -136,9 +136,11 @@ fn walk_leaf<S: Store>(
     if let Some(cached) = lock_map(&cache.leaves).get(&id).copied() {
         return Ok(cached);
     }
-    let pair = if let Ok(blob) = store.get_object::<Blob>(id) {
+    // Read once and try each leaf shape against the same bytes.
+    let bytes = store.get(id)?;
+    let pair = if let Ok(blob) = hord_encoding::decode::<Blob>(&bytes) {
         (EntryKind::Blob.into(), sink.blob(&blob.bytes)?)
-    } else if let Ok(leaf) = store.get_object::<GitLeaf>(id) {
+    } else if let Ok(leaf) = hord_encoding::decode::<GitLeaf>(&bytes) {
         let mode = parse_mode(&leaf.mode)
             .ok_or_else(|| Error::Git(format!("invalid stored git mode {:?}", leaf.mode)))?;
         let blob: Blob = store.get_object(leaf.blob)?;
@@ -152,7 +154,12 @@ fn walk_leaf<S: Store>(
         };
         (mode, oid)
     } else {
-        let node_file: NodeFile = store.get_object(id)?;
+        let node_file: NodeFile =
+            hord_encoding::decode(&bytes).map_err(|source| Error::UnexpectedObject {
+                id,
+                kind: std::any::type_name::<NodeFile>(),
+                source,
+            })?;
         let blob: Blob = store.get_object(node_file.raw_hash)?;
         (EntryKind::Blob.into(), sink.blob(&blob.bytes)?)
     };
@@ -170,9 +177,9 @@ fn walk_leaf<S: Store>(
 /// Hord-Actor: <actor>
 /// ```
 ///
-/// The commit tree is the projection of `change.result`. Parent git commits
-/// are resolved from previously exported changes (`refs/hord/changes/<id>`)
-/// or from [`hord_core::IntentRef::GitCommit`] on the parent records.
+/// The commit tree is the projection of `change.result`. Each parent change is
+/// exported first unless `refs/hord/changes/<id>` already names its commit.
+/// Ancestors are exported iteratively, so long histories do not grow the stack.
 pub fn export_change<S: Store>(
     store: &S,
     change_id: ChangeId,
@@ -183,23 +190,81 @@ pub fn export_change<S: Store>(
     export_change_into(store, change_id, &repo, &cache).map(GitOid::from_gix)
 }
 
+/// Export `change_id` and any unexported ancestors, parents before children.
+///
+/// Depth-first with an explicit stack: a linear history is as deep as it is
+/// long, which recursion would turn into a stack overflow.
 fn export_change_into<S: Store>(
     store: &S,
     change_id: ChangeId,
     repo: &gix::Repository,
     cache: &ExportCache,
 ) -> Result<gix::ObjectId, Error> {
-    if let Some(existing) = lookup_exported(repo, change_id) {
-        return Ok(existing);
+    let mut exported: HashMap<ChangeId, gix::ObjectId> = HashMap::new();
+    // Changes waiting on their parents. Meeting one again as an ancestor means
+    // the parent links form a cycle.
+    let mut waiting: HashSet<ChangeId> = HashSet::new();
+    let mut stack: Vec<(ChangeId, Option<ChangeRecord>)> = vec![(change_id, None)];
+    while let Some((id, record)) = stack.pop() {
+        if exported.contains_key(&id) {
+            continue;
+        }
+        let change = match record {
+            Some(change) => change,
+            None => {
+                if waiting.contains(&id) {
+                    return Err(Error::Git(format!("change {id} is its own ancestor")));
+                }
+                if let Some(existing) = lookup_exported(repo, id) {
+                    exported.insert(id, existing);
+                    continue;
+                }
+                let change: ChangeRecord = store.get_object(id)?;
+                let pending: Vec<ChangeId> = change
+                    .parents
+                    .iter()
+                    .copied()
+                    .filter(|parent| !exported.contains_key(parent))
+                    .collect();
+                if !pending.is_empty() {
+                    // Revisit this change once its parents are exported.
+                    waiting.insert(id);
+                    stack.push((id, Some(change)));
+                    stack.extend(pending.into_iter().rev().map(|parent| (parent, None)));
+                    continue;
+                }
+                change
+            }
+        };
+        let commit = write_commit(store, id, &change, &exported, repo, cache)?;
+        waiting.remove(&id);
+        exported.insert(id, commit);
     }
+    exported
+        .get(&change_id)
+        .copied()
+        .ok_or_else(|| Error::Git(format!("change {change_id} was not exported")))
+}
 
-    let change: ChangeRecord = store.get_object(change_id)?;
+/// Write one commit whose parents are already in `exported`.
+fn write_commit<S: Store>(
+    store: &S,
+    change_id: ChangeId,
+    change: &ChangeRecord,
+    exported: &HashMap<ChangeId, gix::ObjectId>,
+    repo: &gix::Repository,
+    cache: &ExportCache,
+) -> Result<gix::ObjectId, Error> {
     let tree = walk_tree(store, change.result, &Sink::Repo(repo), cache)?;
-
-    let mut parents = Vec::new();
-    for parent in &change.parents {
-        parents.push(export_change_into(store, *parent, repo, cache)?);
-    }
+    let parents = change
+        .parents
+        .iter()
+        .map(|parent| {
+            exported.get(parent).copied().ok_or_else(|| {
+                Error::Git(format!("parent {parent} of {change_id} was not exported"))
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
 
     let actor = actor_trailer(&change.provenance.actor);
     let message = format_commit_message(
@@ -276,7 +341,7 @@ fn git_signature(actor: &Actor, created_at_ms: u64) -> gix::actor::Signature {
         Actor::Human { id } => parse_git_author(id),
         Actor::Agent { id, .. } => (id.clone(), "agent@hord".to_owned()),
     };
-    let seconds = (created_at_ms / 1000) as i64;
+    let seconds = i64::try_from(created_at_ms / 1000).unwrap_or(i64::MAX);
     gix::actor::Signature {
         name: BString::from(name),
         email: BString::from(email),

@@ -48,7 +48,8 @@ impl ObjectId {
     /// Lowercase hex encoding (64 characters).
     #[must_use]
     pub fn to_hex(&self) -> String {
-        hex_encode(&self.0)
+        let hex = hex_encode(&self.0);
+        hex_str(&hex).to_owned()
     }
 }
 
@@ -84,13 +85,14 @@ impl TryFrom<&[u8]> for ObjectId {
 
 impl fmt::Debug for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ObjectId").field(&self.to_hex()).finish()
+        let hex = hex_encode(&self.0);
+        f.debug_tuple("ObjectId").field(&hex_str(&hex)).finish()
     }
 }
 
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
+        f.write_str(hex_str(&hex_encode(&self.0)))
     }
 }
 
@@ -147,14 +149,19 @@ impl<'de> Deserialize<'de> for ObjectId {
     }
 }
 
-fn hex_encode(bytes: &[u8; ObjectId::LEN]) -> String {
+/// Lowercase hex on the stack, so `Display` does not allocate.
+fn hex_encode(bytes: &[u8; ObjectId::LEN]) -> [u8; ObjectId::LEN * 2] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(ObjectId::LEN * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+    let mut out = [0u8; ObjectId::LEN * 2];
+    for (i, &b) in bytes.iter().enumerate() {
+        out[i * 2] = HEX[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
     out
+}
+
+fn hex_str(hex: &[u8; ObjectId::LEN * 2]) -> &str {
+    std::str::from_utf8(hex).expect("hex digits are ascii")
 }
 
 fn hex_byte(hi: u8, lo: u8) -> Result<u8, char> {

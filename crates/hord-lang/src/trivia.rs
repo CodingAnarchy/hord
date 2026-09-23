@@ -141,18 +141,7 @@ pub fn attach_trivia_spans(source: &[u8], tokens: Vec<TokenSpan>) -> Vec<Attache
     }
     for i in 0..n {
         let gap_from = if i == 0 { 0 } else { spans[i - 1].text.end };
-        let tok_start = spans[i].text.start;
-        let lead_start = if i == 0 {
-            0
-        } else {
-            match source
-                .get(gap_from..tok_start)
-                .and_then(|gap| gap.iter().position(|&b| b == b'\n'))
-            {
-                Some(rel) => gap_from + rel,
-                None => tok_start,
-            }
-        };
+        let lead_start = leading_start(source, gap_from, spans[i].text.start, i == 0);
         spans[i].raw.start = lead_start;
         if i > 0 {
             spans[i - 1].raw.end = lead_start;
@@ -160,6 +149,24 @@ pub fn attach_trivia_spans(source: &[u8], tokens: Vec<TokenSpan>) -> Vec<Attache
     }
     spans[n - 1].raw.end = source.len();
     spans
+}
+
+/// Where leading trivia starts for the token at `tok_start`.
+///
+/// The first token takes everything from byte 0. Between tokens, bytes before
+/// the first `\n` stay trailing on the previous token; the `\n` and after are
+/// leading. No newline means the gap is entirely trailing.
+fn leading_start(source: &[u8], gap_from: usize, tok_start: usize, first: bool) -> usize {
+    if first {
+        return 0;
+    }
+    match source
+        .get(gap_from..tok_start)
+        .and_then(|gap| gap.iter().position(|&b| b == b'\n'))
+    {
+        Some(rel) => gap_from + rel,
+        None => tok_start,
+    }
 }
 
 /// Attach trivia in `lexemes` to tokens (spec §3.3).

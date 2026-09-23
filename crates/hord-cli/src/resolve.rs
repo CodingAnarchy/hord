@@ -176,10 +176,21 @@ pub(crate) fn write_set_touches_path(
     cache: &mut IdentityCache,
 ) -> Result<bool> {
     for node in &change.write_set {
-        if node_at_snapshot(store, cache, change.result, *node, filter)?
-            || node_at_snapshot(store, cache, change.base, *node, filter)?
-        {
-            return Ok(true);
+        // Copy the path out before borrowing the cache again for the base map.
+        let result_file = cache
+            .get(store, change.result)?
+            .and_then(|map| map.nodes.get(node).map(|path| path.file.clone()));
+        match result_file {
+            Some(file) => {
+                if path_touches(&file, filter) {
+                    return Ok(true);
+                }
+            }
+            None => {
+                if node_at_snapshot(store, cache, change.base, *node, filter)? {
+                    return Ok(true);
+                }
+            }
         }
     }
     Ok(false)

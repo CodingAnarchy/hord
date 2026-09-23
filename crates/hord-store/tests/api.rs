@@ -174,6 +174,31 @@ fn duplicate_put_after_pack_stays_readable() {
 }
 
 #[test]
+fn pack_refuses_a_loose_object_that_fails_its_hash() {
+    let (guard, store) = store();
+    let id = store.put(b"\x41\x61").unwrap();
+    let hex = id.to_hex();
+    let loose = guard
+        .0
+        .join(".hord/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    fs::write(&loose, b"torn").unwrap();
+    let err = store.pack().unwrap_err();
+    assert!(
+        matches!(err, Error::Corrupt { id: got, .. } if got == id),
+        "{err}"
+    );
+    // Nothing was packed, and the loose file is still there to be re-put.
+    assert!(loose.is_file());
+    drop(store);
+    let reopened = Store::open(&guard.0).unwrap();
+    reopened.put(b"\x41\x61").unwrap();
+    assert_eq!(reopened.pack().unwrap(), 1);
+    assert_eq!(reopened.get(id).unwrap(), b"\x41\x61");
+}
+
+#[test]
 fn invalid_ref_name_is_rejected() {
     let (_g, store) = store();
     let id = store.put(b"x").unwrap();

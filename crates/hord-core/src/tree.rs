@@ -74,7 +74,13 @@ impl RepoPath {
 
 impl fmt::Display for RepoPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.join("/"))
+        for (i, component) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("/")?;
+            }
+            f.write_str(component)?;
+        }
+        Ok(())
     }
 }
 

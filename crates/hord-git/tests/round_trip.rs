@@ -304,6 +304,70 @@ fn export_change_writes_hord_trailers() {
     assert!(text.contains("Hord-Actor: Ada Lovelace <ada@example.com>"));
 }
 
+/// A linear history is as deep as it is long. Export must not recurse per
+/// ancestor: run it on a thread whose stack a recursive walk would overflow.
+#[test]
+fn export_change_handles_a_long_linear_history() {
+    use hord_core::{Actor, Intent, Provenance, Timestamp, Tree};
+    use std::collections::BTreeSet;
+
+    const DEPTH: usize = 3_000;
+    let mut store = MemoryStore::new();
+    let tree = store.put_object(&Tree::default()).unwrap();
+    let mut parent = None;
+    for i in 0..DEPTH {
+        let change = ChangeRecord {
+            base: tree,
+            result: tree,
+            parents: parent.into_iter().collect(),
+            ops: Vec::new(),
+            intent: Intent {
+                summary: format!("step {i}"),
+                body: String::new(),
+                refs: Vec::new(),
+                acceptance: Vec::new(),
+            },
+            provenance: Provenance {
+                actor: Actor::Human {
+                    id: "Ada Lovelace <ada@example.com>".into(),
+                },
+                toolchain: tree,
+                created_at: Timestamp::from_millis(i as u64 * 1000),
+                session: None,
+                parent_intent: None,
+            },
+            read_set: BTreeSet::new(),
+            write_set: BTreeSet::new(),
+            identity_deltas: Vec::new(),
+            evidence: Vec::new(),
+            signature: None,
+        };
+        parent = Some(store.put_object(&change).unwrap());
+    }
+    let tip = parent.unwrap();
+    let dest = TempDir::new("export-deep");
+    let dest_path = dest.path().to_owned();
+    let commit_oid = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || export_change(&store, tip, &dest_path).unwrap())
+        .unwrap()
+        .join()
+        .unwrap();
+
+    let repo = gix::open_opts(dest.path(), gix::open::Options::isolated()).unwrap();
+    let mut commit = repo.find_commit(commit_oid.as_gix()).unwrap();
+    let mut depth = 1;
+    loop {
+        let parent = commit.parent_ids().next().map(|id| id.detach());
+        let Some(parent) = parent else { break };
+        commit = repo.find_commit(parent).unwrap();
+        depth += 1;
+    }
+    assert_eq!(depth, DEPTH);
+    let message = commit.message_raw().unwrap();
+    assert!(message.to_str().unwrap().starts_with("step 0\n"));
+}
+
 #[test]
 fn window_imports_newest_n() {
     let (src, _fx) = build_history();

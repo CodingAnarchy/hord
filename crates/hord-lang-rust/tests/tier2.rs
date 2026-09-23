@@ -1031,3 +1031,280 @@ fn path_attribute_accepts_raw_and_byte_strings() {
     assert!(edges.contains(&id_of(&files[2], "hash_f")), "{edges:?}");
     assert!(edges.contains(&id_of(&files[3], "byte_f")), "{edges:?}");
 }
+
+fn ctx_with<'a>(
+    files: &'a [Owned],
+    manifests: &'a [(&'a RepoPath, &'a [u8])],
+) -> hord_lang::ResolveCtx {
+    let views: Vec<RustFile<'_>> = files
+        .iter()
+        .map(|file| RustFile {
+            path: &file.path,
+            tree: &file.tree,
+            ids: &file.ids,
+        })
+        .collect();
+    let parsed: Vec<ManifestFile<'_>> = manifests
+        .iter()
+        .map(|(path, bytes)| ManifestFile { path, bytes })
+        .collect();
+    adapter().resolve_context_with(&views, &parsed)
+}
+
+fn node_named<'a>(file: &'a Owned, kind: &str, name: &str) -> &'a Node {
+    file.tree
+        .iter()
+        .map(|(_, node)| node)
+        .find(|node| {
+            node.kind.as_str() == kind && node.name.as_ref().is_some_and(|q| q.as_str() == name)
+        })
+        .unwrap_or_else(|| panic!("no {kind} named {name}"))
+}
+
+#[test]
+fn outer_attributes_belong_to_the_definition_and_stay_lossless() {
+    let src = r#"
+/// docs
+#[foo::bar]
+
+#[baz::qux]
+fn qux() {}
+
+#[link_name::c]
+extern "C" {
+    fn abs(n: i32) -> i32;
+}
+
+enum E {
+    #[serde::rename]
+    A,
+}
+
+struct S {
+    #[field::attr]
+    field: i32,
+}
+
+struct Tuple(#[tuple::attr] i32);
+
+impl S {
+    #[method::attr]
+    fn method(&self) {}
+}
+
+#[foo::bar]
+let _x = 1;
+fn after_let() {}
+"#;
+    let files = [parse_one("src/lib.rs", src)];
+    let ctx = context(&files);
+
+    let qux = find(&files[0], "qux");
+    let qux_raw = String::from_utf8_lossy(qux.raw.as_slice());
+    assert!(qux_raw.contains("foo::bar"), "{qux_raw}");
+    assert!(qux_raw.contains("/// docs"), "{qux_raw}");
+    let refs = adapter().references(&ctx, qux);
+    assert!(
+        refs.iter().any(|r| r.name.as_str() == "foo::bar"),
+        "{refs:?}"
+    );
+    assert!(
+        refs.iter().any(|r| r.name.as_str() == "baz::qux"),
+        "{refs:?}"
+    );
+
+    let ext = node_named(&files[0], "foreign_mod_item", "extern \"C\"");
+    let ext_raw = String::from_utf8_lossy(ext.raw.as_slice());
+    assert!(ext_raw.contains("link_name::c"), "{ext_raw}");
+    let refs = adapter().references(&ctx, ext);
+    assert!(
+        refs.iter().any(|r| r.name.as_str() == "link_name::c"),
+        "{refs:?}"
+    );
+
+    let variant = find(&files[0], "E::A");
+    let refs = adapter().references(&ctx, variant);
+    assert!(
+        refs.iter().any(|r| r.name.as_str() == "serde::rename"),
+        "{refs:?}"
+    );
+
+    let method = find(&files[0], "impl S::method");
+    let refs = adapter().references(&ctx, method);
+    assert!(
+        refs.iter().any(|r| r.name.as_str() == "method::attr"),
+        "{refs:?}"
+    );
+
+    let tuple = find(&files[0], "Tuple");
+    let refs = adapter().references(&ctx, tuple);
+    assert!(
+        refs.iter().any(|r| r.name.as_str() == "tuple::attr"),
+        "{refs:?}"
+    );
+
+    let after = find(&files[0], "after_let");
+    let after_raw = String::from_utf8_lossy(after.raw.as_slice());
+    assert!(
+        !after_raw.contains("foo::bar"),
+        "attribute on the let must not move onto the next function: {after_raw}"
+    );
+}
+
+#[test]
+fn custom_lib_path_resolves_a_workspace_dependency() {
+    let lib = parse_one("crates/crates-io/lib.rs", "pub fn registry_index() {}\n");
+    let caller = parse_one(
+        "src/lib.rs",
+        "fn caller() { crates_io::registry_index(); registry_index(); }\n",
+    );
+    let mut files = [lib, caller];
+    reassign_ids(&mut files);
+    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let member = RepoPath::from_str("crates/crates-io/Cargo.toml").unwrap();
+    let root_src = br#"
+[package]
+name = "cargo"
+[workspace]
+[workspace.dependencies]
+crates-io = { path = "crates/crates-io" }
+[dependencies]
+crates-io.workspace = true
+"#;
+    let member_src = br#"
+[package]
+name = "crates-io"
+[lib]
+name = "crates_io"
+path = "lib.rs"
+"#;
+    let ctx = ctx_with(
+        &files,
+        &[
+            (&root, root_src.as_slice()),
+            (&member, member_src.as_slice()),
+        ],
+    );
+    let target = id_of(&files[0], "registry_index");
+    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    assert!(
+        refs.iter()
+            .any(|r| r.name.as_str() == "crates_io::registry_index" && r.resolved == Some(target)),
+        "{refs:?}"
+    );
+    assert!(
+        refs.iter()
+            .any(|r| r.name.as_str() == "registry_index" && r.resolved == Some(target)),
+        "{refs:?}"
+    );
+}
+
+#[test]
+fn table_form_workspace_dep_resolves_from_a_nested_module() {
+    let lib = parse_one("crates/support/src/lib.rs", "pub fn project_layout() {}\n");
+    let main = parse_one("tests/testsuite/main.rs", "mod inner;\n");
+    let inner = parse_one(
+        "tests/testsuite/inner.rs",
+        "fn caller() { support::project_layout(); project_layout(); }\n",
+    );
+    let mut files = [lib, main, inner];
+    reassign_ids(&mut files);
+    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest = br#"
+[package]
+name = "app"
+[workspace]
+[workspace.dependencies.support]
+path = "crates/support"
+[dev-dependencies.support]
+workspace = true
+"#;
+    let ctx = ctx_with(&files, &[(&root, manifest.as_slice())]);
+    let target = id_of(&files[0], "project_layout");
+    let refs = adapter().references(&ctx, find(&files[2], "caller"));
+    assert!(
+        refs.iter()
+            .any(|r| r.name.as_str() == "support::project_layout" && r.resolved == Some(target)),
+        "{refs:?}"
+    );
+    assert!(
+        refs.iter()
+            .any(|r| r.name.as_str() == "project_layout" && r.resolved == Some(target)),
+        "{refs:?}"
+    );
+}
+
+#[test]
+fn registry_and_git_deps_stay_unresolved_when_source_is_present() {
+    let serde = parse_one("crates/serde/src/lib.rs", "pub fn json() {}\n");
+    let gix = parse_one("vendor/gix/src/lib.rs", "pub fn discover() {}\n");
+    let caller = parse_one(
+        "src/lib.rs",
+        "fn caller() { serde::json(); gix::discover(); json(); discover(); }\n",
+    );
+    let mut files = [serde, gix, caller];
+    reassign_ids(&mut files);
+    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest = br#"
+[package]
+name = "app"
+[workspace]
+members = ["crates/serde", "vendor/gix"]
+[workspace.dependencies]
+serde = "1.0"
+[dependencies]
+serde.workspace = true
+gix = { git = "https://example.com/gix.git" }
+"#;
+    let ctx = ctx_with(&files, &[(&root, manifest.as_slice())]);
+    let refs = adapter().references(&ctx, find(&files[2], "caller"));
+    assert!(
+        refs.iter()
+            .filter(|r| r.name.as_str() == "serde::json" || r.name.as_str() == "gix::discover")
+            .all(|r| r.resolved.is_none()),
+        "{refs:?}"
+    );
+    let serde_id = id_of(&files[0], "json");
+    let gix_id = id_of(&files[1], "discover");
+    assert!(
+        refs.iter()
+            .filter(|r| r.name.as_str() == "json" || r.name.as_str() == "discover")
+            .all(|r| r.resolved != Some(serde_id) && r.resolved != Some(gix_id)),
+        "{refs:?}"
+    );
+}
+
+#[test]
+fn bare_call_includes_same_crate_and_linked_functions_only() {
+    let linked = parse_one("crates/support/src/lib.rs", "pub fn project_layout() {}\n");
+    let unlinked = parse_one("crates/other/src/lib.rs", "pub fn project_layout() {}\n");
+    let caller = parse_one(
+        "src/lib.rs",
+        "mod inner { pub fn project_layout() {} }\nfn caller() { project_layout(); }\n",
+    );
+    let mut files = [linked, unlinked, caller];
+    reassign_ids(&mut files);
+    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest = br#"
+[package]
+name = "app"
+[dependencies]
+support = { path = "crates/support" }
+"#;
+    let ctx = ctx_with(&files, &[(&root, manifest.as_slice())]);
+    let refs = adapter().references(&ctx, find(&files[2], "caller"));
+    let hit: BTreeSet<NodeId> = refs
+        .iter()
+        .filter(|r| r.name.as_str() == "project_layout")
+        .filter_map(|r| r.resolved)
+        .collect();
+    assert!(hit.contains(&id_of(&files[0], "project_layout")), "{hit:?}");
+    assert!(
+        hit.contains(&id_of(&files[2], "inner::project_layout")),
+        "{hit:?}"
+    );
+    assert!(
+        !hit.contains(&id_of(&files[1], "project_layout")),
+        "{hit:?}"
+    );
+}

@@ -1,6 +1,7 @@
-//! Carrying rules from spec §3.4 steps 1–3, 5, and 6.
+//! Carrying rules from spec §3.4.
 //!
-//! Step 4 (rename similarity) is open and must not match.
+//! ADR 0007 rename similarity is applied by `default_identify` and is not
+//! retuned here. A different name and a different body are not a rename.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -601,6 +602,63 @@ fn second_continuation_of_the_same_id_is_claimed() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::Claimed(id) if id == nid(1)));
+}
+
+#[test]
+fn birth_ids_are_stable_and_ignore_unrelated_nodes() {
+    let adapter = TestAdapter;
+    let (tree, foo) = fn_file("foo_body", "foo");
+    let once = assign(&adapter, &tree);
+    let twice = assign(&adapter, &tree);
+    assert_eq!(once, twice);
+    let foo_id = once.nodes.get(&foo).copied().unwrap();
+
+    let mut with_extra = NodeTree::new();
+    let extra = leaf(&mut with_extra, "fn", "zzz_body", Some("zzz"));
+    let foo2 = leaf(&mut with_extra, "fn", "foo_body", Some("foo"));
+    finish(&mut with_extra, vec![extra, foo2]);
+    let mapping = assign(&adapter, &with_extra);
+    assert_eq!(mapping.nodes.get(&foo2).copied(), Some(foo_id));
+    assert_ne!(mapping.nodes.get(&extra).copied(), Some(foo_id));
+}
+
+#[test]
+fn copy_id_is_stable_and_ignores_unrelated_nodes() {
+    let adapter = TestAdapter;
+    let mut base_tree = NodeTree::new();
+    let foo = leaf(&mut base_tree, "fn", "foo_body", Some("foo"));
+    let other = leaf(&mut base_tree, "fn", "other_body", Some("other"));
+    finish(&mut base_tree, vec![foo, other]);
+    let base = identified(base_tree, &[(foo, 1), (other, 2)]);
+
+    let copy_of = |extra: bool| {
+        let mut result = NodeTree::new();
+        let foo_r = leaf(&mut result, "fn", "foo_body", Some("foo"));
+        let other_r = leaf(&mut result, "fn", "other_body", Some("other"));
+        if extra {
+            let extra = leaf(&mut result, "fn", "zzz_body", Some("zzz"));
+            finish(&mut result, vec![foo_r, extra, other_r]);
+        } else {
+            finish(&mut result, vec![foo_r, other_r]);
+        }
+        let carried = carry(
+            &adapter,
+            &base,
+            &result,
+            &[Declaration::DerivedFrom {
+                result: other_r,
+                from: nid(1),
+            }],
+        )
+        .unwrap();
+        carried.nodes.get(&other_r).copied().unwrap()
+    };
+
+    let first = copy_of(false);
+    assert_eq!(first, copy_of(false));
+    assert_ne!(first, nid(1));
+    assert_ne!(first, nid(2));
+    assert_eq!(first, copy_of(true));
 }
 
 fn moved_base() -> (NodeTree, ObjectId, ObjectId, ObjectId) {

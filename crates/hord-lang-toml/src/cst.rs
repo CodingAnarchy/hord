@@ -27,20 +27,35 @@ fn should_emit(node: tree_sitter::Node<'_>) -> bool {
     is_structural(node) && (node.start_byte() < node.end_byte() || node.child_count() > 0)
 }
 
-fn has_structural_child(node: tree_sitter::Node<'_>) -> bool {
+/// Visit structural children that [`should_emit`].
+///
+/// `visit` returns `Ok(true)` to stop, `Ok(false)` to keep going.
+fn walk_emitted(
+    node: tree_sitter::Node<'_>,
+    mut visit: impl FnMut(tree_sitter::Node<'_>) -> Result<bool, ParseError>,
+) -> Result<(), ParseError> {
     let mut cursor = node.walk();
     if !cursor.goto_first_child() {
-        return false;
+        return Ok(());
     }
     loop {
         let child = cursor.node();
-        if is_structural(child) && should_emit(child) {
-            return true;
+        if should_emit(child) && visit(child)? {
+            return Ok(());
         }
         if !cursor.goto_next_sibling() {
-            return false;
+            return Ok(());
         }
     }
+}
+
+fn has_emitted_child(node: tree_sitter::Node<'_>) -> bool {
+    let mut found = false;
+    let _ = walk_emitted(node, |_| {
+        found = true;
+        Ok(true)
+    });
+    found
 }
 
 fn is_content_parent(kind: &str) -> bool {
@@ -69,7 +84,7 @@ fn collect_tokens(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<Toke
     if !should_emit(node) {
         return;
     }
-    if !has_structural_child(node) {
+    if !has_emitted_child(node) {
         if node.child_count() == 0 {
             out.push(TokenSpan::new(
                 node.kind(),
@@ -81,22 +96,14 @@ fn collect_tokens(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<Toke
     }
 
     let mut cursor_byte = node.start_byte();
-    let mut walk = node.walk();
-    if walk.goto_first_child() {
-        loop {
-            let child = walk.node();
-            if is_structural(child) && should_emit(child) {
-                if child.start_byte() > cursor_byte {
-                    maybe_content_gap(node.kind(), source, cursor_byte, child.start_byte(), out);
-                }
-                collect_tokens(child, source, out);
-                cursor_byte = child.end_byte();
-            }
-            if !walk.goto_next_sibling() {
-                break;
-            }
+    let _ = walk_emitted(node, |child| {
+        if child.start_byte() > cursor_byte {
+            maybe_content_gap(node.kind(), source, cursor_byte, child.start_byte(), out);
         }
-    }
+        collect_tokens(child, source, out);
+        cursor_byte = child.end_byte();
+        Ok(false)
+    });
     if node.end_byte() > cursor_byte {
         maybe_content_gap(node.kind(), source, cursor_byte, node.end_byte(), out);
     }
@@ -145,7 +152,7 @@ fn intern(
     if !should_emit(node) {
         return Ok(None);
     }
-    if !has_structural_child(node) {
+    if !has_emitted_child(node) {
         if node.child_count() == 0 {
             let token = tokens.get(*token_i).ok_or_else(|| {
                 ParseError::failed(format!(
@@ -161,29 +168,21 @@ fn intern(
     }
 
     let mut children = Vec::new();
-    let mut walk = node.walk();
-    if walk.goto_first_child() {
-        loop {
-            let child = walk.node();
-            if is_structural(child) && should_emit(child) {
-                intern_spans_before(
-                    child.start_byte(),
-                    lang,
-                    source,
-                    tokens,
-                    token_i,
-                    tree,
-                    &mut children,
-                )?;
-                if let Some(id) = intern(child, lang, source, tokens, token_i, tree)? {
-                    children.push(id);
-                }
-            }
-            if !walk.goto_next_sibling() {
-                break;
-            }
+    walk_emitted(node, |child| {
+        intern_spans_before(
+            child.start_byte(),
+            lang,
+            source,
+            tokens,
+            token_i,
+            tree,
+            &mut children,
+        )?;
+        if let Some(id) = intern(child, lang, source, tokens, token_i, tree)? {
+            children.push(id);
         }
-    }
+        Ok(false)
+    })?;
     intern_spans_before(
         node.end_byte(),
         lang,
@@ -209,50 +208,29 @@ fn toml_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Qualified
     if node.kind() != "pair" {
         return Some(QualifiedName::new(local));
     }
-    let mut parts = Vec::new();
     let mut parent = node.parent();
     while let Some(p) = parent {
         if matches!(p.kind(), "table" | "table_array_element")
             && let Some(table) = toml_local_name(p, source)
         {
-            parts.push(table);
-            break;
+            return Some(QualifiedName::new(format!("{table}::{local}")));
         }
         parent = p.parent();
     }
-    parts.reverse();
-    parts.push(local);
-    Some(QualifiedName::new(parts.join("::")))
+    Some(QualifiedName::new(local))
 }
 
 fn toml_local_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    match node.kind() {
+    let name = match node.kind() {
         "table" | "table_array_element" => {
             let text = node.utf8_text(source).ok()?.trim();
-            let inner = text
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .trim();
-            let name = inner.lines().next()?.trim();
-            if name.is_empty() {
-                None
-            } else {
-                Some(name.to_owned())
-            }
+            let inner = text.trim_start_matches('[').trim_end_matches(']').trim();
+            inner.lines().next()?.trim().to_owned()
         }
-        "pair" => {
-            let key = node.child(0)?;
-            let text = key.utf8_text(source).ok()?.trim();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text.to_owned())
-            }
-        }
-        _ => None,
-    }
+        "pair" => node.child(0)?.utf8_text(source).ok()?.trim().to_owned(),
+        _ => return None,
+    };
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn with_parser<T>(f: impl FnOnce(&mut tree_sitter::Parser) -> T) -> Result<T, ParseError> {

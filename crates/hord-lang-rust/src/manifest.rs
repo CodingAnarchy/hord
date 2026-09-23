@@ -2,7 +2,9 @@
 //!
 //! A name resolves into another crate only when a manifest links it and that
 //! crate's source was parsed. Registry and git dependencies stay unresolved.
-//! `workspace = true` takes `path` from `[workspace.dependencies]`.
+//! `workspace = true` takes `path` from `[workspace.dependencies]`. A
+//! `[lib] path` on the target package is that crate's root; otherwise the
+//! root is `src/lib.rs` or `src/main.rs`.
 
 use std::collections::HashMap;
 
@@ -31,6 +33,8 @@ struct ParsedManifest {
     dir: String,
     package: bool,
     workspace: bool,
+    /// `[lib] path`, relative to this manifest. Absent means `src/lib.rs`.
+    lib_path: Option<String>,
     workspace_deps: HashMap<String, Dep>,
     normal: HashMap<String, Dep>,
     dev: HashMap<String, Dep>,
@@ -44,6 +48,7 @@ enum TableKind {
     WorkspaceDeps,
     Package,
     Workspace,
+    Lib,
     Other,
 }
 
@@ -80,8 +85,11 @@ pub(crate) fn install_links(
             let Some(dir) = resolved_dir(key, dep, package, workspace) else {
                 continue;
             };
+            let lib_rel = by_dir
+                .get(dir.as_str())
+                .and_then(|manifest| manifest.lib_path.as_deref());
             let extern_name = key.replace('-', "_");
-            for target in target_modules(&dir, files, modules) {
+            for target in target_modules(&dir, lib_rel, files, modules) {
                 if target != module_key {
                     ctx.add_link(module_key.as_str(), extern_name.as_str(), target.as_str());
                 }
@@ -124,17 +132,31 @@ fn resolved_dir(
     None
 }
 
-fn target_modules(dir: &str, files: &[RustFile<'_>], modules: &[Vec<String>]) -> Vec<String> {
+fn target_modules(
+    dir: &str,
+    lib_rel: Option<&str>,
+    files: &[RustFile<'_>],
+    modules: &[Vec<String>],
+) -> Vec<String> {
+    let mut wanted = vec![child(dir, "src/lib.rs"), child(dir, "src/main.rs")];
+    if let Some(rel) = lib_rel {
+        let path = join_dir(dir, rel);
+        if !wanted.iter().any(|have| have == &path) {
+            wanted.push(path);
+        }
+    }
     let mut out = Vec::new();
     for (file, module) in files.iter().zip(modules.iter()) {
         if module.is_empty() {
             continue;
         }
         let path = file.path.to_string();
-        let lib = child(dir, "src/lib.rs");
-        let main = child(dir, "src/main.rs");
-        if path == lib || path == main {
-            out.push(module.join("::"));
+        if !wanted.iter().any(|have| have == &path) {
+            continue;
+        }
+        let key = module.join("::");
+        if !out.contains(&key) {
+            out.push(key);
         }
     }
     out
@@ -262,50 +284,112 @@ fn read_table(tree: &NodeTree, id: ObjectId, manifest: &mut ParsedManifest) {
             header.extend(key_parts(tree, *child));
         }
     }
-    let kind = table_kind(&header);
+    let (kind, dep_name) = classify(&header);
     if matches!(kind, TableKind::Package) {
         manifest.package = true;
     }
-    if matches!(kind, TableKind::Workspace) {
+    if matches!(kind, TableKind::Workspace | TableKind::WorkspaceDeps) {
         manifest.workspace = true;
+    }
+    if matches!(kind, TableKind::Lib) {
+        for pair in pairs {
+            let Some((field, value)) = pair_field(tree, pair) else {
+                continue;
+            };
+            if field == "path"
+                && let Some(path) = string_value(tree, value)
+            {
+                manifest.lib_path = Some(path);
+            }
+        }
+        return;
+    }
+    let Some(map) = dep_map(manifest, kind) else {
+        return;
+    };
+    if let Some(name) = dep_name {
+        let dep = dep_from_fields(tree, &pairs);
+        if dep.path.is_some() || dep.workspace {
+            store_dep(map, name, dep);
+        }
+        return;
     }
     for pair in pairs {
         if let Some((name, dep)) = dep_from_pair(tree, pair) {
-            match kind {
-                TableKind::Normal => {
-                    manifest.normal.insert(name, dep);
-                }
-                TableKind::Dev => {
-                    manifest.dev.insert(name, dep);
-                }
-                TableKind::Build => {
-                    manifest.build.insert(name, dep);
-                }
-                TableKind::WorkspaceDeps => {
-                    manifest.workspace_deps.insert(name, dep);
-                }
-                TableKind::Package | TableKind::Workspace | TableKind::Other => {}
-            }
+            store_dep(map, name, dep);
         }
     }
 }
 
-fn table_kind(header: &[String]) -> TableKind {
-    if header == ["workspace", "dependencies"] {
-        TableKind::WorkspaceDeps
-    } else if header.last().is_some_and(|k| k == "dev-dependencies") {
-        TableKind::Dev
-    } else if header.last().is_some_and(|k| k == "build-dependencies") {
-        TableKind::Build
-    } else if header.last().is_some_and(|k| k == "dependencies") {
-        TableKind::Normal
-    } else if header == ["package"] {
-        TableKind::Package
-    } else if header.first().is_some_and(|key| key == "workspace") {
-        TableKind::Workspace
-    } else {
-        TableKind::Other
+fn dep_map(manifest: &mut ParsedManifest, kind: TableKind) -> Option<&mut HashMap<String, Dep>> {
+    match kind {
+        TableKind::Normal => Some(&mut manifest.normal),
+        TableKind::Dev => Some(&mut manifest.dev),
+        TableKind::Build => Some(&mut manifest.build),
+        TableKind::WorkspaceDeps => Some(&mut manifest.workspace_deps),
+        TableKind::Package | TableKind::Workspace | TableKind::Lib | TableKind::Other => None,
     }
+}
+
+/// Dependency table kind, and the dependency name when the header is
+/// `[dependencies.name]` (or the workspace / dev / build form of that).
+fn classify(header: &[String]) -> (TableKind, Option<String>) {
+    if let Some(idx) = header.iter().position(|key| {
+        matches!(
+            key.as_str(),
+            "dependencies" | "dev-dependencies" | "build-dependencies"
+        )
+    }) {
+        let kind = match header[idx].as_str() {
+            "dev-dependencies" => TableKind::Dev,
+            "build-dependencies" => TableKind::Build,
+            "dependencies" if idx > 0 && header[idx - 1] == "workspace" => TableKind::WorkspaceDeps,
+            _ => TableKind::Normal,
+        };
+        let name = if header.len() > idx + 1 {
+            Some(header[idx + 1..].join("."))
+        } else {
+            None
+        };
+        return (kind, name);
+    }
+    if header == ["package"] {
+        (TableKind::Package, None)
+    } else if header == ["lib"] {
+        (TableKind::Lib, None)
+    } else if header.first().is_some_and(|key| key == "workspace") {
+        (TableKind::Workspace, None)
+    } else {
+        (TableKind::Other, None)
+    }
+}
+
+fn store_dep(map: &mut HashMap<String, Dep>, name: String, dep: Dep) {
+    match map.entry(name) {
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            let existing = slot.get_mut();
+            if dep.path.is_some() {
+                existing.path = dep.path;
+            }
+            if dep.workspace {
+                existing.workspace = true;
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(dep);
+        }
+    }
+}
+
+fn dep_from_fields(tree: &NodeTree, pairs: &[ObjectId]) -> Dep {
+    let mut dep = Dep::default();
+    for pair in pairs {
+        let Some((field, value)) = pair_field(tree, *pair) else {
+            continue;
+        };
+        apply_field(&mut dep, &field, tree, value);
+    }
+    dep
 }
 
 fn header_key(kind: &str) -> bool {
@@ -487,5 +571,68 @@ registry = "1.0"
         let dev = manifest.dev.get("support").expect("dev dep");
         assert!(dev.workspace);
         assert!(dev.path.is_none());
+    }
+
+    #[test]
+    fn table_form_path_and_workspace_inheritance() {
+        let src = r#"
+[workspace.dependencies.support]
+path = "crates/support"
+
+[dependencies.support]
+workspace = true
+
+[dev-dependencies.helper]
+path = "../helper"
+
+[lib]
+name = "app"
+path = "lib.rs"
+"#;
+        let path = RepoPath::from_str("crates/app/Cargo.toml").unwrap();
+        let manifest = parse_manifest(&path, src.as_bytes()).expect("manifest");
+        assert!(manifest.workspace);
+        assert_eq!(
+            manifest
+                .workspace_deps
+                .get("support")
+                .and_then(|dep| dep.path.as_deref()),
+            Some("crates/support")
+        );
+        let normal = manifest.normal.get("support").expect("normal dep");
+        assert!(normal.workspace);
+        assert_eq!(
+            manifest
+                .dev
+                .get("helper")
+                .and_then(|dep| dep.path.as_deref()),
+            Some("../helper")
+        );
+        assert_eq!(manifest.lib_path.as_deref(), Some("lib.rs"));
+    }
+
+    #[test]
+    fn registry_git_and_version_deps_are_not_links() {
+        let src = r#"
+[dependencies]
+serde = "1.0"
+gix = { git = "https://example.com/gix.git" }
+local = { path = "crates/local" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+"#;
+        let path = RepoPath::from_str("Cargo.toml").unwrap();
+        let manifest = parse_manifest(&path, src.as_bytes()).expect("manifest");
+        assert!(!manifest.normal.contains_key("serde"));
+        assert!(!manifest.normal.contains_key("gix"));
+        assert!(!manifest.normal.contains_key("libc"));
+        assert_eq!(
+            manifest
+                .normal
+                .get("local")
+                .and_then(|dep| dep.path.as_deref()),
+            Some("crates/local")
+        );
     }
 }
