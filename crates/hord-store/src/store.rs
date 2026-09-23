@@ -24,6 +24,7 @@ mod index;
 mod queue;
 
 pub use index::EdgeKind;
+pub use queue::Landing;
 
 /// Directory name of a Hord store, next to the repository root (spec §8.1).
 pub const HORD_DIR: &str = ".hord";
@@ -63,6 +64,8 @@ struct LandingLog {
     order: Vec<ChangeId>,
     /// First landing index of each id. A repeated id keeps the earlier index.
     first_pos: HashMap<ChangeId, usize>,
+    /// Last landing index of each id.
+    last_pos: HashMap<ChangeId, usize>,
 }
 
 impl LandingLog {
@@ -71,6 +74,7 @@ impl LandingLog {
             loaded: false,
             order: Vec::new(),
             first_pos: HashMap::new(),
+            last_pos: HashMap::new(),
         }
     }
 
@@ -80,6 +84,7 @@ impl LandingLog {
         }
         let pos = self.order.len();
         self.first_pos.entry(change).or_insert(pos);
+        self.last_pos.insert(change, pos);
         self.order.push(change);
     }
 }
@@ -118,6 +123,8 @@ pub struct Store {
     landing_log: Mutex<LandingLog>,
     /// Edge keys inserted by this process. Duplicate `put_edge` skips the write.
     seen_edges: Mutex<HashSet<[u8; index::EDGE_KEY_LEN]>>,
+    /// Set once the queue name index is known to be complete.
+    queue_names_ready: AtomicBool,
 }
 
 impl std::fmt::Debug for Store {
@@ -158,6 +165,7 @@ impl Store {
             pack_files: Mutex::new(HashMap::new()),
             landing_log: Mutex::new(LandingLog::empty()),
             seen_edges: Mutex::new(HashSet::new()),
+            queue_names_ready: AtomicBool::new(false),
         })
     }
 
@@ -188,6 +196,7 @@ impl Store {
             pack_files: Mutex::new(HashMap::new()),
             landing_log: Mutex::new(LandingLog::empty()),
             seen_edges: Mutex::new(HashSet::new()),
+            queue_names_ready: AtomicBool::new(false),
         })
     }
 
@@ -297,6 +306,31 @@ impl Store {
     pub fn log(&self) -> Result<Vec<ChangeId>> {
         let log = self.ensure_landing_log()?;
         Ok(log.order.clone())
+    }
+
+    /// Number of entries in the landing log.
+    pub fn log_len(&self) -> Result<usize> {
+        Ok(self.ensure_landing_log()?.order.len())
+    }
+
+    /// Landing-log entries from index `start` on (empty past the end).
+    pub fn log_since(&self, start: usize) -> Result<Vec<ChangeId>> {
+        let log = self.ensure_landing_log()?;
+        Ok(log
+            .order
+            .get(start..)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default())
+    }
+
+    /// Index of the last landing-log entry equal to `change`, if any.
+    pub fn log_position(&self, change: ChangeId) -> Result<Option<usize>> {
+        Ok(self.ensure_landing_log()?.last_pos.get(&change).copied())
+    }
+
+    /// Whether `change` is in the landing log.
+    pub fn log_contains(&self, change: ChangeId) -> Result<bool> {
+        Ok(self.ensure_landing_log()?.first_pos.contains_key(&change))
     }
 
     /// Set `head` to the latest landed change (spec §3.7).
@@ -607,13 +641,16 @@ impl Store {
             let mut order = self.read_persisted_log()?;
             order.extend_from_slice(&pending);
             let mut first_pos = HashMap::with_capacity(order.len());
+            let mut last_pos = HashMap::with_capacity(order.len());
             for (index, id) in order.iter().enumerate() {
                 first_pos.entry(*id).or_insert(index);
+                last_pos.insert(*id, index);
             }
             *log = LandingLog {
                 loaded: true,
                 order,
                 first_pos,
+                last_pos,
             };
         }
         drop(pending);
@@ -793,6 +830,7 @@ fn init_tables(db: &Database) -> Result<()> {
     txn.open_table(EVIDENCE_BY_SNAPSHOT).map_err(Error::index)?;
     index::open_tables(&txn)?;
     queue::open_tables(&txn)?;
+    queue::mark_names_indexed(&txn)?;
     txn.commit().map_err(Error::index)?;
     Ok(())
 }

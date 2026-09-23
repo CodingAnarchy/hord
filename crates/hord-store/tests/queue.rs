@@ -19,8 +19,8 @@ fn queue_and_identity_index_round_trip_and_persist() {
     {
         let store = Store::create(&path).unwrap();
         assert!(store.queue_entries().unwrap().is_empty());
-        assert_eq!(store.queue_push(b"first").unwrap(), 0);
-        assert_eq!(store.queue_push(b"second").unwrap(), 1);
+        assert_eq!(store.queue_push(b"first", &[], &[]).unwrap(), 0);
+        assert_eq!(store.queue_push(b"second", &[], &[]).unwrap(), 1);
         store.queue_set(0, b"first, updated").unwrap();
         assert!(store.queue_set(7, b"missing").is_err());
         let snapshot = ObjectId::from_bytes([1; 32]);
@@ -42,7 +42,7 @@ fn queue_and_identity_index_round_trip_and_persist() {
         store.identity_index(ObjectId::from_bytes([1; 32])).unwrap(),
         Some(ObjectId::from_bytes([2; 32]))
     );
-    assert_eq!(store.queue_push(b"third").unwrap(), 2);
+    assert_eq!(store.queue_push(b"third", &[], &[]).unwrap(), 2);
     drop(store);
     let _ = fs::remove_dir_all(&path);
 }

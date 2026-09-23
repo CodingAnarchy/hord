@@ -15,9 +15,14 @@
 //! stored objects (spec §8.1). [`Store::rebuild_index`] reconstructs them.
 //! `evidence_by_snapshot` is created empty.
 //!
-//! `hord-txn` keeps two more tables here: the persistent lander queue
-//! ([`Store::queue_push`]) and a per-snapshot identity index pointer
-//! ([`Store::set_identity_index`]). The store does not interpret either value.
+//! `hord-txn` keeps more tables here: the persistent lander queue
+//! ([`Store::queue_push`]) with an index from change ids to its entries
+//! ([`Store::queue_named`]), the changes whose ops were checked
+//! ([`Store::mark_checked`]), and a per-snapshot identity index pointer
+//! ([`Store::set_identity_index`]). The store does not interpret a queue
+//! entry or an identity index. [`Store::land`] writes one landing (queue
+//! entry, log, `head`, identity pointer, `node_history`) in one durable
+//! commit.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -29,7 +34,7 @@ mod store;
 mod workspace;
 
 pub use error::Error;
-pub use store::{EdgeKind, HORD_DIR, Store};
+pub use store::{EdgeKind, HORD_DIR, Landing, Store};
 pub use workspace::{WorkspaceId, WorkspaceMeta};
 
 /// Result of a store operation.

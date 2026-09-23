@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use hord_core::{
     ChangeId, ChangeRecord, IdentityDelta, IdentityMap, NodeId, NodePath, ObjectId, Op, SnapshotId,
 };
-use redb::{Database, Durability, Table, TableDefinition, WriteTransaction};
+use redb::{Database, Durability, ReadableTable, Table, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use super::Store;
@@ -32,10 +32,10 @@ const IDENTITY_FACT_PREFIX: &[u8] = b"\xa1\x68Identity";
 /// Canonical CBOR prefix of [`IndexFact::IdentityIndex`].
 const IDENTITY_INDEX_FACT_PREFIX: &[u8] = b"\xa1\x6dIdentityIndex";
 /// `identity_index` row value: `index || binding`.
-const IDENTITY_INDEX_ROW_LEN: usize = 2 * ObjectId::LEN;
+pub(super) const IDENTITY_INDEX_ROW_LEN: usize = 2 * ObjectId::LEN;
 
 const SNAP_LEN: usize = ObjectId::LEN;
-const NODE_LEN: usize = 16;
+pub(super) const NODE_LEN: usize = 16;
 /// `snapshot || kind || source || target`
 pub(super) const EDGE_KEY_LEN: usize = SNAP_LEN + 1 + NODE_LEN + NODE_LEN;
 const EDGE_PREFIX_LEN: usize = SNAP_LEN + 1 + NODE_LEN;
@@ -306,11 +306,28 @@ impl Store {
     ///
     /// Like [`Store::queue_set`], the commit does not fsync. redb commits
     /// are ordered, so the row is durable once any later durable commit is:
-    /// the lander writes it before [`Store::set_head`] of the same landing,
-    /// and `propose` before the durable [`Store::queue_push`] of `submit`. A
-    /// clean close is also durable.
+    /// `propose` writes it before the durable [`Store::queue_push`] of
+    /// `submit`. A clean close is also durable. The lander writes its row
+    /// inside [`Store::land`] instead.
     pub fn set_identity_index(&self, snapshot: SnapshotId, index: ObjectId) -> Result<()> {
         let _guard = self.lock_index();
+        let row = self.identity_index_binding(snapshot, index)?;
+        let mut txn = self.db.begin_write().map_err(Error::index)?;
+        txn.set_durability(Durability::None);
+        insert_identity_index_row(&txn, snapshot, &row)?;
+        txn.commit().map_err(Error::index)?;
+        Ok(())
+    }
+
+    /// Store the binding object for `(snapshot, index)` and return the
+    /// `identity_index` row that points at both. The caller holds
+    /// `index_lock` until the row is committed, so the supersede chain
+    /// cannot fork.
+    pub(super) fn identity_index_binding(
+        &self,
+        snapshot: SnapshotId,
+        index: ObjectId,
+    ) -> Result<[u8; IDENTITY_INDEX_ROW_LEN]> {
         let supersedes = self.identity_index_row(snapshot)?.and_then(|(_, b)| b);
         let binding = self.put_object(&IndexFact::IdentityIndex {
             format: INDEX_FACT_FORMAT,
@@ -318,17 +335,7 @@ impl Store {
             index,
             supersedes,
         })?;
-        let mut txn = self.db.begin_write().map_err(Error::index)?;
-        txn.set_durability(Durability::None);
-        {
-            let mut table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
-            let row = identity_index_row(index, binding);
-            table
-                .insert(snapshot.as_bytes().as_slice(), row.as_slice())
-                .map_err(Error::index)?;
-        }
-        txn.commit().map_err(Error::index)?;
-        Ok(())
+        Ok(identity_index_row(index, binding))
     }
 
     /// The identity index object recorded for `snapshot`, if any.
@@ -386,7 +393,7 @@ impl Store {
         self.write_rebuilt_index(&history, &edges, &identity, &index_heads)
     }
 
-    fn lock_index(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(super) fn lock_index(&self) -> std::sync::MutexGuard<'_, ()> {
         self.index_lock
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -435,7 +442,7 @@ impl Store {
         let mut updates = Vec::new();
         {
             let log = self.ensure_landing_log()?;
-            let pos_of = &log.first_pos;
+            let pos_of = |id: &ChangeId| log.first_pos.get(id).copied();
             let txn = self.db.begin_read().map_err(Error::index)?;
             let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
             for node in nodes {
@@ -444,7 +451,7 @@ impl Store {
                     .get(key.as_slice())
                     .map_err(Error::index)?
                     .map(|value| value.value().to_vec());
-                if let Some(encoded) = history_value(existing.as_deref(), change, pos_of)? {
+                if let Some(encoded) = history_value(existing.as_deref(), change, &pos_of)? {
                     updates.push((key, encoded));
                 }
             }
@@ -453,14 +460,7 @@ impl Store {
             return Ok(());
         }
         let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            let mut table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
-            for (key, encoded) in &updates {
-                table
-                    .insert(key.as_slice(), encoded.as_slice())
-                    .map_err(Error::index)?;
-            }
-        }
+        write_history_rows(&txn, &updates)?;
         txn.commit().map_err(Error::index)?;
         Ok(())
     }
@@ -607,7 +607,7 @@ impl Store {
 /// Node ids a change touched. `read_set` is a dependency, not an edit, so it
 /// is omitted. Every [`NodeId`] field on [`Op`] and [`IdentityDelta`] counts,
 /// plus `write_set`.
-fn touched_nodes(change: &ChangeRecord) -> BTreeSet<NodeId> {
+pub(super) fn touched_nodes(change: &ChangeRecord) -> BTreeSet<NodeId> {
     let mut nodes = BTreeSet::new();
     nodes.extend(change.write_set.iter().copied());
     for op in &change.ops {
@@ -750,10 +750,61 @@ fn clear_table(table: &mut Table<'_, &[u8], &[u8]>) -> Result<()> {
     Ok(())
 }
 
+/// `node_history` rows to write when `change` lands, read inside `txn`.
+/// `pos_of` gives landing positions, `change`'s included.
+pub(super) fn plan_history_rows(
+    txn: &WriteTransaction,
+    change: ChangeId,
+    nodes: &BTreeSet<NodeId>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
+) -> Result<Vec<([u8; NODE_LEN], Vec<u8>)>> {
+    let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
+    let mut updates = Vec::new();
+    for node in nodes {
+        let key = node_key(*node);
+        let existing = table
+            .get(key.as_slice())
+            .map_err(Error::index)?
+            .map(|value| value.value().to_vec());
+        if let Some(encoded) = history_value(existing.as_deref(), change, pos_of)? {
+            updates.push((key, encoded));
+        }
+    }
+    Ok(updates)
+}
+
+pub(super) fn write_history_rows(
+    txn: &WriteTransaction,
+    updates: &[([u8; NODE_LEN], Vec<u8>)],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
+    for (key, encoded) in updates {
+        table
+            .insert(key.as_slice(), encoded.as_slice())
+            .map_err(Error::index)?;
+    }
+    Ok(())
+}
+
+pub(super) fn insert_identity_index_row(
+    txn: &WriteTransaction,
+    snapshot: SnapshotId,
+    row: &[u8; IDENTITY_INDEX_ROW_LEN],
+) -> Result<()> {
+    let mut table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
+    table
+        .insert(snapshot.as_bytes().as_slice(), row.as_slice())
+        .map_err(Error::index)?;
+    Ok(())
+}
+
 fn history_value(
     existing: Option<&[u8]>,
     change: ChangeId,
-    pos_of: &HashMap<ChangeId, usize>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
 ) -> Result<Option<Vec<u8>>> {
     let Some(bytes) = existing else {
         return Ok(Some(change.as_bytes().to_vec()));
@@ -785,7 +836,7 @@ enum HistoryPlan {
 fn plan_history_update(
     existing: &[u8],
     change: ChangeId,
-    pos_of: &HashMap<ChangeId, usize>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
 ) -> HistoryPlan {
     if existing.is_empty() || !existing.len().is_multiple_of(ObjectId::LEN) {
         return HistoryPlan::Resort;
@@ -794,8 +845,8 @@ fn plan_history_update(
     let Ok(last_id) = ObjectId::try_from(last) else {
         return HistoryPlan::Resort;
     };
-    let last_pos = pos_of.get(&last_id).copied().unwrap_or(usize::MAX);
-    let change_pos = pos_of.get(&change).copied().unwrap_or(usize::MAX);
+    let last_pos = pos_of(&last_id).unwrap_or(usize::MAX);
+    let change_pos = pos_of(&change).unwrap_or(usize::MAX);
     if change_pos < last_pos {
         return HistoryPlan::Resort;
     }
@@ -815,13 +866,12 @@ fn plan_history_update(
 fn insert_in_log_order(
     ids: &mut Vec<ChangeId>,
     change: ChangeId,
-    pos_of: &HashMap<ChangeId, usize>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
 ) {
-    let pos = pos_of.get(&change).copied().unwrap_or(usize::MAX);
-    let at =
-        ids.partition_point(|existing| pos_of.get(existing).copied().unwrap_or(usize::MAX) <= pos);
+    let pos = pos_of(&change).unwrap_or(usize::MAX);
+    let at = ids.partition_point(|existing| pos_of(existing).unwrap_or(usize::MAX) <= pos);
     let mut index = at;
-    while index > 0 && pos_of.get(&ids[index - 1]).copied().unwrap_or(usize::MAX) == pos {
+    while index > 0 && pos_of(&ids[index - 1]).unwrap_or(usize::MAX) == pos {
         if ids[index - 1] == change {
             return;
         }
@@ -1125,7 +1175,7 @@ mod tests {
         let steps = [5u8, 1, 19, 0, 5, 7, 3, 2, 18, 4, 19, 23, 6, 1, 8];
         for step in steps {
             let change = oid(step);
-            insert_in_log_order(&mut got, change, &pos);
+            insert_in_log_order(&mut got, change, &|id: &ObjectId| pos.get(id).copied());
             insert_by_scanning(&mut expect, change, &log);
             assert_eq!(got, expect);
         }

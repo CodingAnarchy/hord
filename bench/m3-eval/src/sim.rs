@@ -68,7 +68,7 @@ impl Rng {
         (self.next_u64() % n as u64) as usize
     }
 
-    fn shuffle<T>(&mut self, items: &mut [T]) {
+    pub(crate) fn shuffle<T>(&mut self, items: &mut [T]) {
         for i in (1..items.len()).rev() {
             items.swap(i, self.below(i + 1));
         }
@@ -365,7 +365,7 @@ pub(crate) fn intent(summary: &str) -> Intent {
 }
 
 /// What one agent did, recorded by the harness.
-struct AgentRun {
+pub(crate) struct AgentRun {
     index: usize,
     change: ChangeId,
     begin: Duration,
@@ -418,7 +418,7 @@ async fn run_agent(
 }
 
 /// Begin, read, edit, and propose; the proposal is returned unsubmitted.
-async fn agent_work(
+pub(crate) async fn agent_work(
     repo: &Repo,
     base: ChangeId,
     plan: AgentPlan,
