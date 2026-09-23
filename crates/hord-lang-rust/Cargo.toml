@@ -1,6 +1,6 @@
 [package]
 name = "hord-lang-rust"
-description = "Tier 1 Rust adapter (tree-sitter-rust)"
+description = "Tier 2 Rust adapter (tree-sitter-rust)"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

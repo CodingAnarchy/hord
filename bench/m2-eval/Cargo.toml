@@ -1,0 +1,21 @@
+[package]
+name = "hord-eval-m2"
+description = "M2 identity, reference, and blame evaluation (spec §12)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hord-eval-m2"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hord-core.workspace = true
+hord-lang.workspace = true
+hord-lang-rust.workspace = true
+hord-store.workspace = true

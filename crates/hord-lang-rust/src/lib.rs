@@ -1,19 +1,29 @@
-//! Tier 1 Rust language adapter (spec §4.2).
+//! Rust language adapter (spec §4.2).
 //!
-//! Parses every path that [`RustAdapter::matches`] accepts (`.rs` suffix).
-//! There is no size cutoff (ADR 0003). Trivia attachment uses
+//! Tier 1 parses every path that [`RustAdapter::matches`] accepts (`.rs`
+//! suffix). There is no size cutoff (ADR 0003). Trivia attachment uses
 //! [`hord_lang::attach_trivia`] (spec §3.3).
+//!
+//! Tier 2 resolves names with tree-sitter: module tree from `mod` items and
+//! file layout, `use` paths, and reference edges by name inside the crate.
+//! The resolver does not do trait resolution or type inference. It is sound
+//! for write sets (every definition kind gets a qualified name) and
+//! conservative for read sets (ambiguous names produce one edge per
+//! candidate). Macro invocations are not expanded.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod cst;
+mod resolve;
 
-use hord_core::{Bytes, LangId, NodeKind, RepoPath};
-use hord_lang::{LangAdapter, NodeTree, ParseError, Tier};
+use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, QualifiedName, RepoPath};
+use hord_lang::{LangAdapter, NameRef, NodeTree, ParseError, ResolveCtx, Tier};
 
-/// tree-sitter-rust adapter (spec §4.2, Tier 1).
+pub use resolve::RustFile;
+
+/// tree-sitter-rust adapter (spec §4.2). Tier 1 syntax plus Tier 2 names.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RustAdapter;
 
@@ -26,7 +36,7 @@ impl LangAdapter for RustAdapter {
     }
 
     fn tier(&self) -> Tier {
-        Tier::Syntax
+        Tier::Semantic
     }
 
     fn matches(&self, path: &RepoPath, _head: &[u8]) -> bool {
@@ -66,6 +76,40 @@ impl LangAdapter for RustAdapter {
                 | "inner_attribute_item"
                 | "foreign_mod_item"
         )
+    }
+
+    fn qualified_name(&self, path: &[&Node], node: &Node) -> Option<QualifiedName> {
+        resolve::qualified_name(path, node)
+    }
+
+    fn references(&self, ctx: &ResolveCtx, node: &Node) -> Vec<NameRef> {
+        resolve::references(ctx, node)
+    }
+
+    fn resolve(&self, ctx: &ResolveCtx, name: &NameRef) -> Option<NodeId> {
+        resolve::resolve_name(ctx, name)
+    }
+
+    fn test_targets(&self, ctx: &ResolveCtx, test: &Node) -> Vec<NodeId> {
+        resolve::test_targets(ctx, test)
+    }
+}
+
+impl RustAdapter {
+    /// Index `files` for Tier 2 resolution (spec §4.2).
+    ///
+    /// Builds the module tree from `mod` items and Cargo-style file layout
+    /// (`src/lib.rs`, `src/foo.rs`, `src/foo/mod.rs`, `#[path]`), records
+    /// `use` imports, and extracts definitions. `#[test]` (any attribute path
+    /// whose last segment is `test`, such as `#[tokio::test]`) and
+    /// `#[cfg(test)]` are recognized by attribute inspection.
+    ///
+    /// A single crate root is the Rust path `crate`. Several roots in one
+    /// context (lib and bin, integration tests) are disambiguated by
+    /// repository path so their modules do not collide.
+    #[must_use]
+    pub fn resolve_context(&self, files: &[RustFile<'_>]) -> ResolveCtx {
+        resolve::resolve_context(files)
     }
 }
 
@@ -209,7 +253,8 @@ mod tests {
     #[test]
     fn lang_is_rust() {
         assert_eq!(adapter().lang().as_str(), "rust");
-        assert_eq!(adapter().tier(), Tier::Syntax);
+        assert_eq!(adapter().tier(), Tier::Semantic);
+        assert_eq!(adapter().tier().as_u8(), 2);
     }
 
     #[test]

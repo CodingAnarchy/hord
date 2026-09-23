@@ -19,6 +19,13 @@ pub enum Error {
     /// No object with this id is in the store.
     #[error("object {0} not found")]
     MissingObject(ObjectId),
+    /// [`crate::Store::index_change`] was given a change that is not in the landing log.
+    #[error("change {0} is not in the landing log")]
+    NotInLog(hord_core::ChangeId),
+    /// [`crate::Store::put_identity`] was given a map that places two
+    /// [`hord_core::NodeId`]s at the same definition path.
+    #[error("identity map assigns two NodeIds to one definition path")]
+    DuplicateIdentity,
     /// A named ref was empty or contained a NUL byte.
     #[error("invalid ref name {0:?}")]
     InvalidRef(String),

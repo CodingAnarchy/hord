@@ -10,8 +10,10 @@ members = [
     "crates/hord-lang-rust",
     "crates/hord-lang-toml",
     "crates/hord-diff",
+    "crates/hord-identity",
     "bench/m0-eval",
     "bench/m1-eval",
+    "bench/m2-eval",
 ]
 
 [workspace.package]
@@ -31,6 +33,7 @@ hord-core = { path = "crates/hord-core" }
 hord-diff = { path = "crates/hord-diff" }
 hord-encoding = { path = "crates/hord-encoding" }
 hord-git = { path = "crates/hord-git" }
+hord-identity = { path = "crates/hord-identity" }
 hord-lang = { path = "crates/hord-lang" }
 hord-lang-rust = { path = "crates/hord-lang-rust" }
 hord-lang-toml = { path = "crates/hord-lang-toml" }

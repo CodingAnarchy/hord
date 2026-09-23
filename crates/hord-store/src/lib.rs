@@ -9,8 +9,11 @@
 //! metadata, and packed-object locations. [`Store::set_ref`] and
 //! [`Store::append_log`] are buffered and flushed on [`Store::set_head`],
 //! [`Store::pack`], [`Store::flush`], or drop. Ingest batches skip fsync;
-//! those flush points use a durable commit. Tables `node_history` and
-//! `evidence_by_snapshot` are created empty and are rebuildable.
+//! those flush points use a durable commit.
+//!
+//! `node_history`, `edges`, and `identity` cache facts that also live in
+//! stored objects (spec §8.1). [`Store::rebuild_index`] reconstructs them.
+//! `evidence_by_snapshot` is created empty.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -22,7 +25,7 @@ mod store;
 mod workspace;
 
 pub use error::Error;
-pub use store::{HORD_DIR, Store};
+pub use store::{EdgeKind, HORD_DIR, Store};
 pub use workspace::{WorkspaceId, WorkspaceMeta};
 
 /// Result of a store operation.

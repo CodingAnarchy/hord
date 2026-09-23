@@ -1,0 +1,2401 @@
+//! Tier 2 Rust name resolution (spec §4.2).
+//!
+//! Tree-sitter only: module tree from `mod` items and file layout, `use`
+//! paths, definition extraction, and reference edges by name inside the
+//! crate. No trait resolution and no type inference.
+//!
+//! Write sets: every definition kind [`RustAdapter::is_definition`] accepts
+//! gets a [`QualifiedName`] from its ancestor chain (or from the name stored
+//! at parse). Read sets over-approximate: ambiguous names and method calls
+//! become one edge per candidate. `macro_rules` and proc-macro invocations
+//! are not expanded; edges are the identifiers lexically present.
+//! `#[test]` and `#[cfg(test)]` are read off attributes.
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
+
+use hord_core::{Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
+use hord_lang::{LangAdapter, NameRef, NodeTree, ResolveCtx};
+
+use crate::RustAdapter;
+use crate::cst::{self, is_name_container, local_name_from_raw};
+
+/// One parsed Rust file in a crate snapshot.
+pub struct RustFile<'a> {
+    /// Repository path (`src/lib.rs`, `crates/foo/src/bar.rs`, …).
+    pub path: &'a RepoPath,
+    /// Lossless CST from [`RustAdapter::parse`](crate::RustAdapter::parse).
+    pub tree: &'a NodeTree,
+    /// Definition content id → durable [`NodeId`].
+    ///
+    /// Definitions missing from this map are stored as [`NodeId::nil`] and
+    /// are not returned from [`RustAdapter::resolve`](crate::RustAdapter::resolve).
+    pub ids: &'a std::collections::BTreeMap<ObjectId, NodeId>,
+}
+
+/// Qualified name of a definition from its ancestor chain.
+///
+/// Uses the name recorded at parse when present. Otherwise rebuilds the same
+/// file-local path `def_name` stored: container locals (`mod`, `impl`, …)
+/// joined with `::`, then this node's local name.
+pub(crate) fn qualified_name(path: &[&Node], node: &Node) -> Option<QualifiedName> {
+    if !RustAdapter.is_definition(&node.kind) {
+        return None;
+    }
+    if let Some(name) = &node.name {
+        return Some(name.clone());
+    }
+    let local = local_name_from_raw(node.kind.as_str(), node.raw.as_slice())?;
+    let mut parts = Vec::new();
+    for anc in path {
+        if is_name_container(anc.kind.as_str())
+            && let Some(piece) = local_name_from_raw(anc.kind.as_str(), anc.raw.as_slice())
+        {
+            parts.push(piece);
+        }
+    }
+    parts.push(local);
+    Some(QualifiedName::new(parts.join("::")))
+}
+
+/// Index `files` into a [`ResolveCtx`].
+pub(crate) fn resolve_context(files: &[RustFile<'_>]) -> ResolveCtx {
+    let modules = assign_modules(files);
+    let mut ctx = ResolveCtx::new();
+    for (file, module) in files.iter().zip(modules.iter()) {
+        if module.is_empty() {
+            continue;
+        }
+        index_file(file, module, &mut ctx);
+    }
+    ctx
+}
+
+pub(crate) fn references(ctx: &ResolveCtx, node: &Node) -> Vec<NameRef> {
+    let idx = Index::build(ctx);
+    refs_from_node(&idx, node)
+}
+
+pub(crate) fn resolve_name(ctx: &ResolveCtx, name: &NameRef) -> Option<NodeId> {
+    if let Some(id) = name.resolved {
+        return real_id(id);
+    }
+    let idx = Index::build(ctx);
+    let scope = name.scope.as_ref().map(QualifiedName::as_str);
+    let hits = idx.lookup(scope, None, None, name.name.as_str());
+    let mut ids: Vec<NodeId> = hits.finals.into_iter().filter_map(real_id).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.len() == 1 { Some(ids[0]) } else { None }
+}
+
+pub(crate) fn test_targets(ctx: &ResolveCtx, test: &Node) -> Vec<NodeId> {
+    let idx = Index::build(ctx);
+    let mut ids = Vec::new();
+    if idx.is_test_node(test) {
+        ids.extend(resolved_ids(&refs_from_node(&idx, test)));
+    }
+    ids.extend(inner_test_targets(&idx, test));
+    if let Some(self_id) = idx.node_id_of(test) {
+        ids.retain(|id| *id != self_id);
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn real_id(id: NodeId) -> Option<NodeId> {
+    (id != NodeId::nil()).then_some(id)
+}
+
+fn resolved_ids(refs: &[NameRef]) -> Vec<NodeId> {
+    refs.iter()
+        .filter_map(|r| r.resolved)
+        .filter_map(real_id)
+        .collect()
+}
+
+// --- module tree -----------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct ModFound {
+    name: String,
+    path_attr: Option<String>,
+    inline: Vec<ModFound>,
+    has_body: bool,
+}
+
+fn assign_modules(files: &[RustFile<'_>]) -> Vec<Vec<String>> {
+    let mut assigned: HashMap<RepoPath, Vec<String>> = HashMap::new();
+    let mut by_path: HashMap<RepoPath, usize> = HashMap::new();
+    for (i, file) in files.iter().enumerate() {
+        by_path.insert(file.path.clone(), i);
+    }
+
+    let mut roots: Vec<usize> = (0..files.len())
+        .filter(|i| is_crate_root(files[*i].path))
+        .collect();
+    if roots.is_empty() && files.len() == 1 {
+        roots.push(0);
+    }
+    roots.sort_by(|&a, &b| files[a].path.cmp(files[b].path));
+    let multi = roots.len() > 1;
+
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for idx in roots {
+        let key = if multi {
+            path_key(files[idx].path)
+        } else {
+            "crate".to_owned()
+        };
+        if assigned.contains_key(files[idx].path) {
+            continue;
+        }
+        assigned.insert(files[idx].path.clone(), vec![key]);
+        queue.push_back(idx);
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        let path = files[idx].path.clone();
+        let base = assigned.get(&path).cloned().unwrap_or_default();
+        let subdir = module_subdir(files[idx].path);
+        let file_dir = parent_dir(files[idx].path);
+        let source = files[idx].tree.to_bytes();
+        let mods = parse_mods(source.as_slice());
+        link_mods(
+            &mods,
+            &base,
+            &subdir,
+            &file_dir,
+            &by_path,
+            &mut assigned,
+            &mut queue,
+        );
+    }
+
+    for file in files {
+        if assigned.contains_key(file.path) {
+            continue;
+        }
+        let key = if files.len() == 1 {
+            "crate".to_owned()
+        } else {
+            path_key(file.path)
+        };
+        assigned.insert(file.path.clone(), vec![key]);
+    }
+
+    files
+        .iter()
+        .map(|f| assigned.remove(f.path).unwrap_or_default())
+        .collect()
+}
+
+fn is_crate_root(path: &RepoPath) -> bool {
+    let c = path.components();
+    let Some(name) = c.last().map(String::as_str) else {
+        return false;
+    };
+    let parent = c
+        .len()
+        .checked_sub(2)
+        .and_then(|i| c.get(i))
+        .map(String::as_str);
+    let gparent = c
+        .len()
+        .checked_sub(3)
+        .and_then(|i| c.get(i))
+        .map(String::as_str);
+    if name == "lib.rs" {
+        return true;
+    }
+    if name == "build.rs" && parent != Some("src") {
+        return true;
+    }
+    if name == "main.rs" {
+        return matches!(
+            parent,
+            Some("src" | "tests" | "examples" | "benches" | "bin") | None
+        ) || matches!(gparent, Some("bin" | "tests" | "examples" | "benches"));
+    }
+    if matches!(parent, Some("tests" | "examples" | "benches")) && name.ends_with(".rs") {
+        return true;
+    }
+    if parent == Some("bin") && gparent == Some("src") && name.ends_with(".rs") {
+        return true;
+    }
+    false
+}
+
+fn path_key(path: &RepoPath) -> String {
+    let s = path.to_string();
+    s.strip_suffix(".rs").unwrap_or(&s).to_owned()
+}
+
+fn parent_dir(path: &RepoPath) -> Vec<String> {
+    let c = path.components();
+    if c.len() <= 1 {
+        Vec::new()
+    } else {
+        c[..c.len() - 1].to_vec()
+    }
+}
+
+/// Directory in which this file's child `mod` items are looked up.
+fn module_subdir(path: &RepoPath) -> Vec<String> {
+    let c = path.components();
+    let Some(name) = c.last() else {
+        return Vec::new();
+    };
+    let parent = parent_dir(path);
+    if name == "mod.rs" || name == "lib.rs" || name == "main.rs" {
+        parent
+    } else {
+        let stem = name.trim_end_matches(".rs");
+        let mut dir = parent;
+        dir.push(stem.to_owned());
+        dir
+    }
+}
+
+fn link_mods(
+    mods: &[ModFound],
+    parent_module: &[String],
+    parent_subdir: &[String],
+    file_dir: &[String],
+    by_path: &HashMap<RepoPath, usize>,
+    assigned: &mut HashMap<RepoPath, Vec<String>>,
+    queue: &mut VecDeque<usize>,
+) {
+    for m in mods {
+        let mut child_mod = parent_module.to_vec();
+        child_mod.push(m.name.clone());
+        if m.has_body {
+            let mut sub = parent_subdir.to_vec();
+            sub.push(m.name.clone());
+            link_mods(
+                &m.inline, &child_mod, &sub, file_dir, by_path, assigned, queue,
+            );
+            continue;
+        }
+        let comps = if let Some(rel) = &m.path_attr {
+            join_relative(file_dir, rel)
+        } else {
+            find_mod_file(by_path, parent_subdir, &m.name)
+        };
+        let Some(comps) = comps else {
+            continue;
+        };
+        let path = RepoPath::new(comps);
+        if assigned.contains_key(&path) {
+            continue;
+        }
+        if let Some(&idx) = by_path.get(&path) {
+            assigned.insert(path, child_mod);
+            queue.push_back(idx);
+        }
+    }
+}
+
+fn find_mod_file(
+    by_path: &HashMap<RepoPath, usize>,
+    subdir: &[String],
+    name: &str,
+) -> Option<Vec<String>> {
+    let mut rs = subdir.to_vec();
+    rs.push(format!("{name}.rs"));
+    if by_path.contains_key(&RepoPath::new(rs.clone())) {
+        return Some(rs);
+    }
+    let mut modrs = subdir.to_vec();
+    modrs.push(name.to_owned());
+    modrs.push("mod.rs".to_owned());
+    if by_path.contains_key(&RepoPath::new(modrs.clone())) {
+        return Some(modrs);
+    }
+    None
+}
+
+fn join_relative(dir: &[String], rel: &str) -> Option<Vec<String>> {
+    let mut out = dir.to_vec();
+    for comp in rel.split(['/', '\\']) {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            out.pop()?;
+            continue;
+        }
+        out.push(comp.to_owned());
+    }
+    Some(out)
+}
+
+fn parse_mods(source: &[u8]) -> Vec<ModFound> {
+    cst::with_parser(|parser| {
+        let Some(tree) = parser.parse(source, None) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        collect_mods(tree.root_node(), source, &mut out);
+        out
+    })
+    .unwrap_or_default()
+}
+
+fn collect_mods(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<ModFound>) {
+    let mut pending = Vec::new();
+    for child in structural_children(node) {
+        match child.kind() {
+            "attribute_item" => pending.push(child),
+            "inner_attribute_item" => {}
+            "mod_item" => {
+                let path_attr = path_attr_of(&pending, source);
+                pending.clear();
+                let name = child
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(n, source))
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let mut inline = Vec::new();
+                let has_body = child.child_by_field_name("body").is_some();
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_mods(body, source, &mut inline);
+                }
+                out.push(ModFound {
+                    name,
+                    path_attr,
+                    inline,
+                    has_body,
+                });
+            }
+            _ => pending.clear(),
+        }
+    }
+}
+
+// --- per-file index --------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct TsInfo {
+    simple: String,
+    parent: String,
+    is_test: bool,
+    cfg_test: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RawImport {
+    module: String,
+    local: String,
+    path: String,
+    glob: bool,
+}
+
+struct RawDef {
+    node_id: NodeId,
+    object_id: ObjectId,
+    kind: NodeKind,
+    module: String,
+    local_name: Option<String>,
+}
+
+fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
+    let bytes = file.tree.to_bytes();
+    let source = bytes.as_slice();
+    let (infos, imports) = collect_ts(source, module);
+    let mut queues: HashMap<String, VecDeque<TsInfo>> = HashMap::new();
+    for (qname, info) in infos {
+        queues.entry(qname).or_default().push_back(info);
+    }
+
+    let mut raws = Vec::new();
+    if let Some(root) = file.tree.root() {
+        ctx.add_file(root, segs_join(module));
+        walk_nt(file, root, module, &mut raws);
+    }
+
+    for raw in raws {
+        let info = raw
+            .local_name
+            .as_ref()
+            .and_then(|name| queues.get_mut(name).and_then(VecDeque::pop_front));
+        let (simple, parent, is_test, cfg_test) = if let Some(info) = info {
+            (info.simple, info.parent, info.is_test, info.cfg_test)
+        } else {
+            (
+                fallback_simple(raw.kind.as_str(), raw.local_name.as_deref()),
+                fallback_parent(raw.kind.as_str()),
+                false,
+                false,
+            )
+        };
+        ctx.add_definition(
+            raw.node_id,
+            Some(raw.object_id),
+            raw.kind,
+            raw.module,
+            simple,
+            parent,
+            is_test,
+            cfg_test,
+        );
+    }
+
+    for import in imports {
+        ctx.add_import(import.module, import.local, import.path, import.glob);
+    }
+}
+
+fn walk_nt(file: &RustFile<'_>, oid: ObjectId, module: &[String], out: &mut Vec<RawDef>) {
+    let Some(node) = file.tree.get(oid) else {
+        return;
+    };
+    if RustAdapter.is_definition(&node.kind) {
+        out.push(RawDef {
+            node_id: file.ids.get(&oid).copied().unwrap_or_else(NodeId::nil),
+            object_id: oid,
+            kind: node.kind,
+            module: segs_join(module),
+            local_name: node.name.as_ref().map(|n| n.as_str().to_owned()),
+        });
+    }
+    let mut child_mod = module.to_vec();
+    if node.kind.as_str() == "mod_item"
+        && let Some(name) = node
+            .name
+            .as_ref()
+            .and_then(|n| n.as_str().rsplit("::").next())
+            .filter(|s| !s.is_empty() && !s.contains(' '))
+    {
+        // `mod` local names are identifiers. Impl-like names contain spaces
+        // and are not modules; a nested `mod` stores `outer::inner`.
+        child_mod.push(name.to_owned());
+    }
+    for child in &node.children {
+        walk_nt(file, *child, &child_mod, out);
+    }
+}
+
+fn fallback_simple(kind: &str, local: Option<&str>) -> String {
+    let Some(local) = local else {
+        return String::new();
+    };
+    match kind {
+        "use_declaration"
+        | "extern_crate_declaration"
+        | "inner_attribute_item"
+        | "impl_item"
+        | "foreign_mod_item" => String::new(),
+        _ => local.rsplit("::").next().unwrap_or(local).trim().to_owned(),
+    }
+}
+
+fn fallback_parent(kind: &str) -> String {
+    match kind {
+        "use_declaration" => "use".to_owned(),
+        "extern_crate_declaration" => "extern".to_owned(),
+        "inner_attribute_item" => "attr".to_owned(),
+        "impl_item" => "impl-item".to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn collect_ts(source: &[u8], module: &[String]) -> (Vec<(String, TsInfo)>, Vec<RawImport>) {
+    cst::with_parser(|parser| {
+        let Some(tree) = parser.parse(source, None) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut infos = Vec::new();
+        let mut imports = Vec::new();
+        walk_ts(
+            tree.root_node(),
+            source,
+            module,
+            &[],
+            false,
+            Flags::default(),
+            &mut infos,
+            &mut imports,
+        );
+        (infos, imports)
+    })
+    .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Default)]
+struct Flags {
+    is_test: bool,
+    cfg_test: bool,
+}
+
+#[derive(Clone, Debug)]
+enum Frame {
+    Impl { ty: String, tr: String },
+    Trait(String),
+    Struct(String),
+    Enum(String),
+    Union(String),
+    Variant(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_ts(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    module: &[String],
+    frames: &[Frame],
+    inherited_cfg: bool,
+    outer: Flags,
+    infos: &mut Vec<(String, TsInfo)>,
+    imports: &mut Vec<RawImport>,
+) {
+    let kind = node.kind();
+    let cfg_test = inherited_cfg || outer.cfg_test || item_inner_cfg_test(node, source);
+    let module_s = segs_join(module);
+
+    if RustAdapter.is_definition(&NodeKind::new(kind))
+        && let Some(qname) = cst::def_name(node, source)
+    {
+        infos.push((
+            qname.as_str().to_owned(),
+            TsInfo {
+                simple: simple_of(node, source, kind),
+                parent: parent_of(frames, kind),
+                is_test: outer.is_test,
+                cfg_test,
+            },
+        ));
+    }
+
+    if kind == "use_declaration"
+        && let Some(arg) = node.child_by_field_name("argument")
+    {
+        expand_use(arg, source, &[], &module_s, imports);
+    }
+    if kind == "extern_crate_declaration" {
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| node_text(n, source))
+            .unwrap_or_default();
+        let local = node
+            .child_by_field_name("alias")
+            .and_then(|n| node_text(n, source))
+            .unwrap_or_else(|| name.clone());
+        if !local.is_empty() && !name.is_empty() {
+            imports.push(RawImport {
+                module: module_s.clone(),
+                local,
+                path: format!("::{name}"),
+                glob: false,
+            });
+        }
+    }
+
+    let mut child_module = module.to_vec();
+    let mut child_frames = frames.to_vec();
+    match kind {
+        "mod_item" => {
+            if let Some(name) = field_text(node, source, "name") {
+                child_module.push(name);
+            }
+        }
+        "impl_item" => child_frames.push(Frame::Impl {
+            ty: type_key(&field_text(node, source, "type").unwrap_or_default()),
+            tr: field_text(node, source, "trait")
+                .map(|t| type_key(&t))
+                .unwrap_or_default(),
+        }),
+        "trait_item" => {
+            if let Some(name) = field_text(node, source, "name") {
+                child_frames.push(Frame::Trait(name));
+            }
+        }
+        "struct_item" => {
+            if let Some(name) = field_text(node, source, "name") {
+                child_frames.push(Frame::Struct(name));
+            }
+        }
+        "enum_item" => {
+            if let Some(name) = field_text(node, source, "name") {
+                child_frames.push(Frame::Enum(name));
+            }
+        }
+        "union_item" => {
+            if let Some(name) = field_text(node, source, "name") {
+                child_frames.push(Frame::Union(name));
+            }
+        }
+        "enum_variant" => {
+            if let Some(name) = field_text(node, source, "name") {
+                child_frames.push(Frame::Variant(name));
+            }
+        }
+        _ => {}
+    }
+
+    let mut pending = Vec::new();
+    for child in structural_children(node) {
+        match child.kind() {
+            "attribute_item" => {
+                pending.push(child);
+                walk_ts(
+                    child,
+                    source,
+                    &child_module,
+                    &child_frames,
+                    cfg_test,
+                    Flags::default(),
+                    infos,
+                    imports,
+                );
+            }
+            "inner_attribute_item" => walk_ts(
+                child,
+                source,
+                &child_module,
+                &child_frames,
+                cfg_test,
+                Flags::default(),
+                infos,
+                imports,
+            ),
+            _ => {
+                let flags = flags_of_attrs(&pending, source);
+                pending.clear();
+                walk_ts(
+                    child,
+                    source,
+                    &child_module,
+                    &child_frames,
+                    cfg_test,
+                    flags,
+                    infos,
+                    imports,
+                );
+            }
+        }
+    }
+}
+
+fn simple_of(node: tree_sitter::Node<'_>, source: &[u8], kind: &str) -> String {
+    if let Some(name) = field_text(node, source, "name") {
+        return name;
+    }
+    match kind {
+        "impl_item" => type_key(&field_text(node, source, "type").unwrap_or_default()),
+        _ => String::new(),
+    }
+}
+
+fn parent_of(frames: &[Frame], kind: &str) -> String {
+    let in_impl = matches!(
+        kind,
+        "function_item"
+            | "function_signature_item"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "associated_type"
+            | "macro_definition"
+    );
+    for frame in frames.iter().rev() {
+        match frame {
+            Frame::Impl { ty, tr } if in_impl => return format!("impl|{ty}|{tr}"),
+            Frame::Trait(t)
+                if matches!(
+                    kind,
+                    "function_item"
+                        | "function_signature_item"
+                        | "const_item"
+                        | "associated_type"
+                        | "type_item"
+                ) =>
+            {
+                if matches!(kind, "associated_type" | "type_item") {
+                    return format!("assoc|{t}");
+                }
+                return format!("trait|{t}");
+            }
+            Frame::Struct(s) | Frame::Union(s) if kind == "field_declaration" => {
+                return format!("field|{s}");
+            }
+            Frame::Enum(e) if kind == "enum_variant" => return format!("variant|{e}"),
+            Frame::Variant(v) if kind == "field_declaration" => return format!("field|{v}"),
+            _ => {}
+        }
+    }
+    fallback_parent(kind)
+}
+
+fn expand_use(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    prefix: &[String],
+    module: &str,
+    out: &mut Vec<RawImport>,
+) {
+    match node.kind() {
+        "use_list" => {
+            for child in structural_children(node) {
+                if !matches!(child.kind(), "{" | "}" | ",") {
+                    expand_use(child, source, prefix, module, out);
+                }
+            }
+        }
+        "scoped_use_list" => {
+            let mut pre = prefix.to_vec();
+            if let Some(path) = node.child_by_field_name("path") {
+                pre.extend(path_segments(path, source));
+            }
+            if let Some(list) = node.child_by_field_name("list") {
+                expand_use(list, source, &pre, module, out);
+            }
+        }
+        "use_as_clause" => {
+            let Some(path) = node.child_by_field_name("path") else {
+                return;
+            };
+            let Some(alias) = node.child_by_field_name("alias") else {
+                return;
+            };
+            let mut segs = prefix.to_vec();
+            segs.extend(path_segments(path, source));
+            let Some(local) = node_text(alias, source) else {
+                return;
+            };
+            out.push(RawImport {
+                module: module.to_owned(),
+                local,
+                path: segs_join(&segs),
+                glob: false,
+            });
+        }
+        "use_wildcard" => {
+            let mut segs = prefix.to_vec();
+            for child in structural_children(node) {
+                if is_path_kind(child.kind()) {
+                    segs.extend(path_segments(child, source));
+                }
+            }
+            out.push(RawImport {
+                module: module.to_owned(),
+                local: "*".to_owned(),
+                path: segs_join(&segs),
+                glob: true,
+            });
+        }
+        kind if is_path_kind(kind) => {
+            let mut segs = prefix.to_vec();
+            segs.extend(path_segments(node, source));
+            let Some(local) = segs.last().cloned() else {
+                return;
+            };
+            if local.is_empty() || local == "*" {
+                return;
+            }
+            out.push(RawImport {
+                module: module.to_owned(),
+                local,
+                path: segs_join(&segs),
+                glob: false,
+            });
+        }
+        _ => {}
+    }
+}
+
+// --- attributes ------------------------------------------------------------
+
+fn flags_of_attrs(attrs: &[tree_sitter::Node<'_>], source: &[u8]) -> Flags {
+    let mut flags = Flags::default();
+    for attr in attrs {
+        if attr_is_test(*attr, source) {
+            flags.is_test = true;
+        }
+        if attr_is_cfg_test(*attr, source) {
+            flags.cfg_test = true;
+        }
+    }
+    flags
+}
+
+fn attr_is_test(attr_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let segs = attribute_path(attr_item, source);
+    segs.last().is_some_and(|s| s == "test")
+}
+
+fn attr_is_cfg_test(attr_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let segs = attribute_path(attr_item, source);
+    if segs != ["cfg"] {
+        return false;
+    }
+    let Some(attr) = attribute_body(attr_item) else {
+        return false;
+    };
+    let Some(args) = attr.child_by_field_name("arguments") else {
+        return false;
+    };
+    cfg_tree_is_test(args, source)
+}
+
+fn item_inner_cfg_test(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if node.kind() == "inner_attribute_item" && attr_is_cfg_test(node, source) {
+        return true;
+    }
+    // `#![cfg(test)]` is a direct child of the item or of its body list.
+    for child in structural_children(node) {
+        if child.kind() == "inner_attribute_item" && attr_is_cfg_test(child, source) {
+            return true;
+        }
+    }
+    let bodies: Vec<tree_sitter::Node<'_>> = structural_children(node)
+        .into_iter()
+        .filter(|n| {
+            n.kind() == "declaration_list"
+                || n.kind() == "block"
+                || n.child_by_field_name("body").is_some()
+        })
+        .collect();
+    let mut lists = Vec::new();
+    if let Some(body) = node.child_by_field_name("body") {
+        lists.push(body);
+    }
+    lists.extend(bodies);
+    for list in lists {
+        for child in structural_children(list) {
+            if child.kind() == "inner_attribute_item" && attr_is_cfg_test(child, source) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn cfg_tree_is_test(tree: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let kids = structural_children(tree);
+    let inner = trim_delims(&kids);
+    eval_cfg(&inner, source)
+}
+
+fn eval_cfg(nodes: &[tree_sitter::Node<'_>], source: &[u8]) -> bool {
+    if nodes.is_empty() {
+        return false;
+    }
+    if nodes.len() == 1 && nodes[0].kind() == "identifier" {
+        return node_text(nodes[0], source).as_deref() == Some("test");
+    }
+    let Some(head) = nodes
+        .iter()
+        .find(|n| n.kind() == "identifier")
+        .and_then(|n| node_text(*n, source))
+    else {
+        return nodes
+            .iter()
+            .any(|n| n.kind() == "token_tree" && cfg_tree_is_test(*n, source));
+    };
+    if head == "not" {
+        return false;
+    }
+    if (head == "any" || head == "all")
+        && let Some(group) = nodes.iter().find(|n| n.kind() == "token_tree")
+    {
+        return split_comma(*group)
+            .into_iter()
+            .any(|part| eval_cfg(&part, source));
+    }
+    nodes.iter().any(|n| match n.kind() {
+        "identifier" => node_text(*n, source).as_deref() == Some("test"),
+        "token_tree" => cfg_tree_is_test(*n, source),
+        _ => false,
+    })
+}
+
+fn split_comma(group: tree_sitter::Node<'_>) -> Vec<Vec<tree_sitter::Node<'_>>> {
+    let kids = structural_children(group);
+    let inner = trim_delims(&kids);
+    let mut parts = Vec::new();
+    let mut cur = Vec::new();
+    for n in inner {
+        if n.kind() == "," {
+            if !cur.is_empty() {
+                parts.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(n);
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+fn trim_delims<'a>(nodes: &[tree_sitter::Node<'a>]) -> Vec<tree_sitter::Node<'a>> {
+    let mut nodes = nodes.to_vec();
+    if nodes
+        .first()
+        .is_some_and(|n| matches!(n.kind(), "(" | "[" | "{"))
+    {
+        nodes.remove(0);
+    }
+    if nodes
+        .last()
+        .is_some_and(|n| matches!(n.kind(), ")" | "]" | "}"))
+    {
+        nodes.pop();
+    }
+    nodes
+}
+
+fn path_attr_of(attrs: &[tree_sitter::Node<'_>], source: &[u8]) -> Option<String> {
+    for attr in attrs {
+        if attribute_path(*attr, source) == ["path"] {
+            let body = attribute_body(*attr)?;
+            let value = body.child_by_field_name("value")?;
+            return unquote(value, source);
+        }
+    }
+    None
+}
+
+fn attribute_body(attr_item: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    structural_children(attr_item)
+        .into_iter()
+        .find(|n| n.kind() == "attribute")
+}
+
+fn attribute_path(attr_item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let Some(attr) = attribute_body(attr_item) else {
+        return Vec::new();
+    };
+    for child in structural_children(attr) {
+        if child.kind() == "=" || child.kind() == "token_tree" {
+            break;
+        }
+        if is_path_kind(child.kind()) {
+            return path_segments(child, source);
+        }
+    }
+    Vec::new()
+}
+
+fn unquote(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let text = node_text(node, source)?;
+    let t = text.trim();
+    if let Some(rest) = t.strip_prefix("r#\"") {
+        return rest.strip_suffix("\"#").map(str::to_owned);
+    }
+    if let Some(rest) = t.strip_prefix("b\"") {
+        return rest.strip_suffix('"').map(str::to_owned);
+    }
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        return Some(t[1..t.len() - 1].to_owned());
+    }
+    None
+}
+
+// --- paths -----------------------------------------------------------------
+
+fn path_segments(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => {
+            let mut segs = Vec::new();
+            if let Some(path) = node.child_by_field_name("path") {
+                segs.extend(path_segments(path, source));
+            } else if node_text(node, source).is_some_and(|t| t.trim_start().starts_with("::")) {
+                segs.push("::".to_owned());
+            }
+            if let Some(name) = node.child_by_field_name("name")
+                && let Some(text) = node_text(name, source)
+            {
+                segs.push(text);
+            }
+            segs
+        }
+        "generic_type" | "generic_type_with_turbofish" => node
+            .child_by_field_name("type")
+            .map(|n| path_segments(n, source))
+            .unwrap_or_default(),
+        "generic_function" => node
+            .child_by_field_name("function")
+            .map(|n| path_segments(n, source))
+            .unwrap_or_default(),
+        "identifier" | "type_identifier" | "field_identifier" => {
+            node_text(node, source).into_iter().collect()
+        }
+        "crate" => vec!["crate".to_owned()],
+        "self" => vec!["self".to_owned()],
+        "super" => vec!["super".to_owned()],
+        "scoped_use_list" => {
+            let mut segs = Vec::new();
+            if let Some(path) = node.child_by_field_name("path") {
+                segs.extend(path_segments(path, source));
+            }
+            segs
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn is_path_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "scoped_identifier"
+            | "scoped_type_identifier"
+            | "identifier"
+            | "type_identifier"
+            | "crate"
+            | "self"
+            | "super"
+            | "generic_type"
+            | "generic_type_with_turbofish"
+            | "generic_function"
+    )
+}
+
+fn type_key(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut s = collapsed.trim();
+    if let Some(rest) = s.strip_prefix('&') {
+        s = rest.trim();
+        if let Some(rest) = s.strip_prefix('\'') {
+            s = rest
+                .split_once(|c: char| c.is_whitespace())
+                .map(|(_, r)| r.trim())
+                .unwrap_or(rest);
+        }
+        s = s.trim_start_matches("mut ").trim();
+    }
+    s = s
+        .trim_start_matches("dyn ")
+        .trim_start_matches("impl ")
+        .trim();
+    if let Some(i) = s.find(['<', ' ']) {
+        s = s[..i].trim();
+    }
+    s.rsplit("::").next().unwrap_or(s).trim().to_owned()
+}
+
+fn segs_join(segs: &[String]) -> String {
+    segs.join("::")
+}
+
+fn mod_join(module: &str, name: &str) -> String {
+    if module.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{module}::{name}")
+    }
+}
+
+fn crate_key(module: &str) -> &str {
+    module.split("::").next().unwrap_or(module)
+}
+
+fn parent_module(module: &str) -> Option<String> {
+    let mut segs: Vec<&str> = module.split("::").collect();
+    if segs.len() <= 1 {
+        return None;
+    }
+    segs.pop();
+    Some(segs.join("::"))
+}
+
+// --- resolution index ------------------------------------------------------
+
+struct Def {
+    node_id: NodeId,
+    kind: String,
+    module: String,
+    simple: String,
+    parent: String,
+    is_test: bool,
+    cfg_test: bool,
+}
+
+struct Imp {
+    module: String,
+    local: String,
+    path: String,
+    glob: bool,
+    done: bool,
+    external: bool,
+    def_indices: Vec<usize>,
+    target_module: Option<String>,
+}
+
+struct Index {
+    defs: Vec<Def>,
+    imps: Vec<Imp>,
+    /// `(module, simple)` → direct (parent-empty) definition indices.
+    direct: HashMap<(String, String), Vec<usize>>,
+    /// Simple name → associated definition indices.
+    associated: HashMap<String, Vec<usize>>,
+    by_object: HashMap<ObjectId, usize>,
+    files: HashMap<ObjectId, String>,
+    crate_keys: BTreeSet<String>,
+}
+
+struct PathHits {
+    all: Vec<NodeId>,
+    finals: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+struct Hit {
+    node_id: Option<NodeId>,
+    module: String,
+    def_index: Option<usize>,
+    kind: HitKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HitKind {
+    Module,
+    Def,
+    Type,
+}
+
+enum Head {
+    Ready(Vec<Hit>),
+    Pending,
+    Missing,
+}
+
+impl Index {
+    fn build(ctx: &ResolveCtx) -> Self {
+        let mut idx = Self {
+            defs: Vec::new(),
+            imps: Vec::new(),
+            direct: HashMap::new(),
+            associated: HashMap::new(),
+            by_object: HashMap::new(),
+            files: HashMap::new(),
+            crate_keys: BTreeSet::new(),
+        };
+        ctx.for_each_definition(
+            |node_id, object_id, kind, module, simple, parent, is_test, cfg_test| {
+                let i = idx.defs.len();
+                let module = module.as_str().to_owned();
+                let simple = simple.as_str().to_owned();
+                let parent = parent.as_str().to_owned();
+                let kind_s = kind.as_str().to_owned();
+                if !module.is_empty() {
+                    idx.crate_keys.insert(crate_key(&module).to_owned());
+                }
+                if parent.is_empty() && !simple.is_empty() {
+                    idx.direct
+                        .entry((module.clone(), simple.clone()))
+                        .or_default()
+                        .push(i);
+                } else if !simple.is_empty() && is_associated_kind(&kind_s) {
+                    idx.associated.entry(simple.clone()).or_default().push(i);
+                }
+                if let Some(oid) = object_id {
+                    idx.by_object.insert(oid, i);
+                }
+                idx.defs.push(Def {
+                    node_id,
+                    kind: kind_s,
+                    module,
+                    simple,
+                    parent,
+                    is_test,
+                    cfg_test,
+                });
+            },
+        );
+        ctx.for_each_import(|module, local, path, glob| {
+            idx.imps.push(Imp {
+                module: module.as_str().to_owned(),
+                local: local.as_str().to_owned(),
+                path: path.as_str().to_owned(),
+                glob,
+                done: false,
+                external: false,
+                def_indices: Vec::new(),
+                target_module: None,
+            });
+        });
+        ctx.for_each_file(|oid, module| {
+            let module = module.as_str().to_owned();
+            if !module.is_empty() {
+                idx.crate_keys.insert(crate_key(&module).to_owned());
+            }
+            idx.files.insert(oid, module);
+        });
+        idx.resolve_imports();
+        idx
+    }
+
+    fn resolve_imports(&mut self) {
+        for _ in 0..=self.imps.len() {
+            let mut updates = Vec::new();
+            for (i, imp) in self.imps.iter().enumerate() {
+                if imp.done {
+                    continue;
+                }
+                if let Some(res) = self.attempt_import(imp) {
+                    updates.push((i, res));
+                }
+            }
+            if updates.is_empty() {
+                break;
+            }
+            for (i, res) in updates {
+                let imp = &mut self.imps[i];
+                imp.done = true;
+                imp.external = res.external;
+                imp.def_indices = res.def_indices;
+                imp.target_module = res.target_module;
+            }
+        }
+        for imp in &mut self.imps {
+            if !imp.done {
+                imp.done = true;
+                imp.external = true;
+            }
+        }
+    }
+
+    fn attempt_import(&self, imp: &Imp) -> Option<Resolution> {
+        if imp.path.starts_with("::") {
+            return Some(Resolution::external());
+        }
+        let segs = split_path(&imp.path);
+        if segs.is_empty() {
+            return Some(Resolution::external());
+        }
+        let walked = self.walk_import(&imp.module, &segs)?;
+        if walked.def_indices.is_empty() && walked.module.is_none() {
+            return Some(Resolution::external());
+        }
+        Some(Resolution {
+            external: false,
+            def_indices: walked.def_indices,
+            target_module: walked.module,
+        })
+    }
+
+    /// `None` means a segment is waiting on an import that is not done yet.
+    fn walk_import(&self, module: &str, segs: &[String]) -> Option<ImportWalk> {
+        let mut hits = Vec::new();
+        for (n, seg) in segs.iter().enumerate() {
+            let head = if n == 0 {
+                self.head_status(module, seg, None, None)?
+            } else {
+                let mut next = Vec::new();
+                let mut pending = false;
+                for hit in &hits {
+                    match self.step_status(hit, seg) {
+                        Head::Pending => pending = true,
+                        Head::Ready(h) => next.extend(h),
+                        Head::Missing => {}
+                    }
+                }
+                if pending && next.is_empty() {
+                    return None;
+                }
+                Head::Ready(next)
+            };
+            match head {
+                Head::Pending => return None,
+                Head::Missing => {
+                    return Some(ImportWalk {
+                        def_indices: Vec::new(),
+                        module: None,
+                    });
+                }
+                Head::Ready(ready) => {
+                    hits = ready;
+                }
+            }
+        }
+        let mut def_indices = Vec::new();
+        let mut mod_path = None;
+        for hit in &hits {
+            if let Some(i) = hit.def_index {
+                def_indices.push(i);
+            }
+            if hit.kind == HitKind::Module {
+                mod_path = Some(hit.module.clone());
+            }
+        }
+        Some(ImportWalk {
+            def_indices,
+            module: mod_path,
+        })
+    }
+
+    fn head_status(
+        &self,
+        module: &str,
+        seg: &str,
+        self_ty: Option<&str>,
+        self_tr: Option<&str>,
+    ) -> Option<Head> {
+        match seg {
+            "crate" => Some(Head::Ready(vec![self.module_hit(crate_key(module))])),
+            "self" => Some(Head::Ready(vec![self.module_hit(module)])),
+            "super" => Some(match parent_module(module) {
+                Some(p) => Head::Ready(vec![self.module_hit(&p)]),
+                None => Head::Missing,
+            }),
+            "::" => Some(Head::Missing),
+            "Self" => Some(Head::Ready(self.self_hits(module, self_ty, self_tr))),
+            _ => Some(self.ident_status(module, seg)),
+        }
+    }
+
+    fn ident_status(&self, module: &str, name: &str) -> Head {
+        let locals = self.direct.get(&(module.to_owned(), name.to_owned()));
+        let mut ready = Vec::new();
+        let mut pending = false;
+        let mut external = false;
+        for imp in self
+            .imps
+            .iter()
+            .filter(|i| !i.glob && i.module == module && i.local == name)
+        {
+            if !imp.done {
+                pending = true;
+                continue;
+            }
+            if imp.external {
+                external = true;
+                continue;
+            }
+            ready.extend(self.hits_from_import(imp));
+        }
+        if let Some(ids) = locals {
+            for &i in ids {
+                ready.push(self.hit_from_def(i));
+            }
+        }
+        if !ready.is_empty() {
+            return Head::Ready(ready);
+        }
+        if pending {
+            return Head::Pending;
+        }
+        if self
+            .imps
+            .iter()
+            .any(|i| i.glob && !i.done && i.module == module)
+        {
+            return Head::Pending;
+        }
+        if external {
+            return Head::Missing;
+        }
+        let mut glob_hits = Vec::new();
+        for imp in self
+            .imps
+            .iter()
+            .filter(|i| i.glob && i.done && i.module == module)
+        {
+            glob_hits.extend(self.glob_hits(imp, name));
+        }
+        if glob_hits.is_empty() {
+            Head::Missing
+        } else {
+            Head::Ready(glob_hits)
+        }
+    }
+
+    fn hits_from_import(&self, imp: &Imp) -> Vec<Hit> {
+        let mut hits = Vec::new();
+        for &i in &imp.def_indices {
+            hits.push(self.hit_from_def(i));
+        }
+        if hits.is_empty()
+            && let Some(m) = &imp.target_module
+        {
+            hits.push(self.module_hit(m));
+        }
+        hits
+    }
+
+    fn glob_hits(&self, imp: &Imp, name: &str) -> Vec<Hit> {
+        let Some(module) = imp.target_module.as_deref() else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        if let Some(ids) = self.direct.get(&(module.to_owned(), name.to_owned())) {
+            for &i in ids {
+                hits.push(self.hit_from_def(i));
+            }
+        }
+        for other in self
+            .imps
+            .iter()
+            .filter(|i| i.done && !i.glob && !i.external && i.module == module && i.local == name)
+        {
+            hits.extend(self.hits_from_import(other));
+        }
+        hits
+    }
+
+    fn step_status(&self, hit: &Hit, seg: &str) -> Head {
+        match hit.kind {
+            HitKind::Module => self.ident_status(&hit.module, seg),
+            HitKind::Def => {
+                let Some(i) = hit.def_index else {
+                    return Head::Missing;
+                };
+                let def = &self.defs[i];
+                let from_trait = def.kind == "trait_item";
+                let key = def.simple.clone();
+                let crate_k = crate_key(&def.module).to_owned();
+                let hits = self.associated_hits(&crate_k, &key, seg, from_trait);
+                if hits.is_empty() {
+                    Head::Missing
+                } else {
+                    Head::Ready(hits)
+                }
+            }
+            HitKind::Type => {
+                let crate_k = crate_key_of_type_hit(hit);
+                let key = type_key_of_type_hit(hit);
+                let hits = self.associated_hits(&crate_k, &key, seg, false);
+                if hits.is_empty() {
+                    Head::Missing
+                } else {
+                    Head::Ready(hits)
+                }
+            }
+        }
+    }
+
+    fn associated_hits(
+        &self,
+        crate_k: &str,
+        type_key: &str,
+        seg: &str,
+        from_trait: bool,
+    ) -> Vec<Hit> {
+        let Some(ids) = self.associated.get(seg) else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for &i in ids {
+            let def = &self.defs[i];
+            if crate_key(&def.module) != crate_k {
+                continue;
+            }
+            if parent_matches(&def.parent, type_key, from_trait) {
+                hits.push(self.hit_from_def(i));
+            }
+        }
+        hits
+    }
+
+    fn self_hits(&self, module: &str, self_ty: Option<&str>, _self_tr: Option<&str>) -> Vec<Hit> {
+        let Some(ty) = self_ty.filter(|s| !s.is_empty()) else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        if let Some(ids) = self.direct.get(&(module.to_owned(), ty.to_owned())) {
+            for &i in ids {
+                hits.push(self.hit_from_def(i));
+            }
+        }
+        if hits.is_empty() {
+            let key = crate_key(module);
+            for (i, def) in self.defs.iter().enumerate() {
+                if def.parent.is_empty() && def.simple == ty && crate_key(&def.module) == key {
+                    hits.push(self.hit_from_def(i));
+                }
+            }
+        }
+        // `{crate_key}\u{1}{type}` so a type hit carries both without a NodeId.
+        hits.push(Hit {
+            node_id: None,
+            module: format!("{}\u{1}{ty}", crate_key(module)),
+            def_index: None,
+            kind: HitKind::Type,
+        });
+        hits
+    }
+
+    fn module_hit(&self, module: &str) -> Hit {
+        // A `mod` item whose denoted path is `module`, if one exists.
+        if let Some(parent) = parent_module(module) {
+            let simple = module.rsplit("::").next().unwrap_or(module);
+            if let Some(ids) = self.direct.get(&(parent, simple.to_owned())) {
+                for &i in ids {
+                    if self.defs[i].kind == "mod_item" {
+                        return self.hit_from_def(i);
+                    }
+                }
+            }
+        }
+        Hit {
+            node_id: None,
+            module: module.to_owned(),
+            def_index: None,
+            kind: HitKind::Module,
+        }
+    }
+
+    fn hit_from_def(&self, i: usize) -> Hit {
+        let def = &self.defs[i];
+        let node_id = real_id(def.node_id);
+        if def.kind == "mod_item" {
+            Hit {
+                node_id,
+                module: mod_join(&def.module, &def.simple),
+                def_index: Some(i),
+                kind: HitKind::Module,
+            }
+        } else {
+            Hit {
+                node_id,
+                module: def.module.clone(),
+                def_index: Some(i),
+                kind: HitKind::Def,
+            }
+        }
+    }
+
+    fn lookup(
+        &self,
+        scope: Option<&str>,
+        self_ty: Option<&str>,
+        self_tr: Option<&str>,
+        written: &str,
+    ) -> PathHits {
+        let scope_owned;
+        let module = if let Some(scope) = scope.filter(|s| !s.is_empty()) {
+            scope
+        } else if self.crate_keys.len() == 1 {
+            scope_owned = self.crate_keys.iter().next().cloned().unwrap_or_default();
+            scope_owned.as_str()
+        } else {
+            return self.lookup_everywhere(written);
+        };
+        self.lookup_in(module, self_ty, self_tr, written)
+    }
+
+    fn lookup_everywhere(&self, written: &str) -> PathHits {
+        let mut all = Vec::new();
+        let mut finals = Vec::new();
+        let modules: BTreeSet<String> = self
+            .defs
+            .iter()
+            .map(|d| d.module.clone())
+            .chain(self.files.values().cloned())
+            .collect();
+        for module in modules {
+            let hits = self.lookup_in(&module, None, None, written);
+            all.extend(hits.all);
+            finals.extend(hits.finals);
+        }
+        dedup_ids(&mut all);
+        dedup_ids(&mut finals);
+        PathHits { all, finals }
+    }
+
+    fn lookup_in(
+        &self,
+        module: &str,
+        self_ty: Option<&str>,
+        self_tr: Option<&str>,
+        written: &str,
+    ) -> PathHits {
+        let written = written.trim();
+        if let Some(name) = written.strip_prefix('.') {
+            let ids = self.method_ids(crate_key(module), name.trim());
+            return PathHits {
+                all: ids.clone(),
+                finals: ids,
+            };
+        }
+        if written.starts_with("::") {
+            return PathHits {
+                all: Vec::new(),
+                finals: Vec::new(),
+            };
+        }
+        let segs: Vec<String> = written
+            .split("::")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segs.is_empty() {
+            return PathHits {
+                all: Vec::new(),
+                finals: Vec::new(),
+            };
+        }
+        let mut all = Vec::new();
+        let mut current = match self.head_status(module, &segs[0], self_ty, self_tr) {
+            Some(Head::Ready(hits)) => hits,
+            _ => Vec::new(),
+        };
+        let first_ids = hit_ids(&current);
+        if segs.len() == 1 {
+            return PathHits {
+                all: first_ids.clone(),
+                finals: first_ids,
+            };
+        }
+        all.extend(first_ids);
+        for (n, seg) in segs.iter().enumerate().skip(1) {
+            let mut next = Vec::new();
+            for hit in &current {
+                if let Head::Ready(hits) = self.step_status(hit, seg) {
+                    next.extend(hits);
+                }
+            }
+            current = next;
+            let ids = hit_ids(&current);
+            all.extend(&ids);
+            if n + 1 == segs.len() {
+                dedup_ids(&mut all);
+                return PathHits { all, finals: ids };
+            }
+        }
+        dedup_ids(&mut all);
+        PathHits {
+            all: all.clone(),
+            finals: all,
+        }
+    }
+
+    fn method_ids(&self, crate_k: &str, name: &str) -> Vec<NodeId> {
+        let Some(ids) = self.associated.get(name) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &i in ids {
+            let def = &self.defs[i];
+            if crate_key(&def.module) != crate_k {
+                continue;
+            }
+            if is_method_parent(&def.parent)
+                && let Some(id) = real_id(def.node_id)
+            {
+                out.push(id);
+            }
+        }
+        dedup_ids(&mut out);
+        out
+    }
+
+    fn node_id_of(&self, node: &Node) -> Option<NodeId> {
+        let oid = ObjectId::of(node).ok()?;
+        let i = *self.by_object.get(&oid)?;
+        real_id(self.defs[i].node_id)
+    }
+
+    fn is_test_node(&self, node: &Node) -> bool {
+        let Ok(oid) = ObjectId::of(node) else {
+            return false;
+        };
+        let Some(&i) = self.by_object.get(&oid) else {
+            return false;
+        };
+        let def = &self.defs[i];
+        def.is_test || (def.cfg_test && is_fn_kind(&def.kind))
+    }
+
+    fn scope_of(&self, node: &Node) -> Scope {
+        if let Ok(oid) = ObjectId::of(node)
+            && let Some(&i) = self.by_object.get(&oid)
+        {
+            let def = &self.defs[i];
+            let (self_ty, self_tr) = split_impl(&def.parent)
+                .map(|(ty, tr)| {
+                    (
+                        (!ty.is_empty()).then(|| ty.to_owned()),
+                        (!tr.is_empty()).then(|| tr.to_owned()),
+                    )
+                })
+                .unwrap_or((None, None));
+            return Scope {
+                module: def.module.clone(),
+                self_ty,
+                self_tr,
+                cfg_test: def.cfg_test,
+            };
+        }
+        if let Ok(oid) = ObjectId::of(node)
+            && let Some(module) = self.files.get(&oid)
+        {
+            return Scope {
+                module: module.clone(),
+                self_ty: None,
+                self_tr: None,
+                cfg_test: false,
+            };
+        }
+        if self.crate_keys.len() == 1 {
+            return Scope {
+                module: self.crate_keys.iter().next().cloned().unwrap_or_default(),
+                self_ty: None,
+                self_tr: None,
+                cfg_test: false,
+            };
+        }
+        Scope {
+            module: String::new(),
+            self_ty: None,
+            self_tr: None,
+            cfg_test: false,
+        }
+    }
+}
+
+struct Resolution {
+    external: bool,
+    def_indices: Vec<usize>,
+    target_module: Option<String>,
+}
+
+impl Resolution {
+    fn external() -> Self {
+        Self {
+            external: true,
+            def_indices: Vec::new(),
+            target_module: None,
+        }
+    }
+}
+
+struct ImportWalk {
+    def_indices: Vec<usize>,
+    module: Option<String>,
+}
+
+struct Scope {
+    module: String,
+    self_ty: Option<String>,
+    self_tr: Option<String>,
+    cfg_test: bool,
+}
+
+fn crate_key_of_type_hit(hit: &Hit) -> String {
+    hit.module
+        .split('\u{1}')
+        .next()
+        .unwrap_or(hit.module.as_str())
+        .to_owned()
+}
+
+fn type_key_of_type_hit(hit: &Hit) -> String {
+    hit.module
+        .split('\u{1}')
+        .nth(1)
+        .unwrap_or(hit.module.as_str())
+        .to_owned()
+}
+
+fn is_method_parent(parent: &str) -> bool {
+    parent.starts_with("impl|")
+        || parent.starts_with("trait|")
+        || parent.starts_with("field|")
+        || parent.starts_with("assoc|")
+        || parent.starts_with("variant|")
+}
+
+fn parent_matches(parent: &str, key: &str, from_trait: bool) -> bool {
+    if let Some((ty, tr)) = split_impl(parent) {
+        if ty == key {
+            return true;
+        }
+        if from_trait && tr == key {
+            return true;
+        }
+        return false;
+    }
+    parent == format!("field|{key}")
+        || parent == format!("variant|{key}")
+        || parent == format!("trait|{key}")
+        || parent == format!("assoc|{key}")
+}
+
+fn split_impl(parent: &str) -> Option<(&str, &str)> {
+    let rest = parent.strip_prefix("impl|")?;
+    rest.split_once('|')
+}
+
+fn is_associated_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_item"
+            | "function_signature_item"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "associated_type"
+            | "macro_definition"
+            | "field_declaration"
+            | "enum_variant"
+    )
+}
+
+fn is_fn_kind(kind: &str) -> bool {
+    matches!(kind, "function_item" | "function_signature_item")
+}
+
+fn split_path(path: &str) -> Vec<String> {
+    path.split("::")
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn hit_ids(hits: &[Hit]) -> Vec<NodeId> {
+    let mut ids = Vec::new();
+    for hit in hits {
+        if let Some(id) = hit.node_id {
+            ids.push(id);
+        }
+    }
+    dedup_ids(&mut ids);
+    ids
+}
+
+fn dedup_ids(ids: &mut Vec<NodeId>) {
+    ids.sort();
+    ids.dedup();
+}
+
+// --- reference walk --------------------------------------------------------
+
+fn refs_from_node(idx: &Index, node: &Node) -> Vec<NameRef> {
+    let scope = idx.scope_of(node);
+    let bytes = node.raw.clone();
+    let mut refs = Vec::new();
+    let _ = cst::with_parser(|parser| {
+        if let Some(tree) = parser.parse(bytes.as_slice(), None) {
+            let mut walk = RefWalk {
+                idx,
+                source: bytes.as_slice(),
+                module: scope.module,
+                self_ty: scope.self_ty,
+                self_tr: scope.self_tr,
+                refs: Vec::new(),
+            };
+            walk.walk(tree.root_node());
+            refs = walk.refs;
+        }
+    });
+    refs.sort_by(|a, b| {
+        a.name
+            .as_str()
+            .cmp(b.name.as_str())
+            .then(a.resolved.cmp(&b.resolved))
+            .then(a.scope.cmp(&b.scope))
+    });
+    refs.dedup();
+    refs
+}
+
+struct RefWalk<'a> {
+    idx: &'a Index,
+    source: &'a [u8],
+    module: String,
+    self_ty: Option<String>,
+    self_tr: Option<String>,
+    refs: Vec<NameRef>,
+}
+
+impl RefWalk<'_> {
+    fn walk(&mut self, node: tree_sitter::Node<'_>) {
+        if node.is_extra() || node.is_missing() {
+            return;
+        }
+        match node.kind() {
+            "mod_item" => {
+                let saved = self.module.clone();
+                if let Some(name) = field_text(node, self.source, "name") {
+                    self.module = mod_join(&saved, &name);
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    self.walk(body);
+                }
+                self.module = saved;
+            }
+            "impl_item" => {
+                let saved_ty = self.self_ty.clone();
+                let saved_tr = self.self_tr.clone();
+                let ty = type_key(&field_text(node, self.source, "type").unwrap_or_default());
+                let tr = field_text(node, self.source, "trait").map(|t| type_key(&t));
+                if !ty.is_empty() {
+                    self.self_ty = Some(ty);
+                }
+                self.self_tr = tr;
+                if let Some(ty_node) = node.child_by_field_name("type") {
+                    self.walk(ty_node);
+                }
+                if let Some(tr_node) = node.child_by_field_name("trait") {
+                    self.walk(tr_node);
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    self.walk(body);
+                }
+                self.self_ty = saved_ty;
+                self.self_tr = saved_tr;
+            }
+            "macro_invocation" => self.walk_macro(node),
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let segs = path_segments(node, self.source);
+                self.emit_path(&segs);
+            }
+            "generic_type" | "generic_type_with_turbofish" => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    let segs = path_segments(ty, self.source);
+                    self.emit_path(&segs);
+                }
+                if let Some(args) = node.child_by_field_name("type_arguments") {
+                    self.walk(args);
+                }
+            }
+            "generic_function" => {
+                if let Some(fun) = node.child_by_field_name("function") {
+                    let segs = path_segments(fun, self.source);
+                    self.emit_path(&segs);
+                }
+                if let Some(args) = node.child_by_field_name("type_arguments") {
+                    self.walk(args);
+                }
+            }
+            "field_expression" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    self.walk(value);
+                }
+                if let Some(field) = node.child_by_field_name("field")
+                    && field.kind() != "integer_literal"
+                    && let Some(name) = node_text(field, self.source)
+                {
+                    self.emit_method(&name);
+                }
+            }
+            "lifetime" | "metavariable" | "primitive_type" | "string_literal"
+            | "raw_string_literal" | "char_literal" | "string_content" => {}
+            "identifier" | "type_identifier" | "field_identifier" => {
+                if is_declarator(node) {
+                    return;
+                }
+                if node.kind() == "field_identifier" {
+                    if let Some(name) = node_text(node, self.source) {
+                        self.emit_method(&name);
+                    }
+                    return;
+                }
+                if let Some(parent) = node.parent()
+                    && parent.kind() == "shorthand_field_initializer"
+                    && let Some(name) = node_text(node, self.source)
+                {
+                    self.emit_method(&name);
+                    self.emit_path(&[name]);
+                    return;
+                }
+                if let Some(name) = node_text(node, self.source) {
+                    self.emit_path(&[name]);
+                }
+            }
+            _ => {
+                for child in structural_children(node) {
+                    self.walk(child);
+                }
+            }
+        }
+    }
+
+    fn walk_macro(&mut self, node: tree_sitter::Node<'_>) {
+        if let Some(mac) = node.child_by_field_name("macro") {
+            let segs = path_segments(mac, self.source);
+            if segs.is_empty() {
+                self.walk(mac);
+            } else {
+                self.emit_path(&segs);
+            }
+        }
+        for child in structural_children(node) {
+            if child.kind() == "token_tree" {
+                self.emit_lexical(child);
+            }
+        }
+    }
+
+    fn emit_lexical(&mut self, node: tree_sitter::Node<'_>) {
+        let mut leaves = Vec::new();
+        flatten_leaves(node, &mut leaves);
+        let mut i = 0;
+        while i < leaves.len() {
+            if is_name_leaf(leaves[i]) {
+                let mut segs = Vec::new();
+                if let Some(text) = node_text(leaves[i], self.source) {
+                    segs.push(text);
+                }
+                let mut j = i;
+                while j + 2 < leaves.len()
+                    && leaves[j + 1].kind() == "::"
+                    && is_name_leaf(leaves[j + 2])
+                {
+                    if let Some(text) = node_text(leaves[j + 2], self.source) {
+                        segs.push(text);
+                    }
+                    j += 2;
+                }
+                self.emit_path(&segs);
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn emit_path(&mut self, segs: &[String]) {
+        if segs.is_empty() {
+            return;
+        }
+        if segs.len() == 1 && is_skippable_bare(&segs[0]) {
+            return;
+        }
+        if segs.first().is_some_and(|s| s == "::") {
+            self.push(
+                &segs[1..].join("::"),
+                &PathHits {
+                    all: Vec::new(),
+                    finals: Vec::new(),
+                },
+            );
+            return;
+        }
+        let written = segs.join("::");
+        let module = self.module.clone();
+        let self_ty = self.self_ty.clone();
+        let self_tr = self.self_tr.clone();
+        let hits = self
+            .idx
+            .lookup_in(&module, self_ty.as_deref(), self_tr.as_deref(), &written);
+        self.push(&written, &hits);
+    }
+
+    fn emit_method(&mut self, name: &str) {
+        if is_skippable_bare(name) {
+            return;
+        }
+        let written = format!(".{name}");
+        let ids = self.idx.method_ids(crate_key(&self.module), name);
+        let hits = PathHits {
+            all: ids.clone(),
+            finals: ids,
+        };
+        self.push(&written, &hits);
+    }
+
+    fn push(&mut self, written: &str, hits: &PathHits) {
+        if written.is_empty() {
+            return;
+        }
+        let scope = if self.module.is_empty() {
+            None
+        } else {
+            Some(QualifiedName::new(self.module.clone()))
+        };
+        let mut ids = hits.all.clone();
+        dedup_ids(&mut ids);
+        if ids.is_empty() {
+            self.refs.push(NameRef::at(written, scope, None));
+            return;
+        }
+        for id in ids {
+            self.refs
+                .push(NameRef::at(written, scope.clone(), Some(id)));
+        }
+    }
+}
+
+fn inner_test_targets(idx: &Index, node: &Node) -> Vec<NodeId> {
+    let scope = idx.scope_of(node);
+    let bytes = node.raw.clone();
+    let mut ids = Vec::new();
+    let _ = cst::with_parser(|parser| {
+        if let Some(tree) = parser.parse(bytes.as_slice(), None) {
+            scan_tests(
+                idx,
+                tree.root_node(),
+                bytes.as_slice(),
+                &scope.module,
+                scope.self_ty.as_deref(),
+                scope.self_tr.as_deref(),
+                scope.cfg_test,
+                &mut ids,
+            );
+        }
+    });
+    ids
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_tests(
+    idx: &Index,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    module: &str,
+    self_ty: Option<&str>,
+    self_tr: Option<&str>,
+    inherited_cfg: bool,
+    out: &mut Vec<NodeId>,
+) {
+    if node.is_extra() || node.is_missing() {
+        return;
+    }
+    if node.kind() == "mod_item" {
+        let child = field_text(node, source, "name")
+            .map(|name| mod_join(module, &name))
+            .unwrap_or_else(|| module.to_owned());
+        let cfg = inherited_cfg || item_inner_cfg_test(node, source);
+        if let Some(body) = node.child_by_field_name("body") {
+            scan_list(idx, body, source, &child, self_ty, self_tr, cfg, out);
+        }
+        return;
+    }
+    if node.kind() == "impl_item" {
+        let ty = type_key(&field_text(node, source, "type").unwrap_or_default());
+        let tr = field_text(node, source, "trait").map(|t| type_key(&t));
+        let ty = if ty.is_empty() {
+            self_ty.map(str::to_owned)
+        } else {
+            Some(ty)
+        };
+        if let Some(body) = node.child_by_field_name("body") {
+            scan_list(
+                idx,
+                body,
+                source,
+                module,
+                ty.as_deref(),
+                tr.as_deref().or(self_tr),
+                inherited_cfg,
+                out,
+            );
+        }
+        return;
+    }
+    scan_list(
+        idx,
+        node,
+        source,
+        module,
+        self_ty,
+        self_tr,
+        inherited_cfg,
+        out,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_list(
+    idx: &Index,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    module: &str,
+    self_ty: Option<&str>,
+    self_tr: Option<&str>,
+    inherited_cfg: bool,
+    out: &mut Vec<NodeId>,
+) {
+    let cfg = inherited_cfg || item_inner_cfg_test(node, source);
+    let mut pending = Vec::new();
+    for child in structural_children(node) {
+        match child.kind() {
+            "attribute_item" => pending.push(child),
+            "inner_attribute_item" => {}
+            _ => {
+                let flags = flags_of_attrs(&pending, source);
+                pending.clear();
+                let testish =
+                    flags.is_test || ((cfg || flags.cfg_test) && is_fn_kind(child.kind()));
+                if testish && is_fn_kind(child.kind()) {
+                    out.extend(refs_of_ts(idx, child, source, module, self_ty, self_tr));
+                }
+                let next_cfg = cfg || flags.cfg_test;
+                if matches!(
+                    child.kind(),
+                    "mod_item" | "impl_item" | "declaration_list" | "block" | "source_file"
+                ) || child.child_by_field_name("body").is_some()
+                {
+                    scan_tests(idx, child, source, module, self_ty, self_tr, next_cfg, out);
+                }
+            }
+        }
+    }
+}
+
+fn refs_of_ts(
+    idx: &Index,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    module: &str,
+    self_ty: Option<&str>,
+    self_tr: Option<&str>,
+) -> Vec<NodeId> {
+    let mut walk = RefWalk {
+        idx,
+        source,
+        module: module.to_owned(),
+        self_ty: self_ty.map(str::to_owned),
+        self_tr: self_tr.map(str::to_owned),
+        refs: Vec::new(),
+    };
+    walk.walk(node);
+    resolved_ids(&walk.refs)
+}
+
+fn flatten_leaves<'a>(node: tree_sitter::Node<'a>, out: &mut Vec<tree_sitter::Node<'a>>) {
+    if node.child_count() == 0 {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            flatten_leaves(cursor.node(), out);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn is_name_leaf(node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "field_identifier" | "crate" | "self" | "super"
+    )
+}
+
+fn is_declarator(node: tree_sitter::Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !RustAdapter.is_definition(&NodeKind::new(parent.kind())) {
+        return false;
+    }
+    parent.child_by_field_name("name").is_some_and(|name| {
+        name.start_byte() == node.start_byte() && name.end_byte() == node.end_byte()
+    })
+}
+
+fn is_skippable_bare(name: &str) -> bool {
+    name.is_empty() || name == "_" || is_keyword(name) || is_primitive(name)
+}
+
+fn is_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "union"
+            | "box"
+            | "become"
+            | "abstract"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "override"
+            | "final"
+            | "priv"
+            | "try"
+            | "yield"
+            | "macro_rules"
+    )
+}
+
+fn is_primitive(name: &str) -> bool {
+    matches!(
+        name,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "str"
+    )
+}
+
+// --- tree-sitter helpers ---------------------------------------------------
+
+fn structural_children<'a>(node: tree_sitter::Node<'a>) -> Vec<tree_sitter::Node<'a>> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if !child.is_extra() && !child.is_missing() {
+                out.push(child);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn node_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let text = node.utf8_text(source).ok()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+fn field_text(node: tree_sitter::Node<'_>, source: &[u8], field: &str) -> Option<String> {
+    node.child_by_field_name(field)
+        .and_then(|n| node_text(n, source))
+}

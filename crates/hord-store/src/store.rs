@@ -1,6 +1,6 @@
 //! [`Store`]: content-addressed objects, log, refs, and workspaces.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,11 @@ use serde::de::DeserializeOwned;
 use crate::pack::{PackWriter, PackedLocation, pack_path, read_packed};
 use crate::workspace::WorkspaceRow;
 use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
+
+#[path = "index.rs"]
+mod index;
+
+pub use index::EdgeKind;
 
 /// Directory name of a Hord store, next to the repository root (spec §8.1).
 pub const HORD_DIR: &str = ".hord";
@@ -31,7 +36,6 @@ const REFS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("refs");
 const WORKSPACES: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("workspaces");
 const OBJECTS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("objects");
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
-const NODE_HISTORY: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("node_history");
 const EVIDENCE_BY_SNAPSHOT: TableDefinition<'_, &[u8], &[u8]> =
     TableDefinition::new("evidence_by_snapshot");
 
@@ -41,7 +45,8 @@ const META_NEXT_PACK: &str = "next_pack";
 /// Local content-addressed object store (spec §8.1).
 ///
 /// Layout under `<repo>/.hord/`:
-/// - `index.redb` — log, refs, workspaces, packed-object locations
+/// - `index.redb` — log, refs, workspaces, packed-object locations, and the
+///   rebuildable `node_history` / `edges` / `identity` caches
 /// - `objects/<ab>/<rest>` — uncompressed loose objects
 /// - `objects/pack/pack-<id>.pack` + `.idx` — zstd-compressed packs
 /// - `ws/<ulid>/` — workspace materialization directories
@@ -60,6 +65,8 @@ pub struct Store {
     /// Landed changes not yet written to the redb `log` table.
     pending_log: Mutex<Vec<ChangeId>>,
     has_packs: AtomicBool,
+    /// Serializes index updates so an identity supersede chain cannot fork.
+    index_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for Store {
@@ -95,6 +102,7 @@ impl Store {
             pending_refs: Mutex::new(HashMap::new()),
             pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(false),
+            index_lock: Mutex::new(()),
         })
     }
 
@@ -107,6 +115,7 @@ impl Store {
             return Err(Error::MissingStore(hord_dir));
         }
         let db = Database::open(index).map_err(Error::index)?;
+        index::ensure_tables(&db)?;
         let objects_dir = hord_dir.join("objects");
         let has_packs = pack_dir_has_packs(&objects_dir.join("pack"));
         Ok(Self {
@@ -118,6 +127,7 @@ impl Store {
             pending_refs: Mutex::new(HashMap::new()),
             pending_log: Mutex::new(Vec::new()),
             has_packs: AtomicBool::new(has_packs),
+            index_lock: Mutex::new(()),
         })
     }
 
@@ -481,6 +491,44 @@ impl Store {
         }
     }
 
+    /// Visit every stored object. A loose file wins over a packed copy of the
+    /// same id. Callers must not open a write transaction on this store from `f`.
+    fn for_each_stored_object(
+        &self,
+        mut f: impl FnMut(ObjectId, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        for (id, _) in self.list_loose()? {
+            if !seen.insert(id) {
+                continue;
+            }
+            let bytes = self.get(id)?;
+            f(id, &bytes)?;
+        }
+        for id in self.list_packed_ids()? {
+            if !seen.insert(id) {
+                continue;
+            }
+            let bytes = self.get(id)?;
+            f(id, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn list_packed_ids(&self) -> Result<Vec<ObjectId>> {
+        if !self.has_packs.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read().map_err(Error::index)?;
+        let table = txn.open_table(OBJECTS).map_err(Error::index)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(Error::index)? {
+            let (key, _) = entry.map_err(Error::index)?;
+            out.push(object_id_from_value(key.value())?);
+        }
+        Ok(out)
+    }
+
     fn list_loose(&self) -> Result<Vec<(ObjectId, PathBuf)>> {
         let root = &self.objects_dir;
         let mut out = Vec::new();
@@ -538,8 +586,8 @@ fn init_tables(db: &Database) -> Result<()> {
     txn.open_table(WORKSPACES).map_err(Error::index)?;
     txn.open_table(OBJECTS).map_err(Error::index)?;
     txn.open_table(META).map_err(Error::index)?;
-    txn.open_table(NODE_HISTORY).map_err(Error::index)?;
     txn.open_table(EVIDENCE_BY_SNAPSHOT).map_err(Error::index)?;
+    index::open_tables(&txn)?;
     txn.commit().map_err(Error::index)?;
     Ok(())
 }
