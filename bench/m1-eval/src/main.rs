@@ -4,10 +4,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
@@ -138,6 +139,11 @@ fn run(args: &Args) -> Result<Totals> {
 /// original 200 counted every mined conflict, including hand edits and
 /// hunks that cover two definitions.
 const MIN_SCORED_MERGES: u64 = 61;
+/// Parsed trees kept across commits. A blob is usually the result of one
+/// edit and the base of the next, a handful of commits later.
+const PARSE_CACHE_CAP: usize = 1024;
+/// Skip the cache for large sources so one file cannot pin the runner's memory.
+const PARSE_CACHE_MAX_BYTES: usize = 256 * 1024;
 
 fn merge_gates(t: &Totals, merges_only: bool) -> bool {
     if t.merge_cases == 0 {
@@ -747,6 +753,7 @@ fn consecutive_pairs(name: &str, repo: &gix::Repository) -> Result<(u64, u64)> {
         ids.len()
     );
     let start = Instant::now();
+    let cache = ParseCache::new(PARSE_CACHE_CAP);
     let mut batch: Vec<FilePair> = Vec::new();
     let mut n = 0u64;
     let mut fail = 0u64;
@@ -771,11 +778,13 @@ fn consecutive_pairs(name: &str, repo: &gix::Repository) -> Result<(u64, u64)> {
             batch.push(FilePair {
                 path,
                 commit_hex: commit_hex.clone(),
+                base_oid: old_oid,
+                result_oid: new_oid,
                 base,
                 result,
             });
             if batch.len() >= BATCH {
-                let (bn, bf) = drain_batch(name, &mut batch);
+                let (bn, bf) = drain_batch(name, &cache, &mut batch);
                 n += bn;
                 fail += bf;
             }
@@ -788,12 +797,14 @@ fn consecutive_pairs(name: &str, repo: &gix::Repository) -> Result<(u64, u64)> {
             );
         }
     }
-    let (bn, bf) = drain_batch(name, &mut batch);
+    let (bn, bf) = drain_batch(name, &cache, &mut batch);
     n += bn;
     fail += bf;
     eprintln!(
-        "[{name}] apply-diff {n} file-pairs, {fail} fail in {:.1}s",
-        start.elapsed().as_secs_f64()
+        "[{name}] apply-diff {n} file-pairs, {fail} fail in {:.1}s (parse cache {}/{} hits)",
+        start.elapsed().as_secs_f64(),
+        cache.hits(),
+        cache.lookups(),
     );
     Ok((n, fail))
 }
@@ -801,11 +812,13 @@ fn consecutive_pairs(name: &str, repo: &gix::Repository) -> Result<(u64, u64)> {
 struct FilePair {
     path: String,
     commit_hex: String,
+    base_oid: gix::ObjectId,
+    result_oid: gix::ObjectId,
     base: Vec<u8>,
     result: Vec<u8>,
 }
 
-fn drain_batch(name: &str, batch: &mut Vec<FilePair>) -> (u64, u64) {
+fn drain_batch(name: &str, cache: &ParseCache, batch: &mut Vec<FilePair>) -> (u64, u64) {
     if batch.is_empty() {
         return (0, 0);
     }
@@ -821,7 +834,7 @@ fn drain_batch(name: &str, batch: &mut Vec<FilePair>) -> (u64, u64) {
             let fail = &fail;
             s.spawn(move || {
                 for job in chunk {
-                    if let Err(err) = check_apply_diff(&job.path, &job.base, &job.result) {
+                    if let Err(err) = check_apply_diff(cache, job) {
                         fail.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "[{name}] apply-diff FAIL {} @ {}: {err}",
@@ -834,6 +847,90 @@ fn drain_batch(name: &str, batch: &mut Vec<FilePair>) -> (u64, u64) {
     });
     batch.clear();
     (n, fail.load(Ordering::Relaxed))
+}
+
+/// `lang` separates `.rs` and `.toml` parses of the same blob bytes.
+struct ParseCache {
+    cap: usize,
+    inner: Mutex<ParseCacheInner>,
+    hits: AtomicU64,
+    lookups: AtomicU64,
+}
+
+struct ParseCacheInner {
+    order: VecDeque<(gix::ObjectId, u8)>,
+    trees: HashMap<(gix::ObjectId, u8), hord_lang::NodeTree>,
+}
+
+impl ParseCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            inner: Mutex::new(ParseCacheInner {
+                order: VecDeque::new(),
+                trees: HashMap::new(),
+            }),
+            hits: AtomicU64::new(0),
+            lookups: AtomicU64::new(0),
+        }
+    }
+
+    fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    fn lookups(&self) -> u64 {
+        self.lookups.load(Ordering::Relaxed)
+    }
+
+    fn tree<A: LangAdapter>(
+        &self,
+        lang: u8,
+        oid: gix::ObjectId,
+        adapter: &A,
+        bytes: &[u8],
+    ) -> Result<hord_lang::NodeTree> {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        if bytes.len() <= PARSE_CACHE_MAX_BYTES
+            && let Some(tree) = self.cached(lang, oid)
+        {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(tree);
+        }
+        let tree = adapter.parse(bytes).context("parse")?;
+        if bytes.len() <= PARSE_CACHE_MAX_BYTES {
+            self.store(lang, oid, tree.clone());
+        }
+        Ok(tree)
+    }
+
+    fn cached(&self, lang: u8, oid: gix::ObjectId) -> Option<hord_lang::NodeTree> {
+        let mut inner = self.inner.lock().expect("parse cache");
+        let key = (oid, lang);
+        let tree = inner.trees.get(&key)?.clone();
+        if let Some(pos) = inner.order.iter().position(|item| *item == key) {
+            inner.order.remove(pos);
+        }
+        inner.order.push_back(key);
+        Some(tree)
+    }
+
+    fn store(&self, lang: u8, oid: gix::ObjectId, tree: hord_lang::NodeTree) {
+        let mut inner = self.inner.lock().expect("parse cache");
+        let key = (oid, lang);
+        if inner.trees.contains_key(&key)
+            && let Some(pos) = inner.order.iter().position(|item| *item == key)
+        {
+            inner.order.remove(pos);
+        }
+        inner.order.push_back(key);
+        inner.trees.insert(key, tree);
+        while inner.order.len() > self.cap {
+            if let Some(old) = inner.order.pop_front() {
+                inner.trees.remove(&old);
+            }
+        }
+    }
 }
 
 fn check_lossless(path: &str, bytes: &[u8]) -> Result<()> {
@@ -852,29 +949,30 @@ fn check_lossless(path: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn check_apply_diff(path: &str, base_src: &[u8], result_src: &[u8]) -> Result<()> {
-    if path.ends_with(".rs") {
-        check_apply_pair(&RustAdapter, path, base_src, result_src)
-    } else if path.ends_with(".toml") {
-        check_apply_pair(&TomlAdapter, path, base_src, result_src)
+fn check_apply_diff(cache: &ParseCache, job: &FilePair) -> Result<()> {
+    if job.path.ends_with(".rs") {
+        check_apply_pair(cache, 1, &RustAdapter, &job.path, job)
+    } else if job.path.ends_with(".toml") {
+        check_apply_pair(cache, 2, &TomlAdapter, &job.path, job)
     } else {
-        bail!("not a .rs/.toml path: {path}");
+        bail!("not a .rs/.toml path: {}", job.path);
     }
 }
 
 fn check_apply_pair<A: LangAdapter>(
+    cache: &ParseCache,
+    lang: u8,
     adapter: &A,
     path: &str,
-    base_src: &[u8],
-    result_src: &[u8],
+    job: &FilePair,
 ) -> Result<()> {
-    let base_tree = adapter.parse(base_src).context("parse base")?;
+    let base_tree = cache.tree(lang, job.base_oid, adapter, &job.base)?;
+    let result_tree = cache.tree(lang, job.result_oid, adapter, &job.result)?;
     let empty = IdentifiedTree::default();
     let base_map = default_identify(adapter, &empty, &base_tree);
     let base = IdentifiedTree::new(base_tree, base_map.nodes);
-    let result_tree = adapter.parse(result_src).context("parse result")?;
-    let want = result_tree.root();
     let mapping = default_identify(adapter, &base, &result_tree);
+    let want = result_tree.root();
     let ops = diff(&base, &result_tree, &mapping);
     // `diff` verifies apply identity (file Replace fallback if needed).
     let got = match ops.first() {
@@ -1093,5 +1191,32 @@ mod conflict_marker_tests {
             out.push(*byte);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod parse_cache_tests {
+    use super::ParseCache;
+    use hord_lang_rust::RustAdapter;
+
+    fn oid(byte: u8) -> gix::ObjectId {
+        let mut bytes = [0u8; 20];
+        bytes[0] = byte;
+        gix::ObjectId::from_bytes_or_panic(&bytes)
+    }
+
+    #[test]
+    fn reused_blob_is_a_hit_until_evicted() {
+        let cache = ParseCache::new(1);
+        let first = b"fn a() {}\n";
+        let second = b"fn b() {}\n";
+        let kept = cache.tree(1, oid(1), &RustAdapter, first).expect("parse");
+        let again = cache.tree(1, oid(1), &RustAdapter, first).expect("hit");
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(kept.root(), again.root());
+        cache.tree(1, oid(2), &RustAdapter, second).expect("evict");
+        cache.tree(1, oid(1), &RustAdapter, first).expect("reparse");
+        assert_eq!(cache.hits(), 1, "the evicted blob is parsed again");
+        assert_eq!(cache.lookups(), 4);
     }
 }
