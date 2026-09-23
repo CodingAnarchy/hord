@@ -70,7 +70,7 @@ impl NameRef {
 /// Tier 1 methods (`parse`, `project`, `is_definition`) are required.
 /// `project(parse(bytes))` must equal `bytes`. Tier 2 methods default to
 /// empty/`None`. [`identify`](Self::identify) defaults to
-/// [`default_identify`] (spec §3.4 steps 1–3; rename is M2).
+/// [`default_identify`] (spec §3.4, ADR 0007).
 ///
 /// Tree-sitter is **not** used here; language crates own grammars.
 pub trait LangAdapter: Send + Sync {

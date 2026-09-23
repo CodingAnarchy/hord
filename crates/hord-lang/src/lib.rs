@@ -21,6 +21,7 @@ mod adapter;
 mod error;
 mod identify;
 mod normalized;
+mod rename;
 mod tree;
 mod trivia;
 

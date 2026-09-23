@@ -1,6 +1,6 @@
 //! Default identity carrying (spec §3.4 steps 1–3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{IdentityDelta, Node, NodeId, NodeKind, ObjectId, Op, QualifiedName};
 
@@ -38,10 +38,17 @@ pub struct IdentityMapping {
     /// have [`NodeId`]s. `index` is the node's position in its immediate CST
     /// parent's `children` list.
     pub moves: Vec<Op>,
+    /// [`Op::Rename`] from carrying rule 4 (ADR 0007).
+    ///
+    /// Emitted only when both sides have a [`QualifiedName`]. The carried
+    /// [`NodeId`] is the same either way; [`IdentityDelta::DerivedFrom`]
+    /// records the pair.
+    pub renames: Vec<Op>,
 }
 
 #[derive(Clone, Debug)]
 struct BaseDef {
+    object_id: ObjectId,
     node_id: NodeId,
     parent_id: Option<NodeId>,
     kind: NodeKind,
@@ -70,8 +77,10 @@ struct ResultDef {
 /// 2. **Named:** same [`QualifiedName`] under the same parent (`name` from
 ///    [`Node::name`] or [`LangAdapter::qualified_name`]).
 /// 3. **Moved:** same `normalized` under a different parent; emit [`Op::Move`].
+/// 4. **Renamed:** unmatched definitions of the same kind whose trivia-stripped
+///    tree-edit-distance ratio is at least 0.8 (ADR 0007). Emit [`Op::Rename`]
+///    and [`IdentityDelta::DerivedFrom`].
 ///
-/// Step 4 (rename by body similarity) is skipped: it is OPEN until M2.
 /// Step 5 (declared relations) is not supplied to this function.
 /// Remaining result defs are births; remaining base defs are deaths.
 ///
@@ -123,6 +132,14 @@ pub fn default_identify<A: LangAdapter + ?Sized>(
         }
         break;
     }
+
+    rename_pass(
+        &base.tree,
+        result,
+        &mut mapping,
+        &mut base_defs,
+        &result_defs,
+    );
 
     for r in &result_defs {
         if mapping.nodes.contains_key(&r.object_id) {
@@ -219,6 +236,89 @@ fn match_pass(
     progress
 }
 
+fn rename_pass(
+    base_tree: &NodeTree,
+    result_tree: &NodeTree,
+    mapping: &mut IdentityMapping,
+    base_defs: &mut [BaseDef],
+    result_defs: &[ResultDef],
+) {
+    struct Candidate {
+        base_id: NodeId,
+        preorder: usize,
+        result_oid: ObjectId,
+        slack: usize,
+    }
+
+    let mut candidates = Vec::new();
+    for (preorder, result_def) in result_defs.iter().enumerate() {
+        if mapping.nodes.contains_key(&result_def.object_id) {
+            continue;
+        }
+        for base_def in base_defs.iter() {
+            if base_def.used || base_def.kind != result_def.kind {
+                continue;
+            }
+            let Some(slack) = crate::rename::similarity_slack(
+                base_tree,
+                base_def.object_id,
+                result_tree,
+                result_def.object_id,
+            ) else {
+                continue;
+            };
+            candidates.push(Candidate {
+                base_id: base_def.node_id,
+                preorder,
+                result_oid: result_def.object_id,
+                slack,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .slack
+            .cmp(&left.slack)
+            .then(left.base_id.as_u128().cmp(&right.base_id.as_u128()))
+            .then(left.preorder.cmp(&right.preorder))
+    });
+
+    let mut taken_result = BTreeSet::new();
+    let mut taken_base = BTreeSet::new();
+    for candidate in candidates {
+        if taken_base.contains(&candidate.base_id) || taken_result.contains(&candidate.preorder) {
+            continue;
+        }
+        taken_base.insert(candidate.base_id);
+        taken_result.insert(candidate.preorder);
+        let Some(base_def) = base_defs
+            .iter_mut()
+            .find(|def| def.node_id == candidate.base_id)
+        else {
+            continue;
+        };
+        base_def.used = true;
+        let base_name = base_def.name.clone();
+        mapping
+            .nodes
+            .insert(candidate.result_oid, candidate.base_id);
+        mapping.deltas.push(IdentityDelta::DerivedFrom {
+            node: candidate.base_id,
+            from: candidate.base_id,
+        });
+        let result_name = result_defs[candidate.preorder].name.clone();
+        if let (Some(from), Some(to)) = (base_name, result_name)
+            && from != to
+        {
+            mapping.renames.push(Op::Rename {
+                node: candidate.base_id,
+                from,
+                to,
+            });
+        }
+    }
+}
+
 fn names_equal(a: &Option<QualifiedName>, b: &Option<QualifiedName>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => x == y,
@@ -262,6 +362,7 @@ fn collect_base_walk<A: LangAdapter + ?Sized>(
     {
         let name = def_name(adapter, &base.tree, ancestor_ids, node);
         out.push(BaseDef {
+            object_id: oid,
             node_id,
             parent_id: nearest_def_id,
             kind: node.kind,
@@ -508,6 +609,88 @@ mod tests {
         let born = mapping.nodes.get(&new).copied().unwrap();
         assert_ne!(born, nid(1));
         assert!(mapping.moves.is_empty());
+    }
+
+    fn fn_with_leaves(tree: &mut NodeTree, name: &str, texts: &[&str]) -> ObjectId {
+        let leaves: Vec<ObjectId> = texts
+            .iter()
+            .map(|text| leaf(tree, "id", text, None))
+            .collect();
+        tree.intern_branch(
+            NodeKind::new("fn"),
+            lang(),
+            leaves,
+            Some(QualifiedName::new(name)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rename_keeps_id_when_body_distance_is_within_threshold() {
+        let adapter = TestAdapter;
+        let mut base_tree = NodeTree::new();
+        let old = fn_with_leaves(&mut base_tree, "foo", &["a", "b", "c", "d", "e"]);
+        let base_root = base_tree
+            .intern_branch(NodeKind::new("file"), lang(), vec![old], None)
+            .unwrap();
+        base_tree.set_root(base_root).unwrap();
+        let mut ids = BTreeMap::new();
+        ids.insert(old, nid(1));
+        let base = IdentifiedTree::new(base_tree, ids);
+
+        let mut result = NodeTree::new();
+        let new = fn_with_leaves(&mut result, "bar", &["a", "b", "c", "d", "z"]);
+        let result_root = result
+            .intern_branch(NodeKind::new("file"), lang(), vec![new], None)
+            .unwrap();
+        result.set_root(result_root).unwrap();
+
+        let mapping = default_identify(&adapter, &base, &result);
+        assert_eq!(mapping.nodes.get(&new).copied(), Some(nid(1)));
+        assert!(mapping.deltas.iter().any(|delta| matches!(
+            delta,
+            IdentityDelta::DerivedFrom { node, from } if *node == nid(1) && *from == nid(1)
+        )));
+        assert_eq!(
+            mapping.renames,
+            vec![Op::Rename {
+                node: nid(1),
+                from: QualifiedName::new("foo"),
+                to: QualifiedName::new("bar"),
+            }]
+        );
+        assert!(mapping.moves.is_empty());
+    }
+
+    #[test]
+    fn dissimilar_bodies_stay_a_birth_and_a_death() {
+        let adapter = TestAdapter;
+        let mut base_tree = NodeTree::new();
+        let old = fn_with_leaves(&mut base_tree, "foo", &["a", "b", "c", "d", "e"]);
+        let base_root = base_tree
+            .intern_branch(NodeKind::new("file"), lang(), vec![old], None)
+            .unwrap();
+        base_tree.set_root(base_root).unwrap();
+        let mut ids = BTreeMap::new();
+        ids.insert(old, nid(1));
+        let base = IdentifiedTree::new(base_tree, ids);
+
+        let mut result = NodeTree::new();
+        let new = fn_with_leaves(&mut result, "bar", &["a", "x", "y", "z", "e"]);
+        let result_root = result
+            .intern_branch(NodeKind::new("file"), lang(), vec![new], None)
+            .unwrap();
+        result.set_root(result_root).unwrap();
+
+        let mapping = default_identify(&adapter, &base, &result);
+        assert_ne!(mapping.nodes.get(&new).copied(), Some(nid(1)));
+        assert!(mapping.renames.is_empty());
+        assert!(
+            mapping
+                .deltas
+                .iter()
+                .any(|delta| matches!(delta, IdentityDelta::Death { node } if *node == nid(1)))
+        );
     }
 
     #[test]
