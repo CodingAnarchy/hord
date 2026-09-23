@@ -183,18 +183,6 @@ pub fn export_change<S: Store>(
     export_change_into(store, change_id, &repo, &cache).map(GitOid::from_gix)
 }
 
-/// Export every landed change in log order. Returns the tip commit SHA.
-pub fn export_log<S: Store>(store: &S, git_dir: impl AsRef<Path>) -> Result<GitOid, Error> {
-    let repo = open_or_init(git_dir.as_ref())?;
-    let cache = ExportCache::default();
-    let mut last = None;
-    for change_id in store.log()? {
-        last = Some(export_change_into(store, change_id, &repo, &cache)?);
-    }
-    last.map(GitOid::from_gix)
-        .ok_or_else(|| Error::Git("hord log is empty".into()))
-}
-
 fn export_change_into<S: Store>(
     store: &S,
     change_id: ChangeId,
@@ -258,12 +246,7 @@ fn lookup_exported(repo: &gix::Repository, change_id: ChangeId) -> Option<gix::O
 }
 
 /// Build the git commit message with Hord trailers (spec §9).
-pub fn format_commit_message(
-    summary: &str,
-    body: &str,
-    change_id: ChangeId,
-    actor: &str,
-) -> String {
+fn format_commit_message(summary: &str, body: &str, change_id: ChangeId, actor: &str) -> String {
     let mut msg = format!("{summary}\n");
     if !body.is_empty() {
         msg.push('\n');

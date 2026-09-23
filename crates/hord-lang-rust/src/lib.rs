@@ -18,7 +18,7 @@
 mod cst;
 mod resolve;
 
-use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, QualifiedName, RepoPath};
+use hord_core::{LangId, Node, NodeId, NodeKind, QualifiedName, RepoPath};
 use hord_lang::{LangAdapter, NameRef, NodeTree, ParseError, ResolveCtx, Tier};
 
 pub use resolve::RustFile;
@@ -47,10 +47,6 @@ impl LangAdapter for RustAdapter {
 
     fn parse(&self, bytes: &[u8]) -> Result<NodeTree, ParseError> {
         cst::parse(bytes, &self.lang())
-    }
-
-    fn project(&self, tree: &NodeTree) -> Bytes {
-        tree.to_bytes()
     }
 
     fn is_definition(&self, kind: &NodeKind) -> bool {
