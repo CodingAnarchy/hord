@@ -262,7 +262,7 @@ async fn blob_tier_files_conflict_by_path_and_line_merge() {
 async fn cargo_lock_goes_through_the_lockfile_merge_call_site() {
     let lock = "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"m\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"z\"\nversion = \"1.0.0\"\n";
     let mut files = fixture();
-    files.push(("Cargo.lock", &lock));
+    files.push(("Cargo.lock", lock));
     let t = repo(&files).await;
     let mut a = begin(&t.repo, "a").await;
     let mut b = begin(&t.repo, "b").await;
