@@ -14,10 +14,10 @@ use crate::ParseError;
 /// (RFC 8949 §4.2.1). Kind, language, `name`, and `raw` are not part of this
 /// hash.
 ///
-/// Internal nodes do not use this. Their `normalized` id is
-/// [`normalized_of_children`] (ADR 0008). A whitespace-only change therefore
-/// alters a leaf's `raw` and content [`ObjectId`], and every ancestor's
-/// content id, but no `normalized` id.
+/// Internal nodes do not use this. Their `normalized` id hashes the
+/// children's `normalized` ids, in order (ADR 0008). A whitespace-only change
+/// therefore alters a leaf's `raw` and content [`ObjectId`], and every
+/// ancestor's content id, but no `normalized` id.
 pub fn normalized_hash(stripped: &[u8]) -> Result<ObjectId, ParseError> {
     Ok(ObjectId::of(&Bytes::from(stripped))?)
 }
