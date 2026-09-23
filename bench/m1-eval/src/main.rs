@@ -290,9 +290,9 @@ fn hunk_covers_disjoint_defs<A: LangAdapter>(
     let mut theirs_at = 0usize;
     for (ours_body, theirs_body) in conflict_bodies(conflicted) {
         let mut touched = BTreeSet::new();
-        // The conflict body ends with the line's newline, which is often the
-        // next definition's leading trivia. Don't let that one byte pull in
-        // the following def.
+        // The conflict body ends with the line ending, which is often the
+        // next definition's leading trivia. On a CRLF checkout that ending
+        // is `\r\n`; leaving the `\r` still overlaps the following def.
         let ours_body = trim_one_trailing_newline(&ours_body);
         let theirs_body = trim_one_trailing_newline(&theirs_body);
         if let Some((start, end)) = locate(ours_src, ours_body, &mut ours_at)
@@ -388,7 +388,8 @@ fn minimal_defs(spans: &[DefSpan], start: usize, end: usize) -> BTreeSet<hord_co
 }
 
 fn trim_one_trailing_newline(body: &[u8]) -> &[u8] {
-    body.strip_suffix(b"\n").unwrap_or(body)
+    let body = body.strip_suffix(b"\n").unwrap_or(body);
+    body.strip_suffix(b"\r").unwrap_or(body)
 }
 
 fn locate(haystack: &[u8], needle: &[u8], cursor: &mut usize) -> Option<(usize, usize)> {
@@ -998,7 +999,8 @@ fn walk_tree(
 
 #[cfg(test)]
 mod conflict_marker_tests {
-    use super::conflict_bodies;
+    use super::{conflict_bodies, hunk_covers_disjoint_defs};
+    use hord_lang_rust::RustAdapter;
 
     #[test]
     fn lf_conflict_hunks_keep_each_side() {
@@ -1017,5 +1019,79 @@ mod conflict_marker_tests {
         assert_eq!(hunks.len(), 1, "crlf hunks");
         assert_eq!(hunks[0].0, b"ours line\r\n");
         assert_eq!(hunks[0].1, b"theirs line\r\n");
+    }
+
+    #[test]
+    fn crlf_newline_after_one_function_is_not_a_second_definition() {
+        let lf_ours = b"fn a() {}\nfn b() {}\n";
+        let lf_theirs = b"fn a() { let _x = 1; }\nfn b() {}\n";
+        let lf_base = b"fn a() {}\nfn b() {}\n";
+        let lf_conflict =
+            b"<<<<<<< ours\nfn a() {}\n=======\nfn a() { let _x = 1; }\n>>>>>>> theirs\nfn b() {}\n";
+        assert!(
+            !hunk_covers_disjoint_defs(&RustAdapter, lf_base, lf_ours, lf_theirs, lf_conflict),
+            "lf"
+        );
+
+        assert!(
+            !hunk_covers_disjoint_defs(
+                &RustAdapter,
+                &to_crlf(lf_base),
+                &to_crlf(lf_ours),
+                &to_crlf(lf_theirs),
+                &to_crlf(lf_conflict),
+            ),
+            "crlf"
+        );
+    }
+
+    /// Windows CI checks `corpora/merges` out with `core.autocrlf=true`.
+    /// Classification has to match the LF corpus or the 61-case floor fails.
+    #[test]
+    #[ignore = "rewrites every merge case; mirrors the Windows checkout"]
+    fn crlf_checkout_classifies_like_lf() {
+        let dir = super::merges_dir().expect("merges dir");
+        let mut cases: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read merges")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.is_dir())
+            .collect();
+        cases.sort();
+        let tmp = std::env::temp_dir().join(format!("hord-crlf-merges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let mut mismatches = Vec::new();
+        for case in &cases {
+            let lf = super::case_class(case).expect("lf class");
+            let crlf_dir = tmp.join(case.file_name().expect("case name"));
+            std::fs::create_dir_all(&crlf_dir).expect("case dir");
+            for entry in std::fs::read_dir(case).expect("case files") {
+                let entry = entry.expect("file");
+                let bytes = std::fs::read(entry.path()).expect("read");
+                std::fs::write(crlf_dir.join(entry.file_name()), to_crlf(&bytes)).expect("write");
+            }
+            let crlf = super::case_class(&crlf_dir).expect("crlf class");
+            if std::mem::discriminant(&lf) != std::mem::discriminant(&crlf) {
+                mismatches.push(
+                    case.file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(mismatches.is_empty(), "CRLF class differs: {mismatches:?}");
+    }
+
+    fn to_crlf(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() + 8);
+        for (i, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
+                out.push(b'\r');
+            }
+            out.push(*byte);
+        }
+        out
     }
 }
