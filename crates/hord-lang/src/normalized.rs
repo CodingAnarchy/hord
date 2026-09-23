@@ -4,26 +4,28 @@ use hord_core::{Bytes, ObjectId};
 
 use crate::ParseError;
 
-/// Hash of the trivia-stripped canonical form of a subtree (spec §3.3).
+/// Hash of a leaf's trivia-stripped token text (spec §3.3).
 ///
 /// **Strip:** drop every attached leading and trailing trivia byte (comments,
-/// whitespace, blank lines) as produced by [`crate::attach_trivia`]. What
-/// remains is the concatenation of leaf token `text` bytes in tree order.
-/// Internal nodes use the concatenation of their children's stripped bytes,
-/// which is the same sequence.
+/// whitespace, blank lines) as produced by [`crate::attach_trivia`].
 ///
 /// **Hash:** the stripped byte string is wrapped as [`Bytes`] (CBOR major
 /// type 2) and hashed with [`ObjectId::of`] — BLAKE3-256 of canonical CBOR
-/// (RFC 8949 §4.2.1). Kind, language, `name`, content [`ObjectId`]s, and
-/// `raw` are not part of this hash.
+/// (RFC 8949 §4.2.1). Kind, language, `name`, and `raw` are not part of this
+/// hash.
 ///
-/// A whitespace- or comment-only change therefore alters `raw` and the node's
-/// content [`ObjectId`], but not [`hord_core::Node::normalized`].
-///
-/// This definition is the stable identity for this crate; do not change it
-/// without an ADR.
+/// Internal nodes do not use this. Their `normalized` id is
+/// [`normalized_of_children`] (ADR 0008). A whitespace-only change therefore
+/// alters a leaf's `raw` and content [`ObjectId`], and every ancestor's
+/// content id, but no `normalized` id.
 pub fn normalized_hash(stripped: &[u8]) -> Result<ObjectId, ParseError> {
     Ok(ObjectId::of(&Bytes::from(stripped))?)
+}
+
+/// `normalized` for an internal node: BLAKE3 of the canonical CBOR array of
+/// `children`'s `normalized` ids, in child order (ADR 0008).
+pub(crate) fn normalized_of_children(children: &[ObjectId]) -> Result<ObjectId, ParseError> {
+    Ok(ObjectId::of(children)?)
 }
 
 #[cfg(test)]
@@ -52,5 +54,16 @@ mod tests {
         let b = normalized_hash(&[]).unwrap();
         assert_eq!(a, b);
         assert_eq!(a, ObjectId::of(&Bytes::default()).unwrap());
+    }
+
+    #[test]
+    fn child_order_changes_internal_normalized() {
+        let a = ObjectId::from_bytes([1; 32]);
+        let b = ObjectId::from_bytes([2; 32]);
+        let left = normalized_of_children(&[a, b]).unwrap();
+        let right = normalized_of_children(&[b, a]).unwrap();
+        let again = normalized_of_children(&[a, b]).unwrap();
+        assert_eq!(left, again);
+        assert_ne!(left, right);
     }
 }

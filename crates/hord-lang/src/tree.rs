@@ -5,13 +5,14 @@ use std::collections::BTreeMap;
 use hord_core::{Bytes, LangId, Node, NodeKind, ObjectId, QualifiedName};
 
 use crate::ParseError;
-use crate::normalized::normalized_hash;
+use crate::normalized::{normalized_hash, normalized_of_children};
 use crate::trivia::{AttachedSpan, AttachedToken};
 
-/// Trivia-stripped form used for `normalized`.
+/// Trivia-stripped bytes kept so [`NodeTree::stripped`] can return them.
 ///
 /// Leaves store offsets into [`Node::raw`] so the token text is not copied
-/// twice. Branches store concat of children's stripped bytes.
+/// twice. Branches cache the concat of children's stripped bytes. That cache
+/// is not an input to an internal node's `normalized` id (ADR 0008).
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Stripped {
     /// `node.raw[lead as usize..][..text as usize]`.
@@ -85,8 +86,9 @@ impl NodeTree {
     /// non-empty.
     ///
     /// `stripped` is the trivia-stripped source of this subtree (leaf token
-    /// text, or concat of children's stripped bytes). [`Node::normalized`] is
-    /// [`crate::normalized_hash`] of those bytes.
+    /// text, or concat of children's stripped bytes). A leaf's
+    /// [`Node::normalized`] is [`crate::normalized_hash`] of that text. An
+    /// internal node's is the hash of its children's `normalized` ids.
     pub fn intern(
         &mut self,
         kind: NodeKind,
@@ -137,12 +139,21 @@ impl NodeTree {
         children: Vec<ObjectId>,
         name: Option<QualifiedName>,
     ) -> Result<ObjectId, ParseError> {
-        let normalized = match &stripped {
-            Stripped::InRaw { lead, text } => {
-                let start = *lead as usize;
-                normalized_hash(&raw[start..start + *text as usize])?
+        let normalized = if children.is_empty() {
+            match &stripped {
+                Stripped::InRaw { lead, text } => {
+                    let start = *lead as usize;
+                    normalized_hash(&raw[start..start + *text as usize])?
+                }
+                Stripped::Owned(bytes) => normalized_hash(bytes.as_slice())?,
             }
-            Stripped::Owned(bytes) => normalized_hash(bytes.as_slice())?,
+        } else {
+            let mut child_norm = Vec::with_capacity(children.len());
+            for id in &children {
+                let child = self.entries.get(id).ok_or(ParseError::MissingNode(*id))?;
+                child_norm.push(child.node.normalized);
+            }
+            normalized_of_children(&child_norm)?
         };
         let node = Node {
             kind,
@@ -389,7 +400,7 @@ impl NodeTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::normalized_hash;
+    use crate::normalized::{normalized_hash, normalized_of_children};
     use crate::trivia::{Lexeme, attach_trivia};
 
     fn lang() -> LangId {
@@ -473,6 +484,12 @@ mod tests {
             .unwrap();
         let node = tree.get(id).unwrap();
         assert_eq!(id, ObjectId::of(node).unwrap());
+        let parent = tree
+            .intern_branch(NodeKind::new("file"), lang(), vec![id], None)
+            .unwrap();
+        let branch = tree.get(parent).unwrap();
+        assert!(!branch.raw.is_empty(), "projection cache is kept in memory");
+        assert_eq!(parent, ObjectId::of(branch).unwrap());
     }
 
     #[test]
@@ -501,6 +518,23 @@ mod tests {
         );
         assert_eq!(a.get(id_ws).unwrap().raw.as_slice(), b"  foo\n");
         assert_eq!(b.get(id_bare).unwrap().raw.as_slice(), b"foo");
+
+        let parent_a = a
+            .intern_branch(NodeKind::new("file"), lang(), vec![id_ws], None)
+            .unwrap();
+        let parent_b = b
+            .intern_branch(NodeKind::new("file"), lang(), vec![id_bare], None)
+            .unwrap();
+        assert_eq!(
+            a.get(parent_a).unwrap().normalized,
+            b.get(parent_b).unwrap().normalized,
+            "whitespace does not change an internal normalized id"
+        );
+        assert_ne!(parent_a, parent_b, "ancestor content ids still change");
+        assert_eq!(
+            a.get(parent_a).unwrap().normalized,
+            normalized_of_children(&[a.get(id_ws).unwrap().normalized]).unwrap()
+        );
     }
 
     #[test]

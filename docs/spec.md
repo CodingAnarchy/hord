@@ -102,18 +102,18 @@ Every persistent value is an `Object` with a canonical encoding (see §3.9). Obj
 pub struct Node {
     pub kind: NodeKind,           // adapter-defined, e.g. "fn_item", "struct_item", "block"
     pub lang: LangId,
-    pub raw: Bytes,               // exact source bytes of this subtree, including trivia
+    pub raw: Bytes,               // leaves only; internal nodes omit this field (ADR 0008)
     pub normalized: ObjectId,     // hash of trivia-stripped canonical form (semantic identity)
-    pub children: Vec<ObjectId>,  // child Node ObjectIds; concatenation of children.raw == raw
+    pub children: Vec<ObjectId>,  // child Node ObjectIds; projection is concat(children.raw)
     pub name: Option<QualifiedName>, // only for named definitions
 }
 ```
 
 **Invariants:**
 
-- `concat(children[i].raw) == raw` for every node with children. Leaf nodes hold tokens plus attached trivia. This guarantees the file projection is a tree walk.
-- `ObjectId(node) = blake3(canonical(node))` covers `raw` and `children`; therefore identical subtrees anywhere in the repository share storage.
-- `normalized` is what semantic operations compare. A whitespace-only change alters `ObjectId` but not `normalized`.
+- Leaves store `raw` (the token plus attached trivia). An internal node's stored object has no `raw` (ADR 0008). Its projection is `concat(children.raw)`, which keeps the file walk lossless.
+- A leaf `ObjectId` is `blake3(canonical(node))` and covers `raw`. An internal `ObjectId` is `blake3(canonical(stored object))` over `kind`, `lang`, `normalized`, `children`, and `name`. Identical child sequences share one stored node.
+- A leaf `normalized` hashes its stripped token text. An internal `normalized` hashes the canonical CBOR array of its children's `normalized` ids, in order. A whitespace-only change alters `ObjectId`s up the path and no `normalized` id.
 
 **Trivia attachment rule (DECIDED):** leading trivia (comments, blank lines) attaches to the following token; trailing trivia on the same line attaches to the preceding token. This makes "doc comment moves with the function" the default.
 

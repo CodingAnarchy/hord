@@ -181,25 +181,80 @@ string_newtype! {
     AdapterId
 }
 
-/// One syntax-tree node, holding its exact source bytes and its children.
+/// One syntax-tree node.
 ///
-/// Invariants (spec §3.3) are enforced by parse/project, not by this type:
-/// concatenation of children's `raw` equals `raw`, and `normalized` is the
-/// trivia-stripped semantic identity.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+/// Invariants (spec §3.3, ADR 0008) are enforced by parse/project, not by this
+/// type. A leaf stores `raw`. An internal node's stored object has no `raw`;
+/// an in-memory value may still cache `concat(children.raw)` for projection,
+/// and that cache is omitted from the content hash.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Node {
     /// Adapter-defined kind, e.g. `fn_item`.
     pub kind: NodeKind,
     /// Language this node was parsed as.
     pub lang: LangId,
     /// Exact source bytes of this subtree, including trivia.
+    ///
+    /// Present on leaves. On an internal node this is an optional cache of
+    /// `concat(children.raw)` and is not part of the stored object.
     pub raw: Bytes,
-    /// Hash of the trivia-stripped canonical form (semantic identity).
+    /// Semantic identity. A leaf hashes its stripped token text. An internal
+    /// node hashes its children's `normalized` ids, in order.
     pub normalized: ObjectId,
-    /// Child [`Node`] object ids. Concatenation of children `raw` equals `raw`.
+    /// Child [`Node`] object ids.
     pub children: Vec<ObjectId>,
     /// Qualified name, only for named definitions.
     pub name: Option<QualifiedName>,
+}
+
+impl Serialize for Node {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Leaves store `raw`. Internal nodes do not (ADR 0008).
+        let leaf = self.children.is_empty();
+        let mut out = serializer.serialize_struct("Node", if leaf { 6 } else { 5 })?;
+        out.serialize_field("children", &self.children)?;
+        out.serialize_field("kind", &self.kind)?;
+        out.serialize_field("lang", &self.lang)?;
+        out.serialize_field("name", &self.name)?;
+        out.serialize_field("normalized", &self.normalized)?;
+        if leaf {
+            out.serialize_field("raw", &self.raw)?;
+        }
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let stored = NodeStored::deserialize(deserializer)?;
+        let raw = if stored.children.is_empty() {
+            stored.raw
+        } else {
+            Bytes::default()
+        };
+        Ok(Node {
+            kind: stored.kind,
+            lang: stored.lang,
+            raw,
+            normalized: stored.normalized,
+            children: stored.children,
+            name: stored.name,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct NodeStored {
+    kind: NodeKind,
+    lang: LangId,
+    #[serde(default)]
+    raw: Bytes,
+    normalized: ObjectId,
+    #[serde(default)]
+    children: Vec<ObjectId>,
+    #[serde(default)]
+    name: Option<QualifiedName>,
 }
 
 #[cfg(test)]

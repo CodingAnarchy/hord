@@ -54,7 +54,14 @@ proptest! {
         };
         let encoded = encode(&node).unwrap();
         let back: Node = decode(&encoded).unwrap();
-        prop_assert_eq!(&node, &back);
+        if node.children.is_empty() {
+            prop_assert_eq!(&node, &back);
+        } else {
+            prop_assert!(back.raw.is_empty());
+            prop_assert_eq!(&back.kind, &node.kind);
+            prop_assert_eq!(&back.children, &node.children);
+            prop_assert_eq!(back.normalized, node.normalized);
+        }
         prop_assert_eq!(ObjectId::of(&node).unwrap(), ObjectId::from_canonical(&encoded));
     }
 
