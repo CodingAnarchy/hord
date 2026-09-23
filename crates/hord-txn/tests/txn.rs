@@ -262,7 +262,7 @@ async fn blob_tier_files_conflict_by_path_and_line_merge() {
 async fn cargo_lock_goes_through_the_lockfile_merge_call_site() {
     let lock = "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"m\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"z\"\nversion = \"1.0.0\"\n";
     let mut files = fixture();
-    files.push(("Cargo.lock", lock));
+    files.push(("Cargo.lock", &lock));
     let t = repo(&files).await;
     let mut a = begin(&t.repo, "a").await;
     let mut b = begin(&t.repo, "b").await;
@@ -553,7 +553,9 @@ async fn rebased_records_carry_structural_ops_and_land_validated() {
 /// `Cargo.lock` both land through the lockfile merge.
 #[tokio::test]
 async fn concurrent_cargo_lock_dependency_additions_both_land() {
-    const LOCK: &str = include_str!("../../hord-lang-rust/testdata/lock/hord-v4.lock");
+    // Normalized: git may check the fixture out with CRLF (Windows autocrlf).
+    let lock =
+        include_str!("../../hord-lang-rust/testdata/lock/hord-v4.lock").replace("\r\n", "\n");
     const STORE_DEPS: &str = "name = \"hord-store\"\nversion = \"0.0.0\"\ndependencies = [\n";
     let package = |name: &str, sum: char| {
         format!(
@@ -563,25 +565,25 @@ async fn concurrent_cargo_lock_dependency_additions_both_land() {
     };
     // a adds `zz-alpha` (sorts last); b adds `aaa-beta` (sorts first). Both
     // make hord-store depend on theirs.
-    let a_lock = format!("{LOCK}\n{}", package("zz-alpha", 'a').trim_end()).replacen(
+    let a_lock = format!("{lock}\n{}", package("zz-alpha", 'a').trim_end()).replacen(
         STORE_DEPS,
         &format!("{STORE_DEPS} \"zz-alpha\",\n"),
         1,
     ) + "\n";
     let a_lock = a_lock.replacen(" \"zz-alpha\",\n \"hord-core\",", " \"hord-core\",", 1);
     let a_lock = a_lock.replacen(" \"zstd\",\n]", " \"zstd\",\n \"zz-alpha\",\n]", 1);
-    let b_lock = LOCK
+    let b_lock = lock
         .replacen(
             "[[package]]\n",
             &format!("{}[[package]]\n", package("aaa-beta", 'b')),
             1,
         )
         .replacen(STORE_DEPS, &format!("{STORE_DEPS} \"aaa-beta\",\n"), 1);
-    assert_ne!(a_lock, LOCK);
-    assert_ne!(b_lock, LOCK);
+    assert_ne!(a_lock, lock);
+    assert_ne!(b_lock, lock);
 
     let mut files = fixture();
-    files.push(("Cargo.lock", LOCK));
+    files.push(("Cargo.lock", &lock));
     let t = repo(&files).await;
     let mut a = begin(&t.repo, "a").await;
     let mut b = begin(&t.repo, "b").await;
