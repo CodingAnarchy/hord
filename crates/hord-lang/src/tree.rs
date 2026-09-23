@@ -1,6 +1,7 @@
 //! Interned lossless CSTs (spec §3.3).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hord_core::{Bytes, LangId, Node, NodeKind, ObjectId, QualifiedName};
 
@@ -74,11 +75,15 @@ fn find_in_raw(raw: &[u8], stripped: &[u8]) -> Option<(u32, u32)> {
 /// holds this by construction; [`intern`](Self::intern) checks it.
 ///
 /// Leaf nodes hold tokens plus attached trivia (see [`crate::attach_trivia`]).
+///
+/// Cloning is O(1): clones share the interned nodes until one of them
+/// interns more (perf review #3: an identified view no longer deep-copies
+/// the tree it wraps).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeTree {
     root: Option<ObjectId>,
     /// Keyed by content id. Iteration order is that key, not insertion order.
-    entries: BTreeMap<ObjectId, Entry>,
+    entries: Arc<BTreeMap<ObjectId, Entry>>,
 }
 
 impl NodeTree {
@@ -148,8 +153,10 @@ impl NodeTree {
             children,
             name,
         };
-        let id = ObjectId::of(&node)?;
-        self.entries.entry(id).or_insert(Entry { node, stripped });
+        let id = node.content_id()?;
+        Arc::make_mut(&mut self.entries)
+            .entry(id)
+            .or_insert(Entry { node, stripped });
         Ok(id)
     }
 
@@ -332,6 +339,33 @@ impl NodeTree {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Estimated heap bytes this tree holds, for byte-bounded caches.
+    ///
+    /// Counts each node's stored bytes (`raw`, an owned stripped copy, child
+    /// ids) plus a fixed per-node overhead. A single-child branch shares its
+    /// child's `raw`, so it is not counted twice. Clones share one copy, so
+    /// a cache holding clones over-estimates, which only evicts earlier.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        // BTreeMap slot, `Entry`, and the `Arc` headers of `raw`/`stripped`.
+        const PER_NODE: usize = std::mem::size_of::<(ObjectId, Entry)>() + 48;
+        self.entries
+            .values()
+            .map(|e| {
+                let raw = if e.node.children.len() == 1 {
+                    0
+                } else {
+                    e.node.raw.len()
+                };
+                let stripped = match &e.stripped {
+                    Stripped::InRaw { .. } => 0,
+                    Stripped::Owned(bytes) => bytes.len(),
+                };
+                PER_NODE + raw + stripped + e.node.children.len() * ObjectId::LEN
+            })
+            .sum()
     }
 
     /// Iterate interned `(id, node)` pairs. Order is unspecified.
@@ -566,6 +600,26 @@ mod tests {
         assert_eq!(tree.to_bytes().as_slice(), b"// c\nfn f");
         let root = tree.root().unwrap();
         assert_eq!(tree.stripped(root).unwrap(), b"fnf");
+    }
+
+    #[test]
+    fn clones_share_nodes_and_resident_bytes_tracks_source() {
+        let source = "fn f() { 1 }\n".repeat(200);
+        let lexemes: Vec<Lexeme> = source
+            .split_inclusive(' ')
+            .map(|w| Lexeme::token("word", w.as_bytes()))
+            .collect();
+        let tokens = attach_trivia(&lexemes);
+        let tree = NodeTree::from_tokens(lang(), NodeKind::new("file"), &tokens).unwrap();
+        let copy = tree.clone();
+        let root = tree.root().unwrap();
+        assert!(
+            std::ptr::eq(tree.get(root).unwrap(), copy.get(root).unwrap()),
+            "a clone must not deep-copy the interned nodes"
+        );
+        let bytes = tree.resident_bytes();
+        assert!(bytes >= source.len(), "counts at least the root's raw");
+        assert!(bytes < source.len() * 64, "estimate stays bounded: {bytes}");
     }
 
     #[test]

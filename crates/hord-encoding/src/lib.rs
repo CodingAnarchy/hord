@@ -36,6 +36,22 @@ pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
     cbor2::to_canonical_vec(value).map_err(|e| Error::Encode(e.to_string()))
 }
 
+/// Encode `value` into `out` with cbor2's streaming serializer, skipping the
+/// canonicalization pass that [`encode`] runs.
+///
+/// The bytes equal [`encode`]'s only for a value already in canonical form:
+/// every struct and map emits its keys in RFC 8949 §4.2.1 order (shorter
+/// encoded key first, then bytewise), no map is emitted from unordered
+/// storage, and no float appears. Integers, lengths, and definite-length
+/// items are the same in both paths. Callers own that guarantee and must
+/// check it with a test against [`encode`] (for example, a proptest).
+pub fn encode_ordered_into<T: Serialize + ?Sized>(
+    value: &T,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    cbor2::to_writer(value, out).map_err(|e| Error::Encode(e.to_string()))
+}
+
 /// Decode exactly one well-formed CBOR item from `bytes` into `T`.
 ///
 /// Trailing bytes are rejected. Non-canonical encodings are accepted; re-encode

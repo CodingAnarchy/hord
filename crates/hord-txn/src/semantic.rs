@@ -40,7 +40,7 @@ use hord_core::{
     QualifiedName, RepoPath, SnapshotId,
 };
 use hord_lang::{Anchor, IdentifiedTree, LangAdapter, NodeTree, ResolveCtx, Site};
-use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
+use hord_lang_rust::{ManifestFile, RustAdapter};
 use hord_store::EdgeKind;
 use serde::{Deserialize, Serialize};
 
@@ -155,7 +155,7 @@ impl Inner {
     ) -> Option<Arc<NodeTree>> {
         let key = (blob, adapter.lang());
         if let Some(tree) = lock(&self.parsed).get(&key) {
-            return Some(Arc::clone(tree));
+            return Some(tree);
         }
         let tree = Arc::new(adapter.parse(bytes).ok()?);
         self.cache_parsed(key, Arc::clone(&tree));
@@ -301,10 +301,7 @@ impl Inner {
         // A FileIdentity object names its blob, so (blob, identity) keys are
         // only ever inserted for a matching pair.
         if let Some(tree) = lock(&self.identified).get(&(path.clone(), blob, identity)) {
-            return Ok(Some(Parsed {
-                lang,
-                tree: Arc::clone(tree),
-            }));
+            return Ok(Some(Parsed { lang, tree }));
         }
         let stored = match identity {
             Some(id) => {
@@ -356,7 +353,53 @@ impl Inner {
             })
     }
 
+    /// Build `snapshot`'s context from the most recently built one: only
+    /// files whose blob or carried identity changed (or whose module moved)
+    /// are loaded and re-indexed (perf review #1). The contents equal a full
+    /// build (`build_rust_ctx_full`, checked by the tests below).
     fn build_rust_ctx(&self, snapshot: SnapshotId) -> Result<Arc<RustCtx>> {
+        let rust = RustAdapter;
+        let identity = self.identity_index(snapshot)?;
+        let mut files = Vec::new();
+        let mut manifests = Vec::new();
+        for (path, blob) in self.list_files(snapshot)? {
+            if rust.matches(&path, &[]) {
+                let key = (blob, identity.get(&path));
+                files.push((path, key));
+            } else if path.components().last().is_some_and(|n| n == "Cargo.toml") {
+                manifests.push((path, self.blob_bytes(blob)?));
+            }
+        }
+        let manifest_views: Vec<ManifestFile<'_>> = manifests
+            .iter()
+            .map(|(path, bytes)| ManifestFile {
+                path,
+                bytes: bytes.as_slice(),
+            })
+            .collect();
+        let prev = self.latest_rust_ctx();
+        let ctx = rust.resolve_context_incremental(
+            prev.as_ref().map(|p| &p.ctx),
+            &files,
+            &manifest_views,
+            |path| {
+                Ok::<_, Error>(
+                    self.file_view(snapshot, path)?
+                        .and_then(|view| view.parsed)
+                        .filter(|parsed| parsed.lang.as_str() == hord_lang_rust::LANG)
+                        .map(|parsed| parsed.tree),
+                )
+            },
+        )?;
+        let ctx = Arc::new(RustCtx { ctx });
+        self.set_latest_rust_ctx(Arc::clone(&ctx));
+        Ok(ctx)
+    }
+
+    /// The context as a from-scratch build over every file: the reference
+    /// [`Self::build_rust_ctx`] must equal.
+    #[cfg(test)]
+    pub(crate) fn build_rust_ctx_full(&self, snapshot: SnapshotId) -> Result<ResolveCtx> {
         let rust = RustAdapter;
         let mut trees = Vec::new();
         let mut manifests = Vec::new();
@@ -372,9 +415,9 @@ impl Inner {
                 manifests.push((path, self.blob_bytes(blob)?));
             }
         }
-        let views: Vec<RustFile<'_>> = trees
+        let views: Vec<hord_lang_rust::RustFile<'_>> = trees
             .iter()
-            .map(|(path, tree)| RustFile {
+            .map(|(path, tree)| hord_lang_rust::RustFile {
                 path,
                 tree: &tree.tree,
                 ids: &tree.ids,
@@ -387,8 +430,7 @@ impl Inner {
                 bytes: bytes.as_slice(),
             })
             .collect();
-        let ctx = rust.resolve_context_with(&views, &manifest_views);
-        Ok(Arc::new(RustCtx { ctx }))
+        Ok(rust.resolve_context_with(&views, &manifest_views))
     }
 
     /// Targets of `References` edges leaving `node` (one hop), resolved in the
@@ -579,4 +621,149 @@ pub(crate) fn result_anchor(
         }
     }
     Anchor::File(path.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use hord_core::{Actor, Intent, RepoPath};
+
+    use crate::{BeginOptions, Repo, Workspace};
+
+    fn actor() -> Actor {
+        Actor::Agent {
+            id: "ctx".into(),
+            model: "test".into(),
+            model_hash: Bytes::default(),
+            harness: "semantic tests".into(),
+        }
+    }
+
+    fn intent(summary: &str) -> Intent {
+        Intent {
+            summary: summary.into(),
+            body: String::new(),
+            refs: Vec::new(),
+            acceptance: Vec::new(),
+        }
+    }
+
+    fn path(p: &str) -> RepoPath {
+        p.parse().unwrap()
+    }
+
+    use super::*;
+
+    async fn land(repo: &Repo, edit: impl AsyncFnOnce(&mut Workspace)) {
+        let mut ws = repo.begin(BeginOptions::at_head(actor())).await.unwrap();
+        edit(&mut ws).await;
+        let before = repo.head().await.unwrap().snapshot;
+        let proposal = ws.propose(intent("step")).await.unwrap();
+        repo.submit(proposal.change).await.unwrap();
+        repo.land_local().await.unwrap();
+        assert_ne!(repo.head().await.unwrap().snapshot, before, "landed");
+    }
+
+    /// The head's context, built incrementally from the previous head's,
+    /// equals a full rebuild after every landing (perf review #1).
+    #[tokio::test]
+    async fn incremental_context_equals_full_rebuild_over_landings() {
+        let dir = std::env::temp_dir().join(format!("hord-txn-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repo::create(&dir).await.unwrap();
+        let files = [
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            (
+                "b/Cargo.toml",
+                "[package]\nname = \"b\"\n[dependencies]\na = { path = \"../a\" }\n",
+            ),
+            (
+                "a/src/lib.rs",
+                "mod x;\npub use x::helper;\n\npub fn f() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "a/src/x.rs",
+                "pub fn helper() -> u32 {\n    crate::f()\n}\n",
+            ),
+            (
+                "b/src/lib.rs",
+                "use a::helper;\n\npub fn g() -> u32 {\n    helper() + a::f()\n}\n",
+            ),
+            ("README.md", "fixture\n"),
+        ];
+        let files = files
+            .iter()
+            .map(|(p, s)| (path(p), s.as_bytes().to_vec()))
+            .collect();
+        repo.bootstrap(files, intent("bootstrap"), actor())
+            .await
+            .unwrap();
+
+        let check = |step: &str| {
+            let inner = &repo.inner;
+            let head = inner.head().unwrap().snapshot;
+            let full = inner.build_rust_ctx_full(head).unwrap();
+            let inc = inner.rust_ctx(head).unwrap();
+            assert!(
+                inc.ctx.same_contents(&full),
+                "{step}: incremental context differs from a full rebuild"
+            );
+            assert!(full.definition_count() > 0);
+        };
+        check("bootstrap");
+
+        land(&repo, async |ws| {
+            ws.write_file(
+                &path("a/src/x.rs"),
+                "pub fn helper() -> u32 {\n    crate::f() + 1\n}\n",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        assert!(repo.inner.latest_rust_ctx().is_some(), "propose built one");
+        check("edit a body");
+
+        land(&repo, async |ws| {
+            ws.write_file(
+                &path("a/src/lib.rs"),
+                "mod x;\nmod y;\npub use x::helper;\n\npub fn f() -> u32 {\n    1\n}\n",
+            )
+            .await
+            .unwrap();
+            ws.write_file(&path("a/src/y.rs"), "pub struct Y;\n")
+                .await
+                .unwrap();
+        })
+        .await;
+        check("add a module");
+
+        land(&repo, async |ws| {
+            ws.write_file(
+                &path("a/src/x.rs"),
+                "pub fn helper_renamed() -> u32 {\n    crate::f() + 1\n}\n",
+            )
+            .await
+            .unwrap();
+            ws.write_file(
+                &path("a/src/lib.rs"),
+                "mod x;\nmod y;\npub use x::helper_renamed as helper;\n\npub fn f() -> u32 {\n    1\n}\n",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        check("rename (carried identity)");
+
+        land(&repo, async |ws| {
+            ws.delete_file(&path("a/src/y.rs")).await.unwrap();
+            ws.write_file(&path("b/Cargo.toml"), "[package]\nname = \"b\"\n")
+                .await
+                .unwrap();
+        })
+        .await;
+        check("delete a file and a dependency");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

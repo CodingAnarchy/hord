@@ -33,6 +33,19 @@ impl IdentifiedTree {
         Self { tree, ids }
     }
 
+    /// Estimated heap bytes: [`NodeTree::resident_bytes`] plus the id map.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        // BTreeMap slot, the site vector's header, and its indices.
+        const PER_ID: usize = 64 + std::mem::size_of::<(Site, NodeId)>();
+        self.tree.resident_bytes()
+            + self
+                .ids
+                .keys()
+                .map(|site| PER_ID + site.len() * std::mem::size_of::<u32>())
+                .sum::<usize>()
+    }
+
     /// Content id of the node at `site`.
     #[must_use]
     pub fn oid_at(&self, site: &[u32]) -> Option<ObjectId> {

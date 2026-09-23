@@ -212,16 +212,30 @@ impl Serialize for Node {
         use serde::ser::SerializeStruct;
         // Leaves store `raw`. Internal nodes do not (ADR 0008).
         let leaf = self.children.is_empty();
+        // Fields are emitted in canonical key order (RFC 8949 §4.2.1: shorter
+        // encoded key first, then bytewise), so [`Node::content_id`] can
+        // stream the encoding without sorting it.
         let mut out = serializer.serialize_struct("Node", if leaf { 6 } else { 5 })?;
-        out.serialize_field("children", &self.children)?;
-        out.serialize_field("kind", &self.kind)?;
-        out.serialize_field("lang", &self.lang)?;
-        out.serialize_field("name", &self.name)?;
-        out.serialize_field("normalized", &self.normalized)?;
         if leaf {
             out.serialize_field("raw", &self.raw)?;
         }
+        out.serialize_field("kind", &self.kind)?;
+        out.serialize_field("lang", &self.lang)?;
+        out.serialize_field("name", &self.name)?;
+        out.serialize_field("children", &self.children)?;
+        out.serialize_field("normalized", &self.normalized)?;
         out.end()
+    }
+}
+
+impl Node {
+    /// Content [`ObjectId`]: equal to `ObjectId::of(self)`, computed without
+    /// the canonicalizing pass. `Node`'s `Serialize` emits its fields in
+    /// canonical order and holds no map or float, so the streamed bytes are
+    /// already canonical (checked against [`hord_encoding::encode`] by the
+    /// `canonical_order` proptest).
+    pub fn content_id(&self) -> Result<ObjectId, hord_encoding::Error> {
+        ObjectId::of_ordered(self)
     }
 }
 

@@ -1,7 +1,8 @@
 //! [`LangAdapter`] trait and supporting types (spec §4.3).
 
-use std::sync::Arc;
+use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
 
@@ -40,7 +41,7 @@ impl Tier {
 /// Language adapters fill these through [`ResolveCtx::add_definition`].
 /// `parent` is adapter-defined linkage (for example an impl or enum) and is
 /// empty for names in the module's own namespace.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Definition {
     node_id: NodeId,
     object_id: Option<ObjectId>,
@@ -53,7 +54,7 @@ struct Definition {
 }
 
 /// A `use` (or glob) recorded in the module that contains it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Import {
     module: QualifiedName,
     /// Binding name, or `*` for a glob.
@@ -64,7 +65,7 @@ struct Import {
 }
 
 /// A parsed file root, so a whole-file node can be placed in a module.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FileRoot {
     object_id: ObjectId,
     /// Repository path, when the adapter recorded it. Two files with the
@@ -89,7 +90,7 @@ pub enum Anchor {
     File(RepoPath),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Link {
     from: QualifiedName,
     name: QualifiedName,
@@ -114,6 +115,25 @@ pub struct ResolveCtx {
     /// Adapters use this to reuse a name index. Equal stamps mean equal
     /// contents, including two clones that have not been edited since.
     stamp: u64,
+    /// Adapter data derived from these contents (a name index), built on
+    /// first use by [`Self::derived`]. Replaced, not cleared, on every edit,
+    /// so a clone that has not been edited keeps sharing it.
+    derived: Derived,
+    /// Adapter state kept for building the next snapshot's context from
+    /// this one ([`Self::set_carry`]). Not part of the contents.
+    carry: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+/// One lazily built, shareable value derived from a [`ResolveCtx`].
+#[derive(Clone, Default)]
+struct Derived(Arc<OnceLock<Arc<dyn Any + Send + Sync>>>);
+
+impl std::fmt::Debug for Derived {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Derived")
+            .field(&self.0.get().is_some())
+            .finish()
+    }
 }
 
 fn fresh_stamp() -> u64 {
@@ -149,6 +169,53 @@ impl ResolveCtx {
 
     fn bump(&mut self) {
         self.stamp = fresh_stamp();
+        self.derived = Derived::default();
+    }
+
+    /// Attach adapter state that a later build can start from (for example
+    /// per-file facts, so the next snapshot re-indexes only changed files).
+    /// It does not change the contents or [`Self::stamp`].
+    pub fn set_carry<T: Any + Send + Sync>(&mut self, carry: Arc<T>) {
+        self.carry = Some(carry);
+    }
+
+    /// The state attached by [`Self::set_carry`], if it has type `T`.
+    #[must_use]
+    pub fn carry<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        Arc::clone(self.carry.as_ref()?).downcast::<T>().ok()
+    }
+
+    /// Whether `self` and `other` hold the same definitions, imports, file
+    /// roots, and links, in the same order. Stamps, derived data, and carry
+    /// are ignored.
+    #[must_use]
+    pub fn same_contents(&self, other: &Self) -> bool {
+        self.definitions == other.definitions
+            && self.imports == other.imports
+            && self.files == other.files
+            && self.links == other.links
+    }
+
+    /// The value `build` derives from this context, built once per contents.
+    ///
+    /// Adapters keep their name index here, so it lives exactly as long as
+    /// the context (per snapshot and per repository; no process-global
+    /// cache). Concurrent callers wait for one build. Any edit through the
+    /// `add_*` methods drops it. If an earlier call stored a different type,
+    /// the value is built without being cached.
+    pub fn derived<T: Any + Send + Sync>(&self, build: impl FnOnce(&Self) -> T) -> Arc<T> {
+        let mut build = Some(build);
+        let stored = self.derived.0.get_or_init(|| {
+            let build = build.take().expect("built once");
+            Arc::new(build(self))
+        });
+        match Arc::clone(stored).downcast::<T>() {
+            Ok(value) => value,
+            Err(_) => Arc::new(match build.take() {
+                Some(build) => build(self),
+                None => unreachable!("a value stored by this call has type T"),
+            }),
+        }
     }
 
     /// Record a definition.

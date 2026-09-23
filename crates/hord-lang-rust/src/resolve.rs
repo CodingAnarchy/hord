@@ -15,11 +15,12 @@
 //! at parse). Read sets over-approximate: ambiguous names become one edge
 //! per candidate. `#[test]` and `#[cfg(test)]` are read off attributes.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 use hord_core::{Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
-use hord_lang::{Anchor, LangAdapter, NameRef, NodeTree, ResolveCtx};
+use hord_lang::{Anchor, IdentifiedTree, LangAdapter, NameRef, NodeTree, ResolveCtx};
 
 use crate::RustAdapter;
 use crate::cst::{self, is_name_container, local_name_from_raw};
@@ -106,6 +107,248 @@ pub(crate) fn resolve_context_with(
     ctx
 }
 
+/// Identifies one file's tree and ids across snapshots. At one path, equal
+/// keys mean an equal parse and equal [`NodeId`]s.
+type FileKey = (ObjectId, Option<ObjectId>);
+
+impl RustAdapter {
+    /// [`Self::resolve_context_with`] for a snapshot, reusing the per-file
+    /// work of `prev`, the context of an earlier snapshot built by this
+    /// method (perf review #1).
+    ///
+    /// `files` lists every candidate Rust path in snapshot order, each with
+    /// a key: at one path, equal keys must mean an equal parse and equal
+    /// [`NodeId`]s (hord-txn passes the blob id and the file's carried
+    /// identity object). `load(path)` returns the identified tree, or `None`
+    /// when the file does not parse as Rust. It is called only for a path
+    /// whose key differs from `prev`'s, or whose module moved, so a landing
+    /// that changed three files re-indexes three files. Manifest links are
+    /// recomputed only when a manifest, a path, or a module changed.
+    ///
+    /// The contents equal [`Self::resolve_context_with`] over the files that
+    /// parse, in `files` order ([`ResolveCtx::same_contents`]).
+    pub fn resolve_context_incremental<E>(
+        &self,
+        prev: Option<&ResolveCtx>,
+        files: &[(RepoPath, (ObjectId, Option<ObjectId>))],
+        manifests: &[crate::manifest::ManifestFile<'_>],
+        load: impl FnMut(&RepoPath) -> Result<Option<Arc<IdentifiedTree>>, E>,
+    ) -> Result<ResolveCtx, E> {
+        resolve_context_incremental(prev, files, manifests, load)
+    }
+}
+
+/// Per-file results a context carries to the next snapshot's build
+/// ([`ResolveCtx::set_carry`]). Trees are not kept: a file whose key and
+/// module are unchanged is never loaded again.
+#[derive(Default)]
+struct Carry {
+    files: HashMap<RepoPath, Arc<FileFacts>>,
+    links: Option<Arc<LinksMemo>>,
+}
+
+struct FileFacts {
+    key: FileKey,
+    /// `None` when the file does not parse as Rust.
+    parsed: Option<ParsedFacts>,
+}
+
+struct ParsedFacts {
+    mods: Arc<[ModFound]>,
+    module: Vec<String>,
+    rows: Arc<FileRows>,
+}
+
+/// Inputs and output of [`crate::manifest::install_links`] for one build.
+struct LinksMemo {
+    paths: Vec<RepoPath>,
+    modules: Vec<Vec<String>>,
+    manifests: Vec<(RepoPath, Vec<u8>)>,
+    links: Vec<(String, String, String)>,
+}
+
+/// A file being built: its reused facts, or its freshly loaded tree.
+struct Pending {
+    reused: Option<Arc<FileFacts>>,
+    tree: Option<Arc<IdentifiedTree>>,
+    mods: Option<Arc<[ModFound]>>,
+}
+
+/// See [`RustAdapter::resolve_context_incremental`]. The result carries its
+/// own facts for the next build.
+fn resolve_context_incremental<E>(
+    prev: Option<&ResolveCtx>,
+    files: &[(RepoPath, FileKey)],
+    manifests: &[crate::manifest::ManifestFile<'_>],
+    mut load: impl FnMut(&RepoPath) -> Result<Option<Arc<IdentifiedTree>>, E>,
+) -> Result<ResolveCtx, E> {
+    let prev = prev
+        .and_then(ResolveCtx::carry::<Carry>)
+        .unwrap_or_default();
+
+    // Which files parse, and their `mod` items.
+    let mut pending = Vec::new();
+    let mut rust = Vec::new();
+    for (i, (path, key)) in files.iter().enumerate() {
+        let reused = prev.files.get(path).filter(|f| f.key == *key).cloned();
+        let entry = match reused {
+            Some(facts) => {
+                let mods = facts.parsed.as_ref().map(|p| Arc::clone(&p.mods));
+                Pending {
+                    reused: Some(facts),
+                    tree: None,
+                    mods,
+                }
+            }
+            None => {
+                let tree = load(path)?;
+                let mods = tree
+                    .as_ref()
+                    .map(|t| Arc::from(parse_mods(t.tree.to_bytes().as_slice())));
+                Pending {
+                    reused: None,
+                    tree,
+                    mods,
+                }
+            }
+        };
+        if entry.mods.is_some() {
+            rust.push(i);
+        }
+        pending.push(entry);
+    }
+
+    let paths: Vec<&RepoPath> = rust.iter().map(|&i| &files[i].0).collect();
+    let modules = assign_modules_by(&paths, |r| {
+        Cow::Owned(
+            pending[rust[r]]
+                .mods
+                .as_deref()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+    });
+
+    let mut ctx = ResolveCtx::new();
+    let mut carry = Carry::default();
+    for (r, &i) in rust.iter().enumerate() {
+        let (path, key) = &files[i];
+        let module = &modules[r];
+        let entry = &mut pending[i];
+        let facts = match entry.reused.take() {
+            Some(facts) if facts.parsed.as_ref().is_some_and(|p| &p.module == module) => facts,
+            _ => {
+                let tree = match entry.tree.take() {
+                    Some(tree) => Some(tree),
+                    None => load(path)?,
+                };
+                let mods = entry.mods.clone().unwrap_or_else(|| Arc::from([]));
+                let rows = match &tree {
+                    Some(tree) if !module.is_empty() => file_rows(
+                        &RustFile {
+                            path,
+                            tree: &tree.tree,
+                            ids: &tree.ids,
+                        },
+                        module,
+                    ),
+                    _ => FileRows {
+                        root: None,
+                        defs: Vec::new(),
+                        imports: Vec::new(),
+                    },
+                };
+                Arc::new(FileFacts {
+                    key: *key,
+                    parsed: Some(ParsedFacts {
+                        mods,
+                        module: module.clone(),
+                        rows: Arc::new(rows),
+                    }),
+                })
+            }
+        };
+        if let Some(parsed) = &facts.parsed
+            && !module.is_empty()
+        {
+            add_rows(path, &parsed.rows, &mut ctx);
+        }
+        carry.files.insert(path.clone(), facts);
+    }
+    for (i, (path, key)) in files.iter().enumerate() {
+        if pending[i].mods.is_none() {
+            carry.files.insert(
+                path.clone(),
+                Arc::new(FileFacts {
+                    key: *key,
+                    parsed: None,
+                }),
+            );
+        }
+    }
+
+    let memo = links_memo(prev.links.as_ref(), &paths, &modules, manifests);
+    for (from, name, target) in &memo.links {
+        ctx.add_link(from.as_str(), name.as_str(), target.as_str());
+    }
+    carry.links = Some(memo);
+    ctx.set_carry(Arc::new(carry));
+    Ok(ctx)
+}
+
+/// Manifest links for `paths` in `modules`: `prev`'s when every input is
+/// unchanged, else [`crate::manifest::install_links`] run again.
+fn links_memo(
+    prev: Option<&Arc<LinksMemo>>,
+    paths: &[&RepoPath],
+    modules: &[Vec<String>],
+    manifests: &[crate::manifest::ManifestFile<'_>],
+) -> Arc<LinksMemo> {
+    if let Some(prev) = prev
+        && prev.modules == modules
+        && prev.paths.len() == paths.len()
+        && prev.paths.iter().zip(paths).all(|(a, b)| a == *b)
+        && prev.manifests.len() == manifests.len()
+        && prev
+            .manifests
+            .iter()
+            .zip(manifests)
+            .all(|((path, bytes), m)| path == m.path && bytes.as_slice() == m.bytes)
+    {
+        return Arc::clone(prev);
+    }
+    // `install_links` reads only paths and modules, never the trees.
+    let empty_tree = NodeTree::new();
+    let empty_ids = BTreeMap::new();
+    let views: Vec<RustFile<'_>> = paths
+        .iter()
+        .map(|path| RustFile {
+            path,
+            tree: &empty_tree,
+            ids: &empty_ids,
+        })
+        .collect();
+    let mut scratch = ResolveCtx::new();
+    crate::manifest::install_links(&views, modules, manifests, &mut scratch);
+    let mut links = Vec::new();
+    scratch.for_each_link(|from, name, target| {
+        links.push((
+            from.as_str().to_owned(),
+            name.as_str().to_owned(),
+            target.as_str().to_owned(),
+        ));
+    });
+    Arc::new(LinksMemo {
+        paths: paths.iter().map(|p| (*p).clone()).collect(),
+        modules: modules.to_vec(),
+        manifests: manifests
+            .iter()
+            .map(|m| (m.path.clone(), m.bytes.to_vec()))
+            .collect(),
+        links,
+    })
+}
+
 pub(crate) fn references(ctx: &ResolveCtx, node: &Node) -> Vec<NameRef> {
     with_index(ctx, |idx| refs_from_node(idx, node))
 }
@@ -145,24 +388,11 @@ pub(crate) fn test_targets(ctx: &ResolveCtx, test: &Node) -> Vec<NodeId> {
     })
 }
 
-/// One name index per [`ResolveCtx::stamp`]. Building it walks every
-/// definition; reference queries on one snapshot must not repeat that.
+/// The name index of `ctx`, built once and kept inside the context
+/// ([`ResolveCtx::derived`]), so each snapshot's context has its own and
+/// nothing is shared across contexts or repositories.
 fn with_index<R>(ctx: &ResolveCtx, f: impl FnOnce(&Index) -> R) -> R {
-    static CACHE: Mutex<Option<(u64, Arc<Index>)>> = Mutex::new(None);
-    let stamp = ctx.stamp();
-    let idx = {
-        let mut slot = CACHE.lock().expect("rust name index");
-        if let Some((cached, idx)) = slot.as_ref()
-            && *cached == stamp
-        {
-            Arc::clone(idx)
-        } else {
-            let idx = Arc::new(Index::build(ctx));
-            *slot = Some((stamp, Arc::clone(&idx)));
-            idx
-        }
-    };
-    f(&idx)
+    f(&ctx.derived(Index::build))
 }
 
 #[cfg(test)]
@@ -183,7 +413,7 @@ fn resolved_ids(refs: &[NameRef]) -> Vec<NodeId> {
 
 // --- module tree -----------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ModFound {
     name: String,
     path_attr: Option<String>,
@@ -192,42 +422,53 @@ struct ModFound {
 }
 
 fn assign_modules(files: &[RustFile<'_>]) -> Vec<Vec<String>> {
+    let paths: Vec<&RepoPath> = files.iter().map(|f| f.path).collect();
+    assign_modules_by(&paths, |i| {
+        Cow::Owned(parse_mods(files[i].tree.to_bytes().as_slice()))
+    })
+}
+
+/// Module path of each of `paths`. `mods_of(i)` is the `mod` items of file
+/// `i`; it is asked only for files reached from a crate root.
+fn assign_modules_by<'m>(
+    paths: &[&RepoPath],
+    mut mods_of: impl FnMut(usize) -> Cow<'m, [ModFound]>,
+) -> Vec<Vec<String>> {
     let mut assigned: HashMap<RepoPath, Vec<String>> = HashMap::new();
     let mut by_path: HashMap<RepoPath, usize> = HashMap::new();
-    for (i, file) in files.iter().enumerate() {
-        by_path.insert(file.path.clone(), i);
+    for (i, path) in paths.iter().enumerate() {
+        by_path.insert((*path).clone(), i);
     }
 
-    let mut roots: Vec<usize> = (0..files.len())
-        .filter(|i| is_crate_root(files[*i].path))
+    let mut roots: Vec<usize> = (0..paths.len())
+        .filter(|i| is_crate_root(paths[*i]))
         .collect();
-    if roots.is_empty() && files.len() == 1 {
+    if roots.is_empty() && paths.len() == 1 {
         roots.push(0);
     }
-    roots.sort_by(|&a, &b| files[a].path.cmp(files[b].path));
+    roots.sort_by(|&a, &b| paths[a].cmp(paths[b]));
     let multi = roots.len() > 1;
 
     let mut queue: VecDeque<usize> = VecDeque::new();
     for idx in roots {
         let key = if multi {
-            path_key(files[idx].path)
+            path_key(paths[idx])
         } else {
             "crate".to_owned()
         };
-        if assigned.contains_key(files[idx].path) {
+        if assigned.contains_key(paths[idx]) {
             continue;
         }
-        assigned.insert(files[idx].path.clone(), vec![key]);
+        assigned.insert(paths[idx].clone(), vec![key]);
         queue.push_back(idx);
     }
 
     while let Some(idx) = queue.pop_front() {
-        let path = files[idx].path.clone();
+        let path = paths[idx].clone();
         let base = assigned.get(&path).cloned().unwrap_or_default();
-        let subdir = module_subdir(files[idx].path);
-        let file_dir = parent_dir(files[idx].path);
-        let source = files[idx].tree.to_bytes();
-        let mods = parse_mods(source.as_slice());
+        let subdir = module_subdir(paths[idx]);
+        let file_dir = parent_dir(paths[idx]);
+        let mods = mods_of(idx);
         link_mods(
             &mods,
             &base,
@@ -239,21 +480,21 @@ fn assign_modules(files: &[RustFile<'_>]) -> Vec<Vec<String>> {
         );
     }
 
-    for file in files {
-        if assigned.contains_key(file.path) {
+    for path in paths {
+        if assigned.contains_key(*path) {
             continue;
         }
-        let key = if files.len() == 1 {
+        let key = if paths.len() == 1 {
             "crate".to_owned()
         } else {
-            path_key(file.path)
+            path_key(path)
         };
-        assigned.insert(file.path.clone(), vec![key]);
+        assigned.insert((*path).clone(), vec![key]);
     }
 
-    files
+    paths
         .iter()
-        .map(|f| assigned.remove(f.path).unwrap_or_default())
+        .map(|p| assigned.remove(*p).unwrap_or_default())
         .collect()
 }
 
@@ -469,7 +710,56 @@ struct RawDef {
     local_name: Option<String>,
 }
 
+/// What [`index_file`] adds to a context for one file in one module.
+struct FileRows {
+    /// Root content id and module, when the tree has a root.
+    root: Option<(ObjectId, String)>,
+    defs: Vec<DefRow>,
+    imports: Vec<RawImport>,
+}
+
+struct DefRow {
+    node_id: NodeId,
+    object_id: ObjectId,
+    kind: NodeKind,
+    module: String,
+    simple: String,
+    parent: String,
+    is_test: bool,
+    cfg_test: bool,
+}
+
 fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
+    add_rows(file.path, &file_rows(file, module), ctx);
+}
+
+fn add_rows(path: &RepoPath, rows: &FileRows, ctx: &mut ResolveCtx) {
+    if let Some((root, module)) = &rows.root {
+        ctx.add_file_at(path.clone(), *root, module.as_str());
+    }
+    for def in &rows.defs {
+        ctx.add_definition(
+            def.node_id,
+            Some(def.object_id),
+            def.kind,
+            def.module.as_str(),
+            def.simple.as_str(),
+            def.parent.as_str(),
+            def.is_test,
+            def.cfg_test,
+        );
+    }
+    for import in &rows.imports {
+        ctx.add_import(
+            import.module.as_str(),
+            import.local.as_str(),
+            import.path.as_str(),
+            import.glob,
+        );
+    }
+}
+
+fn file_rows(file: &RustFile<'_>, module: &[String]) -> FileRows {
     let bytes = file.tree.to_bytes();
     let source = bytes.as_slice();
     let (infos, imports) = collect_ts(source, module);
@@ -479,11 +769,13 @@ fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
     }
 
     let mut raws = Vec::new();
+    let mut root_row = None;
     if let Some(root) = file.tree.root() {
-        ctx.add_file_at(file.path.clone(), root, segs_join(module));
+        root_row = Some((root, segs_join(module)));
         walk_nt(file, root, &mut Vec::new(), module, &mut raws);
     }
 
+    let mut defs = Vec::with_capacity(raws.len());
     for raw in raws {
         let info = raw
             .local_name
@@ -499,20 +791,22 @@ fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
                 false,
             )
         };
-        ctx.add_definition(
-            raw.node_id,
-            Some(raw.object_id),
-            raw.kind,
-            raw.module,
+        defs.push(DefRow {
+            node_id: raw.node_id,
+            object_id: raw.object_id,
+            kind: raw.kind,
+            module: raw.module,
             simple,
             parent,
             is_test,
             cfg_test,
-        );
+        });
     }
 
-    for import in imports {
-        ctx.add_import(import.module, import.local, import.path, import.glob);
+    FileRows {
+        root: root_row,
+        defs,
+        imports,
     }
 }
 
@@ -1204,11 +1498,11 @@ struct Def {
     cfg_test: bool,
 }
 
+/// One import; [`Index::named_imps`] and [`Index::glob_imps`] hold its
+/// binding name and glob flag.
 struct Imp {
     module: String,
-    local: String,
     path: String,
-    glob: bool,
     done: bool,
     external: bool,
     def_indices: Vec<usize>,
@@ -1218,6 +1512,10 @@ struct Imp {
 struct Index {
     defs: Vec<Def>,
     imps: Vec<Imp>,
+    /// `(module, local)` → non-glob import indices, ascending.
+    named_imps: HashMap<(String, String), Vec<usize>>,
+    /// Module → glob import indices, ascending.
+    glob_imps: HashMap<String, Vec<usize>>,
     /// `(module, simple)` → direct (parent-empty) definition indices.
     direct: HashMap<(String, String), Vec<usize>>,
     /// Simple name → associated definition indices.
@@ -1279,6 +1577,8 @@ impl Index {
         let mut idx = Self {
             defs: Vec::new(),
             imps: Vec::new(),
+            named_imps: HashMap::new(),
+            glob_imps: HashMap::new(),
             direct: HashMap::new(),
             associated: HashMap::new(),
             callables: HashMap::new(),
@@ -1334,11 +1634,21 @@ impl Index {
             },
         );
         ctx.for_each_import(|module, local, path, glob| {
+            let i = idx.imps.len();
+            if glob {
+                idx.glob_imps
+                    .entry(module.as_str().to_owned())
+                    .or_default()
+                    .push(i);
+            } else {
+                idx.named_imps
+                    .entry((module.as_str().to_owned(), local.as_str().to_owned()))
+                    .or_default()
+                    .push(i);
+            }
             idx.imps.push(Imp {
                 module: module.as_str().to_owned(),
-                local: local.as_str().to_owned(),
                 path: path.as_str().to_owned(),
-                glob,
                 done: false,
                 external: false,
                 def_indices: Vec::new(),
@@ -1475,16 +1785,31 @@ impl Index {
         }
     }
 
+    /// Non-glob imports of `name` in `module`, in declaration order.
+    fn named_imports(&self, module: &str, name: &str) -> impl Iterator<Item = &Imp> + '_ {
+        self.named_imps
+            .get(&(module.to_owned(), name.to_owned()))
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.imps[i])
+    }
+
+    /// Glob imports in `module`, in declaration order.
+    fn glob_imports(&self, module: &str) -> impl Iterator<Item = &Imp> + '_ {
+        self.glob_imps
+            .get(module)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.imps[i])
+    }
+
     fn ident_status(&self, module: &str, name: &str) -> Head {
-        let locals = self.direct.get(&(module.to_owned(), name.to_owned()));
+        let key = (module.to_owned(), name.to_owned());
+        let locals = self.direct.get(&key);
         let mut ready = Vec::new();
         let mut pending = false;
         let mut external = false;
-        for imp in self
-            .imps
-            .iter()
-            .filter(|i| !i.glob && i.module == module && i.local == name)
-        {
+        for imp in self.named_imports(module, name) {
             if !imp.done {
                 pending = true;
                 continue;
@@ -1506,11 +1831,7 @@ impl Index {
         if pending {
             return Head::Pending;
         }
-        if self
-            .imps
-            .iter()
-            .any(|i| i.glob && !i.done && i.module == module)
-        {
+        if self.glob_imports(module).any(|i| !i.done) {
             return Head::Pending;
         }
         if let Some(links) = self.externs.get(crate_key(module)) {
@@ -1528,11 +1849,7 @@ impl Index {
             return Head::Missing;
         }
         let mut glob_hits = Vec::new();
-        for imp in self
-            .imps
-            .iter()
-            .filter(|i| i.glob && i.done && i.module == module)
-        {
+        for imp in self.glob_imports(module).filter(|i| i.done) {
             glob_hits.extend(self.glob_hits(imp, name));
         }
         if glob_hits.is_empty() {
@@ -1566,9 +1883,8 @@ impl Index {
             }
         }
         for other in self
-            .imps
-            .iter()
-            .filter(|i| i.done && !i.glob && !i.external && i.module == module && i.local == name)
+            .named_imports(module, name)
+            .filter(|i| i.done && !i.external)
         {
             hits.extend(self.hits_from_import(other));
         }
@@ -1847,7 +2163,7 @@ impl Index {
     /// Every definition with `node`'s content (several when identical
     /// definitions sit in different modules).
     fn defs_of(&self, node: &Node) -> &[usize] {
-        ObjectId::of(node)
+        node.content_id()
             .ok()
             .and_then(|oid| self.by_object.get(&oid))
             .map_or(&[], Vec::as_slice)
@@ -1904,7 +2220,7 @@ impl Index {
             }
         }
         if out.is_empty()
-            && let Ok(oid) = ObjectId::of(node)
+            && let Ok(oid) = node.content_id()
             && let Some(modules) = self.files.get(&oid)
         {
             out.extend(modules.iter().map(|m| Self::module_scope(m)));
@@ -2664,5 +2980,265 @@ mod index_cache {
         );
         let _ = references(&ctx, &node);
         assert_eq!(index_builds(), before + 2);
+    }
+}
+
+#[cfg(test)]
+mod incremental {
+    use std::collections::{BTreeMap, HashSet};
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    use hord_core::{NodeId, ObjectId, RepoPath};
+    use hord_lang::{IdentifiedTree, LangAdapter, ResolveCtx, Site};
+
+    use crate::{ManifestFile, RustAdapter, RustFile};
+
+    /// Deterministic ids per (path, site, salt), so a salt change models a
+    /// carried identity that differs while the bytes stay the same.
+    fn identify(path: &RepoPath, source: &str, salt: u8) -> IdentifiedTree {
+        let tree = RustAdapter.parse(source.as_bytes()).unwrap();
+        let mut ids = BTreeMap::new();
+        fn walk(
+            tree: &hord_lang::NodeTree,
+            oid: ObjectId,
+            site: &mut Site,
+            seed: &str,
+            ids: &mut BTreeMap<Site, NodeId>,
+        ) {
+            let node = tree.get(oid).unwrap();
+            if RustAdapter.is_definition(&node.kind) {
+                let h = ObjectId::of_byte_string(format!("{seed}{site:?}").as_bytes());
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&h.as_bytes()[..16]);
+                ids.insert(site.clone(), NodeId::from_u128(u128::from_le_bytes(b)));
+            }
+            for (i, child) in node.children.iter().enumerate() {
+                site.push(u32::try_from(i).unwrap());
+                walk(tree, *child, site, seed, ids);
+                site.pop();
+            }
+        }
+        if let Some(root) = tree.root() {
+            walk(
+                &tree,
+                root,
+                &mut Vec::new(),
+                &format!("{path}{salt}"),
+                &mut ids,
+            );
+        }
+        IdentifiedTree::new(tree, ids)
+    }
+
+    fn rp(path: &str) -> RepoPath {
+        RepoPath::new(path.split('/').map(str::to_owned).collect::<Vec<_>>())
+    }
+
+    struct Snap {
+        files: BTreeMap<RepoPath, (String, u8)>,
+    }
+
+    impl Snap {
+        fn set(&mut self, path: &str, source: &str) {
+            let salt = self.files.get(&rp(path)).map_or(0, |f| f.1);
+            self.files.insert(rp(path), (source.to_owned(), salt));
+        }
+
+        fn key(path: &RepoPath, source: &str, salt: u8) -> (ObjectId, Option<ObjectId>) {
+            let blob = ObjectId::of_byte_string(source.as_bytes());
+            let carried = (salt > 0).then(|| ObjectId::of_byte_string(&[salt]));
+            let _ = path;
+            (blob, carried)
+        }
+
+        /// Full build over every `.rs` file, and the incremental build from
+        /// `prev`. Returns the incremental context and the paths it loaded.
+        fn build(&self, prev: Option<&ResolveCtx>) -> (ResolveCtx, ResolveCtx, HashSet<RepoPath>) {
+            let manifests: Vec<(RepoPath, &str)> = self
+                .files
+                .iter()
+                .filter(|(p, _)| p.to_string().ends_with("Cargo.toml"))
+                .map(|(p, (s, _))| (p.clone(), s.as_str()))
+                .collect();
+            let manifest_views: Vec<ManifestFile<'_>> = manifests
+                .iter()
+                .map(|(path, s)| ManifestFile {
+                    path,
+                    bytes: s.as_bytes(),
+                })
+                .collect();
+            let rs: Vec<(RepoPath, IdentifiedTree)> = self
+                .files
+                .iter()
+                .filter(|(p, _)| p.to_string().ends_with(".rs"))
+                .map(|(p, (s, salt))| (p.clone(), identify(p, s, *salt)))
+                .collect();
+            let views: Vec<RustFile<'_>> = rs
+                .iter()
+                .map(|(path, t)| RustFile {
+                    path,
+                    tree: &t.tree,
+                    ids: &t.ids,
+                })
+                .collect();
+            let full = RustAdapter.resolve_context_with(&views, &manifest_views);
+
+            let keys: Vec<(RepoPath, (ObjectId, Option<ObjectId>))> = self
+                .files
+                .iter()
+                .filter(|(p, _)| p.to_string().ends_with(".rs"))
+                .map(|(p, (s, salt))| (p.clone(), Self::key(p, s, *salt)))
+                .collect();
+            let mut loaded = HashSet::new();
+            let inc = RustAdapter
+                .resolve_context_incremental(prev, &keys, &manifest_views, |path| {
+                    loaded.insert(path.clone());
+                    let (s, salt) = &self.files[path];
+                    Ok::<_, Infallible>(Some(Arc::new(identify(path, s, *salt))))
+                })
+                .unwrap();
+            (full, inc, loaded)
+        }
+    }
+
+    fn paths(list: &[&str]) -> HashSet<RepoPath> {
+        list.iter().map(|p| rp(p)).collect()
+    }
+
+    fn assert_same(full: &ResolveCtx, inc: &ResolveCtx, step: &str) {
+        assert!(
+            full.same_contents(inc),
+            "{step}: incremental context differs from a full build"
+        );
+        assert!(
+            full.definition_count() > 0,
+            "{step}: fixture indexes nothing"
+        );
+    }
+
+    #[test]
+    fn incremental_context_equals_full_rebuild_over_landings() {
+        let mut snap = Snap {
+            files: BTreeMap::new(),
+        };
+        snap.set(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"a\", \"b\"]\n[workspace.dependencies]\na = { path = \"a\" }\n",
+        );
+        snap.set("a/Cargo.toml", "[package]\nname = \"a\"\n");
+        snap.set(
+            "b/Cargo.toml",
+            "[package]\nname = \"b\"\n[dependencies]\na = { workspace = true }\n",
+        );
+        snap.set(
+            "a/src/lib.rs",
+            "mod x;\npub use x::helper;\npub fn f() -> u32 { 1 }\n",
+        );
+        snap.set("a/src/x.rs", "pub fn helper() -> u32 { crate::f() }\n");
+        snap.set(
+            "b/src/lib.rs",
+            "use a::f;\nuse a::*;\npub fn g() -> u32 { f() + helper() }\n",
+        );
+        snap.set(
+            "b/tests/t.rs",
+            "#[test]\nfn t() { assert_eq!(b::g(), 2); }\n",
+        );
+
+        let (full, mut prev, loaded) = snap.build(None);
+        assert_same(&full, &prev, "initial");
+        assert_eq!(loaded.len(), 4, "the first build loads every file");
+
+        type Step = (&'static str, fn(&mut Snap), &'static [&'static str]);
+        let steps: [Step; 8] = [
+            (
+                "edit a body",
+                |s| s.set("a/src/x.rs", "pub fn helper() -> u32 { crate::f() + 1 }\n"),
+                &["a/src/x.rs"],
+            ),
+            ("no change", |_| {}, &[]),
+            (
+                "add a mod and its file",
+                |s| {
+                    s.set(
+                        "a/src/lib.rs",
+                        "mod x;\nmod y;\npub use x::helper;\npub fn f() -> u32 { 1 }\n",
+                    );
+                    s.set(
+                        "a/src/y.rs",
+                        "pub(crate) struct Y;\nimpl Y { fn new() -> Self { Y } }\n",
+                    );
+                },
+                &["a/src/lib.rs", "a/src/y.rs"],
+            ),
+            (
+                "move a file to mod.rs",
+                |s| {
+                    let body = s.files.remove(&rp("a/src/y.rs")).unwrap().0;
+                    s.set("a/src/y/mod.rs", &body);
+                },
+                &["a/src/y/mod.rs"],
+            ),
+            (
+                "orphan a file (its module falls back to its path)",
+                |s| {
+                    s.set(
+                        "a/src/lib.rs",
+                        "mod x;\npub use x::helper;\npub fn f() -> u32 { 1 }\n",
+                    )
+                },
+                // y/mod.rs is unchanged but its module moved, so it reloads.
+                &["a/src/lib.rs", "a/src/y/mod.rs"],
+            ),
+            (
+                "drop a manifest dependency",
+                |s| s.set("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+                &[],
+            ),
+            (
+                "carried identity changes, bytes do not",
+                |s| s.files.get_mut(&rp("b/src/lib.rs")).unwrap().1 = 7,
+                &["b/src/lib.rs"],
+            ),
+            (
+                "delete a file",
+                |s| {
+                    s.files.remove(&rp("b/tests/t.rs"));
+                },
+                &[],
+            ),
+        ];
+        for (step, edit, expect) in steps {
+            edit(&mut snap);
+            let (full, inc, loaded) = snap.build(Some(&prev));
+            assert_same(&full, &inc, step);
+            assert_eq!(loaded, paths(expect), "{step}: files re-indexed");
+            prev = inc;
+        }
+    }
+
+    #[test]
+    fn links_change_with_manifests() {
+        let mut snap = Snap {
+            files: BTreeMap::new(),
+        };
+        snap.set("a/Cargo.toml", "[package]\nname = \"a\"\n");
+        snap.set("a/src/lib.rs", "pub fn f() {}\n");
+        snap.set("b/Cargo.toml", "[package]\nname = \"b\"\n");
+        snap.set("b/src/lib.rs", "pub fn g() { a::f() }\n");
+        let (_, prev, _) = snap.build(None);
+        let mut links = 0;
+        prev.for_each_link(|_, _, _| links += 1);
+        assert_eq!(links, 0);
+        snap.set(
+            "b/Cargo.toml",
+            "[package]\nname = \"b\"\n[dependencies]\na = { path = \"../a\" }\n",
+        );
+        let (full, inc, loaded) = snap.build(Some(&prev));
+        assert!(loaded.is_empty());
+        assert!(full.same_contents(&inc));
+        let mut links = 0;
+        inc.for_each_link(|_, _, _| links += 1);
+        assert_eq!(links, 1, "a new path dependency links b to a");
     }
 }
