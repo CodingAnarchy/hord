@@ -1,6 +1,6 @@
 //! [`Workspace`]: a snapshot pointer, an overlay, and an access log (spec §6.1).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use hord_lang::IdentifiedTree;
 use hord_store::WorkspaceId;
 use serde::{Deserialize, Serialize};
 
-use crate::materialize::{MaterializeMode, Stat, load_stat_index, read_checkout_file, walk_files};
+use crate::materialize::{MaterializeMode, load_stat_index, read_checkout_file, walk_checkout};
 use crate::propose::{ProposeInput, ReadDeclaration};
 use crate::repo::{Inner, Repo, blocking, fs_path};
 use crate::semantic::{DefinitionInfo, definitions};
@@ -88,7 +88,13 @@ pub struct Workspace {
     materialized_as: Option<MaterializeMode>,
     /// Re-hash every file at propose instead of trusting the stat index.
     paranoid: bool,
+    /// Untracked paths of a `Directory` checkout the last build left out.
+    skipped: Vec<RepoPath>,
 }
+
+/// Changed paths with their new content (`None`: deleted), and the untracked
+/// paths a `Directory` walk skipped.
+type Changes = (BTreeMap<RepoPath, Option<Bytes>>, Vec<RepoPath>);
 
 #[derive(Clone, Debug)]
 struct View {
@@ -123,6 +129,7 @@ impl Workspace {
             views: HashMap::new(),
             materialized_as: None,
             paranoid: false,
+            skipped: Vec::new(),
         }
     }
 
@@ -139,10 +146,21 @@ impl Workspace {
     }
 
     /// Re-hash every file of a `Directory` workspace at propose and preview
-    /// instead of skipping files whose size, mtime, and inode are unchanged
+    /// instead of skipping files whose size and mtime are unchanged
     /// (`hord status --paranoid`, ADR 0016).
     pub fn set_paranoid(&mut self, paranoid: bool) {
         self.paranoid = paranoid;
+    }
+
+    /// Untracked paths of a `Directory` checkout that the last
+    /// [`Self::propose`] or [`Self::preview`] left out, sorted: those an
+    /// ignore rule matches (the base snapshot's `.gitignore` files, plus
+    /// `.hord/` and `.git`), with an ignored directory listed once rather than
+    /// its contents, and symlinks or other non-files, which a tree cannot
+    /// hold. A tracked file is never skipped. Empty for `InMemory`.
+    #[must_use]
+    pub fn skipped(&self) -> &[RepoPath] {
+        &self.skipped
     }
 
     /// Workspace id (ULID).
@@ -267,7 +285,9 @@ impl Workspace {
         Ok(())
     }
 
-    /// Every file in the workspace view. Listing is not a content read.
+    /// Every file in the workspace view. Listing is not a content read. For
+    /// a `Directory` workspace, untracked files an ignore rule matches are
+    /// not in the view ([`Self::skipped`]).
     pub async fn list_files(&mut self) -> Result<Vec<RepoPath>> {
         match &self.materialization {
             Materialization::InMemory => {
@@ -289,10 +309,13 @@ impl Workspace {
             }
             Materialization::Directory { path } => {
                 let dir = path.clone();
-                let files = tokio::task::spawn_blocking(move || scan_dir(&dir))
-                    .await
-                    .map_err(|err| Error::Task(err.to_string()))??;
-                Ok(files.into_iter().map(|(path, _)| path).collect())
+                let base = self.base;
+                let walked = blocking(&self.repo.inner, move |inner| {
+                    let filter = inner.checkout_filter(&dir, inner.list_files(base)?)?;
+                    walk_checkout(&dir, Some(&filter), None)
+                })
+                .await?;
+                Ok(walked.files.into_iter().map(|(path, _)| path).collect())
             }
         }
     }
@@ -427,7 +450,8 @@ impl Workspace {
     }
 
     async fn build(&mut self, intent: Intent, store: bool) -> Result<Proposal> {
-        let changes = self.changed_files().await?;
+        let (changes, skipped) = self.changed_files().await?;
+        self.skipped = skipped;
         self.access_log
             .written_paths
             .extend(changes.keys().cloned());
@@ -447,8 +471,9 @@ impl Workspace {
         .await
     }
 
-    /// Paths whose content differs from the base, with the new content.
-    async fn changed_files(&self) -> Result<BTreeMap<RepoPath, Option<Bytes>>> {
+    /// Paths whose content differs from the base, with the new content, and
+    /// the untracked paths a `Directory` walk skipped.
+    async fn changed_files(&self) -> Result<Changes> {
         match &self.materialization {
             Materialization::InMemory => {
                 let base = self.base;
@@ -465,7 +490,7 @@ impl Workspace {
                             out.insert(path, bytes);
                         }
                     }
-                    Ok(out)
+                    Ok((out, Vec::new()))
                 })
                 .await
             }
@@ -568,30 +593,29 @@ fn view_of(
     Ok(Some(View { defs }))
 }
 
-/// Files of a `Directory` checkout that differ from `base`. With a stat
-/// index and not `paranoid`, a file whose size, mtime, and inode match the
-/// checkout is unchanged without being read (ADR 0016).
+/// Files of a `Directory` checkout that differ from `base`, and the
+/// untracked paths the walk skipped. With a stat index and not `paranoid`, a
+/// file whose size and mtime match the index, and whose entry is not racily
+/// clean, is unchanged without being read (ADR 0016).
 fn directory_changes(
     inner: &Inner,
     base: SnapshotId,
     dir: &Path,
     paranoid: bool,
-) -> Result<BTreeMap<RepoPath, Option<Bytes>>> {
+) -> Result<Changes> {
     let index = if paranoid { None } else { load_stat_index(dir) };
-    let mut base_files: BTreeMap<RepoPath, ObjectId> =
-        inner.list_files(base)?.into_iter().collect();
-    let mut seen = Vec::new();
-    walk_files(dir, &mut Vec::new(), &mut |path, meta| {
-        seen.push((path, Stat::of(meta)));
-    })?;
+    let filter = inner.checkout_filter(dir, inner.list_files(base)?)?;
+    let walked = walk_checkout(dir, Some(&filter), None)?;
+    let base_files = filter.tracked();
+    let mut seen = HashSet::with_capacity(base_files.len());
     let mut out = BTreeMap::new();
-    for (path, stat) in seen {
-        let base_blob = base_files.remove(&path);
-        let unchanged = base_blob.is_some()
-            && index
-                .as_ref()
-                .and_then(|i| i.files.get(&path))
-                .is_some_and(|at| *at == stat);
+    for (path, stat) in walked.files {
+        let base_blob = base_files.get_key_value(&path).map(|(key, blob)| {
+            seen.insert(key);
+            *blob
+        });
+        let unchanged =
+            base_blob.is_some() && index.as_ref().is_some_and(|i| i.is_clean(&path, stat));
         if unchanged {
             continue;
         }
@@ -600,10 +624,12 @@ fn directory_changes(
             out.insert(path, Some(Bytes::new(bytes)));
         }
     }
-    for path in base_files.into_keys() {
-        out.insert(path, None);
+    for path in base_files.keys() {
+        if !seen.contains(path) {
+            out.insert(path.clone(), None);
+        }
     }
-    Ok(out)
+    Ok((out, walked.skipped))
 }
 
 fn overlaps(span: &Range<usize>, start: usize, end: usize) -> bool {
@@ -611,34 +637,4 @@ fn overlaps(span: &Range<usize>, start: usize, end: usize) -> bool {
         return span.start <= start && start < span.end;
     }
     span.start < end && start < span.end
-}
-
-/// Every regular file under `dir`, as repository paths with contents.
-fn scan_dir(dir: &Path) -> Result<Vec<(RepoPath, Vec<u8>)>> {
-    fn walk(
-        dir: &Path,
-        prefix: &mut Vec<String>,
-        out: &mut Vec<(RepoPath, Vec<u8>)>,
-    ) -> Result<()> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|name| Error::InvalidPath(name.to_string_lossy().into_owned()))?;
-            let kind = entry.file_type()?;
-            prefix.push(name);
-            if kind.is_dir() {
-                walk(&entry.path(), prefix, out)?;
-            } else if kind.is_file() {
-                out.push((RepoPath::new(prefix.clone()), std::fs::read(entry.path())?));
-            }
-            prefix.pop();
-        }
-        Ok(())
-    }
-    let mut out = Vec::new();
-    walk(dir, &mut Vec::new(), &mut out)?;
-    Ok(out)
 }

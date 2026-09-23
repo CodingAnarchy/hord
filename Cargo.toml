@@ -41,6 +41,7 @@ hord-lang-rust = { path = "crates/hord-lang-rust" }
 hord-lang-toml = { path = "crates/hord-lang-toml" }
 hord-store = { path = "crates/hord-store" }
 hord-txn = { path = "crates/hord-txn" }
+ignore = "0.4"
 lasso = { version = "0.7", features = ["multi-threaded"] }
 proptest = "1"
 semver = "1"
