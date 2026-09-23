@@ -5,9 +5,7 @@ use std::collections::BTreeSet;
 use hord_core::{IdentityDelta, NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree};
 
-use crate::defs::{
-    collect_sites, def_oids, file_parent, local_glue, result_ids, root_glue, sites_by_id,
-};
+use crate::defs::{collect_sites, def_oids, file_parent, local_glue, root_glue, sites_by_id};
 
 /// Diff `base` → `result` at definition granularity.
 ///
@@ -34,14 +32,14 @@ pub(crate) fn diff_structural(
     result: &NodeTree,
     mapping: &IdentityMapping,
 ) -> Vec<Op> {
-    let Some(_base_root) = base.tree.root() else {
+    if base.tree.root().is_none() {
         return root_only(result);
-    };
-    let Some(_result_root) = result.root() else {
-        return deaths_only(base, mapping);
-    };
+    }
+    if result.root().is_none() {
+        return deaths_only(mapping);
+    }
 
-    let result_ids = result_ids(mapping);
+    let result_ids = &mapping.nodes;
     let base_sites = collect_sites(&base.tree, &base.ids);
     let result_sites = collect_sites(result, result_ids);
     let base_by_id = sites_by_id(&base_sites);
@@ -117,7 +115,10 @@ pub(crate) fn diff_structural(
 
     for mv in &mapping.moves {
         let Op::Move {
-            node, to_parent, ..
+            node,
+            from_parent,
+            to_parent,
+            ..
         } = mv
         else {
             continue;
@@ -129,7 +130,7 @@ pub(crate) fn diff_structural(
             continue;
         }
         if covered(*to_parent, &result_by_id, &replace_cover)
-            || covered(move_from_parent(mv), &base_by_id, &replace_cover)
+            || covered(*from_parent, &base_by_id, &replace_cover)
         {
             continue;
         }
@@ -213,20 +214,19 @@ fn ensure_apply_identity(base: &IdentifiedTree, result: &NodeTree, ops: Vec<Op>)
     if from == to {
         return ops;
     }
-    if ops.is_empty() {
-        return vec![Op::Replace {
+    let whole_file = || {
+        vec![Op::Replace {
             node: file_parent(),
             from,
             to,
-        }];
+        }]
+    };
+    if ops.is_empty() {
+        return whole_file();
     }
     match crate::apply(base, &ops, result) {
         Ok(applied) if applied.tree.root() == Some(to) => ops,
-        _ => vec![Op::Replace {
-            node: file_parent(),
-            from,
-            to,
-        }],
+        _ => whole_file(),
     }
 }
 
@@ -241,7 +241,7 @@ fn root_only(result: &NodeTree) -> Vec<Op> {
     }]
 }
 
-fn deaths_only(_base: &IdentifiedTree, mapping: &IdentityMapping) -> Vec<Op> {
+fn deaths_only(mapping: &IdentityMapping) -> Vec<Op> {
     mapping
         .deltas
         .iter()
@@ -269,12 +269,5 @@ fn covered(
             return replace_cover.contains(&file_parent());
         }
         cur = site.parent_id;
-    }
-}
-
-fn move_from_parent(op: &Op) -> NodeId {
-    match op {
-        Op::Move { from_parent, .. } => *from_parent,
-        _ => file_parent(),
     }
 }

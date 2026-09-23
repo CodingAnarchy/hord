@@ -30,6 +30,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+mod align;
 mod apply;
 mod blob;
 mod cst_merge;
@@ -46,6 +47,3 @@ pub use defs::file_parent;
 pub use diff::diff;
 pub use error::Error;
 pub use merge::{Conflict, ConflictKind, MergeResult, merge, merge_ops};
-
-/// Result alias for this crate.
-pub type Result<T, E = Error> = std::result::Result<T, E>;

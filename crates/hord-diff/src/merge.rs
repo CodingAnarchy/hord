@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use hord_core::{NodeId, ObjectId, Op};
+use hord_core::{Bytes, NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree};
 
 use crate::apply::apply;
@@ -34,7 +34,7 @@ pub struct Conflict {
 }
 
 impl Conflict {
-    fn hard(nodes: Vec<NodeId>, reason: impl Into<String>) -> Self {
+    pub(crate) fn hard(nodes: Vec<NodeId>, reason: impl Into<String>) -> Self {
         Self {
             nodes,
             kind: ConflictKind::Hard,
@@ -105,11 +105,12 @@ pub fn merge<A: LangAdapter + ?Sized>(
         Err(conflict) if conflict.delete_vs => Err(conflict),
         Ok(ok) => {
             let projected = adapter.project(&ok.tree.tree);
+            let src = sources(adapter, base, ours, theirs);
             // A line in none of the three inputs was invented by the merge
             // (a comma glued onto the wrong token, a hand-style rewrite).
             // That is not an auto-resolution. Landing order is git's.
-            if projection_invents_line(adapter, base, ours, theirs, projected.as_slice())
-                && let Some(git) = git_ours_result(adapter, base, ours, theirs)
+            if projection_invents_line(&src, projected.as_slice())
+                && let Some(git) = git_ours_result(adapter, base, &src)
             {
                 return Ok(git);
             }
@@ -118,42 +119,46 @@ pub fn merge<A: LangAdapter + ?Sized>(
         Err(structural) => {
             // Overlapping edits. Keep non-conflicting edits from both sides
             // and ours' side of each conflict hunk. Do not invent a rewrite.
-            if let Some(ok) = git_ours_result(adapter, base, ours, theirs) {
-                return Ok(ok);
-            }
-            if let Some(ok) = text_merge_result(adapter, base, ours, theirs) {
-                return Ok(ok);
-            }
-            if let Some(ok) = cst_file_fallback(adapter, base, ours, theirs, &mut store) {
-                return Ok(ok);
-            }
-            match blob_file_fallback(adapter, base, ours, theirs) {
-                Some(ok) => Ok(ok),
-                None => Err(structural),
-            }
+            // Delete vs anything else never reaches here.
+            let src = sources(adapter, base, ours, theirs);
+            git_ours_result(adapter, base, &src)
+                .or_else(|| text_merge_result(adapter, base, &src))
+                .or_else(|| cst_file_fallback(adapter, base, ours, theirs, &mut store))
+                .or_else(|| blob_file_fallback(adapter, base, &src))
+                .ok_or(structural)
         }
+    }
+}
+
+struct Sources {
+    base: Bytes,
+    ours: Bytes,
+    theirs: Bytes,
+}
+
+fn sources<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+) -> Sources {
+    Sources {
+        base: adapter.project(&base.tree),
+        ours: adapter.project(&ours.tree),
+        theirs: adapter.project(&theirs.tree),
     }
 }
 
 /// True when `merged` has a non-blank line that occurs in none of base, ours,
 /// and theirs. Unchanged context may come from base alone.
-fn projection_invents_line<A: LangAdapter + ?Sized>(
-    adapter: &A,
-    base: &IdentifiedTree,
-    ours: &IdentifiedTree,
-    theirs: &IdentifiedTree,
-    merged: &[u8],
-) -> bool {
-    let base_src = adapter.project(&base.tree);
-    let ours_src = adapter.project(&ours.tree);
-    let theirs_src = adapter.project(&theirs.tree);
+fn projection_invents_line(src: &Sources, merged: &[u8]) -> bool {
     let mut allowed: BTreeSet<&[u8]> = BTreeSet::new();
-    for src in [
-        base_src.as_slice(),
-        ours_src.as_slice(),
-        theirs_src.as_slice(),
+    for side in [
+        src.base.as_slice(),
+        src.ours.as_slice(),
+        src.theirs.as_slice(),
     ] {
-        for line in src.split(|byte| *byte == b'\n') {
+        for line in side.split(|byte| *byte == b'\n') {
             if !trim_ascii(line).is_empty() {
                 allowed.insert(line);
             }
@@ -179,29 +184,23 @@ fn trim_ascii(line: &[u8]) -> &[u8] {
 fn git_ours_result<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
-    ours: &IdentifiedTree,
-    theirs: &IdentifiedTree,
+    src: &Sources,
 ) -> Option<MergeResult> {
-    let base_src = adapter.project(&base.tree);
-    let ours_src = adapter.project(&ours.tree);
-    let theirs_src = adapter.project(&theirs.tree);
     let merged = crate::text_merge::git_merge_ours(
-        base_src.as_slice(),
-        ours_src.as_slice(),
-        theirs_src.as_slice(),
+        src.base.as_slice(),
+        src.ours.as_slice(),
+        src.theirs.as_slice(),
     )?;
-    let parsed = adapter.parse(&merged).ok()?;
-    if adapter.project(&parsed).as_slice() != merged.as_slice() {
-        return None;
-    }
-    let mapping = adapter.identify(base, &parsed);
-    Some(MergeResult {
-        tree: IdentifiedTree::new(parsed, mapping.nodes),
-        soft: vec![Conflict::soft(
+    reparse(
+        adapter,
+        base,
+        &merged,
+        true,
+        vec![Conflict::soft(
             Vec::new(),
             "git auto-merge with landing-order (ours) conflict hunks",
         )],
-    })
+    )
 }
 
 /// Line/token 3-way of the source. Used when it re-parses losslessly, because
@@ -209,29 +208,23 @@ fn git_ours_result<A: LangAdapter + ?Sized>(
 fn text_merge_result<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
-    ours: &IdentifiedTree,
-    theirs: &IdentifiedTree,
+    src: &Sources,
 ) -> Option<MergeResult> {
-    let base_src = adapter.project(&base.tree);
-    let ours_src = adapter.project(&ours.tree);
-    let theirs_src = adapter.project(&theirs.tree);
     let merged = crate::text_merge::merge_text(
-        std::str::from_utf8(base_src.as_slice()).ok()?,
-        std::str::from_utf8(ours_src.as_slice()).ok()?,
-        std::str::from_utf8(theirs_src.as_slice()).ok()?,
+        std::str::from_utf8(src.base.as_slice()).ok()?,
+        std::str::from_utf8(src.ours.as_slice()).ok()?,
+        std::str::from_utf8(src.theirs.as_slice()).ok()?,
     )?;
-    let parsed = adapter.parse(merged.as_bytes()).ok()?;
-    if adapter.project(&parsed).as_slice() != merged.as_bytes() {
-        return None;
-    }
-    let mapping = adapter.identify(base, &parsed);
-    Some(MergeResult {
-        tree: IdentifiedTree::new(parsed, mapping.nodes),
-        soft: vec![Conflict::soft(
+    reparse(
+        adapter,
+        base,
+        merged.as_bytes(),
+        true,
+        vec![Conflict::soft(
             Vec::new(),
             "line/token 3-way kept both sides' disjoint edits",
         )],
-    })
+    )
 }
 
 /// Positional 3-way of the file CST (spec §3.4) when definition-granularity
@@ -251,15 +244,16 @@ fn cst_file_fallback<A: LangAdapter + ?Sized>(
     crate::graft::graft(&mut tree, store, merged).ok()?;
     tree.set_root(merged).ok()?;
     let bytes = adapter.project(&tree);
-    let parsed = adapter.parse(bytes.as_slice()).ok()?;
-    let mapping = adapter.identify(base, &parsed);
-    Some(MergeResult {
-        tree: IdentifiedTree::new(parsed, mapping.nodes),
-        soft: vec![Conflict::soft(
+    reparse(
+        adapter,
+        base,
+        bytes.as_slice(),
+        false,
+        vec![Conflict::soft(
             Vec::new(),
             "positional CST 3-way of the file (spec §3.4)",
         )],
-    })
+    )
 }
 
 /// When structural compose hard-conflicts, a clean line merge of the whole
@@ -268,18 +262,32 @@ fn cst_file_fallback<A: LangAdapter + ?Sized>(
 fn blob_file_fallback<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
-    ours: &IdentifiedTree,
-    theirs: &IdentifiedTree,
+    src: &Sources,
 ) -> Option<MergeResult> {
-    let b = adapter.project(&base.tree);
-    let o = adapter.project(&ours.tree);
-    let t = adapter.project(&theirs.tree);
-    let merged = crate::merge_blob(b.as_slice(), o.as_slice(), t.as_slice()).ok()?;
-    let parsed = adapter.parse(merged.as_slice()).ok()?;
+    let merged = crate::merge_blob(
+        src.base.as_slice(),
+        src.ours.as_slice(),
+        src.theirs.as_slice(),
+    )
+    .ok()?;
+    reparse(adapter, base, merged.as_slice(), false, Vec::new())
+}
+
+fn reparse<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    merged: &[u8],
+    lossless: bool,
+    soft: Vec<Conflict>,
+) -> Option<MergeResult> {
+    let parsed = adapter.parse(merged).ok()?;
+    if lossless && adapter.project(&parsed).as_slice() != merged {
+        return None;
+    }
     let mapping = adapter.identify(base, &parsed);
     Some(MergeResult {
         tree: IdentifiedTree::new(parsed, mapping.nodes),
-        soft: Vec::new(),
+        soft,
     })
 }
 
@@ -339,11 +347,12 @@ fn compose(
     for nid in nids {
         let o = ours_by.get(&nid).map(Vec::as_slice).unwrap_or(&[]);
         let t = theirs_by.get(&nid).map(Vec::as_slice).unwrap_or(&[]);
-        match (o.is_empty(), t.is_empty()) {
-            (false, true) => out.extend(o.iter().cloned()),
-            (true, false) => out.extend(t.iter().cloned()),
-            (false, false) => out.extend(resolve_same_node(nid, o, t, store)?),
-            (true, true) => {}
+        if o.is_empty() {
+            out.extend(t.iter().cloned());
+        } else if t.is_empty() {
+            out.extend(o.iter().cloned());
+        } else {
+            out.extend(resolve_same_node(nid, o, t, store)?);
         }
     }
 
@@ -351,21 +360,15 @@ fn compose(
     soft.extend(insert_soft);
     out.extend(inserts);
 
-    for op in ours {
-        if matches!(op, Op::Blob { .. } | Op::Tree { .. }) {
-            return Err(Conflict::hard(
-                Vec::new(),
-                "blob/tree ops are merged via merge_blob, not structural merge",
-            ));
-        }
-    }
-    for op in theirs {
-        if matches!(op, Op::Blob { .. } | Op::Tree { .. }) {
-            return Err(Conflict::hard(
-                Vec::new(),
-                "blob/tree ops are merged via merge_blob, not structural merge",
-            ));
-        }
+    if ours
+        .iter()
+        .chain(theirs)
+        .any(|op| matches!(op, Op::Blob { .. } | Op::Tree { .. }))
+    {
+        return Err(Conflict::hard(
+            Vec::new(),
+            "blob/tree ops are merged via merge_blob, not structural merge",
+        ));
     }
 
     Ok((out, soft))
@@ -425,24 +428,16 @@ fn resolve_same_node(
     match (o_rep, t_rep) {
         (Some(o), Some(t)) => {
             if same_normalized(store, o, t) {
-                let mut ops = vec![o.clone()];
-                ops.extend(non_replace(ours).cloned());
-                ops.extend(non_replace(theirs).cloned());
-                return Ok(dedup_tail(ops));
+                return Ok(assemble(vec![o.clone()], ours, theirs));
             }
             if let Some(merged) = merge_replace_via_cst(nid, o, t, store) {
-                let mut ops = vec![merged];
-                ops.extend(non_replace(ours).cloned());
-                ops.extend(non_replace(theirs).cloned());
-                return Ok(dedup_tail(ops));
+                return Ok(assemble(vec![merged], ours, theirs));
             }
             // Landing order: keep ours, then insert named child defs that
             // exist only on theirs (fields, methods, uses).
-            let mut ops = vec![o.clone()];
-            ops.extend(child_inserts_only_in(nid, o, t, store));
-            ops.extend(non_replace(ours).cloned());
-            ops.extend(non_replace(theirs).cloned());
-            Ok(dedup_tail(ops))
+            let mut head = vec![o.clone()];
+            head.extend(child_inserts_only_in(nid, o, t, store));
+            Ok(assemble(head, ours, theirs))
         }
         (Some(o), None) => {
             let mut ops = vec![o.clone()];
@@ -543,6 +538,12 @@ fn non_replace(ops: &[Op]) -> impl Iterator<Item = &Op> {
     ops.iter().filter(|o| !matches!(o, Op::Replace { .. }))
 }
 
+fn assemble(mut ops: Vec<Op>, ours: &[Op], theirs: &[Op]) -> Vec<Op> {
+    ops.extend(non_replace(ours).cloned());
+    ops.extend(non_replace(theirs).cloned());
+    dedup_tail(ops)
+}
+
 fn same_normalized(store: &NodeTree, ours: &Op, theirs: &Op) -> bool {
     let (Op::Replace { to: a, .. }, Op::Replace { to: b, .. }) = (ours, theirs) else {
         return false;
@@ -554,28 +555,18 @@ fn same_normalized(store: &NodeTree, ours: &Op, theirs: &Op) -> bool {
 }
 
 fn compose_move_rename(nid: NodeId, ours: &[Op], theirs: &[Op]) -> Result<Vec<Op>, Conflict> {
-    let o_mv = ours.iter().find(|o| matches!(o, Op::Move { .. }));
-    let t_mv = theirs.iter().find(|o| matches!(o, Op::Move { .. }));
-    match (o_mv, t_mv) {
-        (Some(o), Some(t)) if o != t => {
-            return Err(Conflict::hard(
-                vec![nid],
-                "Move to different destinations on the same NodeId",
-            ));
-        }
-        _ => {}
-    }
-    let o_rn = ours.iter().find(|o| matches!(o, Op::Rename { .. }));
-    let t_rn = theirs.iter().find(|o| matches!(o, Op::Rename { .. }));
-    match (o_rn, t_rn) {
-        (Some(o), Some(t)) if o != t => {
-            return Err(Conflict::hard(
-                vec![nid],
-                "Rename to different names on the same NodeId",
-            ));
-        }
-        _ => {}
-    }
+    reject_distinct(
+        nid,
+        ours.iter().find(|o| matches!(o, Op::Move { .. })),
+        theirs.iter().find(|o| matches!(o, Op::Move { .. })),
+        "Move to different destinations on the same NodeId",
+    )?;
+    reject_distinct(
+        nid,
+        ours.iter().find(|o| matches!(o, Op::Rename { .. })),
+        theirs.iter().find(|o| matches!(o, Op::Rename { .. })),
+        "Rename to different names on the same NodeId",
+    )?;
     // Rule 4: Rename composes with Replace (handled above). Move+Rename compose.
     let mut ops = ours.to_vec();
     for t in theirs {
@@ -584,6 +575,20 @@ fn compose_move_rename(nid: NodeId, ours: &[Op], theirs: &[Op]) -> Result<Vec<Op
         }
     }
     Ok(ops)
+}
+
+fn reject_distinct(
+    nid: NodeId,
+    left: Option<&Op>,
+    right: Option<&Op>,
+    reason: &str,
+) -> Result<(), Conflict> {
+    if let (Some(left), Some(right)) = (left, right)
+        && left != right
+    {
+        return Err(Conflict::hard(vec![nid], reason));
+    }
+    Ok(())
 }
 
 fn dedup_tail(ops: Vec<Op>) -> Vec<Op> {
@@ -597,80 +602,77 @@ fn dedup_tail(ops: Vec<Op>) -> Vec<Op> {
     out
 }
 
+#[derive(Clone, Copy)]
+struct InsertAt {
+    parent: NodeId,
+    index: u32,
+    node: ObjectId,
+}
+
 fn compose_inserts(ours: &[Op], theirs: &[Op]) -> (Vec<Op>, Vec<Conflict>) {
-    let o_ins: Vec<&Op> = ours
-        .iter()
-        .filter(|o| matches!(o, Op::Insert { .. }))
-        .collect();
-    let t_ins: Vec<&Op> = theirs
-        .iter()
-        .filter(|o| matches!(o, Op::Insert { .. }))
-        .collect();
+    let ours_at = insert_ats(ours);
+    let theirs_at = insert_ats(theirs);
     let mut soft = Vec::new();
-    let mut out = Vec::new();
-    for o in &o_ins {
-        out.push((*o).clone());
-    }
-    for t in &t_ins {
-        let Op::Insert {
-            parent,
-            index,
-            node,
-        } = t
-        else {
-            continue;
-        };
-        let clash = o_ins.iter().any(|o| {
-            matches!(
-                o,
-                Op::Insert {
-                    parent: p,
-                    index: i,
-                    ..
-                } if p == parent && i == index
-            )
-        });
+    let mut out: Vec<Op> = ours_at.iter().copied().map(InsertAt::into_op).collect();
+    for ins in &theirs_at {
+        let clash = ours_at
+            .iter()
+            .any(|o| o.parent == ins.parent && o.index == ins.index);
         if clash {
             soft.push(Conflict::soft(
-                vec![*parent],
+                vec![ins.parent],
                 format!(
-                    "two inserts at parent {parent} index {index}; landing order then NodeId (spec §5.2 rule 1)"
+                    "two inserts at parent {} index {}; landing order then NodeId (spec §5.2 rule 1)",
+                    ins.parent, ins.index
                 ),
             ));
         }
-        let shift = o_ins
-            .iter()
-            .filter(|o| {
-                matches!(
-                    o,
-                    Op::Insert {
-                        parent: p,
-                        index: i,
-                        ..
-                    } if p == parent && *i <= *index
-                )
-            })
-            .count();
-        let new_index = index.saturating_add(u32::try_from(shift).unwrap_or(0));
         // Identical insert (same object) at the same slot: skip duplicate.
-        let dup = o_ins.iter().any(|o| {
-            matches!(
-                o,
-                Op::Insert {
-                    parent: p,
-                    index: i,
-                    node: n,
-                } if p == parent && i == index && n == node
-            )
-        });
-        if dup {
+        if ours_at
+            .iter()
+            .any(|o| o.parent == ins.parent && o.index == ins.index && o.node == ins.node)
+        {
             continue;
         }
-        out.push(Op::Insert {
-            parent: *parent,
-            index: new_index,
-            node: *node,
-        });
+        let shift = ours_at
+            .iter()
+            .filter(|o| o.parent == ins.parent && o.index <= ins.index)
+            .count();
+        out.push(
+            InsertAt {
+                parent: ins.parent,
+                index: ins.index.saturating_add(u32::try_from(shift).unwrap_or(0)),
+                node: ins.node,
+            }
+            .into_op(),
+        );
     }
     (out, soft)
+}
+
+fn insert_ats(ops: &[Op]) -> Vec<InsertAt> {
+    ops.iter()
+        .filter_map(|op| match op {
+            Op::Insert {
+                parent,
+                index,
+                node,
+            } => Some(InsertAt {
+                parent: *parent,
+                index: *index,
+                node: *node,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+impl InsertAt {
+    fn into_op(self) -> Op {
+        Op::Insert {
+            parent: self.parent,
+            index: self.index,
+            node: self.node,
+        }
+    }
 }

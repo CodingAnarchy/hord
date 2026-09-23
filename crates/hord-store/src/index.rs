@@ -10,7 +10,7 @@
 //! The longest identity supersede chain for a snapshot wins. Equal lengths break
 //! ties by the greater binding [`hord_core::ObjectId`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hord_core::{
     ChangeId, ChangeRecord, IdentityDelta, IdentityMap, NodeId, NodePath, ObjectId, Op, SnapshotId,
@@ -24,10 +24,15 @@ use crate::{Error, Result};
 const INDEX_FACT_FORMAT: u8 = 1;
 const PRESENT: &[u8] = &[0];
 
+/// Canonical CBOR prefix of [`IndexFact::Edge`]: a one-entry map keyed by `"Edge"`.
+const EDGE_FACT_PREFIX: &[u8] = b"\xa1\x64Edge";
+/// Canonical CBOR prefix of [`IndexFact::Identity`].
+const IDENTITY_FACT_PREFIX: &[u8] = b"\xa1\x68Identity";
+
 const SNAP_LEN: usize = ObjectId::LEN;
 const NODE_LEN: usize = 16;
 /// `snapshot || kind || source || target`
-const EDGE_KEY_LEN: usize = SNAP_LEN + 1 + NODE_LEN + NODE_LEN;
+pub(super) const EDGE_KEY_LEN: usize = SNAP_LEN + 1 + NODE_LEN + NODE_LEN;
 const EDGE_PREFIX_LEN: usize = SNAP_LEN + 1 + NODE_LEN;
 
 const NODE_HISTORY: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("node_history");
@@ -128,6 +133,17 @@ impl Store {
         target: NodeId,
     ) -> Result<ObjectId> {
         let _guard = self.lock_index();
+        let key = edge_key(snapshot, kind, source, target);
+        if super::lock(&self.seen_edges).contains(&key) {
+            let bytes = hord_encoding::encode(&IndexFact::Edge {
+                format: INDEX_FACT_FORMAT,
+                snapshot,
+                kind,
+                source,
+                target,
+            })?;
+            return Ok(ObjectId::from_canonical(&bytes));
+        }
         let id = self.put_object(&IndexFact::Edge {
             format: INDEX_FACT_FORMAT,
             snapshot,
@@ -138,12 +154,12 @@ impl Store {
         let txn = self.db.begin_write().map_err(Error::index)?;
         {
             let mut table = txn.open_table(EDGES).map_err(Error::index)?;
-            let key = edge_key(snapshot, kind, source, target);
             table
                 .insert(key.as_slice(), PRESENT)
                 .map_err(Error::index)?;
         }
         txn.commit().map_err(Error::index)?;
+        super::lock(&self.seen_edges).insert(key);
         Ok(id)
     }
 
@@ -171,7 +187,8 @@ impl Store {
             }
             targets.push(node_from_bytes(&key[EDGE_PREFIX_LEN..])?);
         }
-        targets.sort_unstable();
+        // The target is the last key field, big-endian, so the range is already
+        // in NodeId order.
         Ok(targets)
     }
 
@@ -254,13 +271,13 @@ impl Store {
     pub fn index_change(&self, change: ChangeId) -> Result<()> {
         let _guard = self.lock_index();
         self.flush()?;
-        let log = self.log()?;
-        if !log.contains(&change) {
+        let log = self.ensure_landing_log()?;
+        if !log.first_pos.contains_key(&change) {
             return Err(Error::NotInLog(change));
         }
         let bytes = self.get(change)?;
         let record: ChangeRecord = hord_encoding::decode(&bytes)?;
-        self.insert_history(&log, change, &touched_nodes(&record))
+        self.insert_history(&log.first_pos, change, &touched_nodes(&record))
     }
 
     /// Replace `node_history`, `edges`, and `identity` from stored objects.
@@ -325,24 +342,37 @@ impl Store {
 
     fn insert_history(
         &self,
-        log: &[ChangeId],
+        pos_of: &HashMap<ChangeId, usize>,
         change: ChangeId,
         nodes: &BTreeSet<NodeId>,
     ) -> Result<()> {
         if nodes.is_empty() {
             return Ok(());
         }
+        // `index_change` holds `index_lock`, so these rows cannot change before
+        // the write below. A no-op reindex then skips the durable commit.
+        let mut updates = Vec::new();
+        {
+            let txn = self.db.begin_read().map_err(Error::index)?;
+            let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
+            for node in nodes {
+                let key = node_key(*node);
+                let existing = table
+                    .get(key.as_slice())
+                    .map_err(Error::index)?
+                    .map(|value| value.value().to_vec());
+                if let Some(encoded) = history_value(existing.as_deref(), change, pos_of)? {
+                    updates.push((key, encoded));
+                }
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
         let txn = self.db.begin_write().map_err(Error::index)?;
         {
             let mut table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
-            for node in nodes {
-                let key = node_key(*node);
-                let mut ids = match table.get(key.as_slice()).map_err(Error::index)? {
-                    Some(value) => decode_change_ids(value.value())?,
-                    None => Vec::new(),
-                };
-                insert_in_log_order(&mut ids, change, log);
-                let encoded = encode_change_ids(&ids);
+            for (key, encoded) in &updates {
                 table
                     .insert(key.as_slice(), encoded.as_slice())
                     .map_err(Error::index)?;
@@ -355,16 +385,18 @@ impl Store {
     fn history_from_log(&self) -> Result<BTreeMap<NodeId, Vec<ChangeId>>> {
         let log = self.log()?;
         let mut history: BTreeMap<NodeId, Vec<ChangeId>> = BTreeMap::new();
+        let mut seen = HashSet::with_capacity(log.len());
         for change in log {
+            // A repeated ChangeId is the same record. One pass records every touch.
+            if !seen.insert(change) {
+                continue;
+            }
             let bytes = self.get(change)?;
             let Ok(record) = hord_encoding::decode::<ChangeRecord>(&bytes) else {
                 continue;
             };
             for node in touched_nodes(&record) {
-                let ids = history.entry(node).or_default();
-                if !ids.contains(&change) {
-                    ids.push(change);
-                }
+                history.entry(node).or_default().push(change);
             }
         }
         Ok(history)
@@ -374,6 +406,9 @@ impl Store {
         let mut edges = Vec::new();
         let mut bindings = Vec::new();
         self.for_each_stored_object(|id, bytes| {
+            if !looks_like_index_fact(bytes) {
+                return Ok(());
+            }
             match hord_encoding::decode::<IndexFact>(bytes) {
                 Ok(IndexFact::Edge {
                     format,
@@ -591,11 +626,18 @@ fn remove_snapshot_identity(
     table: &mut Table<'_, &[u8], &[u8]>,
     snapshot: SnapshotId,
 ) -> Result<()> {
-    let prefix = snapshot.as_bytes().as_slice();
+    let prefix = *snapshot.as_bytes();
+    let end = prefix_successor(&prefix);
     let mut keys = Vec::new();
-    for entry in table.iter().map_err(Error::index)? {
-        let (key, _) = entry.map_err(Error::index)?;
-        if key.value().starts_with(prefix) {
+    {
+        let range = match &end {
+            Some(end) => table
+                .range(prefix.as_slice()..end.as_slice())
+                .map_err(Error::index)?,
+            None => table.range(prefix.as_slice()..).map_err(Error::index)?,
+        };
+        for entry in range {
+            let (key, _) = entry.map_err(Error::index)?;
             keys.push(key.value().to_vec());
         }
     }
@@ -610,24 +652,100 @@ fn clear_table(table: &mut Table<'_, &[u8], &[u8]>) -> Result<()> {
     Ok(())
 }
 
-fn insert_in_log_order(ids: &mut Vec<ChangeId>, change: ChangeId, log: &[ChangeId]) {
-    if ids.contains(&change) {
-        return;
+fn history_value(
+    existing: Option<&[u8]>,
+    change: ChangeId,
+    pos_of: &HashMap<ChangeId, usize>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(bytes) = existing else {
+        return Ok(Some(change.as_bytes().to_vec()));
+    };
+    match plan_history_update(bytes, change, pos_of) {
+        HistoryPlan::Unchanged => Ok(None),
+        HistoryPlan::Replace(updated) => Ok(Some(updated)),
+        HistoryPlan::Resort => {
+            let mut ids = decode_change_ids(bytes)?;
+            let before = ids.len();
+            insert_in_log_order(&mut ids, change, pos_of);
+            if ids.len() == before {
+                Ok(None)
+            } else {
+                Ok(Some(encode_change_ids(&ids)))
+            }
+        }
     }
-    let pos = log
-        .iter()
-        .position(|id| *id == change)
-        .unwrap_or(usize::MAX);
-    let at = ids
-        .iter()
-        .position(|existing| {
-            log.iter()
-                .position(|id| id == existing)
-                .unwrap_or(usize::MAX)
-                > pos
-        })
-        .unwrap_or(ids.len());
+}
+
+enum HistoryPlan {
+    Unchanged,
+    Replace(Vec<u8>),
+    Resort,
+}
+
+/// Append when `change` lands after every id already stored. Otherwise the
+/// caller re-sorts. Positions come from the first landing index.
+fn plan_history_update(
+    existing: &[u8],
+    change: ChangeId,
+    pos_of: &HashMap<ChangeId, usize>,
+) -> HistoryPlan {
+    if existing.is_empty() || !existing.len().is_multiple_of(ObjectId::LEN) {
+        return HistoryPlan::Resort;
+    }
+    let last = &existing[existing.len() - ObjectId::LEN..];
+    let Ok(last_id) = ObjectId::try_from(last) else {
+        return HistoryPlan::Resort;
+    };
+    let last_pos = pos_of.get(&last_id).copied().unwrap_or(usize::MAX);
+    let change_pos = pos_of.get(&change).copied().unwrap_or(usize::MAX);
+    if change_pos < last_pos {
+        return HistoryPlan::Resort;
+    }
+    if change_pos == last_pos {
+        return if last_id == change {
+            HistoryPlan::Unchanged
+        } else {
+            HistoryPlan::Resort
+        };
+    }
+    let mut out = Vec::with_capacity(existing.len() + ObjectId::LEN);
+    out.extend_from_slice(existing);
+    out.extend_from_slice(change.as_bytes());
+    HistoryPlan::Replace(out)
+}
+
+fn insert_in_log_order(
+    ids: &mut Vec<ChangeId>,
+    change: ChangeId,
+    pos_of: &HashMap<ChangeId, usize>,
+) {
+    let pos = pos_of.get(&change).copied().unwrap_or(usize::MAX);
+    let at =
+        ids.partition_point(|existing| pos_of.get(existing).copied().unwrap_or(usize::MAX) <= pos);
+    let mut index = at;
+    while index > 0 && pos_of.get(&ids[index - 1]).copied().unwrap_or(usize::MAX) == pos {
+        if ids[index - 1] == change {
+            return;
+        }
+        index -= 1;
+    }
     ids.insert(at, change);
+}
+
+fn looks_like_index_fact(bytes: &[u8]) -> bool {
+    bytes.starts_with(EDGE_FACT_PREFIX) || bytes.starts_with(IDENTITY_FACT_PREFIX)
+}
+
+/// Exclusive end of the key range that starts with `prefix`.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last != 0xff {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 fn edge_key(
@@ -711,7 +829,10 @@ mod tests {
     };
     use hord_encoding::{decode, encode};
 
-    use super::{FoundBinding, IndexFact, chain_len, select_identity_heads, touched_nodes};
+    use super::{
+        FoundBinding, IndexFact, chain_len, insert_in_log_order, looks_like_index_fact,
+        prefix_successor, select_identity_heads, touched_nodes,
+    };
 
     fn nid(n: u128) -> NodeId {
         NodeId::from_u128(n)
@@ -743,6 +864,8 @@ mod tests {
         };
         let bytes = encode(&edge).unwrap();
         assert_eq!(encode(&edge).unwrap(), bytes);
+        assert!(bytes.starts_with(super::EDGE_FACT_PREFIX));
+        assert!(looks_like_index_fact(&bytes));
         assert_eq!(decode::<IndexFact>(&bytes).unwrap(), edge);
 
         let identity = IndexFact::Identity {
@@ -752,6 +875,8 @@ mod tests {
             supersedes: Some(oid(5)),
         };
         let bytes = encode(&identity).unwrap();
+        assert!(bytes.starts_with(super::IDENTITY_FACT_PREFIX));
+        assert!(looks_like_index_fact(&bytes));
         assert_eq!(decode::<IndexFact>(&bytes).unwrap(), identity);
 
         let blob = encode(&Blob::new(b"hi".to_vec())).unwrap();
@@ -876,6 +1001,60 @@ mod tests {
         assert!(!got.contains(&read));
         let bytes = encode(&record).unwrap();
         assert!(decode::<IndexFact>(&bytes).is_err());
+        assert!(!looks_like_index_fact(&bytes));
+    }
+
+    #[test]
+    fn insert_in_log_order_matches_a_full_scan() {
+        let log: Vec<ObjectId> = (0..24u8).map(oid).collect();
+        let pos: HashMap<_, _> = log
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
+        let mut got = Vec::new();
+        let mut expect = Vec::new();
+        let steps = [5u8, 1, 19, 0, 5, 7, 3, 2, 18, 4, 19, 23, 6, 1, 8];
+        for step in steps {
+            let change = oid(step);
+            insert_in_log_order(&mut got, change, &pos);
+            insert_by_scanning(&mut expect, change, &log);
+            assert_eq!(got, expect);
+        }
+    }
+
+    fn insert_by_scanning(ids: &mut Vec<ObjectId>, change: ObjectId, log: &[ObjectId]) {
+        if ids.contains(&change) {
+            return;
+        }
+        let pos = log
+            .iter()
+            .position(|id| *id == change)
+            .unwrap_or(usize::MAX);
+        let at = ids
+            .iter()
+            .position(|existing| {
+                log.iter()
+                    .position(|id| id == existing)
+                    .unwrap_or(usize::MAX)
+                    > pos
+            })
+            .unwrap_or(ids.len());
+        ids.insert(at, change);
+    }
+
+    #[test]
+    fn prefix_successor_covers_exactly_the_prefix() {
+        assert_eq!(prefix_successor(&[0x01, 0x02]).unwrap(), vec![0x01, 0x03]);
+        assert_eq!(prefix_successor(&[0x01, 0xff]).unwrap(), vec![0x02]);
+        assert!(prefix_successor(&[0xff, 0xff]).is_none());
+        let prefix = [0x10u8, 0xff];
+        let end = prefix_successor(&prefix).unwrap();
+        assert!(prefix.as_slice() < end.as_slice());
+        let with_tail = [0x10u8, 0xff, 0x00];
+        assert!(with_tail.as_slice() < end.as_slice());
+        assert!(end.as_slice() <= [0x11].as_slice());
     }
 
     #[test]

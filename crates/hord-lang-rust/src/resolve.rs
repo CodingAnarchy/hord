@@ -81,7 +81,7 @@ pub(crate) fn resolve_name(ctx: &ResolveCtx, name: &NameRef) -> Option<NodeId> {
     }
     let idx = Index::build(ctx);
     let scope = name.scope.as_ref().map(QualifiedName::as_str);
-    let hits = idx.lookup(scope, None, None, name.name.as_str());
+    let hits = idx.lookup(scope, None, name.name.as_str());
     let mut ids: Vec<NodeId> = hits.finals.into_iter().filter_map(real_id).collect();
     ids.sort();
     ids.dedup();
@@ -190,6 +190,10 @@ fn assign_modules(files: &[RustFile<'_>]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Cargo roots in one snapshot: `src/lib.rs`, `src/main.rs`, `src/bin/*.rs`,
+/// a top-level `build.rs`, and each `tests`, `examples`, or `benches` entry
+/// file. With more than one root, a root's module path is its repository
+/// path without the `.rs` suffix.
 fn is_crate_root(path: &RepoPath) -> bool {
     let c = path.components();
     let Some(name) = c.last().map(String::as_str) else {
@@ -331,15 +335,12 @@ fn join_relative(dir: &[String], rel: &str) -> Option<Vec<String>> {
 }
 
 fn parse_mods(source: &[u8]) -> Vec<ModFound> {
-    cst::with_parser(|parser| {
-        let Some(tree) = parser.parse(source, None) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        collect_mods(tree.root_node(), source, &mut out);
-        out
-    })
-    .unwrap_or_default()
+    let Ok(Some(tree)) = cst::with_parser(|parser| parser.parse(source, None)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_mods(tree.root_node(), source, &mut out);
+    out
 }
 
 fn collect_mods(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<ModFound>) {
@@ -503,25 +504,22 @@ fn fallback_parent(kind: &str) -> String {
 }
 
 fn collect_ts(source: &[u8], module: &[String]) -> (Vec<(String, TsInfo)>, Vec<RawImport>) {
-    cst::with_parser(|parser| {
-        let Some(tree) = parser.parse(source, None) else {
-            return (Vec::new(), Vec::new());
-        };
-        let mut infos = Vec::new();
-        let mut imports = Vec::new();
-        walk_ts(
-            tree.root_node(),
-            source,
-            module,
-            &[],
-            false,
-            Flags::default(),
-            &mut infos,
-            &mut imports,
-        );
-        (infos, imports)
-    })
-    .unwrap_or_default()
+    let Ok(Some(tree)) = cst::with_parser(|parser| parser.parse(source, None)) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut infos = Vec::new();
+    let mut imports = Vec::new();
+    walk_ts(
+        tree.root_node(),
+        source,
+        module,
+        &[],
+        false,
+        Flags::default(),
+        &mut infos,
+        &mut imports,
+    );
+    (infos, imports)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -689,6 +687,10 @@ fn simple_of(node: tree_sitter::Node<'_>, source: &[u8], kind: &str) -> String {
     }
 }
 
+/// Link from a nested definition back to its owner.
+///
+/// `impl|{type}|{trait}`, `trait|{name}`, `assoc|{name}`, `field|{owner}`,
+/// or `variant|{enum}`. Empty when the name lives in the module namespace.
 fn parent_of(frames: &[Frame], kind: &str) -> String {
     let in_impl = matches!(
         kind,
@@ -840,37 +842,34 @@ fn attr_is_cfg_test(attr_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     cfg_tree_is_test(args, source)
 }
 
+fn is_inner_cfg_test(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    node.kind() == "inner_attribute_item" && attr_is_cfg_test(node, source)
+}
+
+fn direct_inner_cfg_test(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    structural_children(node)
+        .into_iter()
+        .any(|child| is_inner_cfg_test(child, source))
+}
+
+/// `#![cfg(test)]` attached to `node`.
+///
+/// The attribute is a direct child of `source_file`, or a direct child of the
+/// item body (`declaration_list` for modules, `block` for functions).
 fn item_inner_cfg_test(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    if node.kind() == "inner_attribute_item" && attr_is_cfg_test(node, source) {
+    if is_inner_cfg_test(node, source) || direct_inner_cfg_test(node, source) {
         return true;
     }
-    // `#![cfg(test)]` is a direct child of the item or of its body list.
-    for child in structural_children(node) {
-        if child.kind() == "inner_attribute_item" && attr_is_cfg_test(child, source) {
-            return true;
-        }
+    if let Some(body) = node.child_by_field_name("body")
+        && direct_inner_cfg_test(body, source)
+    {
+        return true;
     }
-    let bodies: Vec<tree_sitter::Node<'_>> = structural_children(node)
-        .into_iter()
-        .filter(|n| {
-            n.kind() == "declaration_list"
-                || n.kind() == "block"
-                || n.child_by_field_name("body").is_some()
-        })
-        .collect();
-    let mut lists = Vec::new();
-    if let Some(body) = node.child_by_field_name("body") {
-        lists.push(body);
-    }
-    lists.extend(bodies);
-    for list in lists {
-        for child in structural_children(list) {
-            if child.kind() == "inner_attribute_item" && attr_is_cfg_test(child, source) {
-                return true;
-            }
-        }
-    }
-    false
+    structural_children(node).into_iter().any(|child| {
+        let body_list = matches!(child.kind(), "declaration_list" | "block")
+            || child.child_by_field_name("body").is_some();
+        body_list && direct_inner_cfg_test(child, source)
+    })
 }
 
 fn cfg_tree_is_test(tree: tree_sitter::Node<'_>, source: &[u8]) -> bool {
@@ -895,6 +894,8 @@ fn eval_cfg(nodes: &[tree_sitter::Node<'_>], source: &[u8]) -> bool {
             .iter()
             .any(|n| n.kind() == "token_tree" && cfg_tree_is_test(*n, source));
     };
+    // `not` is not unfolded: `cfg(not(test))` is never test code.
+    // `all` counts when any argument mentions `test`, same as `any`.
     if head == "not" {
         return false;
     }
@@ -981,17 +982,26 @@ fn attribute_path(attr_item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
     Vec::new()
 }
 
+/// Contents of a `#[path = …]` string: `"…"`, `b"…"`, `r"…"`, `r#"…"#`, `br#"…"#`.
 fn unquote(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let text = node_text(node, source)?;
-    let t = text.trim();
-    if let Some(rest) = t.strip_prefix("r#\"") {
-        return rest.strip_suffix("\"#").map(str::to_owned);
+    rust_string_contents(text.trim())
+}
+
+fn rust_string_contents(text: &str) -> Option<String> {
+    let rest = text.strip_prefix('b').unwrap_or(text);
+    if let Some(rest) = rest.strip_prefix('r') {
+        let hashes = rest.bytes().take_while(|b| *b == b'#').count();
+        let rest = rest.get(hashes..)?.strip_prefix('"')?;
+        let suffix_len = 1 + hashes;
+        let (body, suffix) = rest.split_at_checked(rest.len().checked_sub(suffix_len)?)?;
+        if suffix.starts_with('"') && suffix[1..].bytes().all(|b| b == b'#') {
+            return Some(body.to_owned());
+        }
+        return None;
     }
-    if let Some(rest) = t.strip_prefix("b\"") {
-        return rest.strip_suffix('"').map(str::to_owned);
-    }
-    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
-        return Some(t[1..t.len() - 1].to_owned());
+    if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
+        return Some(rest[1..rest.len() - 1].to_owned());
     }
     None
 }
@@ -1146,9 +1156,12 @@ struct PathHits {
 #[derive(Clone, Debug)]
 struct Hit {
     node_id: Option<NodeId>,
+    /// Module path, or the crate key when `kind` is [`HitKind::Type`].
     module: String,
     def_index: Option<usize>,
     kind: HitKind,
+    /// Set for [`HitKind::Type`]: the type `Self` names (`Point`, or a trait).
+    type_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1284,7 +1297,7 @@ impl Index {
         let mut hits = Vec::new();
         for (n, seg) in segs.iter().enumerate() {
             let head = if n == 0 {
-                self.head_status(module, seg, None, None)?
+                self.head_status(module, seg, None)?
             } else {
                 let mut next = Vec::new();
                 let mut pending = false;
@@ -1329,13 +1342,7 @@ impl Index {
         })
     }
 
-    fn head_status(
-        &self,
-        module: &str,
-        seg: &str,
-        self_ty: Option<&str>,
-        self_tr: Option<&str>,
-    ) -> Option<Head> {
+    fn head_status(&self, module: &str, seg: &str, self_ty: Option<&str>) -> Option<Head> {
         match seg {
             "crate" => Some(Head::Ready(vec![self.module_hit(crate_key(module))])),
             "self" => Some(Head::Ready(vec![self.module_hit(module)])),
@@ -1344,7 +1351,7 @@ impl Index {
                 None => Head::Missing,
             }),
             "::" => Some(Head::Missing),
-            "Self" => Some(Head::Ready(self.self_hits(module, self_ty, self_tr))),
+            "Self" => Some(Head::Ready(self.self_hits(module, self_ty))),
             _ => Some(self.ident_status(module, seg)),
         }
     }
@@ -1457,9 +1464,8 @@ impl Index {
                 }
             }
             HitKind::Type => {
-                let crate_k = crate_key_of_type_hit(hit);
-                let key = type_key_of_type_hit(hit);
-                let hits = self.associated_hits(&crate_k, &key, seg, false);
+                let key = hit.type_name.as_deref().unwrap_or("");
+                let hits = self.associated_hits(&hit.module, key, seg, false);
                 if hits.is_empty() {
                     Head::Missing
                 } else {
@@ -1492,7 +1498,7 @@ impl Index {
         hits
     }
 
-    fn self_hits(&self, module: &str, self_ty: Option<&str>, _self_tr: Option<&str>) -> Vec<Hit> {
+    fn self_hits(&self, module: &str, self_ty: Option<&str>) -> Vec<Hit> {
         let Some(ty) = self_ty.filter(|s| !s.is_empty()) else {
             return Vec::new();
         };
@@ -1510,12 +1516,13 @@ impl Index {
                 }
             }
         }
-        // `{crate_key}\u{1}{type}` so a type hit carries both without a NodeId.
+        // Type hit: `Self::item` matches associated items of `ty` with no NodeId of its own.
         hits.push(Hit {
             node_id: None,
-            module: format!("{}\u{1}{ty}", crate_key(module)),
+            module: crate_key(module).to_owned(),
             def_index: None,
             kind: HitKind::Type,
+            type_name: Some(ty.to_owned()),
         });
         hits
     }
@@ -1537,6 +1544,7 @@ impl Index {
             module: module.to_owned(),
             def_index: None,
             kind: HitKind::Module,
+            type_name: None,
         }
     }
 
@@ -1549,6 +1557,7 @@ impl Index {
                 module: mod_join(&def.module, &def.simple),
                 def_index: Some(i),
                 kind: HitKind::Module,
+                type_name: None,
             }
         } else {
             Hit {
@@ -1556,17 +1565,12 @@ impl Index {
                 module: def.module.clone(),
                 def_index: Some(i),
                 kind: HitKind::Def,
+                type_name: None,
             }
         }
     }
 
-    fn lookup(
-        &self,
-        scope: Option<&str>,
-        self_ty: Option<&str>,
-        self_tr: Option<&str>,
-        written: &str,
-    ) -> PathHits {
+    fn lookup(&self, scope: Option<&str>, self_ty: Option<&str>, written: &str) -> PathHits {
         let scope_owned;
         let module = if let Some(scope) = scope.filter(|s| !s.is_empty()) {
             scope
@@ -1576,7 +1580,7 @@ impl Index {
         } else {
             return self.lookup_everywhere(written);
         };
-        self.lookup_in(module, self_ty, self_tr, written)
+        self.lookup_in(module, self_ty, written)
     }
 
     fn lookup_everywhere(&self, written: &str) -> PathHits {
@@ -1589,7 +1593,7 @@ impl Index {
             .chain(self.files.values().cloned())
             .collect();
         for module in modules {
-            let hits = self.lookup_in(&module, None, None, written);
+            let hits = self.lookup_in(&module, None, written);
             all.extend(hits.all);
             finals.extend(hits.finals);
         }
@@ -1598,13 +1602,7 @@ impl Index {
         PathHits { all, finals }
     }
 
-    fn lookup_in(
-        &self,
-        module: &str,
-        self_ty: Option<&str>,
-        self_tr: Option<&str>,
-        written: &str,
-    ) -> PathHits {
+    fn lookup_in(&self, module: &str, self_ty: Option<&str>, written: &str) -> PathHits {
         let written = written.trim();
         if let Some(name) = written.strip_prefix('.') {
             let ids = self.method_ids(crate_key(module), name.trim());
@@ -1631,7 +1629,7 @@ impl Index {
             };
         }
         let mut all = Vec::new();
-        let mut current = match self.head_status(module, &segs[0], self_ty, self_tr) {
+        let mut current = match self.head_status(module, &segs[0], self_ty) {
             Some(Head::Ready(hits)) => hits,
             _ => Vec::new(),
         };
@@ -1643,7 +1641,7 @@ impl Index {
             };
         }
         all.extend(first_ids);
-        for (n, seg) in segs.iter().enumerate().skip(1) {
+        for seg in segs.iter().skip(1) {
             let mut next = Vec::new();
             for hit in &current {
                 if let Head::Ready(hits) = self.step_status(hit, seg) {
@@ -1651,17 +1649,12 @@ impl Index {
                 }
             }
             current = next;
-            let ids = hit_ids(&current);
-            all.extend(&ids);
-            if n + 1 == segs.len() {
-                dedup_ids(&mut all);
-                return PathHits { all, finals: ids };
-            }
+            all.extend(hit_ids(&current));
         }
         dedup_ids(&mut all);
         PathHits {
-            all: all.clone(),
-            finals: all,
+            all,
+            finals: hit_ids(&current),
         }
     }
 
@@ -1707,18 +1700,9 @@ impl Index {
             && let Some(&i) = self.by_object.get(&oid)
         {
             let def = &self.defs[i];
-            let (self_ty, self_tr) = split_impl(&def.parent)
-                .map(|(ty, tr)| {
-                    (
-                        (!ty.is_empty()).then(|| ty.to_owned()),
-                        (!tr.is_empty()).then(|| tr.to_owned()),
-                    )
-                })
-                .unwrap_or((None, None));
             return Scope {
                 module: def.module.clone(),
-                self_ty,
-                self_tr,
+                self_ty: self_type_of(&def.parent),
                 cfg_test: def.cfg_test,
             };
         }
@@ -1728,7 +1712,6 @@ impl Index {
             return Scope {
                 module: module.clone(),
                 self_ty: None,
-                self_tr: None,
                 cfg_test: false,
             };
         }
@@ -1736,14 +1719,12 @@ impl Index {
             return Scope {
                 module: self.crate_keys.iter().next().cloned().unwrap_or_default(),
                 self_ty: None,
-                self_tr: None,
                 cfg_test: false,
             };
         }
         Scope {
             module: String::new(),
             self_ty: None,
-            self_tr: None,
             cfg_test: false,
         }
     }
@@ -1773,24 +1754,26 @@ struct ImportWalk {
 struct Scope {
     module: String,
     self_ty: Option<String>,
-    self_tr: Option<String>,
     cfg_test: bool,
 }
 
-fn crate_key_of_type_hit(hit: &Hit) -> String {
-    hit.module
-        .split('\u{1}')
-        .next()
-        .unwrap_or(hit.module.as_str())
-        .to_owned()
-}
-
-fn type_key_of_type_hit(hit: &Hit) -> String {
-    hit.module
-        .split('\u{1}')
-        .nth(1)
-        .unwrap_or(hit.module.as_str())
-        .to_owned()
+/// Type that `Self` names in `parent`.
+///
+/// `impl|{type}|{trait}` uses the type. `trait|{name}` and `assoc|{name}`
+/// use that trait, so `Self::item` inside the trait sees its associated items.
+fn self_type_of(parent: &str) -> Option<String> {
+    if let Some((ty, _)) = split_impl(parent) {
+        return (!ty.is_empty()).then(|| ty.to_owned());
+    }
+    for prefix in ["trait|", "assoc|"] {
+        if let Some(name) = parent.strip_prefix(prefix)
+            && !name.is_empty()
+            && !name.contains('|')
+        {
+            return Some(name.to_owned());
+        }
+    }
+    None
 }
 
 fn is_method_parent(parent: &str) -> bool {
@@ -1877,7 +1860,6 @@ fn refs_from_node(idx: &Index, node: &Node) -> Vec<NameRef> {
                 source: bytes.as_slice(),
                 module: scope.module,
                 self_ty: scope.self_ty,
-                self_tr: scope.self_tr,
                 refs: Vec::new(),
             };
             walk.walk(tree.root_node());
@@ -1900,7 +1882,6 @@ struct RefWalk<'a> {
     source: &'a [u8],
     module: String,
     self_ty: Option<String>,
-    self_tr: Option<String>,
     refs: Vec<NameRef>,
 }
 
@@ -1922,24 +1903,25 @@ impl RefWalk<'_> {
             }
             "impl_item" => {
                 let saved_ty = self.self_ty.clone();
-                let saved_tr = self.self_tr.clone();
                 let ty = type_key(&field_text(node, self.source, "type").unwrap_or_default());
-                let tr = field_text(node, self.source, "trait").map(|t| type_key(&t));
                 if !ty.is_empty() {
                     self.self_ty = Some(ty);
                 }
-                self.self_tr = tr;
-                if let Some(ty_node) = node.child_by_field_name("type") {
-                    self.walk(ty_node);
-                }
-                if let Some(tr_node) = node.child_by_field_name("trait") {
-                    self.walk(tr_node);
-                }
-                if let Some(body) = node.child_by_field_name("body") {
-                    self.walk(body);
+                // Header bounds and the where clause are part of the item.
+                for child in structural_children(node) {
+                    self.walk(child);
                 }
                 self.self_ty = saved_ty;
-                self.self_tr = saved_tr;
+            }
+            "trait_item" => {
+                let saved_ty = self.self_ty.clone();
+                if let Some(name) = field_text(node, self.source, "name") {
+                    self.self_ty = Some(name);
+                }
+                for child in structural_children(node) {
+                    self.walk(child);
+                }
+                self.self_ty = saved_ty;
             }
             "macro_invocation" => self.walk_macro(node),
             "scoped_identifier" | "scoped_type_identifier" => {
@@ -2071,10 +2053,7 @@ impl RefWalk<'_> {
         let written = segs.join("::");
         let module = self.module.clone();
         let self_ty = self.self_ty.clone();
-        let self_tr = self.self_tr.clone();
-        let hits = self
-            .idx
-            .lookup_in(&module, self_ty.as_deref(), self_tr.as_deref(), &written);
+        let hits = self.idx.lookup_in(&module, self_ty.as_deref(), &written);
         self.push(&written, &hits);
     }
 
@@ -2125,7 +2104,6 @@ fn inner_test_targets(idx: &Index, node: &Node) -> Vec<NodeId> {
                 bytes.as_slice(),
                 &scope.module,
                 scope.self_ty.as_deref(),
-                scope.self_tr.as_deref(),
                 scope.cfg_test,
                 &mut ids,
             );
@@ -2134,14 +2112,12 @@ fn inner_test_targets(idx: &Index, node: &Node) -> Vec<NodeId> {
     ids
 }
 
-#[allow(clippy::too_many_arguments)]
 fn scan_tests(
     idx: &Index,
     node: tree_sitter::Node<'_>,
     source: &[u8],
     module: &str,
     self_ty: Option<&str>,
-    self_tr: Option<&str>,
     inherited_cfg: bool,
     out: &mut Vec<NodeId>,
 ) {
@@ -2154,52 +2130,47 @@ fn scan_tests(
             .unwrap_or_else(|| module.to_owned());
         let cfg = inherited_cfg || item_inner_cfg_test(node, source);
         if let Some(body) = node.child_by_field_name("body") {
-            scan_list(idx, body, source, &child, self_ty, self_tr, cfg, out);
+            scan_list(idx, body, source, &child, self_ty, cfg, out);
         }
         return;
     }
     if node.kind() == "impl_item" {
         let ty = type_key(&field_text(node, source, "type").unwrap_or_default());
-        let tr = field_text(node, source, "trait").map(|t| type_key(&t));
         let ty = if ty.is_empty() {
             self_ty.map(str::to_owned)
         } else {
             Some(ty)
         };
         if let Some(body) = node.child_by_field_name("body") {
+            scan_list(idx, body, source, module, ty.as_deref(), inherited_cfg, out);
+        }
+        return;
+    }
+    if node.kind() == "trait_item" {
+        let name = field_text(node, source, "name");
+        let cfg = inherited_cfg || item_inner_cfg_test(node, source);
+        if let Some(body) = node.child_by_field_name("body") {
             scan_list(
                 idx,
                 body,
                 source,
                 module,
-                ty.as_deref(),
-                tr.as_deref().or(self_tr),
-                inherited_cfg,
+                name.as_deref().or(self_ty),
+                cfg,
                 out,
             );
         }
         return;
     }
-    scan_list(
-        idx,
-        node,
-        source,
-        module,
-        self_ty,
-        self_tr,
-        inherited_cfg,
-        out,
-    );
+    scan_list(idx, node, source, module, self_ty, inherited_cfg, out);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn scan_list(
     idx: &Index,
     node: tree_sitter::Node<'_>,
     source: &[u8],
     module: &str,
     self_ty: Option<&str>,
-    self_tr: Option<&str>,
     inherited_cfg: bool,
     out: &mut Vec<NodeId>,
 ) {
@@ -2215,15 +2186,20 @@ fn scan_list(
                 let testish =
                     flags.is_test || ((cfg || flags.cfg_test) && is_fn_kind(child.kind()));
                 if testish && is_fn_kind(child.kind()) {
-                    out.extend(refs_of_ts(idx, child, source, module, self_ty, self_tr));
+                    out.extend(refs_of_ts(idx, child, source, module, self_ty));
                 }
                 let next_cfg = cfg || flags.cfg_test;
                 if matches!(
                     child.kind(),
-                    "mod_item" | "impl_item" | "declaration_list" | "block" | "source_file"
+                    "mod_item"
+                        | "impl_item"
+                        | "trait_item"
+                        | "declaration_list"
+                        | "block"
+                        | "source_file"
                 ) || child.child_by_field_name("body").is_some()
                 {
-                    scan_tests(idx, child, source, module, self_ty, self_tr, next_cfg, out);
+                    scan_tests(idx, child, source, module, self_ty, next_cfg, out);
                 }
             }
         }
@@ -2236,14 +2212,12 @@ fn refs_of_ts(
     source: &[u8],
     module: &str,
     self_ty: Option<&str>,
-    self_tr: Option<&str>,
 ) -> Vec<NodeId> {
     let mut walk = RefWalk {
         idx,
         source,
         module: module.to_owned(),
         self_ty: self_ty.map(str::to_owned),
-        self_tr: self_tr.map(str::to_owned),
         refs: Vec::new(),
     };
     walk.walk(node);

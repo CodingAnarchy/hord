@@ -4,8 +4,9 @@
 //! A sidecar `.idx` file stores [`PackIndex`] as canonical CBOR so the objects
 //! table in redb is rebuildable.
 
+use std::cell::RefCell;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use hord_core::ObjectId;
@@ -18,6 +19,14 @@ pub(crate) const MAGIC: &[u8; 8] = b"HORDPAK1";
 
 /// zstd compression level (default). Per-kind dictionaries are deferred.
 const COMPRESSION_LEVEL: i32 = 3;
+
+/// Give up growing the decompress buffer past this. Matches the 4 GiB object cap.
+const MAX_DECOMPRESSED: usize = u32::MAX as usize;
+
+thread_local! {
+    static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+}
 
 /// One object's location inside a pack.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -35,7 +44,7 @@ pub(crate) struct PackIndex {
 }
 
 /// Location of a packed object, stored in the `objects` redb table.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PackedLocation {
     pub pack: u64,
     pub offset: u64,
@@ -47,7 +56,69 @@ pub(crate) fn compress(bytes: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 pub(crate) fn decompress(bytes: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::decode_all(bytes)
+    DECOMPRESSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Decompressor::new()?);
+        }
+        let decompressor = slot.as_mut().expect("decompressor was just installed");
+        // Each frame is independent. Guess from the compressed size and grow
+        // until the frame fits, reusing the same zstd context.
+        let mut capacity = bytes.len().saturating_mul(3).max(256);
+        loop {
+            match decompressor.decompress(bytes, capacity) {
+                Ok(out) => return Ok(out),
+                Err(err) if output_too_small(&err) => {
+                    let next = capacity.saturating_mul(2);
+                    if next <= capacity || next > MAX_DECOMPRESSED {
+                        return Err(err);
+                    }
+                    capacity = next;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    })
+}
+
+fn output_too_small(err: &io::Error) -> bool {
+    err.to_string().contains("too small")
+}
+
+/// Read `buf.len()` bytes at `offset` without changing the file cursor.
+pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut read = 0;
+        while read < buf.len() {
+            let n = file.seek_read(
+                &mut buf[read..],
+                offset + u64::try_from(read).unwrap_or(u64::MAX),
+            )?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short pack read",
+                ));
+            }
+            read += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, buf, offset);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional pack reads are unavailable on this platform",
+        ))
+    }
 }
 
 pub(crate) fn pack_file_name(pack_id: u64) -> String {
@@ -87,7 +158,9 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 
 /// Streaming writer for a new pack file and its sidecar index.
 pub(crate) struct PackWriter {
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
+    /// Next byte offset. Tracked here so buffering does not require a seek.
+    offset: u64,
     tmp_path: PathBuf,
     final_path: PathBuf,
     pack_id: u64,
@@ -103,10 +176,11 @@ impl PackWriter {
             pack_file_name(pack_id),
             ulid::Ulid::generate()
         ));
-        let mut file = File::create(&tmp_path)?;
+        let mut file = BufWriter::with_capacity(256 * 1024, File::create(&tmp_path)?);
         file.write_all(MAGIC)?;
         Ok(Self {
             file: Some(file),
+            offset: MAGIC.len() as u64,
             tmp_path,
             final_path,
             pack_id,
@@ -114,7 +188,7 @@ impl PackWriter {
         })
     }
 
-    fn file(&mut self) -> Result<&mut File, Error> {
+    fn file(&mut self) -> Result<&mut BufWriter<File>, Error> {
         self.file
             .as_mut()
             .ok_or_else(|| io::Error::other("pack writer is closed").into())
@@ -127,8 +201,12 @@ impl PackWriter {
     ) -> Result<PackedLocation, Error> {
         let compressed = compress(uncompressed)?;
         let compressed_len = u32::try_from(compressed.len()).map_err(|_| Error::ObjectTooLarge)?;
-        let offset = self.file()?.stream_position()?;
+        let offset = self.offset;
         self.file()?.write_all(&compressed)?;
+        self.offset = self
+            .offset
+            .checked_add(u64::from(compressed_len))
+            .ok_or(Error::ObjectTooLarge)?;
         self.entries.push(PackEntry {
             id,
             offset,
@@ -148,7 +226,8 @@ impl PackWriter {
     /// Fsync, rename into place, and write the sidecar index. Returns the index.
     pub(crate) fn finish(mut self, pack_dir: &Path) -> Result<PackIndex, Error> {
         if let Some(file) = self.file.as_mut() {
-            file.sync_all()?;
+            file.flush()?;
+            file.get_mut().sync_all()?;
         }
         self.file.take();
         fs::rename(&self.tmp_path, &self.final_path)?;
@@ -170,11 +249,9 @@ impl Drop for PackWriter {
     }
 }
 
-pub(crate) fn read_packed(pack_path: &Path, loc: &PackedLocation) -> Result<Vec<u8>, Error> {
-    let mut file = File::open(pack_path)?;
-    file.seek(SeekFrom::Start(loc.offset))?;
+pub(crate) fn read_packed_file(file: &File, loc: &PackedLocation) -> Result<Vec<u8>, Error> {
     let mut buf = vec![0u8; loc.compressed_len as usize];
-    file.read_exact(&mut buf)?;
+    read_exact_at(file, &mut buf, loc.offset)?;
     Ok(decompress(&buf)?)
 }
 
@@ -188,7 +265,17 @@ mod tests {
         let src = b"the same inputs produce the same ObjectId";
         let c = compress(src).unwrap();
         assert_ne!(c, src);
+        assert_eq!(compress(src).unwrap(), c);
         assert_eq!(decompress(&c).unwrap(), src);
+
+        let zeros = vec![0u8; 100_000];
+        let compressed = compress(&zeros).unwrap();
+        assert!(compressed.len() < zeros.len());
+        assert_eq!(decompress(&compressed).unwrap(), zeros);
+        assert_eq!(compress(&zeros).unwrap(), compressed);
+
+        let empty = compress(b"").unwrap();
+        assert_eq!(decompress(&empty).unwrap(), b"");
     }
 
     #[test]
@@ -203,7 +290,8 @@ mod tests {
         let mut writer = PackWriter::create(&dir, 1).unwrap();
         let loc = writer.add(id, b"abc").unwrap();
         writer.finish(&dir).unwrap();
-        let got = read_packed(&pack_path(&dir, 1), &loc).unwrap();
+        let file = File::open(pack_path(&dir, 1)).unwrap();
+        let got = read_packed_file(&file, &loc).unwrap();
         assert_eq!(got, b"abc");
         let idx_bytes = fs::read(index_path(&dir, 1)).unwrap();
         let idx: PackIndex = hord_encoding::decode(&idx_bytes).unwrap();

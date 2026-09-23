@@ -1,5 +1,6 @@
 //! Apply a definition-granularity edit script to an identified tree.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{NodeId, ObjectId, Op};
@@ -49,10 +50,30 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
 
     for op in ops {
         match op {
-            Op::Replace { .. } => replaces.push(op),
-            Op::Insert { .. } => inserts.push(op),
-            Op::Move { .. } => moves.push(op),
-            Op::Delete { .. } => deletes.push(op),
+            Op::Replace { node, to, .. } => replaces.push(ReplaceEdit {
+                node: *node,
+                to: *to,
+            }),
+            Op::Insert {
+                parent,
+                index,
+                node,
+            } => inserts.push(InsertEdit {
+                parent: *parent,
+                index: *index,
+                node: *node,
+            }),
+            Op::Move {
+                node,
+                to_parent,
+                index,
+                ..
+            } => moves.push(MoveEdit {
+                node: *node,
+                to_parent: *to_parent,
+                index: *index,
+            }),
+            Op::Delete { node } => deletes.push(*node),
             // M1: name lives in source tokens; a paired Replace carries the
             // new body. Rename is recorded for merge rule 4.
             Op::Rename { .. } | Op::Blob { .. } | Op::Tree { .. } => {}
@@ -61,77 +82,36 @@ pub fn apply(base: &IdentifiedTree, ops: &[Op], store: &NodeTree) -> Result<Iden
 
     // Ancestors first, then content id. `NodeId` is a random ULID and must
     // not decide which edit lands.
-    replaces.sort_by_key(|op| match op {
-        Op::Replace { node, .. } => content_order(base, *node),
-        _ => (usize::MAX, ObjectId::from_bytes([0xff; 32])),
-    });
+    replaces.sort_by_key(|op| content_order(base, op.node));
 
     for op in replaces {
-        let Op::Replace { node, to, .. } = op else {
-            continue;
-        };
-        graft(&mut working.tree, store, *to)?;
-        apply_replace(&mut working, *node, *to)?;
+        graft(&mut working.tree, store, op.to)?;
+        apply_replace(&mut working, op.node, op.to)?;
     }
 
-    deletes.sort_by_key(|op| match op {
-        Op::Delete { node } => {
-            let (depth, oid) = content_order(&working, *node);
-            (std::cmp::Reverse(depth), oid)
-        }
-        _ => (std::cmp::Reverse(0), ObjectId::from_bytes([0; 32])),
+    deletes.sort_by_key(|node| {
+        let (depth, oid) = content_order(&working, *node);
+        (Reverse(depth), oid)
     });
 
-    for op in deletes {
-        let Op::Delete { node } = op else {
-            continue;
-        };
-        apply_delete(&mut working, *node)?;
+    for node in deletes {
+        apply_delete(&mut working, node)?;
     }
 
-    moves.sort_by_key(|op| match op {
-        Op::Move {
-            node,
-            to_parent,
-            index,
-            ..
-        } => {
-            let (_, oid) = content_order(&working, *node);
-            let (_, parent) = content_order(&working, *to_parent);
-            (*index, parent, oid)
-        }
-        _ => (
-            0,
-            ObjectId::from_bytes([0; 32]),
-            ObjectId::from_bytes([0; 32]),
-        ),
+    moves.sort_by_key(|op| {
+        let (_, oid) = content_order(&working, op.node);
+        let (_, parent) = content_order(&working, op.to_parent);
+        (op.index, parent, oid)
     });
 
     for op in moves {
-        let Op::Move {
-            node,
-            to_parent,
-            index,
-            ..
-        } = op
-        else {
-            continue;
-        };
-        apply_move(&mut working, *node, *to_parent, *index)?;
+        apply_move(&mut working, op.node, op.to_parent, op.index)?;
     }
 
     // Inserts last so `index` is the result-side CST index after deletes.
     for op in inserts {
-        let Op::Insert {
-            parent,
-            index,
-            node,
-        } = op
-        else {
-            continue;
-        };
-        graft(&mut working.tree, store, *node)?;
-        apply_insert(&mut working, *parent, *index, *node)?;
+        graft(&mut working.tree, store, op.node)?;
+        apply_insert(&mut working, op.parent, op.index, op.node)?;
     }
 
     let seps = trailing_commas(store);
@@ -213,13 +193,24 @@ fn restore_trailing_commas(
     if !changed {
         return Ok(id);
     }
-    let new_id = working
-        .tree
-        .intern_branch(node.kind, node.lang, kids, node.name)?;
-    if let Some(nid) = working.ids.remove(&id) {
-        working.ids.insert(new_id, nid);
-    }
-    Ok(new_id)
+    intern_children(working, id, kids)
+}
+
+struct ReplaceEdit {
+    node: NodeId,
+    to: ObjectId,
+}
+
+struct MoveEdit {
+    node: NodeId,
+    to_parent: NodeId,
+    index: u32,
+}
+
+struct InsertEdit {
+    parent: NodeId,
+    index: u32,
+    node: ObjectId,
 }
 
 /// Tree depth, then the node's content id. Both come from the CST, not from
@@ -261,11 +252,7 @@ fn apply_insert(
     node: ObjectId,
 ) -> Result<(), Error> {
     let site = insert_container(working, parent)?;
-    let idx = if site.fallback {
-        fallback_insert_index(&working.tree, site.container)
-    } else {
-        index as usize
-    };
+    let idx = child_index(&working.tree, &site, index);
     insert_oid(working, site.container, &site.path, idx, node)?;
     working.ids.entry(node).or_insert_with(NodeId::generate);
     Ok(())
@@ -286,11 +273,7 @@ fn apply_move(
     }
 
     let site = insert_container(working, to_parent)?;
-    let idx = if site.fallback {
-        fallback_insert_index(&working.tree, site.container)
-    } else {
-        index as usize
-    };
+    let idx = child_index(&working.tree, &site, index);
     insert_oid(working, site.container, &site.path, idx, oid)?;
     Ok(())
 }
@@ -336,13 +319,9 @@ fn insert_container(working: &IdentifiedTree, parent: NodeId) -> Result<InsertSi
 fn find_def_container(
     tree: &NodeTree,
     start: ObjectId,
-    ids: &std::collections::BTreeMap<ObjectId, NodeId>,
+    ids: &BTreeMap<ObjectId, NodeId>,
 ) -> Option<ObjectId> {
-    fn walk(
-        tree: &NodeTree,
-        oid: ObjectId,
-        ids: &std::collections::BTreeMap<ObjectId, NodeId>,
-    ) -> Option<ObjectId> {
+    fn walk(tree: &NodeTree, oid: ObjectId, ids: &BTreeMap<ObjectId, NodeId>) -> Option<ObjectId> {
         let node = tree.get(oid)?;
         if node.children.iter().any(|c| ids.contains_key(c)) {
             return Some(oid);
@@ -355,6 +334,14 @@ fn find_def_container(
         None
     }
     walk(tree, start, ids)
+}
+
+fn child_index(tree: &NodeTree, site: &InsertSite, index: u32) -> usize {
+    if site.fallback {
+        fallback_insert_index(tree, site.container)
+    } else {
+        index as usize
+    }
 }
 
 fn fallback_insert_index(tree: &NodeTree, container: ObjectId) -> usize {
@@ -376,6 +363,25 @@ fn fallback_insert_index(tree: &NodeTree, container: ObjectId) -> usize {
     node.children.len()
 }
 
+fn intern_children(
+    working: &mut IdentifiedTree,
+    old: ObjectId,
+    kids: Vec<ObjectId>,
+) -> Result<ObjectId, Error> {
+    let node = working
+        .tree
+        .get(old)
+        .ok_or(Error::MissingNode(old))?
+        .clone();
+    let new_id = working
+        .tree
+        .intern_branch(node.kind, node.lang, kids, node.name)?;
+    if let Some(nid) = working.ids.remove(&old) {
+        working.ids.insert(new_id, nid);
+    }
+    Ok(new_id)
+}
+
 fn splice_oid(working: &mut IdentifiedTree, old: ObjectId, new: ObjectId) -> Result<(), Error> {
     let path = path_to(&working.tree, old).ok_or(Error::MissingNode(old))?;
     if path.is_empty() {
@@ -391,12 +397,12 @@ fn remove_oid(working: &mut IdentifiedTree, oid: ObjectId) -> Result<(), Error> 
         return Err(Error::apply("cannot delete the CST root"));
     }
     let &(parent, index) = path.last().expect("path non-empty");
-    let p = working
+    let mut kids = working
         .tree
         .get(parent)
         .ok_or(Error::MissingNode(parent))?
+        .children
         .clone();
-    let mut kids = p.children;
     if index >= kids.len() || kids[index] != oid {
         let Some(real) = kids.iter().position(|c| *c == oid) else {
             return Ok(());
@@ -405,10 +411,7 @@ fn remove_oid(working: &mut IdentifiedTree, oid: ObjectId) -> Result<(), Error> 
     } else {
         kids.remove(index);
     }
-    let new_parent = working.tree.intern_branch(p.kind, p.lang, kids, p.name)?;
-    if let Some(nid) = working.ids.remove(&parent) {
-        working.ids.insert(new_parent, nid);
-    }
+    let new_parent = intern_children(working, parent, kids)?;
     let parent_path = &path[..path.len() - 1];
     if parent_path.is_empty() {
         working.tree.set_root(new_parent)?;
@@ -425,18 +428,15 @@ fn insert_oid(
     index: usize,
     node: ObjectId,
 ) -> Result<(), Error> {
-    let c = working
+    let mut kids = working
         .tree
         .get(container)
         .ok_or(Error::MissingNode(container))?
+        .children
         .clone();
-    let mut kids = c.children;
     let at = index.min(kids.len());
     kids.insert(at, node);
-    let new_container = working.tree.intern_branch(c.kind, c.lang, kids, c.name)?;
-    if let Some(nid) = working.ids.remove(&container) {
-        working.ids.insert(new_container, nid);
-    }
+    let new_container = intern_children(working, container, kids)?;
     if path.is_empty() {
         working.tree.set_root(new_container)?;
         Ok(())
@@ -451,12 +451,12 @@ fn splice_up(
     mut current: ObjectId,
 ) -> Result<(), Error> {
     for &(old_parent, index) in path.iter().rev() {
-        let p = working
+        let mut kids = working
             .tree
             .get(old_parent)
             .ok_or(Error::MissingNode(old_parent))?
+            .children
             .clone();
-        let mut kids = p.children;
         if index >= kids.len() {
             return Err(Error::apply(format!(
                 "child index {index} out of range for {old_parent} ({} children)",
@@ -464,10 +464,7 @@ fn splice_up(
             )));
         }
         kids[index] = current;
-        current = working.tree.intern_branch(p.kind, p.lang, kids, p.name)?;
-        if let Some(nid) = working.ids.remove(&old_parent) {
-            working.ids.insert(current, nid);
-        }
+        current = intern_children(working, old_parent, kids)?;
     }
     working.tree.set_root(current)?;
     Ok(())

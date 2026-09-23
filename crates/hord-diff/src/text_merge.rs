@@ -5,6 +5,10 @@
 //! line, the line is merged token by token the same way. This is what turns
 //! two overlapping edits inside one function into the combined body.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::align::spans;
+
 const MAX_LINES: usize = 4_000;
 const MAX_TOKENS: usize = 2_000;
 
@@ -50,8 +54,19 @@ pub(crate) fn merge_text(base: &str, ours: &str, theirs: &str) -> Option<String>
     let base_l = keep_lines(base);
     let ours_l = keep_lines(ours);
     let theirs_l = keep_lines(theirs);
-    let merged = merge_lines(&base_l, &ours_l, &theirs_l)?;
-    Some(merged.concat())
+    merge_pieces(
+        &base_l,
+        &ours_l,
+        &theirs_l,
+        MAX_LINES,
+        |base_line, left, right| {
+            let mut text = merge_tokens(base_line, &left.concat(), &right.concat())?;
+            if base_line.ends_with('\n') && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            Some(text)
+        },
+    )
 }
 
 fn keep_lines(s: &str) -> Vec<&str> {
@@ -70,15 +85,35 @@ fn keep_lines(s: &str) -> Vec<&str> {
     out
 }
 
-fn merge_lines(base: &[&str], ours: &[&str], theirs: &[&str]) -> Option<Vec<String>> {
-    if base.len() > MAX_LINES || ours.len() > MAX_LINES || theirs.len() > MAX_LINES {
+fn merge_tokens(base: &str, ours: &str, theirs: &str) -> Option<String> {
+    let b = tokens(base);
+    let o = tokens(ours);
+    let t = tokens(theirs);
+    merge_pieces(&b, &o, &t, MAX_TOKENS, |_, _, _| None)
+}
+
+type EditMap<'a> = BTreeMap<usize, Vec<&'a str>>;
+
+/// 3-way merge of parallel slices.
+///
+/// `both_changed` runs when the two sides replace the same base element with
+/// different slices. Lines pass token merge; tokens pass a closure that
+/// refuses the conflict.
+fn merge_pieces<'a>(
+    base: &[&'a str],
+    ours: &[&'a str],
+    theirs: &[&'a str],
+    limit: usize,
+    both_changed: impl Fn(&str, &[&'a str], &[&'a str]) -> Option<String>,
+) -> Option<String> {
+    if base.len() > limit || ours.len() > limit || theirs.len() > limit {
         return None;
     }
-    let (ins_o, repl_o, del_o) = edits(base, ours)?;
-    let (ins_t, repl_t, del_t) = edits(base, theirs)?;
-    let mut out = Vec::new();
+    let (ins_o, repl_o, del_o) = edits(base, ours);
+    let (ins_t, repl_t, del_t) = edits(base, theirs);
+    let mut out = String::new();
     for i in 0..=base.len() {
-        push_inserts(&mut out, ins_o.get(&i), ins_t.get(&i));
+        append_inserts(&mut out, ins_o.get(&i), ins_t.get(&i));
         if i == base.len() {
             break;
         }
@@ -94,135 +129,65 @@ fn merge_lines(base: &[&str], ours: &[&str], theirs: &[&str]) -> Option<Vec<Stri
             continue;
         }
         match (repl_o.get(&i), repl_t.get(&i)) {
-            (None, None) => out.push(base[i].to_owned()),
-            (Some(lines), None) | (None, Some(lines)) => {
-                out.extend(lines.iter().map(|s| (*s).to_owned()));
+            (None, None) => out.push_str(base[i]),
+            (Some(parts), None) | (None, Some(parts)) => {
+                for part in parts {
+                    out.push_str(part);
+                }
             }
             (Some(left), Some(right)) if left == right => {
-                out.extend(left.iter().map(|s| (*s).to_owned()));
+                for part in left {
+                    out.push_str(part);
+                }
             }
             (Some(left), Some(right)) => {
-                let joined_l = left.concat();
-                let joined_r = right.concat();
-                let merged = merge_tokens(base[i], &joined_l, &joined_r)?;
-                let mut text = merged;
-                if base[i].ends_with('\n') && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                out.push(text);
+                out.push_str(&both_changed(base[i], left, right)?);
             }
-        }
-    }
-    Some(out)
-}
-
-fn push_inserts(out: &mut Vec<String>, ours: Option<&Vec<&str>>, theirs: Option<&Vec<&str>>) {
-    let o = ours.map(Vec::as_slice).unwrap_or(&[]);
-    let t = theirs.map(Vec::as_slice).unwrap_or(&[]);
-    if o == t {
-        out.extend(o.iter().map(|s| (*s).to_owned()));
-        return;
-    }
-    out.extend(o.iter().map(|s| (*s).to_owned()));
-    for line in t {
-        if !o.contains(line) {
-            out.push((*line).to_owned());
-        }
-    }
-}
-
-type EditMap<'a> = std::collections::BTreeMap<usize, Vec<&'a str>>;
-
-fn edits<'a>(
-    base: &[&'a str],
-    side: &[&'a str],
-) -> Option<(EditMap<'a>, EditMap<'a>, std::collections::BTreeSet<usize>)> {
-    let codes = opcodes(base, side)?;
-    let mut ins = std::collections::BTreeMap::new();
-    let mut repl = std::collections::BTreeMap::new();
-    let mut deleted = std::collections::BTreeSet::new();
-    for code in codes {
-        match code {
-            Code::Insert { at, j1, j2 } => {
-                ins.entry(at).or_insert_with(Vec::new).extend(&side[j1..j2]);
-            }
-            Code::Delete { i1, i2 } => {
-                deleted.extend(i1..i2);
-            }
-            Code::Replace { i1, i2, j1, j2 } => {
-                if i2 == i1 + 1 {
-                    repl.insert(i1, side[j1..j2].to_vec());
-                } else {
-                    deleted.extend(i1..i2);
-                    ins.entry(i2).or_insert_with(Vec::new).extend(&side[j1..j2]);
-                }
-            }
-        }
-    }
-    Some((ins, repl, deleted))
-}
-
-fn merge_tokens(base: &str, ours: &str, theirs: &str) -> Option<String> {
-    let b = tokens(base);
-    let o = tokens(ours);
-    let t = tokens(theirs);
-    if b.len() > MAX_TOKENS || o.len() > MAX_TOKENS || t.len() > MAX_TOKENS {
-        return None;
-    }
-    let (ins_o, repl_o, del_o) = edits(&b, &o)?;
-    let (ins_t, repl_t, del_t) = edits(&b, &t)?;
-    let mut out = String::new();
-    for i in 0..=b.len() {
-        append_inserts(&mut out, ins_o.get(&i), ins_t.get(&i));
-        if i == b.len() {
-            break;
-        }
-        let gone_o = del_o.contains(&i);
-        let gone_t = del_t.contains(&i);
-        if gone_o && gone_t {
-            continue;
-        }
-        if gone_o != gone_t && (repl_o.contains_key(&i) || repl_t.contains_key(&i)) {
-            return None;
-        }
-        if gone_o || gone_t {
-            continue;
-        }
-        match (repl_o.get(&i), repl_t.get(&i)) {
-            (None, None) => out.push_str(b[i]),
-            (Some(toks), None) | (None, Some(toks)) => {
-                for tok in toks {
-                    out.push_str(tok);
-                }
-            }
-            (Some(left), Some(right)) if left == right => {
-                for tok in left {
-                    out.push_str(tok);
-                }
-            }
-            (Some(_), Some(_)) => return None,
         }
     }
     Some(out)
 }
 
 fn append_inserts(out: &mut String, ours: Option<&Vec<&str>>, theirs: Option<&Vec<&str>>) {
-    let o = ours.map(Vec::as_slice).unwrap_or(&[]);
-    let t = theirs.map(Vec::as_slice).unwrap_or(&[]);
-    if o == t {
-        for tok in o {
-            out.push_str(tok);
+    let ours = ours.map(Vec::as_slice).unwrap_or(&[]);
+    let theirs = theirs.map(Vec::as_slice).unwrap_or(&[]);
+    if ours == theirs {
+        for piece in ours {
+            out.push_str(piece);
         }
         return;
     }
-    for tok in o {
-        out.push_str(tok);
+    for piece in ours {
+        out.push_str(piece);
     }
-    for tok in t {
-        if !o.contains(tok) {
-            out.push_str(tok);
+    for piece in theirs {
+        if !ours.contains(piece) {
+            out.push_str(piece);
         }
     }
+}
+
+fn edits<'a>(base: &[&'a str], side: &[&'a str]) -> (EditMap<'a>, EditMap<'a>, BTreeSet<usize>) {
+    let mut ins: EditMap<'a> = BTreeMap::new();
+    let mut repl: EditMap<'a> = BTreeMap::new();
+    let mut deleted = BTreeSet::new();
+    for span in spans(base, side) {
+        if span.a0 == span.a1 {
+            ins.entry(span.a0)
+                .or_default()
+                .extend(&side[span.b0..span.b1]);
+        } else if span.b0 == span.b1 {
+            deleted.extend(span.a0..span.a1);
+        } else if span.a1 == span.a0 + 1 {
+            repl.insert(span.a0, side[span.b0..span.b1].to_vec());
+        } else {
+            deleted.extend(span.a0..span.a1);
+            ins.entry(span.a1)
+                .or_default()
+                .extend(&side[span.b0..span.b1]);
+        }
+    }
+    (ins, repl, deleted)
 }
 
 fn tokens(s: &str) -> Vec<&str> {
@@ -255,85 +220,4 @@ fn tokens(s: &str) -> Vec<&str> {
         rest = &rest[len..];
     }
     out
-}
-
-enum Code {
-    Insert {
-        at: usize,
-        j1: usize,
-        j2: usize,
-    },
-    Delete {
-        i1: usize,
-        i2: usize,
-    },
-    Replace {
-        i1: usize,
-        i2: usize,
-        j1: usize,
-        j2: usize,
-    },
-}
-
-fn opcodes(a: &[&str], b: &[&str]) -> Option<Vec<Code>> {
-    if a.len() > MAX_LINES || b.len() > MAX_LINES {
-        return None;
-    }
-    let pairs = lcs(a, b);
-    let mut out = Vec::new();
-    let mut ai = 0usize;
-    let mut bi = 0usize;
-    for &(aj, bj) in &pairs {
-        if ai < aj || bi < bj {
-            push_change(&mut out, ai, aj, bi, bj);
-        }
-        ai = aj + 1;
-        bi = bj + 1;
-    }
-    if ai < a.len() || bi < b.len() {
-        push_change(&mut out, ai, a.len(), bi, b.len());
-    }
-    Some(out)
-}
-
-fn push_change(out: &mut Vec<Code>, i1: usize, i2: usize, j1: usize, j2: usize) {
-    if i1 == i2 {
-        out.push(Code::Insert { at: i1, j1, j2 });
-    } else if j1 == j2 {
-        out.push(Code::Delete { i1, i2 });
-    } else {
-        out.push(Code::Replace { i1, i2, j1, j2 });
-    }
-}
-
-fn lcs(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
-    let n = a.len();
-    let m = b.len();
-    let mut dp = vec![0u32; (n + 1) * (m + 1)];
-    let idx = |i: usize, j: usize| i * (m + 1) + j;
-    for i in 0..n {
-        for j in 0..m {
-            dp[idx(i + 1, j + 1)] = if a[i] == b[j] {
-                dp[idx(i, j)] + 1
-            } else {
-                dp[idx(i + 1, j)].max(dp[idx(i, j + 1)])
-            };
-        }
-    }
-    let mut pairs = Vec::new();
-    let mut i = n;
-    let mut j = m;
-    while i > 0 && j > 0 {
-        if a[i - 1] == b[j - 1] {
-            pairs.push((i - 1, j - 1));
-            i -= 1;
-            j -= 1;
-        } else if dp[idx(i - 1, j)] >= dp[idx(i, j - 1)] {
-            i -= 1;
-        } else {
-            j -= 1;
-        }
-    }
-    pairs.reverse();
-    pairs
 }
