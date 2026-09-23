@@ -682,12 +682,13 @@ fn node_from_bytes(bytes: &[u8]) -> Result<NodeId> {
 }
 
 fn decode_change_ids(bytes: &[u8]) -> Result<Vec<ChangeId>> {
-    if !bytes.len().is_multiple_of(ObjectId::LEN) {
+    let (chunks, rest) = bytes.as_chunks::<{ ObjectId::LEN }>();
+    if !rest.is_empty() {
         return Err(Error::CorruptIndex("node_history"));
     }
-    let mut ids = Vec::with_capacity(bytes.len() / ObjectId::LEN);
-    for chunk in bytes.chunks_exact(ObjectId::LEN) {
-        ids.push(ObjectId::try_from(chunk)?);
+    let mut ids = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        ids.push(ObjectId::try_from(chunk.as_slice())?);
     }
     Ok(ids)
 }
