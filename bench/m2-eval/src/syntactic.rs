@@ -94,7 +94,7 @@ pub(crate) fn measure(
         if !metas.contains_key(&(file_i, def.oid)) {
             continue;
         }
-        let Some(node_id) = files[file_i].ids.get(&def.oid).copied() else {
+        let Some(node_id) = files[file_i].by_oid.get(&def.oid).copied() else {
             continue;
         };
         labeled += 1;

@@ -31,6 +31,8 @@ pub(crate) struct IdentityReport {
 
 struct Site {
     oid: ObjectId,
+    /// Child-index path from the file root.
+    at: Vec<u32>,
     kind: String,
     qname: String,
     /// Alphanumeric runs of each CST leaf, lowercased, excluding the
@@ -127,8 +129,8 @@ fn score_file(
             continue;
         };
         used.insert(old_sites[oi].oid);
-        let old_id = base.ids.get(&old_sites[oi].oid).copied();
-        let new_id = result_map.nodes.get(&new_site.oid).copied();
+        let old_id = base.ids.get(&old_sites[oi].at).copied();
+        let new_id = result_map.nodes.get(&new_site.at).copied();
         if old_id.is_some() && old_id == new_id {
             report.stable += 1;
         }
@@ -138,12 +140,12 @@ fn score_file(
         if !is_function(&new_site.kind) {
             continue;
         }
-        let Some(new_id) = result_map.nodes.get(&new_site.oid).copied() else {
+        let Some(new_id) = result_map.nodes.get(&new_site.at).copied() else {
             continue;
         };
         let Some(old_site) = old_sites.iter().find(|old| {
             is_function(&old.kind)
-                && base.ids.get(&old.oid).copied() == Some(new_id)
+                && base.ids.get(&old.at).copied() == Some(new_id)
                 && old.qname != new_site.qname
         }) else {
             continue;
@@ -196,7 +198,14 @@ fn sites(adapter: &RustAdapter, tree: &NodeTree) -> Vec<Site> {
     };
     let mut out = Vec::new();
     let mut ancestors = Vec::new();
-    walk(adapter, tree, root, &mut ancestors, &mut out);
+    walk(
+        adapter,
+        tree,
+        root,
+        &mut Vec::new(),
+        &mut ancestors,
+        &mut out,
+    );
     out
 }
 
@@ -204,6 +213,7 @@ fn walk(
     adapter: &RustAdapter,
     tree: &NodeTree,
     oid: ObjectId,
+    at: &mut Vec<u32>,
     ancestors: &mut Vec<ObjectId>,
     out: &mut Vec<Site>,
 ) {
@@ -216,14 +226,17 @@ fn walk(
         let simple = qname.as_str().rsplit("::").next().unwrap_or(qname.as_str());
         out.push(Site {
             oid,
+            at: at.clone(),
             kind: node.kind.as_str().to_string(),
             qname: qname.as_str().to_string(),
             leaves: leaf_tokens(tree, oid, simple),
         });
     }
     ancestors.push(oid);
-    for child in &node.children {
-        walk(adapter, tree, *child, ancestors, out);
+    for (i, child) in node.children.iter().enumerate() {
+        at.push(u32::try_from(i).unwrap_or(u32::MAX));
+        walk(adapter, tree, *child, at, ancestors, out);
+        at.pop();
     }
     ancestors.pop();
 }

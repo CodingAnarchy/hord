@@ -10,6 +10,7 @@
 //! comments in other parents stay trivia.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 use hord_core::{LangId, NodeKind, ObjectId, QualifiedName};
 use hord_lang::{AttachedSpan, NodeTree, ParseError, TokenSpan, attach_trivia_spans};
@@ -125,6 +126,124 @@ fn maybe_content_gap(
     }
 }
 
+/// Per-parse naming state (spec §3.4 durable names for TOML definitions).
+///
+/// - `[a.b]` tables are named by their header.
+/// - `[[a.b]]` elements are named `a.b::<v1> <v2> …` from the values of their
+///   leading scalar pairs, taking one more value until the name is unique
+///   among the file's `[[a.b]]` elements. An element with no leading scalars
+///   is named by its header alone; one still ambiguous after all of them
+///   keeps its longest name.
+/// - Pairs are `<enclosing table name>::<key>`.
+struct Namer {
+    /// `table_array_element` start byte → its name.
+    elements: BTreeMap<usize, String>,
+}
+
+impl Namer {
+    fn new(root: tree_sitter::Node<'_>, source: &[u8]) -> Self {
+        let mut by_header: BTreeMap<String, Vec<(usize, Vec<String>)>> = BTreeMap::new();
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() != "table_array_element" {
+                continue;
+            }
+            if let Some(header) = toml_local_name(child, source) {
+                let scalars = leading_scalars(child, source);
+                by_header
+                    .entry(header)
+                    .or_default()
+                    .push((child.start_byte(), scalars));
+            }
+        }
+        let mut elements = BTreeMap::new();
+        for (header, items) in by_header {
+            for (start, scalars) in &items {
+                let mut n = scalars.len().min(1);
+                while n < scalars.len()
+                    && items
+                        .iter()
+                        .filter(|(_, other)| other.len() >= n && other[..n] == scalars[..n])
+                        .count()
+                        > 1
+                {
+                    n += 1;
+                }
+                let name = if n == 0 {
+                    header.clone()
+                } else {
+                    format!("{header}::{}", scalars[..n].join(" "))
+                };
+                elements.insert(*start, name);
+            }
+        }
+        Self { elements }
+    }
+
+    fn def_name(&self, node: tree_sitter::Node<'_>, source: &[u8]) -> Option<QualifiedName> {
+        let local = self.local_name(node, source)?;
+        if node.kind() != "pair" {
+            return Some(QualifiedName::new(local));
+        }
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            if matches!(p.kind(), "table" | "table_array_element")
+                && let Some(table) = self.local_name(p, source)
+            {
+                return Some(QualifiedName::new(format!("{table}::{local}")));
+            }
+            parent = p.parent();
+        }
+        Some(QualifiedName::new(local))
+    }
+
+    fn local_name(&self, node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+        if node.kind() == "table_array_element"
+            && let Some(name) = self.elements.get(&node.start_byte())
+        {
+            return Some(name.clone());
+        }
+        toml_local_name(node, source)
+    }
+}
+
+/// Values of an element's leading `key = scalar` pairs, in order, up to the
+/// first pair whose value is an array or inline table.
+fn leading_scalars(element: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = element.walk();
+    for pair in element.children(&mut cursor) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let Some(value) = pair.child(pair.child_count().saturating_sub(1)) else {
+            break;
+        };
+        if matches!(value.kind(), "array" | "inline_table") {
+            break;
+        }
+        let Ok(text) = value.utf8_text(source) else {
+            break;
+        };
+        out.push(scalar_label(value.kind(), text));
+    }
+    out
+}
+
+/// A scalar's text for a name: single-line strings without their quotes,
+/// everything else as written.
+fn scalar_label(kind: &str, text: &str) -> String {
+    let unquoted = (kind == "string")
+        .then(|| {
+            text.strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .or_else(|| text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))
+        })
+        .flatten()
+        .filter(|t| !t.starts_with(['"', '\'']));
+    unquoted.unwrap_or(text).to_owned()
+}
+
 fn intern_spans_before(
     before: usize,
     lang: &LangId,
@@ -143,6 +262,7 @@ fn intern_spans_before(
 
 fn intern(
     node: tree_sitter::Node<'_>,
+    namer: &Namer,
     lang: &LangId,
     source: &[u8],
     tokens: &[AttachedSpan],
@@ -178,7 +298,7 @@ fn intern(
             tree,
             &mut children,
         )?;
-        if let Some(id) = intern(child, lang, source, tokens, token_i, tree)? {
+        if let Some(id) = intern(child, namer, lang, source, tokens, token_i, tree)? {
             children.push(id);
         }
         Ok(false)
@@ -199,34 +319,21 @@ fn intern(
         NodeKind::new(node.kind()),
         *lang,
         children,
-        toml_def_name(node, source),
+        namer.def_name(node, source),
     )?))
-}
-
-fn toml_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<QualifiedName> {
-    let local = toml_local_name(node, source)?;
-    if node.kind() != "pair" {
-        return Some(QualifiedName::new(local));
-    }
-    let mut parent = node.parent();
-    while let Some(p) = parent {
-        if matches!(p.kind(), "table" | "table_array_element")
-            && let Some(table) = toml_local_name(p, source)
-        {
-            return Some(QualifiedName::new(format!("{table}::{local}")));
-        }
-        parent = p.parent();
-    }
-    Some(QualifiedName::new(local))
 }
 
 fn toml_local_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let name = match node.kind() {
-        "table" | "table_array_element" => {
-            let text = node.utf8_text(source).ok()?.trim();
-            let inner = text.trim_start_matches('[').trim_end_matches(']').trim();
-            inner.lines().next()?.trim().to_owned()
-        }
+        // The header key (`[a.b]` → `a.b`), not the node text: a table's
+        // text runs through its last pair.
+        "table" | "table_array_element" => node
+            .named_child(0)
+            .filter(|k| matches!(k.kind(), "bare_key" | "dotted_key" | "quoted_key"))?
+            .utf8_text(source)
+            .ok()?
+            .trim()
+            .to_owned(),
         "pair" => node.child(0)?.utf8_text(source).ok()?.trim().to_owned(),
         _ => return None,
     };
@@ -280,8 +387,17 @@ pub(crate) fn parse(source: &[u8], lang: &LangId) -> Result<NodeTree, ParseError
     let attached = attach_trivia_spans(source, tokens);
     let mut tree = NodeTree::new();
     let mut token_i = 0;
-    let root_id = intern(root, lang, source, &attached, &mut token_i, &mut tree)?
-        .ok_or_else(|| ParseError::failed("intern produced no root"))?;
+    let namer = Namer::new(root, source);
+    let root_id = intern(
+        root,
+        &namer,
+        lang,
+        source,
+        &attached,
+        &mut token_i,
+        &mut tree,
+    )?
+    .ok_or_else(|| ParseError::failed("intern produced no root"))?;
     if token_i != attached.len() {
         return Err(ParseError::failed(format!(
             "interned {token_i} of {} leaves",

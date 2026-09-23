@@ -1,8 +1,13 @@
 //! Tier 1 TOML language adapter (spec §4.4).
 //!
 //! Parses every path [`TomlAdapter::matches`] accepts (suffix `.toml`,
-//! including `Cargo.toml`). There is no size cutoff (ADR 0003). `Cargo.lock`
-//! is out of scope until M3.
+//! including `Cargo.toml`). There is no size cutoff (ADR 0003).
+//!
+//! [`merge`] is a generic 3-way merge for machine-written TOML (lockfiles):
+//! arrays of tables merge as keyed sets, and the output is re-emitted in a
+//! caller-configured canonical layout. Nothing here knows about any
+//! particular package manager; `Cargo.lock` is bridged from
+//! `hord-lang-rust` (ADR 0013).
 //!
 //! Trivia attachment follows spec §3.3 via [`hord_lang::attach_trivia`].
 //!
@@ -11,7 +16,10 @@
 //! Named tables and keys from the tree-sitter-toml grammar:
 //!
 //! - `table` — `[foo]` / `[foo.bar]`
-//! - `table_array_element` — `[[foo]]`
+//! - `table_array_element` — `[[foo]]`, named `foo::<v1> <v2> …` from the
+//!   values of its leading scalar pairs, taking as many as it needs to be
+//!   unique among the file's `[[foo]]` elements (so identity follows the
+//!   element, not its array position)
 //! - `pair` — `key = value` (named by key, so two sides adding different
 //!   keys in one table compose; spec §5.2 rule 1)
 //!
@@ -24,6 +32,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod cst;
+pub mod merge;
 
 use hord_core::{LangId, NodeKind, RepoPath};
 use hord_lang::{LangAdapter, NodeTree, ParseError, Tier};
@@ -252,6 +261,56 @@ mod tests {
             raw.contains("# note"),
             "same-line trailing comment should stay with the pair, got {raw:?}"
         );
+    }
+
+    fn element_names(src: &str) -> Vec<String> {
+        let tree = parse_ok(src.as_bytes());
+        let mut names: Vec<String> = tree
+            .iter()
+            .filter(|(_, n)| n.kind.as_str() == "table_array_element")
+            .filter_map(|(_, n)| n.name.as_ref().map(ToString::to_string))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn array_elements_named_by_leading_scalars_until_unique() {
+        let src = "[[package]]\nname = \"syn\"\nversion = \"1.0.0\"\n\n\
+                   [[package]]\nname = \"syn\"\nversion = \"2.0.0\"\nsource = \"r\"\n\n\
+                   [[package]]\nname = \"log\"\nversion = \"0.4.0\"\ndeps = [\"x\"]\n\n\
+                   [[bin]]\npath = 'src/main.rs'\n\n[[bin]]\ntags = [1]\n";
+        assert_eq!(
+            element_names(src),
+            [
+                "bin",
+                "bin::src/main.rs",
+                "package::log",
+                "package::syn 1.0.0",
+                "package::syn 2.0.0"
+            ]
+        );
+        let tree = parse_ok(src.as_bytes());
+        assert!(tree.iter().any(|(_, n)| {
+            n.name
+                .as_ref()
+                .is_some_and(|q| q.to_string() == "package::syn 2.0.0::source")
+        }));
+    }
+
+    #[test]
+    fn array_element_name_does_not_depend_on_position() {
+        let one = "[[p]]\nname = \"b\"\n";
+        let two = "[[p]]\nname = \"a\"\n\n[[p]]\nname = \"b\"\n";
+        let id = |src: &str| {
+            parse_ok(src.as_bytes())
+                .iter()
+                .find(|(_, n)| n.name.as_ref().is_some_and(|q| q.to_string() == "p::b"))
+                .map(|(_, n)| n.normalized)
+                .expect("p::b")
+        };
+        // Same name and same normalized content at index 0 and index 1.
+        assert_eq!(id(one), id(two));
     }
 
     #[test]

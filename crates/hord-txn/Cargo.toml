@@ -1,0 +1,26 @@
+[package]
+name = "hord-txn"
+description = "Workspaces, access logs, propose, conflict check, structural rebase, and the lander (spec §6)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hord-core.workspace = true
+hord-diff.workspace = true
+hord-encoding.workspace = true
+hord-identity.workspace = true
+hord-lang.workspace = true
+hord-lang-rust.workspace = true
+hord-lang-toml.workspace = true
+hord-store.workspace = true
+reflink-copy.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

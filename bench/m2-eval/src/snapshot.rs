@@ -20,7 +20,11 @@ const MAX_BYTES: usize = 500_000;
 pub(crate) struct FileSnap {
     pub path: RepoPath,
     pub tree: NodeTree,
-    pub ids: BTreeMap<ObjectId, NodeId>,
+    /// Definition site → id.
+    pub ids: BTreeMap<Vec<u32>, NodeId>,
+    /// Content id → id of its first site in preorder (for oracles that name
+    /// definitions by content).
+    pub by_oid: std::collections::HashMap<ObjectId, NodeId>,
 }
 
 impl FileSnap {
@@ -72,10 +76,12 @@ pub(crate) fn load_head(git_dir: &Path) -> Result<Vec<FileSnap>> {
         let Ok(repo_path) = path.parse::<RepoPath>() else {
             continue;
         };
+        let by_oid = first_site_ids(&tree, &mapping.nodes);
         files.push(FileSnap {
             path: repo_path,
             tree,
             ids: mapping.nodes,
+            by_oid,
         });
     }
     Ok(files)
@@ -264,10 +270,8 @@ pub(crate) fn blame(files: &[&FileSnap]) -> Result<BlameReport> {
     let mut map = IdentityMap::default();
     let mut write_set = std::collections::BTreeSet::new();
     for file in files {
-        for (oid, node_id) in &file.ids {
-            let Some(pointer) = pointer(&file.tree, *oid) else {
-                continue;
-            };
+        for (site, node_id) in &file.ids {
+            let pointer = site.clone();
             let path = NodePath {
                 file: file.path.clone(),
                 pointer,
@@ -447,29 +451,16 @@ fn covers(hord: &BTreeSet<String>, simple: &str) -> bool {
     })
 }
 
-fn pointer(tree: &NodeTree, target: ObjectId) -> Option<Vec<u32>> {
-    let root = tree.root()?;
-    let mut path = Vec::new();
-    if find(tree, root, target, &mut path) {
-        Some(path)
-    } else {
-        None
-    }
-}
-
-fn find(tree: &NodeTree, oid: ObjectId, target: ObjectId, path: &mut Vec<u32>) -> bool {
-    if oid == target {
-        return true;
-    }
-    let Some(node) = tree.get(oid) else {
-        return false;
-    };
-    for (index, child) in node.children.iter().enumerate() {
-        path.push(index as u32);
-        if find(tree, *child, target, path) {
-            return true;
+/// Content id → id of its first definition site in preorder.
+pub(crate) fn first_site_ids(
+    tree: &NodeTree,
+    ids: &BTreeMap<Vec<u32>, NodeId>,
+) -> std::collections::HashMap<ObjectId, NodeId> {
+    let mut out = std::collections::HashMap::new();
+    for (site, id) in ids {
+        if let Some(oid) = hord_lang::oid_at(tree, site) {
+            out.entry(oid).or_insert(*id);
         }
-        path.pop();
     }
-    false
+    out
 }

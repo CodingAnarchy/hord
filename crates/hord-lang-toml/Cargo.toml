@@ -13,6 +13,8 @@ hord-core.workspace = true
 hord-lang.workspace = true
 tree-sitter.workspace = true
 tree-sitter-toml.workspace = true
+thiserror.workspace = true
+toml = { workspace = true, features = ["preserve_order"] }
 
 [dev-dependencies]
 proptest.workspace = true

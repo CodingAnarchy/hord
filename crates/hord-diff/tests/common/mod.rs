@@ -5,9 +5,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{IdentityDelta, NodeId, ObjectId, Op};
-use hord_lang::{IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, default_identify};
+use hord_lang::{IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, default_identify};
 use hord_lang_rust::RustAdapter;
 use hord_lang_toml::TomlAdapter;
+
+/// Path the test trees are diffed as. Only the file-root id depends on it.
+pub fn file() -> hord_core::RepoPath {
+    "src/lib.rs".parse().expect("path")
+}
 
 pub fn rust() -> RustAdapter {
     RustAdapter
@@ -46,10 +51,10 @@ pub fn project<A: LangAdapter>(adapter: &A, tree: &NodeTree) -> Vec<u8> {
 }
 
 pub fn def_named(tree: &IdentifiedTree, needle: &str) -> Option<(ObjectId, NodeId)> {
-    tree.ids.iter().find_map(|(oid, nid)| {
-        let node = tree.tree.get(*oid)?;
+    tree.definitions().find_map(|(_, oid, nid)| {
+        let node = tree.tree.get(oid)?;
         let raw = std::str::from_utf8(node.raw.as_slice()).ok()?;
-        raw.contains(needle).then_some((*oid, *nid))
+        raw.contains(needle).then_some((oid, nid))
     })
 }
 
@@ -73,11 +78,11 @@ pub fn has_kind(ops: &[Op], kind: &str) -> bool {
 
 #[derive(Clone)]
 struct Lab {
-    oid: ObjectId,
+    site: Site,
     nid: Option<NodeId>,
     kind: String,
     label: String,
-    parent_oid: Option<ObjectId>,
+    parent_site: Option<Site>,
     index: u32,
     normalized: ObjectId,
 }
@@ -93,16 +98,14 @@ fn identify_labeled<A: LangAdapter>(
     let result_labs = collect_labs(adapter, result, None);
     let base_nids: BTreeSet<NodeId> = base.ids.values().copied().collect();
 
-    let mut used_base: BTreeSet<ObjectId> = mapping
+    let mut used_base: BTreeSet<Site> = mapping
         .nodes
         .values()
         .filter_map(|nid| {
             if !base_nids.contains(nid) {
                 return None;
             }
-            base.ids
-                .iter()
-                .find_map(|(oid, id)| (*id == *nid).then_some(*oid))
+            base.site_of(*nid).cloned()
         })
         .collect();
 
@@ -110,14 +113,14 @@ fn identify_labeled<A: LangAdapter>(
     // Rebind leftover births onto unmatched base defs by label, then by
     // normalized (moves whose parent def was not identified).
     for r in &result_labs {
-        let Some(&nid) = mapping.nodes.get(&r.oid) else {
+        let Some(&nid) = mapping.nodes.get(&r.site) else {
             continue;
         };
         if base_nids.contains(&nid) {
             continue;
         }
         let found = base_labs.iter().find(|b| {
-            !used_base.contains(&b.oid)
+            !used_base.contains(&b.site)
                 && b.kind == r.kind
                 && !r.label.is_empty()
                 && b.label == r.label
@@ -125,26 +128,26 @@ fn identify_labeled<A: LangAdapter>(
         if let Some(b) = found
             && let Some(bnid) = b.nid
         {
-            used_base.insert(b.oid);
-            mapping.nodes.insert(r.oid, bnid);
+            used_base.insert(b.site.clone());
+            mapping.nodes.insert(r.site.clone(), bnid);
         }
     }
 
     for r in &result_labs {
-        let Some(&nid) = mapping.nodes.get(&r.oid) else {
+        let Some(&nid) = mapping.nodes.get(&r.site) else {
             continue;
         };
         if base_nids.contains(&nid) {
             continue;
         }
         let found = base_labs.iter().find(|b| {
-            !used_base.contains(&b.oid) && b.kind == r.kind && b.normalized == r.normalized
+            !used_base.contains(&b.site) && b.kind == r.kind && b.normalized == r.normalized
         });
         if let Some(b) = found
             && let Some(bnid) = b.nid
         {
-            used_base.insert(b.oid);
-            mapping.nodes.insert(r.oid, bnid);
+            used_base.insert(b.site.clone());
+            mapping.nodes.insert(r.site.clone(), bnid);
         }
     }
 
@@ -164,14 +167,20 @@ fn identify_labeled<A: LangAdapter>(
 
     let mut moves = Vec::new();
     for r in &result_labs {
-        let Some(&nid) = mapping.nodes.get(&r.oid) else {
+        let Some(&nid) = mapping.nodes.get(&r.site) else {
             continue;
         };
         let Some(b) = base_labs.iter().find(|b| b.nid == Some(nid)) else {
             continue;
         };
-        let from_parent = b.parent_oid.and_then(|p| base.ids.get(&p).copied());
-        let to_parent = r.parent_oid.and_then(|p| mapping.nodes.get(&p).copied());
+        let from_parent = b
+            .parent_site
+            .as_ref()
+            .and_then(|p| base.ids.get(p).copied());
+        let to_parent = r
+            .parent_site
+            .as_ref()
+            .and_then(|p| mapping.nodes.get(p).copied());
         if from_parent != to_parent
             && let (Some(from_parent), Some(to_parent)) = (from_parent, to_parent)
         {
@@ -190,44 +199,45 @@ fn identify_labeled<A: LangAdapter>(
 fn collect_labs<A: LangAdapter>(
     adapter: &A,
     tree: &NodeTree,
-    ids: Option<&BTreeMap<ObjectId, NodeId>>,
+    ids: Option<&BTreeMap<Site, NodeId>>,
 ) -> Vec<Lab> {
     let Some(root) = tree.root() else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    walk_labs(adapter, tree, ids, root, None, 0, &mut out);
+    walk_labs(adapter, tree, ids, root, &mut Vec::new(), None, &mut out);
     out
 }
 
 fn walk_labs<A: LangAdapter>(
     adapter: &A,
     tree: &NodeTree,
-    ids: Option<&BTreeMap<ObjectId, NodeId>>,
+    ids: Option<&BTreeMap<Site, NodeId>>,
     oid: ObjectId,
-    parent_def: Option<ObjectId>,
-    index: u32,
+    site: &mut Site,
+    parent_def: Option<Site>,
     out: &mut Vec<Lab>,
 ) {
     let Some(node) = tree.get(oid) else {
         return;
     };
-    let mut child_parent = parent_def;
+    let mut child_parent = parent_def.clone();
     if adapter.is_definition(&node.kind) {
         out.push(Lab {
-            oid,
-            nid: ids.and_then(|m| m.get(&oid).copied()),
+            site: site.clone(),
+            nid: ids.and_then(|m| m.get(site.as_slice()).copied()),
             kind: node.kind.as_str().to_owned(),
             label: def_label(node.kind.as_str(), node.raw.as_slice()),
-            parent_oid: parent_def,
-            index,
+            parent_site: parent_def,
+            index: site.last().copied().unwrap_or(0),
             normalized: node.normalized,
         });
-        child_parent = Some(oid);
+        child_parent = Some(site.clone());
     }
     for (i, child) in node.children.iter().enumerate() {
-        let idx = u32::try_from(i).unwrap_or(u32::MAX);
-        walk_labs(adapter, tree, ids, *child, child_parent, idx, out);
+        site.push(u32::try_from(i).unwrap_or(u32::MAX));
+        walk_labs(adapter, tree, ids, *child, site, child_parent.clone(), out);
+        site.pop();
     }
 }
 

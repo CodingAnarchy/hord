@@ -24,6 +24,9 @@ pub struct SnapshotFile {
 /// that is itself the root has an empty pointer. `deltas` are stored unchanged
 /// (births, deaths, and derivations relative to the parent snapshot).
 ///
+/// Each file with a root also gets [`crate::file_root_id`] at an empty
+/// pointer (ADR 0015), unless a definition is itself the root.
+///
 /// # Errors
 ///
 /// [`Error::DuplicateNode`] if one [`NodeId`] occurs at two paths.
@@ -33,6 +36,22 @@ pub fn identity_map(files: &[SnapshotFile], deltas: Vec<IdentityDelta>) -> Resul
     let mut nodes = BTreeMap::new();
     for file in files {
         locate(&file.path, &file.identified, &mut nodes)?;
+        let root_taken = nodes
+            .values()
+            .any(|at| at.file == file.path && at.pointer.is_empty());
+        if file.identified.tree.root().is_some() && !root_taken {
+            let root = crate::file_root_id(&file.path);
+            if nodes.contains_key(&root) {
+                return Err(Error::DuplicateNode(root));
+            }
+            nodes.insert(
+                root,
+                NodePath {
+                    file: file.path.clone(),
+                    pointer: Vec::new(),
+                },
+            );
+        }
     }
     Ok(IdentityMap { nodes, deltas })
 }
@@ -42,9 +61,9 @@ fn locate(
     identified: &IdentifiedTree,
     nodes: &mut BTreeMap<NodeId, NodePath>,
 ) -> Result<()> {
-    for oid in identified.ids.keys() {
-        if !identified.tree.contains(*oid) {
-            return Err(Error::MissingNode(*oid));
+    for (site, id) in &identified.ids {
+        if identified.oid_at(site).is_none() {
+            return Err(Error::Unmapped(*id));
         }
     }
     if let Some(root) = identified.tree.root() {
@@ -69,12 +88,12 @@ fn locate(
 fn walk(
     path: &RepoPath,
     tree: &NodeTree,
-    ids: &BTreeMap<ObjectId, NodeId>,
+    ids: &BTreeMap<Vec<u32>, NodeId>,
     oid: ObjectId,
     pointer: &mut Vec<u32>,
     nodes: &mut BTreeMap<NodeId, NodePath>,
 ) -> Result<()> {
-    if let Some(&node_id) = ids.get(&oid) {
+    if let Some(&node_id) = ids.get(pointer.as_slice()) {
         let inserted = nodes.insert(
             node_id,
             NodePath {

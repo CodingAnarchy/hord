@@ -5,7 +5,7 @@ mod common;
 use std::path::PathBuf;
 
 use hord_core::Op;
-use hord_diff::{ConflictKind, apply, diff, merge, merge_ops};
+use hord_diff::{ConflictKind, MergeMode, apply, diff, merge, merge_ops};
 use hord_lang::{IdentifiedTree, LangAdapter, default_identify};
 
 use common::{identify_result, parse_identified, rust, toml};
@@ -15,6 +15,16 @@ fn merge_identified<A: LangAdapter>(
     base_src: &[u8],
     ours_src: &[u8],
     theirs_src: &[u8],
+) -> Result<hord_diff::MergeResult, hord_diff::Conflict> {
+    merge_in(adapter, base_src, ours_src, theirs_src, MergeMode::Corpus)
+}
+
+fn merge_in<A: LangAdapter>(
+    adapter: &A,
+    base_src: &[u8],
+    ours_src: &[u8],
+    theirs_src: &[u8],
+    mode: MergeMode,
 ) -> Result<hord_diff::MergeResult, hord_diff::Conflict> {
     let empty = IdentifiedTree::default();
     let base_tree = adapter.parse(base_src).expect("parse base");
@@ -26,7 +36,7 @@ fn merge_identified<A: LangAdapter>(
     let theirs_tree = adapter.parse(theirs_src).expect("parse theirs");
     let theirs_map = default_identify(adapter, &base, &theirs_tree);
     let theirs = IdentifiedTree::new(theirs_tree, theirs_map.nodes);
-    merge(adapter, &base, &ours, &theirs)
+    merge(adapter, &base, &ours, &theirs, mode)
 }
 
 fn projected_text<A: LangAdapter>(adapter: &A, tree: &hord_lang::IdentifiedTree) -> String {
@@ -52,7 +62,7 @@ fn identical_normalized_replace_composes() {
         hord_lang::IdentifiedTree::new(tree, mapping.nodes)
     };
 
-    let merged = merge(&adapter, &base, &ours, &theirs)
+    let merged = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus)
         .unwrap_or_else(|c| panic!("expected compose, got {c:?}"));
     let got = adapter.project(&merged.tree.tree);
     // Landing order picks ours.
@@ -151,7 +161,7 @@ fn delete_vs_replace_is_hard_conflict() {
         hord_lang::IdentifiedTree::new(tree, mapping.nodes)
     };
 
-    let err = merge(&adapter, &base, &ours, &theirs).expect_err("hard conflict");
+    let err = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus).expect_err("hard conflict");
     assert_eq!(err.kind, ConflictKind::Hard);
     assert!(
         !err.nodes.is_empty(),
@@ -176,7 +186,7 @@ fn disjoint_ops_compose() {
         hord_lang::IdentifiedTree::new(tree, mapping.nodes)
     };
 
-    let merged = merge(&adapter, &base, &ours, &theirs)
+    let merged = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus)
         .unwrap_or_else(|c| panic!("disjoint should compose: {c:?}"));
     let got = adapter.project(&merged.tree.tree);
     let want = b"fn a() { let x = 2; }\nfn b() { let y = 2; }\n";
@@ -198,11 +208,11 @@ fn same_index_inserts_are_soft_conflicts() {
     let base = parse_identified(&adapter, base_src);
     let (ours_tree, ours_map) = identify_result(&adapter, &base, ours_src);
     let (theirs_tree, theirs_map) = identify_result(&adapter, &base, theirs_src);
-    let ours_ops = diff(&base, &ours_tree, &ours_map);
-    let theirs_ops = diff(&base, &theirs_tree, &theirs_map);
+    let ours_ops = diff(&common::file(), &base, &ours_tree, &ours_map);
+    let theirs_ops = diff(&common::file(), &base, &theirs_tree, &theirs_map);
     let ours = hord_lang::IdentifiedTree::new(ours_tree, ours_map.nodes);
     let theirs = hord_lang::IdentifiedTree::new(theirs_tree, theirs_map.nodes);
-    let merged = merge(&adapter, &base, &ours, &theirs)
+    let merged = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus)
         .unwrap_or_else(|c| panic!("soft conflict should still merge: {c:?}"));
     assert!(
         merged.soft.iter().any(|c| c.kind == ConflictKind::Soft),
@@ -226,9 +236,17 @@ fn merge_ops_delete_vs_replace() {
     let ours = vec![Op::Delete { node: a_id }];
     let (theirs_tree, theirs_map) =
         identify_result(&adapter, &base, b"fn a() { let x = 9; }\nfn keep() {}\n");
-    let theirs = diff(&base, &theirs_tree, &theirs_map);
-    let err =
-        merge_ops(&adapter, &base, &ours, &theirs, &theirs_tree).expect_err("delete vs replace");
+    let theirs = diff(&common::file(), &base, &theirs_tree, &theirs_map);
+    let err = merge_ops(
+        &adapter,
+        &common::file(),
+        &base,
+        &ours,
+        &theirs,
+        &theirs_tree,
+        MergeMode::Corpus,
+    )
+    .expect_err("delete vs replace");
     assert_eq!(err.kind, ConflictKind::Hard);
 }
 
@@ -385,7 +403,55 @@ fn apply_of_diff_used_by_merge_round_trip() {
     let ours_src = b"fn a() {}\nfn b() {}\n";
     let base = parse_identified(&adapter, base_src);
     let (ours_tree, ours_map) = identify_result(&adapter, &base, ours_src);
-    let ops = diff(&base, &ours_tree, &ours_map);
-    let applied = apply(&base, &ops, &ours_tree).unwrap();
+    let ops = diff(&common::file(), &base, &ours_tree, &ours_map);
+    let applied = apply(&common::file(), &base, &ops, &ours_tree).unwrap();
     assert_eq!(adapter.project(&applied.tree).as_slice(), ours_src);
+}
+
+/// ADR 0014: the same line changed two ways. Corpus mode keeps ours (git
+/// `--ours`); lander mode is a hard conflict naming the definition.
+#[test]
+fn lander_mode_never_resolves_by_landing_order() {
+    let adapter = rust();
+    let base = b"fn f() -> u32 {\n    1\n}\n\nfn g() -> u32 {\n    2\n}\n";
+    let ours = b"fn f() -> u32 {\n    10\n}\n\nfn g() -> u32 {\n    2\n}\n";
+    let theirs = b"fn f() -> u32 {\n    11\n}\n\nfn g() -> u32 {\n    2\n}\n";
+
+    let corpus = merge_in(&adapter, base, ours, theirs, MergeMode::Corpus).expect("corpus merges");
+    assert_eq!(projected_text(&adapter, &corpus.tree).as_bytes(), ours);
+
+    let err = merge_in(&adapter, base, ours, theirs, MergeMode::Lander).expect_err("lander");
+    assert_eq!(err.kind, ConflictKind::Hard);
+    assert_eq!(err.nodes.len(), 1, "{err}");
+
+    // Edits that do combine still merge in lander mode.
+    let theirs_g = b"fn f() -> u32 {\n    1\n}\n\nfn g() -> u32 {\n    20\n}\n";
+    let merged = merge_in(&adapter, base, ours, theirs_g, MergeMode::Lander).expect("disjoint");
+    let text = projected_text(&adapter, &merged.tree);
+    assert!(
+        text.contains("    10\n") && text.contains("    20\n"),
+        "{text}"
+    );
+    // Both sides made the same edit: composes (spec §5.2 rule 2).
+    let same = merge_in(&adapter, base, ours, ours, MergeMode::Lander).expect("same edit");
+    assert_eq!(projected_text(&adapter, &same.tree).as_bytes(), ours);
+}
+
+/// ADR 0014: in lander mode a definition both sides edited, when the edits
+/// do combine, re-parses and is flagged soft for the verifier.
+#[test]
+fn lander_mode_flags_a_combined_same_definition_edit_soft() {
+    let adapter = rust();
+    let base = b"fn f() -> u32 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
+    let ours = b"fn f() -> u32 {\n    let a = 10;\n    let b = 2;\n    a + b\n}\n";
+    let theirs = b"fn f() -> u32 {\n    let a = 1;\n    let b = 20;\n    a + b\n}\n";
+    let merged = merge_in(&adapter, base, ours, theirs, MergeMode::Lander).expect("combines");
+    let text = projected_text(&adapter, &merged.tree);
+    assert!(text.contains("= 10;") && text.contains("= 20;"), "{text}");
+    assert!(
+        merged.soft.iter().any(|c| c.kind == ConflictKind::Soft),
+        "{:?}",
+        merged.soft
+    );
+    assert!(adapter.parse(text.as_bytes()).is_ok());
 }

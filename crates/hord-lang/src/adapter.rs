@@ -67,7 +67,26 @@ struct Import {
 #[derive(Clone, Debug)]
 struct FileRoot {
     object_id: ObjectId,
+    /// Repository path, when the adapter recorded it. Two files with the
+    /// same content share `object_id`; the path tells them apart.
+    path: Option<RepoPath>,
     module: QualifiedName,
+}
+
+/// Which definition (or file) a node is, for Tier 2 scope.
+///
+/// Content does not identify a site: two identical definitions in different
+/// modules are one interned [`Node`]. An anchor names the site, so
+/// [`LangAdapter::references_at`] resolves names in that site's own module
+/// (spec §3.4, positional identity).
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum Anchor {
+    /// The definition with this [`NodeId`] in the context.
+    Definition(NodeId),
+    /// Glue or a definition with no id of its own, placed in this file's
+    /// module.
+    File(RepoPath),
 }
 
 #[derive(Clone, Debug)]
@@ -189,10 +208,29 @@ impl ResolveCtx {
     }
 
     /// Record a file root's module, for nodes that are not themselves definitions.
+    ///
+    /// Prefer [`Self::add_file_at`]: without a path, two files with the same
+    /// content cannot be told apart.
     pub fn add_file(&mut self, object_id: ObjectId, module: impl Into<QualifiedName>) {
         self.bump();
         self.files.push(FileRoot {
             object_id,
+            path: None,
+            module: module.into(),
+        });
+    }
+
+    /// Record the root of the file at `path` and its module.
+    pub fn add_file_at(
+        &mut self,
+        path: RepoPath,
+        object_id: ObjectId,
+        module: impl Into<QualifiedName>,
+    ) {
+        self.bump();
+        self.files.push(FileRoot {
+            object_id,
+            path: Some(path),
             module: module.into(),
         });
     }
@@ -244,6 +282,17 @@ impl ResolveCtx {
     pub fn for_each_file(&self, mut visit: impl FnMut(ObjectId, &QualifiedName)) {
         for f in &self.files {
             visit(f.object_id, &f.module);
+        }
+    }
+
+    /// Visit every file root in insertion order (`path`, `object_id`,
+    /// `module`). `path` is `None` for roots added with [`Self::add_file`].
+    pub fn for_each_file_at(
+        &self,
+        mut visit: impl FnMut(Option<&RepoPath>, ObjectId, &QualifiedName),
+    ) {
+        for f in &self.files {
+            visit(f.path.as_ref(), f.object_id, &f.module);
         }
     }
 
@@ -360,9 +409,22 @@ pub trait LangAdapter: Send + Sync {
     }
 
     /// Tier 2. Outgoing references from a node's body (names, not targets).
+    ///
+    /// The node's scope is looked up by its content. When identical
+    /// definitions sit in several modules, an adapter must search every one
+    /// of their scopes (a superset). Prefer [`Self::references_at`].
     fn references(&self, ctx: &ResolveCtx, node: &Node) -> Vec<NameRef> {
         let _ = (ctx, node);
         Vec::new()
+    }
+
+    /// Tier 2. Outgoing references from `node`'s body, resolved in the scope
+    /// of `anchor`: the site `node` stands for. `node` supplies the text (it
+    /// may be an edited version of the anchored definition). The default
+    /// ignores the anchor.
+    fn references_at(&self, ctx: &ResolveCtx, anchor: &Anchor, node: &Node) -> Vec<NameRef> {
+        let _ = anchor;
+        self.references(ctx, node)
     }
 
     /// Tier 2. Resolve a [`NameRef`] to a definition [`NodeId`], if possible.

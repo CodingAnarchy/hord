@@ -7,28 +7,75 @@ use hord_core::{IdentityDelta, Node, NodeId, NodeKind, ObjectId, Op, QualifiedNa
 use crate::adapter::LangAdapter;
 use crate::tree::NodeTree;
 
+/// Where a node sits in a tree: the child indices from the root down to it.
+/// The root is the empty site.
+///
+/// Identity is keyed by site, not by content: two definitions with the same
+/// text (two identical `use` lines in different functions) are one interned
+/// node but two sites, and each keeps its own [`NodeId`] (spec §3.4). This is
+/// the [`hord_core::NodePath::pointer`] of an identity map. Sites order
+/// lexicographically, which is preorder.
+pub type Site = Vec<u32>;
+
 /// A [`NodeTree`] plus durable [`NodeId`]s for definition nodes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IdentifiedTree {
     /// Interned CST.
     pub tree: NodeTree,
-    /// Definition content id → stable identity.
-    pub ids: BTreeMap<ObjectId, NodeId>,
+    /// Definition site → stable identity.
+    pub ids: BTreeMap<Site, NodeId>,
 }
 
 impl IdentifiedTree {
     /// Wrap an interned tree and its definition ids.
     #[must_use]
-    pub fn new(tree: NodeTree, ids: BTreeMap<ObjectId, NodeId>) -> Self {
+    pub fn new(tree: NodeTree, ids: BTreeMap<Site, NodeId>) -> Self {
         Self { tree, ids }
     }
+
+    /// Content id of the node at `site`.
+    #[must_use]
+    pub fn oid_at(&self, site: &[u32]) -> Option<ObjectId> {
+        oid_at(&self.tree, site)
+    }
+
+    /// The node at `site`.
+    #[must_use]
+    pub fn node_at(&self, site: &[u32]) -> Option<&Node> {
+        self.tree.get(self.oid_at(site)?)
+    }
+
+    /// Site of the definition with identity `node`.
+    #[must_use]
+    pub fn site_of(&self, node: NodeId) -> Option<&Site> {
+        self.ids
+            .iter()
+            .find_map(|(site, id)| (*id == node).then_some(site))
+    }
+
+    /// Every identified definition: site, content id, identity, in preorder.
+    pub fn definitions(&self) -> impl Iterator<Item = (&Site, ObjectId, NodeId)> + '_ {
+        self.ids
+            .iter()
+            .filter_map(|(site, id)| Some((site, self.oid_at(site)?, *id)))
+    }
+}
+
+/// Content id of the node at `site` in `tree`.
+#[must_use]
+pub fn oid_at(tree: &NodeTree, site: &[u32]) -> Option<ObjectId> {
+    let mut oid = tree.root()?;
+    for index in site {
+        oid = *tree.get(oid)?.children.get(*index as usize)?;
+    }
+    Some(oid)
 }
 
 /// Result of [`default_identify`]: carried ids, births/deaths, and moves.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IdentityMapping {
-    /// Result definition [`ObjectId`] → carried or newly assigned [`NodeId`].
-    pub nodes: BTreeMap<ObjectId, NodeId>,
+    /// Result definition [`Site`] → carried or newly assigned [`NodeId`].
+    pub nodes: BTreeMap<Site, NodeId>,
     /// [`IdentityDelta::Birth`] for unmatched result defs and
     /// [`IdentityDelta::Death`] for unmatched base defs.
     pub deltas: Vec<IdentityDelta>,
@@ -60,7 +107,8 @@ struct BaseDef {
 #[derive(Clone, Debug)]
 struct ResultDef {
     object_id: ObjectId,
-    parent_def_oid: Option<ObjectId>,
+    site: Site,
+    parent_def_site: Option<Site>,
     index: u32,
     kind: NodeKind,
     normalized: ObjectId,
@@ -134,11 +182,11 @@ pub fn default_identify<A: LangAdapter + ?Sized>(
     );
 
     for r in &result_defs {
-        if mapping.nodes.contains_key(&r.object_id) {
+        if mapping.nodes.contains_key(&r.site) {
             continue;
         }
         let id = NodeId::generate();
-        mapping.nodes.insert(r.object_id, id);
+        mapping.nodes.insert(r.site.clone(), id);
         mapping.deltas.push(IdentityDelta::Birth { node: id });
     }
 
@@ -151,15 +199,16 @@ pub fn default_identify<A: LangAdapter + ?Sized>(
     }
 
     for r in &result_defs {
-        let Some(&nid) = mapping.nodes.get(&r.object_id) else {
+        let Some(&nid) = mapping.nodes.get(&r.site) else {
             continue;
         };
         let Some(b) = base_defs.iter().find(|d| d.used && d.node_id == nid) else {
             continue;
         };
         let to_parent = r
-            .parent_def_oid
-            .and_then(|oid| mapping.nodes.get(&oid).copied());
+            .parent_def_site
+            .as_ref()
+            .and_then(|site| mapping.nodes.get(site).copied());
         if b.parent_id == to_parent {
             continue;
         }
@@ -185,22 +234,23 @@ enum MatchKind {
 }
 
 fn match_pass(
-    result_ids: &mut BTreeMap<ObjectId, NodeId>,
+    result_ids: &mut BTreeMap<Site, NodeId>,
     base_defs: &mut [BaseDef],
     result_defs: &[ResultDef],
     kind: MatchKind,
 ) -> bool {
     let mut progress = false;
     for r in result_defs {
-        if result_ids.contains_key(&r.object_id) {
+        if result_ids.contains_key(&r.site) {
             continue;
         }
         let parent_nid = r
-            .parent_def_oid
-            .and_then(|oid| result_ids.get(&oid).copied());
+            .parent_def_site
+            .as_ref()
+            .and_then(|site| result_ids.get(site).copied());
         // Wait until the nearest enclosing definition is identified so
         // exact/named/moved see a stable parent [`NodeId`].
-        if r.parent_def_oid.is_some() && parent_nid.is_none() {
+        if r.parent_def_site.is_some() && parent_nid.is_none() {
             continue;
         }
 
@@ -221,7 +271,7 @@ fn match_pass(
         });
         if let Some(b) = found {
             b.used = true;
-            result_ids.insert(r.object_id, b.node_id);
+            result_ids.insert(r.site.clone(), b.node_id);
             progress = true;
         }
     }
@@ -231,7 +281,6 @@ fn match_pass(
 struct RenameCandidate {
     base_id: NodeId,
     preorder: usize,
-    result_oid: ObjectId,
     slack: usize,
 }
 
@@ -263,7 +312,7 @@ fn rename_candidates(
 ) -> Vec<RenameCandidate> {
     let mut candidates = Vec::new();
     for (preorder, result_def) in result_defs.iter().enumerate() {
-        if mapping.nodes.contains_key(&result_def.object_id) {
+        if mapping.nodes.contains_key(&result_def.site) {
             continue;
         }
         for base_def in base_defs {
@@ -281,7 +330,6 @@ fn rename_candidates(
             candidates.push(RenameCandidate {
                 base_id: base_def.node_id,
                 preorder,
-                result_oid: result_def.object_id,
                 slack,
             });
         }
@@ -311,9 +359,10 @@ fn assign_renames(
         };
         base_def.used = true;
         let base_name = base_def.name.clone();
-        mapping
-            .nodes
-            .insert(candidate.result_oid, candidate.base_id);
+        mapping.nodes.insert(
+            result_defs[candidate.preorder].site.clone(),
+            candidate.base_id,
+        );
         mapping.deltas.push(IdentityDelta::DerivedFrom {
             node: candidate.base_id,
             from: candidate.base_id,
@@ -347,23 +396,25 @@ fn names_conflict(a: &Option<QualifiedName>, b: &Option<QualifiedName>) -> bool 
     }
 }
 
-/// Preorder. `visit` returns the parent state seen by this node's children.
-fn walk_defs<T: Copy>(
+/// Preorder. `visit` gets the node's site and returns the parent state seen
+/// by its children.
+fn walk_defs<T: Clone>(
     tree: &NodeTree,
     oid: ObjectId,
     ancestors: &mut Vec<ObjectId>,
-    index: u32,
+    site: &mut Site,
     state: T,
-    visit: &mut impl FnMut(&Node, ObjectId, &[ObjectId], u32, T) -> T,
+    visit: &mut impl FnMut(&Node, ObjectId, &[ObjectId], &[u32], T) -> T,
 ) {
     let Some(node) = tree.get(oid) else {
         return;
     };
-    let child_state = visit(node, oid, ancestors, index, state);
+    let child_state = visit(node, oid, ancestors, site, state);
     ancestors.push(oid);
     for (i, child) in node.children.iter().enumerate() {
-        let child_index = u32::try_from(i).unwrap_or(u32::MAX);
-        walk_defs(tree, *child, ancestors, child_index, child_state, visit);
+        site.push(u32::try_from(i).unwrap_or(u32::MAX));
+        walk_defs(tree, *child, ancestors, site, child_state.clone(), visit);
+        site.pop();
     }
     ancestors.pop();
 }
@@ -378,13 +429,13 @@ fn collect_base_defs<A: LangAdapter + ?Sized>(adapter: &A, base: &IdentifiedTree
         &base.tree,
         root,
         &mut ancestors,
-        0,
+        &mut Vec::new(),
         None,
-        &mut |node, oid, ancestors, _index, parent: Option<NodeId>| {
+        &mut |node, oid, ancestors, site, parent: Option<NodeId>| {
             if !(adapter.is_definition(&node.kind)) {
                 return parent;
             }
-            let Some(&node_id) = base.ids.get(&oid) else {
+            let Some(&node_id) = base.ids.get(site) else {
                 return parent;
             };
             out.push(BaseDef {
@@ -412,21 +463,22 @@ fn collect_result_defs<A: LangAdapter + ?Sized>(adapter: &A, tree: &NodeTree) ->
         tree,
         root,
         &mut ancestors,
-        0,
+        &mut Vec::new(),
         None,
-        &mut |node, oid, ancestors, index, parent: Option<ObjectId>| {
+        &mut |node, oid, ancestors, site, parent: Option<Site>| {
             if !adapter.is_definition(&node.kind) {
                 return parent;
             }
             out.push(ResultDef {
                 object_id: oid,
-                parent_def_oid: parent,
-                index,
+                site: site.to_vec(),
+                parent_def_site: parent,
+                index: site.last().copied().unwrap_or(0),
                 kind: node.kind,
                 normalized: node.normalized,
                 name: def_name(adapter, tree, ancestors, node),
             });
-            Some(oid)
+            Some(site.to_vec())
         },
     );
     out
@@ -468,6 +520,32 @@ mod tests {
             .unwrap()
     }
 
+    /// First site of `oid` in `tree`, in preorder.
+    fn site(tree: &NodeTree, oid: ObjectId) -> Site {
+        fn walk(tree: &NodeTree, at: ObjectId, want: ObjectId, path: &mut Site) -> bool {
+            if at == want {
+                return true;
+            }
+            let Some(node) = tree.get(at) else {
+                return false;
+            };
+            for (i, child) in node.children.iter().enumerate() {
+                path.push(u32::try_from(i).unwrap());
+                if walk(tree, *child, want, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        let mut path = Vec::new();
+        assert!(
+            walk(tree, tree.root().expect("root"), oid, &mut path),
+            "{oid} not in tree"
+        );
+        path
+    }
+
     fn nid(n: u128) -> NodeId {
         NodeId::from_u128(n)
     }
@@ -483,11 +561,11 @@ mod tests {
         tree.set_root(root).unwrap();
 
         let mut ids = BTreeMap::new();
-        ids.insert(foo, nid(1));
+        ids.insert(site(&tree, foo), nid(1));
         let base = IdentifiedTree::new(tree.clone(), ids);
         let mapping = default_identify(&adapter, &base, &tree);
 
-        assert_eq!(mapping.nodes.get(&foo).copied(), Some(nid(1)));
+        assert_eq!(mapping.nodes.get(&site(&tree, foo)).copied(), Some(nid(1)));
         assert!(mapping.deltas.is_empty());
         assert!(mapping.moves.is_empty());
     }
@@ -502,7 +580,7 @@ mod tests {
             .unwrap();
         base_tree.set_root(base_root).unwrap();
         let mut ids = BTreeMap::new();
-        ids.insert(foo_old, nid(1));
+        ids.insert(site(&base_tree, foo_old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
@@ -514,7 +592,10 @@ mod tests {
 
         let mapping = default_identify(&adapter, &base, &result);
         assert_ne!(foo_old, foo_new);
-        assert_eq!(mapping.nodes.get(&foo_new).copied(), Some(nid(1)));
+        assert_eq!(
+            mapping.nodes.get(&site(&result, foo_new)).copied(),
+            Some(nid(1))
+        );
         assert!(mapping.deltas.is_empty());
         assert!(mapping.moves.is_empty());
     }
@@ -546,9 +627,9 @@ mod tests {
             .unwrap();
         base_tree.set_root(base_root).unwrap();
         let mut ids = BTreeMap::new();
-        ids.insert(foo, nid(1));
-        ids.insert(mod_a, nid(2));
-        ids.insert(mod_b, nid(3));
+        ids.insert(site(&base_tree, foo), nid(1));
+        ids.insert(site(&base_tree, mod_a), nid(2));
+        ids.insert(site(&base_tree, mod_b), nid(3));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
@@ -577,9 +658,18 @@ mod tests {
         assert_eq!(foo, foo_r);
 
         let mapping = default_identify(&adapter, &base, &result);
-        assert_eq!(mapping.nodes.get(&foo_r).copied(), Some(nid(1)));
-        assert_eq!(mapping.nodes.get(&mod_a_r).copied(), Some(nid(2)));
-        assert_eq!(mapping.nodes.get(&mod_b_r).copied(), Some(nid(3)));
+        assert_eq!(
+            mapping.nodes.get(&site(&result, foo_r)).copied(),
+            Some(nid(1))
+        );
+        assert_eq!(
+            mapping.nodes.get(&site(&result, mod_a_r)).copied(),
+            Some(nid(2))
+        );
+        assert_eq!(
+            mapping.nodes.get(&site(&result, mod_b_r)).copied(),
+            Some(nid(3))
+        );
         assert!(mapping.deltas.is_empty());
         assert_eq!(
             mapping.moves,
@@ -602,7 +692,7 @@ mod tests {
             .unwrap();
         base_tree.set_root(base_root).unwrap();
         let mut ids = BTreeMap::new();
-        ids.insert(old, nid(1));
+        ids.insert(site(&base_tree, old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
@@ -626,7 +716,7 @@ mod tests {
                 .iter()
                 .any(|d| matches!(d, IdentityDelta::Birth { .. }))
         );
-        let born = mapping.nodes.get(&new).copied().unwrap();
+        let born = mapping.nodes.get(&site(&result, new)).copied().unwrap();
         assert_ne!(born, nid(1));
         assert!(mapping.moves.is_empty());
     }
@@ -655,7 +745,7 @@ mod tests {
             .unwrap();
         base_tree.set_root(base_root).unwrap();
         let mut ids = BTreeMap::new();
-        ids.insert(old, nid(1));
+        ids.insert(site(&base_tree, old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
@@ -666,7 +756,10 @@ mod tests {
         result.set_root(result_root).unwrap();
 
         let mapping = default_identify(&adapter, &base, &result);
-        assert_eq!(mapping.nodes.get(&new).copied(), Some(nid(1)));
+        assert_eq!(
+            mapping.nodes.get(&site(&result, new)).copied(),
+            Some(nid(1))
+        );
         assert!(mapping.deltas.iter().any(|delta| matches!(
             delta,
             IdentityDelta::DerivedFrom { node, from } if *node == nid(1) && *from == nid(1)
@@ -692,7 +785,7 @@ mod tests {
             .unwrap();
         base_tree.set_root(base_root).unwrap();
         let mut ids = BTreeMap::new();
-        ids.insert(old, nid(1));
+        ids.insert(site(&base_tree, old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
@@ -703,7 +796,10 @@ mod tests {
         result.set_root(result_root).unwrap();
 
         let mapping = default_identify(&adapter, &base, &result);
-        assert_ne!(mapping.nodes.get(&new).copied(), Some(nid(1)));
+        assert_ne!(
+            mapping.nodes.get(&site(&result, new)).copied(),
+            Some(nid(1))
+        );
         assert!(mapping.renames.is_empty());
         assert!(
             mapping
@@ -723,11 +819,14 @@ mod tests {
             .unwrap();
         tree.set_root(root).unwrap();
         let mut ids = BTreeMap::new();
-        ids.insert(foo, nid(9));
+        ids.insert(site(&tree, foo), nid(9));
         let base = IdentifiedTree::new(tree.clone(), ids);
         let via_trait = adapter.identify(&base, &tree);
         let via_fn = default_identify(&adapter, &base, &tree);
         assert_eq!(via_trait.nodes, via_fn.nodes);
-        assert_eq!(via_trait.nodes.get(&foo).copied(), Some(nid(9)));
+        assert_eq!(
+            via_trait.nodes.get(&site(&tree, foo)).copied(),
+            Some(nid(9))
+        );
     }
 }

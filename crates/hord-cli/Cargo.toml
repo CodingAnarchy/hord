@@ -18,8 +18,10 @@ clap.workspace = true
 hord-core.workspace = true
 hord-git.workspace = true
 hord-store.workspace = true
+hord-txn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

@@ -25,9 +25,9 @@ mod rename;
 mod tree;
 mod trivia;
 
-pub use adapter::{AdapterRegistry, LangAdapter, NameRef, ResolveCtx, Tier};
+pub use adapter::{AdapterRegistry, Anchor, LangAdapter, NameRef, ResolveCtx, Tier};
 pub use error::ParseError;
-pub use identify::{IdentifiedTree, IdentityMapping, default_identify};
+pub use identify::{IdentifiedTree, IdentityMapping, Site, default_identify, oid_at};
 pub use normalized::normalized_hash;
 pub use tree::NodeTree;
 pub use trivia::{

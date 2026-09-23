@@ -11,7 +11,7 @@ use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
 struct Owned {
     path: RepoPath,
     tree: NodeTree,
-    ids: BTreeMap<ObjectId, NodeId>,
+    ids: BTreeMap<Vec<u32>, NodeId>,
 }
 
 fn adapter() -> RustAdapter {
@@ -28,26 +28,57 @@ fn parse_one(path: &str, src: &str) -> Owned {
     }
 }
 
-fn assign_ids(tree: &NodeTree) -> BTreeMap<ObjectId, NodeId> {
+fn assign_ids(tree: &NodeTree) -> BTreeMap<Vec<u32>, NodeId> {
     let mut ids = BTreeMap::new();
     let mut n = 1u128;
     if let Some(root) = tree.root() {
-        assign_walk(tree, root, &mut ids, &mut n);
+        assign_walk(tree, root, &mut Vec::new(), &mut ids, &mut n);
     }
     ids
 }
 
-fn assign_walk(tree: &NodeTree, oid: ObjectId, ids: &mut BTreeMap<ObjectId, NodeId>, n: &mut u128) {
+fn assign_walk(
+    tree: &NodeTree,
+    oid: ObjectId,
+    site: &mut Vec<u32>,
+    ids: &mut BTreeMap<Vec<u32>, NodeId>,
+    n: &mut u128,
+) {
     let Some(node) = tree.get(oid) else {
         return;
     };
     if adapter().is_definition(&node.kind) {
-        ids.insert(oid, NodeId::from_u128(*n));
+        ids.insert(site.clone(), NodeId::from_u128(*n));
         *n += 1;
     }
-    for child in node.children.clone() {
-        assign_walk(tree, child, ids, n);
+    for (i, child) in node.children.clone().into_iter().enumerate() {
+        site.push(u32::try_from(i).unwrap());
+        assign_walk(tree, child, site, ids, n);
+        site.pop();
     }
+}
+
+/// First site of `oid` in `tree`, in preorder.
+fn site_of(tree: &NodeTree, oid: ObjectId) -> Vec<u32> {
+    fn walk(tree: &NodeTree, at: ObjectId, want: ObjectId, path: &mut Vec<u32>) -> bool {
+        if at == want {
+            return true;
+        }
+        let Some(node) = tree.get(at) else {
+            return false;
+        };
+        for (i, child) in node.children.iter().enumerate() {
+            path.push(u32::try_from(i).unwrap());
+            if walk(tree, *child, want, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    assert!(walk(tree, tree.root().expect("root"), oid, &mut path));
+    path
 }
 
 fn context(files: &[Owned]) -> hord_lang::ResolveCtx {
@@ -91,7 +122,7 @@ fn id_of_kind(file: &Owned, want: &str, kind: Option<&str>) -> NodeId {
     let oid = ObjectId::of(node).expect("object id");
     *file
         .ids
-        .get(&oid)
+        .get(&site_of(&file.tree, oid))
         .unwrap_or_else(|| panic!("no id for {want}"))
 }
 
@@ -104,7 +135,7 @@ fn reassign_ids(files: &mut [Owned]) {
     for file in files {
         file.ids.clear();
         if let Some(root) = file.tree.root() {
-            assign_walk(&file.tree, root, &mut file.ids, &mut n);
+            assign_walk(&file.tree, root, &mut Vec::new(), &mut file.ids, &mut n);
         }
     }
 }
@@ -575,7 +606,7 @@ fn paint(a: &A) { a.draw(); }
         .collect();
     assert_eq!(draws.len(), 2);
     for (_, node) in draws {
-        let id = files[0].ids[&ObjectId::of(node).unwrap()];
+        let id = files[0].ids[&site_of(&files[0].tree, ObjectId::of(node).unwrap())];
         assert!(edges.contains(&id), "missing draw candidate {id}");
     }
 }
@@ -872,7 +903,8 @@ fn nil_definition_ids_are_skipped() {
     let mut file = parse_one("src/lib.rs", "fn helper() {}\nfn caller() { helper(); }\n");
     let helper = find(&file, "helper");
     let oid = ObjectId::of(helper).expect("object id");
-    file.ids.insert(oid, NodeId::nil());
+    let site = site_of(&file.tree, oid);
+    file.ids.insert(site, NodeId::nil());
     let ctx = context(std::slice::from_ref(&file));
     let refs = adapter().references(&ctx, find(&file, "caller"));
     let mention = refs
@@ -1306,5 +1338,142 @@ support = { path = "crates/support" }
     assert!(
         !hit.contains(&id_of(&files[1], "project_layout")),
         "{hit:?}"
+    );
+}
+
+/// Definition sites of `kind` whose text contains every needle, in file
+/// then preorder order: `(file index, site, id, content id)`.
+fn defs_with(
+    files: &[Owned],
+    kind: &str,
+    needles: &[&str],
+) -> Vec<(usize, Vec<u32>, NodeId, ObjectId)> {
+    let mut out = Vec::new();
+    for (f, file) in files.iter().enumerate() {
+        for (site, id) in &file.ids {
+            let Some(oid) = hord_lang::oid_at(&file.tree, site) else {
+                continue;
+            };
+            let node = file.tree.get(oid).unwrap();
+            let raw = String::from_utf8_lossy(node.raw.as_slice()).into_owned();
+            if node.kind.as_str() == kind && needles.iter().all(|n| raw.contains(n)) {
+                out.push((f, site.clone(), *id, oid));
+            }
+        }
+    }
+    out
+}
+
+/// References of each identical `helper` (a's first), anchored at its own
+/// definition, resolved to ids.
+fn anchored_targets(files: &[Owned]) -> [BTreeSet<NodeId>; 2] {
+    let ctx = context(files);
+    let helpers = defs_with(files, "function_item", &["fn helper"]);
+    assert_eq!(helpers.len(), 2);
+    let resolve = |(file, _, id, oid): &(usize, Vec<u32>, NodeId, ObjectId)| {
+        let node = files[*file].tree.get(*oid).unwrap();
+        adapter()
+            .references_at(&ctx, &hord_lang::Anchor::Definition(*id), node)
+            .iter()
+            .filter_map(|r| adapter().resolve(&ctx, r))
+            .collect::<BTreeSet<NodeId>>()
+    };
+    [resolve(&helpers[0]), resolve(&helpers[1])]
+}
+
+fn module_files(helper: &str, a_extra: &str, b_extra: &str) -> Vec<Owned> {
+    let mut files = vec![
+        parse_one("src/lib.rs", "pub mod a;\npub mod b;\n"),
+        parse_one("src/a.rs", &format!("{helper}\n{a_extra}")),
+        parse_one("src/b.rs", &format!("{helper}\n{b_extra}")),
+    ];
+    reassign_ids(&mut files);
+    // Same text in two files: one interned content id for both helpers.
+    let helpers = defs_with(&files, "function_item", &["fn helper"]);
+    assert_eq!(
+        helpers[0].3, helpers[1].3,
+        "the two helpers share one content id"
+    );
+    files
+}
+
+/// Two identical `helper`s calling `target()`, in `a.rs` and `b.rs`, each
+/// module with its own `target`. Each copy resolves to its own module's
+/// `target`. A bare call has no type to pick between same-named functions,
+/// so the other module's `target` is also a candidate (ADR 0011
+/// over-approximation), but never instead of the copy's own.
+#[test]
+fn identical_helpers_in_two_files_resolve_their_own_target() {
+    let files = module_files(
+        "pub fn helper() -> u32 {\n    target()\n}\n",
+        "pub fn target() -> u32 {\n    1\n}\n",
+        "pub fn target() -> u32 {\n    2\n}\n",
+    );
+    let targets = [
+        defs_with(&files, "function_item", &["fn target", "1"])[0].2,
+        defs_with(&files, "function_item", &["fn target", "2"])[0].2,
+    ];
+    let [a, b] = anchored_targets(&files);
+    assert!(a.contains(&targets[0]), "a::helper misses a::target: {a:?}");
+    assert!(b.contains(&targets[1]), "b::helper misses b::target: {b:?}");
+}
+
+/// The scope bug itself: a name resolved through the module's scope (a
+/// type), in two identical copies. Anchored at its own site, each copy
+/// names its own module's `Target` and never the other's. Before, both
+/// copies took the scope of whichever copy the content index kept.
+#[test]
+fn identical_helpers_in_two_files_resolve_types_in_their_own_module() {
+    let files = module_files(
+        "pub fn helper() -> Target {\n    Target\n}\n",
+        "pub struct Target;\n",
+        "pub struct Target;\n",
+    );
+    let structs = defs_with(&files, "struct_item", &["struct Target"]);
+    assert_eq!(structs.len(), 2);
+    let (a_target, b_target) = (structs[0].2, structs[1].2);
+    let [a, b] = anchored_targets(&files);
+    assert!(
+        a.contains(&a_target) && !a.contains(&b_target),
+        "a::helper: {a:?}"
+    );
+    assert!(
+        b.contains(&b_target) && !b.contains(&a_target),
+        "b::helper: {b:?}"
+    );
+
+    // Without an anchor the content is ambiguous; both scopes are searched,
+    // a superset that includes each copy's own target.
+    let ctx = context(&files);
+    let helper = defs_with(&files, "function_item", &["fn helper"])[1].clone();
+    let node = files[helper.0].tree.get(helper.3).unwrap();
+    let union: BTreeSet<NodeId> = adapter()
+        .references(&ctx, node)
+        .iter()
+        .filter_map(|r| adapter().resolve(&ctx, r))
+        .collect();
+    assert!(
+        union.contains(&a_target) && union.contains(&b_target),
+        "{union:?}"
+    );
+}
+
+/// Inline modules: each definition's name includes its module path, so the
+/// two helpers are different content; each still resolves in its own module.
+#[test]
+fn identical_helpers_in_two_inline_modules_resolve_types_in_their_own_module() {
+    let src = "pub mod a {\n    pub struct Target;\n    pub fn helper() -> Target {\n        Target\n    }\n}\n\npub mod b {\n    pub struct Target;\n    pub fn helper() -> Target {\n        Target\n    }\n}\n";
+    let mut files = vec![parse_one("src/lib.rs", src)];
+    reassign_ids(&mut files);
+    let structs = defs_with(&files, "struct_item", &["struct Target"]);
+    let (a_target, b_target) = (structs[0].2, structs[1].2);
+    let [a, b] = anchored_targets(&files);
+    assert!(
+        a.contains(&a_target) && !a.contains(&b_target),
+        "a::helper: {a:?}"
+    );
+    assert!(
+        b.contains(&b_target) && !b.contains(&a_target),
+        "b::helper: {b:?}"
     );
 }

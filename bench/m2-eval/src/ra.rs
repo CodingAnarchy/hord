@@ -116,7 +116,7 @@ pub(crate) fn measure(
             .get(&def.oid)
             .map(|offset| layout.position(*offset))
             .and_then(|pos| lsif.range_at(&def.path, pos));
-        let (Some(range), Some(target)) = (range, files[fi].ids.get(&def.oid).copied()) else {
+        let (Some(range), Some(target)) = (range, files[fi].by_oid.get(&def.oid).copied()) else {
             report
                 .unindexed
                 .push(format!("{} ({})", def.qname, def.path));

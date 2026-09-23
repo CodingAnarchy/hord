@@ -40,6 +40,46 @@ pub enum Command {
         /// Workspace id.
         #[arg(short = 'w', long = "workspace", value_name = "WS")]
         workspace: Option<String>,
+        /// Re-hash every file instead of trusting the stat index (ADR 0016).
+        #[arg(long)]
+        paranoid: bool,
+    },
+    /// Build a change record from a workspace (spec §6.2) and print its id.
+    Propose {
+        /// Workspace id.
+        #[arg(short = 'w', long = "workspace", value_name = "WS")]
+        workspace: Option<String>,
+        /// Intent file: Markdown with YAML front matter (`summary`, `refs`,
+        /// `acceptance`, optional `reads`).
+        #[arg(long, value_name = "FILE")]
+        intent: PathBuf,
+    },
+    /// Send a proposed change to the lander queue.
+    Submit {
+        /// Change id (64 hex digits).
+        #[arg(value_name = "CHANGE")]
+        change: String,
+    },
+    /// Show the lander queue.
+    Queue {
+        /// Only changes whose actor is `HORD_ACTOR` (else `USER`).
+        #[arg(long)]
+        mine: bool,
+    },
+    /// Run the lander inline until the queue is empty (single-user mode).
+    Land {
+        /// Run the lander in this process. Required: there is no remote yet.
+        #[arg(long)]
+        local: bool,
+        /// Submit this change first.
+        #[arg(value_name = "CHANGE")]
+        change: Option<String>,
+    },
+    /// Explain a change's conflict report.
+    Conflicts {
+        /// Change id (64 hex digits), as submitted or as landed.
+        #[arg(value_name = "CHANGE")]
+        change: String,
     },
     /// Show the landed change log.
     Log {
@@ -86,7 +126,28 @@ pub enum WsCommand {
         /// Base snapshot id (hex) or ref name.
         #[arg(long, value_name = "SNAP|REF")]
         base: Option<String>,
+        /// `clone` (copy-on-write, falls back to copy) or `copy` (ADR 0016).
+        #[arg(long, value_name = "MODE", default_value = "clone")]
+        materialize: Materialize,
     },
+    /// Delete a workspace and its checkout.
+    Rm {
+        /// Workspace id.
+        #[arg(value_name = "WS")]
+        id: String,
+    },
+    /// Remove pristine checkouts no workspace uses (ADR 0016).
+    Gc,
+}
+
+/// How `hord ws new` materializes the checkout (ADR 0016).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Materialize {
+    /// Copy-on-write clone of the pristine checkout; a copy where the
+    /// filesystem cannot clone.
+    Clone,
+    /// Plain copy.
+    Copy,
 }
 
 /// Edge kind for `hord query` (spec §3.8, §10.2).

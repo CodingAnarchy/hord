@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use hord_core::{Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
-use hord_lang::{LangAdapter, NameRef, NodeTree, ResolveCtx};
+use hord_lang::{Anchor, LangAdapter, NameRef, NodeTree, ResolveCtx};
 
 use crate::RustAdapter;
 use crate::cst::{self, is_name_container, local_name_from_raw};
@@ -34,7 +34,9 @@ pub struct RustFile<'a> {
     ///
     /// Definitions missing from this map are stored as [`NodeId::nil`] and
     /// are not returned from [`RustAdapter::resolve`](crate::RustAdapter::resolve).
-    pub ids: &'a std::collections::BTreeMap<ObjectId, NodeId>,
+    /// Keyed by site (child-index path from the root), so identical
+    /// definitions at two places keep their own ids.
+    pub ids: &'a std::collections::BTreeMap<hord_lang::Site, NodeId>,
 }
 
 /// Qualified name of a definition from its ancestor chain.
@@ -108,6 +110,12 @@ pub(crate) fn references(ctx: &ResolveCtx, node: &Node) -> Vec<NameRef> {
     with_index(ctx, |idx| refs_from_node(idx, node))
 }
 
+pub(crate) fn references_at(ctx: &ResolveCtx, anchor: &Anchor, node: &Node) -> Vec<NameRef> {
+    with_index(ctx, |idx| {
+        refs_in_scopes(idx, node, idx.scopes_at(anchor, node))
+    })
+}
+
 pub(crate) fn resolve_name(ctx: &ResolveCtx, name: &NameRef) -> Option<NodeId> {
     if let Some(id) = name.resolved {
         return real_id(id);
@@ -129,9 +137,8 @@ pub(crate) fn test_targets(ctx: &ResolveCtx, test: &Node) -> Vec<NodeId> {
             ids.extend(resolved_ids(&refs_from_node(idx, test)));
         }
         ids.extend(inner_test_targets(idx, test));
-        if let Some(self_id) = idx.node_id_of(test) {
-            ids.retain(|id| *id != self_id);
-        }
+        let own = idx.node_ids_of(test);
+        ids.retain(|id| !own.contains(id));
         ids.sort();
         ids.dedup();
         ids
@@ -473,8 +480,8 @@ fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
 
     let mut raws = Vec::new();
     if let Some(root) = file.tree.root() {
-        ctx.add_file(root, segs_join(module));
-        walk_nt(file, root, module, &mut raws);
+        ctx.add_file_at(file.path.clone(), root, segs_join(module));
+        walk_nt(file, root, &mut Vec::new(), module, &mut raws);
     }
 
     for raw in raws {
@@ -509,13 +516,23 @@ fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
     }
 }
 
-fn walk_nt(file: &RustFile<'_>, oid: ObjectId, module: &[String], out: &mut Vec<RawDef>) {
+fn walk_nt(
+    file: &RustFile<'_>,
+    oid: ObjectId,
+    site: &mut Vec<u32>,
+    module: &[String],
+    out: &mut Vec<RawDef>,
+) {
     let Some(node) = file.tree.get(oid) else {
         return;
     };
     if RustAdapter.is_definition(&node.kind) {
         out.push(RawDef {
-            node_id: file.ids.get(&oid).copied().unwrap_or_else(NodeId::nil),
+            node_id: file
+                .ids
+                .get(site.as_slice())
+                .copied()
+                .unwrap_or_else(NodeId::nil),
             object_id: oid,
             kind: node.kind,
             module: segs_join(module),
@@ -534,8 +551,10 @@ fn walk_nt(file: &RustFile<'_>, oid: ObjectId, module: &[String], out: &mut Vec<
         // and are not modules; a nested `mod` stores `outer::inner`.
         child_mod.push(name.to_owned());
     }
-    for child in &node.children {
-        walk_nt(file, *child, &child_mod, out);
+    for (i, child) in node.children.iter().enumerate() {
+        site.push(u32::try_from(i).unwrap_or(u32::MAX));
+        walk_nt(file, *child, site, &child_mod, out);
+        site.pop();
     }
 }
 
@@ -1205,8 +1224,15 @@ struct Index {
     associated: HashMap<String, Vec<usize>>,
     /// Simple name → function and method indices (bare-call candidates).
     callables: HashMap<String, Vec<usize>>,
-    by_object: HashMap<ObjectId, usize>,
-    files: HashMap<ObjectId, String>,
+    /// Content id → every definition with that content. Identical
+    /// definitions in several modules share one content id.
+    by_object: HashMap<ObjectId, Vec<usize>>,
+    /// [`NodeId`] → definition: one per site.
+    by_node: HashMap<NodeId, usize>,
+    /// File root content id → modules of every file with that content.
+    files: HashMap<ObjectId, Vec<String>>,
+    /// File path → module.
+    files_by_path: HashMap<RepoPath, String>,
     crate_keys: BTreeSet<String>,
     /// Crate key → (extern name, target module).
     externs: HashMap<String, Vec<(String, String)>>,
@@ -1257,7 +1283,9 @@ impl Index {
             associated: HashMap::new(),
             callables: HashMap::new(),
             by_object: HashMap::new(),
+            by_node: HashMap::new(),
             files: HashMap::new(),
+            files_by_path: HashMap::new(),
             crate_keys: BTreeSet::new(),
             externs: HashMap::new(),
         };
@@ -1289,7 +1317,10 @@ impl Index {
                     idx.callables.entry(simple.clone()).or_default().push(i);
                 }
                 if let Some(oid) = object_id {
-                    idx.by_object.insert(oid, i);
+                    idx.by_object.entry(oid).or_default().push(i);
+                }
+                if real_id(node_id).is_some() {
+                    idx.by_node.insert(node_id, i);
                 }
                 idx.defs.push(Def {
                     node_id,
@@ -1314,12 +1345,18 @@ impl Index {
                 target_module: None,
             });
         });
-        ctx.for_each_file(|oid, module| {
+        ctx.for_each_file_at(|path, oid, module| {
             let module = module.as_str().to_owned();
             if !module.is_empty() {
                 idx.crate_keys.insert(crate_key(&module).to_owned());
             }
-            idx.files.insert(oid, module);
+            if let Some(path) = path {
+                idx.files_by_path.insert(path.clone(), module.clone());
+            }
+            let modules = idx.files.entry(oid).or_default();
+            if !modules.contains(&module) {
+                modules.push(module);
+            }
         });
         idx.resolve_imports();
         idx
@@ -1683,7 +1720,7 @@ impl Index {
             .defs
             .iter()
             .map(|d| d.module.clone())
-            .chain(self.files.values().cloned())
+            .chain(self.files.values().flatten().cloned())
             .collect();
         for module in modules {
             let hits = self.lookup_in(&module, None, written);
@@ -1807,55 +1844,94 @@ impl Index {
         out
     }
 
-    fn node_id_of(&self, node: &Node) -> Option<NodeId> {
-        let oid = ObjectId::of(node).ok()?;
-        let i = *self.by_object.get(&oid)?;
-        real_id(self.defs[i].node_id)
+    /// Every definition with `node`'s content (several when identical
+    /// definitions sit in different modules).
+    fn defs_of(&self, node: &Node) -> &[usize] {
+        ObjectId::of(node)
+            .ok()
+            .and_then(|oid| self.by_object.get(&oid))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Ids of every definition with `node`'s content.
+    fn node_ids_of(&self, node: &Node) -> Vec<NodeId> {
+        self.defs_of(node)
+            .iter()
+            .filter_map(|i| real_id(self.defs[*i].node_id))
+            .collect()
     }
 
     fn is_test_node(&self, node: &Node) -> bool {
-        let Ok(oid) = ObjectId::of(node) else {
-            return false;
-        };
-        let Some(&i) = self.by_object.get(&oid) else {
-            return false;
-        };
-        let def = &self.defs[i];
-        def.is_test || (def.cfg_test && is_fn_kind(&def.kind))
+        self.defs_of(node).iter().any(|i| {
+            let def = &self.defs[*i];
+            def.is_test || (def.cfg_test && is_fn_kind(&def.kind))
+        })
     }
 
-    fn scope_of(&self, node: &Node) -> Scope {
-        if let Ok(oid) = ObjectId::of(node)
-            && let Some(&i) = self.by_object.get(&oid)
-        {
-            let def = &self.defs[i];
-            return Scope {
-                module: def.module.clone(),
-                self_ty: self_type_of(&def.parent),
-                cfg_test: def.cfg_test,
-            };
-        }
-        if let Ok(oid) = ObjectId::of(node)
-            && let Some(module) = self.files.get(&oid)
-        {
-            return Scope {
-                module: module.clone(),
-                self_ty: None,
-                cfg_test: false,
-            };
-        }
-        if self.crate_keys.len() == 1 {
-            return Scope {
-                module: self.crate_keys.iter().next().cloned().unwrap_or_default(),
-                self_ty: None,
-                cfg_test: false,
-            };
-        }
+    fn def_scope(&self, i: usize) -> Scope {
+        let def = &self.defs[i];
         Scope {
-            module: String::new(),
+            module: def.module.clone(),
+            self_ty: self_type_of(&def.parent),
+            cfg_test: def.cfg_test,
+        }
+    }
+
+    fn module_scope(module: &str) -> Scope {
+        Scope {
+            module: module.to_owned(),
             self_ty: None,
             cfg_test: false,
         }
+    }
+
+    fn fallback_scope(&self) -> Scope {
+        if self.crate_keys.len() == 1 {
+            return Self::module_scope(&self.crate_keys.iter().next().cloned().unwrap_or_default());
+        }
+        Self::module_scope("")
+    }
+
+    /// Scopes `node` may sit in, found by content: one per distinct scope of
+    /// the definitions (or file roots) with that content. Identical
+    /// definitions in two modules give two scopes.
+    fn scopes_of(&self, node: &Node) -> Vec<Scope> {
+        let mut out: Vec<Scope> = Vec::new();
+        for i in self.defs_of(node) {
+            let scope = self.def_scope(*i);
+            if !out.iter().any(|s| s.same_as(&scope)) {
+                out.push(scope);
+            }
+        }
+        if out.is_empty()
+            && let Ok(oid) = ObjectId::of(node)
+            && let Some(modules) = self.files.get(&oid)
+        {
+            out.extend(modules.iter().map(|m| Self::module_scope(m)));
+        }
+        if out.is_empty() {
+            out.push(self.fallback_scope());
+        }
+        out
+    }
+
+    /// The scope of the site `anchor` names, falling back to a content
+    /// lookup when the anchor is unknown to this context.
+    fn scopes_at(&self, anchor: &Anchor, node: &Node) -> Vec<Scope> {
+        match anchor {
+            Anchor::Definition(id) => {
+                if let Some(i) = self.by_node.get(id) {
+                    return vec![self.def_scope(*i)];
+                }
+            }
+            Anchor::File(path) => {
+                if let Some(module) = self.files_by_path.get(path) {
+                    return vec![Self::module_scope(module)];
+                }
+            }
+            _ => {}
+        }
+        self.scopes_of(node)
     }
 }
 
@@ -1884,6 +1960,12 @@ struct Scope {
     module: String,
     self_ty: Option<String>,
     cfg_test: bool,
+}
+
+impl Scope {
+    fn same_as(&self, other: &Self) -> bool {
+        self.module == other.module && self.self_ty == other.self_ty
+    }
 }
 
 /// Type that `Self` names in `parent`.
@@ -1978,21 +2060,28 @@ fn dedup_ids(ids: &mut Vec<NodeId>) {
 
 // --- reference walk --------------------------------------------------------
 
+/// References of `node`, found by content: every scope its content may sit
+/// in is searched (see [`Index::scopes_of`]).
 fn refs_from_node(idx: &Index, node: &Node) -> Vec<NameRef> {
-    let scope = idx.scope_of(node);
+    refs_in_scopes(idx, node, idx.scopes_of(node))
+}
+
+fn refs_in_scopes(idx: &Index, node: &Node, scopes: Vec<Scope>) -> Vec<NameRef> {
     let bytes = node.raw.clone();
     let mut refs = Vec::new();
     let _ = cst::with_parser(|parser| {
         if let Some(tree) = parser.parse(bytes.as_slice(), None) {
-            let mut walk = RefWalk {
-                idx,
-                source: bytes.as_slice(),
-                module: scope.module,
-                self_ty: scope.self_ty,
-                refs: Vec::new(),
-            };
-            walk.walk(tree.root_node());
-            refs = walk.refs;
+            for scope in scopes {
+                let mut walk = RefWalk {
+                    idx,
+                    source: bytes.as_slice(),
+                    module: scope.module,
+                    self_ty: scope.self_ty,
+                    refs: Vec::new(),
+                };
+                walk.walk(tree.root_node());
+                refs.extend(walk.refs);
+            }
         }
     });
     refs.sort_by(|a, b| {
@@ -2243,21 +2332,24 @@ impl RefWalk<'_> {
     }
 }
 
+/// Test targets inside `node`, searched in every scope its content may sit
+/// in (see [`Index::scopes_of`]).
 fn inner_test_targets(idx: &Index, node: &Node) -> Vec<NodeId> {
-    let scope = idx.scope_of(node);
     let bytes = node.raw.clone();
     let mut ids = Vec::new();
     let _ = cst::with_parser(|parser| {
         if let Some(tree) = parser.parse(bytes.as_slice(), None) {
-            scan_tests(
-                idx,
-                tree.root_node(),
-                bytes.as_slice(),
-                &scope.module,
-                scope.self_ty.as_deref(),
-                scope.cfg_test,
-                &mut ids,
-            );
+            for scope in idx.scopes_of(node) {
+                scan_tests(
+                    idx,
+                    tree.root_node(),
+                    bytes.as_slice(),
+                    &scope.module,
+                    scope.self_ty.as_deref(),
+                    scope.cfg_test,
+                    &mut ids,
+                );
+            }
         }
     });
     ids

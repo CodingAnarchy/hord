@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 diffy.workspace = true
 hord-core.workspace = true
+hord-identity.workspace = true
 hord-lang.workspace = true
 thiserror.workspace = true
 

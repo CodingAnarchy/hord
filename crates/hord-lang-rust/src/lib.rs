@@ -11,18 +11,26 @@
 //! for write sets (every definition kind gets a qualified name) and
 //! conservative for read sets (ambiguous names produce one edge per
 //! candidate). Macro invocations are not expanded.
+//!
+//! [`cargo_lock`] bridges `Cargo.lock` onto the generic TOML adapter and
+//! merge (ADR 0013): [`CargoLockAdapter`] and [`merge_cargo_lock`].
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod cargo_lock;
 mod cst;
 mod manifest;
 mod resolve;
 
 use hord_core::{LangId, Node, NodeId, NodeKind, QualifiedName, RepoPath};
-use hord_lang::{LangAdapter, NameRef, NodeTree, ParseError, ResolveCtx, Tier};
+use hord_lang::{Anchor, LangAdapter, NameRef, NodeTree, ParseError, ResolveCtx, Tier};
 
+pub use cargo_lock::{
+    CARGO_LOCK_LANG, CargoLockAdapter, CargoLockConflict, CargoLockMergeError, is_cargo_lock,
+    merge_cargo_lock,
+};
 pub use manifest::ManifestFile;
 pub use resolve::RustFile;
 
@@ -83,6 +91,10 @@ impl LangAdapter for RustAdapter {
 
     fn references(&self, ctx: &ResolveCtx, node: &Node) -> Vec<NameRef> {
         resolve::references(ctx, node)
+    }
+
+    fn references_at(&self, ctx: &ResolveCtx, anchor: &Anchor, node: &Node) -> Vec<NameRef> {
+        resolve::references_at(ctx, anchor, node)
     }
 
     fn resolve(&self, ctx: &ResolveCtx, name: &NameRef) -> Option<NodeId> {

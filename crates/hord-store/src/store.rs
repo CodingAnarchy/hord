@@ -20,6 +20,8 @@ use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
 
 #[path = "index.rs"]
 mod index;
+#[path = "queue.rs"]
+mod queue;
 
 pub use index::EdgeKind;
 
@@ -169,6 +171,7 @@ impl Store {
         }
         let db = Database::open(index).map_err(Error::index)?;
         index::ensure_tables(&db)?;
+        queue::ensure_tables(&db)?;
         let objects_dir = hord_dir.join("objects");
         let has_packs = pack_dir_has_packs(&objects_dir.join("pack"));
         Ok(Self {
@@ -421,6 +424,31 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Delete a workspace's row and its materialization directory. Returns
+    /// whether the row existed. Files next to the directory that share its
+    /// name plus an extension (`<id>.stat`) are removed too.
+    pub fn remove_workspace(&self, id: WorkspaceId) -> Result<bool> {
+        let key = id.to_string();
+        let txn = self.db.begin_write().map_err(Error::index)?;
+        let existed = {
+            let mut table = txn.open_table(WORKSPACES).map_err(Error::index)?;
+            table.remove(key.as_str()).map_err(Error::index)?.is_some()
+        };
+        txn.commit().map_err(Error::index)?;
+        let dir = self.workspace_dir(id);
+        remove_tree(&dir)?;
+        let ws_root = self.hord_dir.join("ws");
+        if let Ok(entries) = fs::read_dir(&ws_root) {
+            let prefix = format!("{key}.");
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    remove_tree(&entry.path())?;
+                }
+            }
+        }
+        Ok(existed)
     }
 
     /// Look up one workspace by id.
@@ -732,6 +760,29 @@ impl Drop for Store {
     }
 }
 
+/// Remove a file or directory tree, making read-only entries writable first
+/// (a copy-on-write checkout may carry read-only mode bits). Missing is fine.
+fn remove_tree(path: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if meta.is_dir() {
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(path, perms)?;
+        for entry in fs::read_dir(path)? {
+            remove_tree(&entry?.path())?;
+        }
+        fs::remove_dir(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn init_tables(db: &Database) -> Result<()> {
     let txn = db.begin_write().map_err(Error::index)?;
     txn.open_table(LOG).map_err(Error::index)?;
@@ -741,6 +792,7 @@ fn init_tables(db: &Database) -> Result<()> {
     txn.open_table(META).map_err(Error::index)?;
     txn.open_table(EVIDENCE_BY_SNAPSHOT).map_err(Error::index)?;
     index::open_tables(&txn)?;
+    queue::open_tables(&txn)?;
     txn.commit().map_err(Error::index)?;
     Ok(())
 }
