@@ -60,6 +60,30 @@ fn identical_normalized_replace_composes() {
 }
 
 #[test]
+fn same_field_with_different_attributes_is_not_duplicated() {
+    let adapter = rust();
+    let base_src = b"struct S {\n    a: i32,\n}\n";
+    let ours_src = b"struct S {\n    a: i32,\n    #[cfg(a)]\n    b: i32,\n}\n";
+    let theirs_src = b"struct S {\n    a: i32,\n    #[cfg(b)]\n    b: i32,\n}\n";
+    let merged = merge_identified(&adapter, base_src, ours_src, theirs_src)
+        .unwrap_or_else(|e| panic!("attribute-only field insert should resolve: {e:?}"));
+    let text = projected_text(&adapter, &merged.tree);
+    assert_eq!(
+        text.matches("b: i32").count(),
+        1,
+        "field inserted twice: {text}"
+    );
+    assert!(
+        text.contains("#[cfg(a)]"),
+        "landing order should keep ours' attribute: {text}"
+    );
+    assert!(
+        !text.contains("#[cfg(b)]"),
+        "theirs' attribute should not also be inserted: {text}"
+    );
+}
+
+#[test]
 fn container_replace_keeps_theirs_unique_fields() {
     let adapter = rust();
     let base_src = b"struct S {\n    a: i32,\n}\n";

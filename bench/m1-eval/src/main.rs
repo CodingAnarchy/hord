@@ -276,12 +276,19 @@ fn case_class(dir: &Path) -> Result<CaseClass> {
 
 struct DefSpan {
     id: hord_core::NodeId,
+    /// Qualified name when the adapter stored one. Empty when it did not.
+    name: String,
     start: usize,
     end: usize,
 }
 
-/// True when some git conflict hunk's ours-side or theirs-side text overlaps
-/// two definitions, neither of which contains the other.
+/// True when some git conflict hunk overlaps two disjoint definitions.
+///
+/// Each side is counted on its own. A definition edited on both sides often
+/// has a different [`hord_core::NodeId`] once the edit is inside it, because
+/// an outer attribute belongs to the next definition (ADR 0011). Those two
+/// ids are still one definition when the qualified name matches. Different
+/// names, or two definitions on one side, are a coarse hunk (ADR 0006).
 fn hunk_covers_disjoint_defs<A: LangAdapter>(
     adapter: &A,
     base_src: &[u8],
@@ -295,27 +302,141 @@ fn hunk_covers_disjoint_defs<A: LangAdapter>(
     let mut ours_at = 0usize;
     let mut theirs_at = 0usize;
     for (ours_body, theirs_body) in conflict_bodies(conflicted) {
-        let mut touched = BTreeSet::new();
+        // Judge each side on its own. The same definition often has a different
+        // `NodeId` on ours and theirs once the edit is inside it (an outer
+        // attribute is part of the next definition, ADR 0011). Unioning the
+        // ids counted that one definition twice.
+        //
         // The conflict body ends with the line ending, which is often the
         // next definition's leading trivia. On a CRLF checkout that ending
         // is `\r\n`; leaving the `\r` still overlaps the following def.
         let ours_body = trim_one_trailing_newline(&ours_body);
         let theirs_body = trim_one_trailing_newline(&theirs_body);
-        if let Some((start, end)) = locate(ours_src, ours_body, &mut ours_at)
-            && end > start
-        {
-            touched.extend(minimal_defs(&ours_spans, start, end));
+        let ours_hits = locate(ours_src, ours_body, &mut ours_at)
+            .filter(|(start, end)| end > start)
+            .map(|(start, end)| minimal_defs(&ours_spans, start, end))
+            .unwrap_or_default();
+        let theirs_hits = locate(theirs_src, theirs_body, &mut theirs_at)
+            .filter(|(start, end)| end > start)
+            .map(|(start, end)| minimal_defs(&theirs_spans, start, end))
+            .unwrap_or_default();
+        if ours_hits.len() >= 2 || theirs_hits.len() >= 2 {
+            return true;
         }
-        if let Some((start, end)) = locate(theirs_src, theirs_body, &mut theirs_at)
-            && end > start
-        {
-            touched.extend(minimal_defs(&theirs_spans, start, end));
-        }
-        if touched.len() >= 2 {
+        if different_definitions(
+            ours_src,
+            &ours_spans,
+            &ours_hits,
+            theirs_src,
+            &theirs_spans,
+            &theirs_hits,
+        ) {
             return true;
         }
     }
     false
+}
+
+/// Ours and theirs each name one definition, and those are not the same one.
+///
+/// The same qualified name with a different id is still one definition when
+/// the only byte change is a leading attribute or doc comment. A body change
+/// keeps the old rule: different ids mean the hunk is coarse.
+fn different_definitions(
+    ours_src: &[u8],
+    ours_spans: &[DefSpan],
+    ours_hits: &BTreeSet<hord_core::NodeId>,
+    theirs_src: &[u8],
+    theirs_spans: &[DefSpan],
+    theirs_hits: &BTreeSet<hord_core::NodeId>,
+) -> bool {
+    let (Some(&ours_id), Some(&theirs_id)) = (only_id(ours_hits), only_id(theirs_hits)) else {
+        return false;
+    };
+    if ours_id == theirs_id {
+        return false;
+    }
+    let ours_name = span_name(ours_spans, ours_id);
+    let theirs_name = span_name(theirs_spans, theirs_id);
+    if ours_name.is_empty() || ours_name != theirs_name {
+        return true;
+    }
+    let Some(ours_raw) = span_bytes(ours_src, ours_spans, ours_id) else {
+        return true;
+    };
+    let Some(theirs_raw) = span_bytes(theirs_src, theirs_spans, theirs_id) else {
+        return true;
+    };
+    !same_after_leading_attrs(ours_raw, theirs_raw)
+}
+
+fn span_bytes<'a>(src: &'a [u8], spans: &[DefSpan], id: hord_core::NodeId) -> Option<&'a [u8]> {
+    let span = spans.iter().find(|span| span.id == id)?;
+    src.get(span.start..span.end)
+}
+
+/// Drop outer attributes and doc comments that sit in front of a definition.
+fn same_after_leading_attrs(ours: &[u8], theirs: &[u8]) -> bool {
+    without_leading_attrs(ours) == without_leading_attrs(theirs)
+}
+
+fn without_leading_attrs(raw: &[u8]) -> &[u8] {
+    let mut i = 0usize;
+    loop {
+        while i < raw.len() && raw[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if raw[i..].starts_with(b"#[")
+            && let Some(end) = end_of_attribute(raw, i)
+        {
+            i = end;
+            continue;
+        }
+        if raw[i..].starts_with(b"///") || raw[i..].starts_with(b"//!") {
+            match raw[i..].iter().position(|byte| *byte == b'\n') {
+                Some(nl) => {
+                    i += nl + 1;
+                    continue;
+                }
+                None => return &raw[i..],
+            }
+        }
+        break;
+    }
+    &raw[i..]
+}
+
+fn end_of_attribute(raw: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < raw.len() {
+        match raw[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn only_id(ids: &BTreeSet<hord_core::NodeId>) -> Option<&hord_core::NodeId> {
+    let mut iter = ids.iter();
+    let id = iter.next()?;
+    iter.next().is_none().then_some(id)
+}
+
+fn span_name(spans: &[DefSpan], id: hord_core::NodeId) -> &str {
+    spans
+        .iter()
+        .find(|span| span.id == id)
+        .map(|span| span.name.as_str())
+        .unwrap_or("")
 }
 
 fn side_spans<A: LangAdapter>(
@@ -362,6 +483,11 @@ fn walk_defs<A: LangAdapter>(
     {
         out.push(DefSpan {
             id: *nid,
+            name: node
+                .name
+                .as_ref()
+                .map(|name| name.as_str().to_owned())
+                .unwrap_or_default(),
             start: offset,
             end,
         });
@@ -1140,6 +1266,45 @@ mod conflict_marker_tests {
                 &to_crlf(lf_conflict),
             ),
             "crlf"
+        );
+    }
+
+    /// An outer attribute belongs to the next definition, so the two sides of
+    /// an attribute-only hunk do not share a `NodeId`. That is still one
+    /// definition, not a coarse hunk.
+    #[test]
+    fn attribute_only_hunk_is_one_definition() {
+        let base = b"struct S {\n    #[cfg(a)]\n    f: u8,\n    g: u8,\n}\n";
+        let ours = base;
+        let theirs = b"struct S {\n    #[cfg(b)]\n    f: u8,\n    g: u8,\n}\n";
+        let conflicted = b"struct S {\n<<<<<<< ours\n    #[cfg(a)]\n=======\n    #[cfg(b)]\n>>>>>>> theirs\n    f: u8,\n    g: u8,\n}\n";
+        assert!(
+            !hunk_covers_disjoint_defs(&RustAdapter, base, ours, theirs, conflicted),
+            "attribute edit is one field"
+        );
+    }
+
+    #[test]
+    fn hunk_mapping_to_two_function_names_is_coarse() {
+        let base = b"fn a() {}\nfn b() {}\n";
+        let ours = b"fn a() { let _x = 1; }\nfn b() {}\n";
+        let theirs = b"fn a() {}\nfn b() { let _y = 2; }\n";
+        let conflicted = b"<<<<<<< ours\nfn a() { let _x = 1; }\n=======\nfn b() { let _y = 2; }\n>>>>>>> theirs\n";
+        assert!(
+            hunk_covers_disjoint_defs(&RustAdapter, base, ours, theirs, conflicted),
+            "the two sides name different functions"
+        );
+    }
+
+    #[test]
+    fn one_hunk_over_two_functions_is_coarse() {
+        let base = b"fn a() {}\nfn b() {}\n";
+        let ours = b"fn a() { let _x = 1; }\nfn b() { let _y = 2; }\n";
+        let theirs = base;
+        let conflicted = b"<<<<<<< ours\nfn a() { let _x = 1; }\nfn b() { let _y = 2; }\n=======\nfn a() {}\nfn b() {}\n>>>>>>> theirs\n";
+        assert!(
+            hunk_covers_disjoint_defs(&RustAdapter, base, ours, theirs, conflicted),
+            "one side covers both functions"
         );
     }
 

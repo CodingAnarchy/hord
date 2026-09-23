@@ -356,7 +356,7 @@ fn compose(
         }
     }
 
-    let (inserts, insert_soft) = compose_inserts(ours, theirs);
+    let (inserts, insert_soft) = compose_inserts(ours, theirs, store);
     soft.extend(insert_soft);
     out.extend(inserts);
 
@@ -609,12 +609,19 @@ struct InsertAt {
     node: ObjectId,
 }
 
-fn compose_inserts(ours: &[Op], theirs: &[Op]) -> (Vec<Op>, Vec<Conflict>) {
+fn compose_inserts(ours: &[Op], theirs: &[Op], store: &NodeTree) -> (Vec<Op>, Vec<Conflict>) {
     let ours_at = insert_ats(ours);
     let theirs_at = insert_ats(theirs);
     let mut soft = Vec::new();
     let mut out: Vec<Op> = ours_at.iter().copied().map(InsertAt::into_op).collect();
     for ins in &theirs_at {
+        // Same definition inserted on both sides. An outer attribute is part
+        // of the definition (ADR 0011), so the object ids differ when only
+        // that attribute differs. Landing order keeps ours. A different body
+        // is still a second insert (spec §5.2 rule 1).
+        if same_inserted_definition(store, &ours_at, ins) {
+            continue;
+        }
         let clash = ours_at
             .iter()
             .any(|o| o.parent == ins.parent && o.index == ins.index);
@@ -648,6 +655,79 @@ fn compose_inserts(ours: &[Op], theirs: &[Op]) -> (Vec<Op>, Vec<Conflict>) {
         );
     }
     (out, soft)
+}
+
+fn same_inserted_definition(store: &NodeTree, ours: &[InsertAt], theirs: &InsertAt) -> bool {
+    let Some(theirs_node) = store.get(theirs.node) else {
+        return false;
+    };
+    let Some(theirs_name) = theirs_node.name.as_ref() else {
+        return false;
+    };
+    if theirs_name.as_str().is_empty() {
+        return false;
+    }
+    ours.iter().any(|ins| {
+        ins.parent == theirs.parent && {
+            let Some(ours_node) = store.get(ins.node) else {
+                return false;
+            };
+            let Some(ours_name) = ours_node.name.as_ref() else {
+                return false;
+            };
+            ours_name.as_str() == theirs_name.as_str()
+                && same_after_leading_attrs(ours_node.raw.as_slice(), theirs_node.raw.as_slice())
+        }
+    })
+}
+
+fn same_after_leading_attrs(ours: &[u8], theirs: &[u8]) -> bool {
+    without_leading_attrs(ours) == without_leading_attrs(theirs)
+}
+
+fn without_leading_attrs(raw: &[u8]) -> &[u8] {
+    let mut i = 0usize;
+    loop {
+        while i < raw.len() && raw[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if raw[i..].starts_with(b"#[")
+            && let Some(end) = end_of_attribute(raw, i)
+        {
+            i = end;
+            continue;
+        }
+        if raw[i..].starts_with(b"///") || raw[i..].starts_with(b"//!") {
+            match raw[i..].iter().position(|byte| *byte == b'\n') {
+                Some(nl) => {
+                    i += nl + 1;
+                    continue;
+                }
+                None => return &raw[i..],
+            }
+        }
+        break;
+    }
+    &raw[i..]
+}
+
+fn end_of_attribute(raw: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < raw.len() {
+        match raw[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn insert_ats(ops: &[Op]) -> Vec<InsertAt> {
