@@ -17,6 +17,17 @@ pub enum Error {
     /// The edit script could not be applied.
     #[error("{0}")]
     Apply(String),
+    /// A [`hord_core::Op::Replace`] expected different content at its node:
+    /// the tree it is applied to is not the one the op was diffed from.
+    #[error("replace of {node} expected content {expected}, found {found}")]
+    StaleReplace {
+        /// The replaced definition (or file root).
+        node: NodeId,
+        /// The op's `from`.
+        expected: ObjectId,
+        /// The content at `node` in the tree being edited.
+        found: ObjectId,
+    },
     /// CST intern or concat failed while splicing.
     #[error(transparent)]
     Parse(#[from] ParseError),

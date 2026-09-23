@@ -15,10 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use hord_core::{
     ChangeId, ChangeRecord, IdentityDelta, IdentityMap, NodeId, NodePath, ObjectId, Op, SnapshotId,
 };
-use redb::{Database, Table, TableDefinition, WriteTransaction};
+use redb::{Database, Durability, Table, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use super::Store;
+use super::queue::IDENTITY_INDEX;
 use crate::{Error, Result};
 
 const INDEX_FACT_FORMAT: u8 = 1;
@@ -28,6 +29,10 @@ const PRESENT: &[u8] = &[0];
 const EDGE_FACT_PREFIX: &[u8] = b"\xa1\x64Edge";
 /// Canonical CBOR prefix of [`IndexFact::Identity`].
 const IDENTITY_FACT_PREFIX: &[u8] = b"\xa1\x68Identity";
+/// Canonical CBOR prefix of [`IndexFact::IdentityIndex`].
+const IDENTITY_INDEX_FACT_PREFIX: &[u8] = b"\xa1\x6dIdentityIndex";
+/// `identity_index` row value: `index || binding`.
+const IDENTITY_INDEX_ROW_LEN: usize = 2 * ObjectId::LEN;
 
 const SNAP_LEN: usize = ObjectId::LEN;
 const NODE_LEN: usize = 16;
@@ -84,6 +89,15 @@ enum IndexFact {
         format: u8,
         snapshot: SnapshotId,
         map: ObjectId,
+        supersedes: Option<ObjectId>,
+    },
+    /// `hord-txn`'s identity index object for `snapshot`
+    /// ([`Store::set_identity_index`]). `supersedes` is the binding it
+    /// replaced for the same snapshot.
+    IdentityIndex {
+        format: u8,
+        snapshot: SnapshotId,
+        index: ObjectId,
         supersedes: Option<ObjectId>,
     },
 }
@@ -281,25 +295,95 @@ impl Store {
         self.insert_history(change, &touched_nodes(&record))
     }
 
-    /// Replace `node_history`, `edges`, and `identity` from stored objects.
+    /// Point `snapshot` at `hord-txn`'s identity index object `index`.
+    ///
+    /// `hord-txn` stores, per snapshot, which files carry
+    /// [`hord_core::NodeId`]s that differ from a fresh assignment. Besides the
+    /// redb row, this writes a content-addressed binding object naming
+    /// `(snapshot, index)` and the binding it replaces, so
+    /// [`Self::rebuild_index`] restores the row. Replaces any previous
+    /// pointer.
+    ///
+    /// Like [`Store::queue_set`], the commit does not fsync. redb commits
+    /// are ordered, so the row is durable once any later durable commit is:
+    /// the lander writes it before [`Store::set_head`] of the same landing,
+    /// and `propose` before the durable [`Store::queue_push`] of `submit`. A
+    /// clean close is also durable.
+    pub fn set_identity_index(&self, snapshot: SnapshotId, index: ObjectId) -> Result<()> {
+        let _guard = self.lock_index();
+        let supersedes = self.identity_index_row(snapshot)?.and_then(|(_, b)| b);
+        let binding = self.put_object(&IndexFact::IdentityIndex {
+            format: INDEX_FACT_FORMAT,
+            snapshot,
+            index,
+            supersedes,
+        })?;
+        let mut txn = self.db.begin_write().map_err(Error::index)?;
+        txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
+            let row = identity_index_row(index, binding);
+            table
+                .insert(snapshot.as_bytes().as_slice(), row.as_slice())
+                .map_err(Error::index)?;
+        }
+        txn.commit().map_err(Error::index)?;
+        Ok(())
+    }
+
+    /// The identity index object recorded for `snapshot`, if any.
+    pub fn identity_index(&self, snapshot: SnapshotId) -> Result<Option<ObjectId>> {
+        Ok(self.identity_index_row(snapshot)?.map(|(index, _)| index))
+    }
+
+    /// `(index, binding)` for `snapshot`. Rows written before bindings
+    /// existed hold only the index.
+    fn identity_index_row(
+        &self,
+        snapshot: SnapshotId,
+    ) -> Result<Option<(ObjectId, Option<ObjectId>)>> {
+        let txn = self.db.begin_read().map_err(Error::index)?;
+        let table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
+        let Some(value) = table
+            .get(snapshot.as_bytes().as_slice())
+            .map_err(Error::index)?
+        else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        match bytes.len() {
+            ObjectId::LEN => Ok(Some((ObjectId::try_from(bytes)?, None))),
+            IDENTITY_INDEX_ROW_LEN => Ok(Some((
+                ObjectId::try_from(&bytes[..ObjectId::LEN])?,
+                Some(ObjectId::try_from(&bytes[ObjectId::LEN..])?),
+            ))),
+            _ => Err(Error::CorruptIndex("identity_index")),
+        }
+    }
+
+    /// Replace `node_history`, `edges`, `identity`, and `identity_index`
+    /// from stored objects.
     ///
     /// Landing-log entries that are not [`ChangeRecord`]s are skipped. A log
     /// entry with no stored object is an error, and the previous cache is left
     /// in place. Edge and identity rows come from the objects written by
-    /// [`Self::put_edge`] and [`Self::put_identity`].
+    /// [`Self::put_edge`] and [`Self::put_identity`], and identity index
+    /// pointers from the bindings [`Self::set_identity_index`] writes (the
+    /// longest supersede chain per snapshot wins, as for identity).
     pub fn rebuild_index(&self) -> Result<()> {
         let _guard = self.lock_index();
         self.flush()?;
         let history = self.history_from_log()?;
-        let (edges, bindings) = self.scan_index_facts()?;
+        let (edges, bindings, index_bindings) = self.scan_index_facts()?;
         let heads = select_identity_heads(&bindings);
+        let index_heads = select_identity_heads(&index_bindings);
         let mut identity = BTreeMap::new();
         for (snapshot, binding) in heads {
             let map: IdentityMap = self.get_object(binding.map)?;
             let rows = identity_rows(snapshot, &map)?;
             identity.insert(snapshot, (binding.id, rows));
         }
-        self.write_rebuilt_index(&history, &edges, &identity)
+        self.write_rebuilt_index(&history, &edges, &identity, &index_heads)
     }
 
     fn lock_index(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -401,9 +485,12 @@ impl Store {
         Ok(history)
     }
 
-    fn scan_index_facts(&self) -> Result<(Vec<StoredEdge>, Vec<FoundBinding>)> {
+    /// Edges, identity bindings, and identity index bindings (the latter
+    /// with the index object in `map`).
+    fn scan_index_facts(&self) -> Result<(Vec<StoredEdge>, Vec<FoundBinding>, Vec<FoundBinding>)> {
         let mut edges = Vec::new();
         let mut bindings = Vec::new();
+        let mut index_bindings = Vec::new();
         self.for_each_stored_object(|id, bytes| {
             if !looks_like_index_fact(bytes) {
                 return Ok(());
@@ -436,11 +523,24 @@ impl Store {
                         supersedes,
                     });
                 }
+                Ok(IndexFact::IdentityIndex {
+                    format,
+                    snapshot,
+                    index,
+                    supersedes,
+                }) if format == INDEX_FACT_FORMAT => {
+                    index_bindings.push(FoundBinding {
+                        id,
+                        snapshot,
+                        map: index,
+                        supersedes,
+                    });
+                }
                 _ => {}
             }
             Ok(())
         })?;
-        Ok((edges, bindings))
+        Ok((edges, bindings, index_bindings))
     }
 
     fn write_rebuilt_index(
@@ -448,6 +548,7 @@ impl Store {
         history: &BTreeMap<NodeId, Vec<ChangeId>>,
         edges: &[StoredEdge],
         identity: &BTreeMap<SnapshotId, (ObjectId, BTreeMap<Vec<u8>, NodeId>)>,
+        identity_index: &BTreeMap<SnapshotId, FoundBinding>,
     ) -> Result<()> {
         let txn = self.db.begin_write().map_err(Error::index)?;
         {
@@ -485,6 +586,16 @@ impl Store {
                 let key = identity_head_key(*snapshot);
                 heads
                     .insert(key.as_slice(), binding_id.as_bytes().as_slice())
+                    .map_err(Error::index)?;
+            }
+        }
+        {
+            let mut table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
+            clear_table(&mut table)?;
+            for (snapshot, binding) in identity_index {
+                let row = identity_index_row(binding.map, binding.id);
+                table
+                    .insert(snapshot.as_bytes().as_slice(), row.as_slice())
                     .map_err(Error::index)?;
             }
         }
@@ -720,7 +831,16 @@ fn insert_in_log_order(
 }
 
 fn looks_like_index_fact(bytes: &[u8]) -> bool {
-    bytes.starts_with(EDGE_FACT_PREFIX) || bytes.starts_with(IDENTITY_FACT_PREFIX)
+    bytes.starts_with(EDGE_FACT_PREFIX)
+        || bytes.starts_with(IDENTITY_FACT_PREFIX)
+        || bytes.starts_with(IDENTITY_INDEX_FACT_PREFIX)
+}
+
+fn identity_index_row(index: ObjectId, binding: ObjectId) -> [u8; IDENTITY_INDEX_ROW_LEN] {
+    let mut row = [0u8; IDENTITY_INDEX_ROW_LEN];
+    row[..ObjectId::LEN].copy_from_slice(index.as_bytes());
+    row[ObjectId::LEN..].copy_from_slice(binding.as_bytes());
+    row
 }
 
 /// Exclusive end of the key range that starts with `prefix`.

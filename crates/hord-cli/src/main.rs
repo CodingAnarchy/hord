@@ -1,7 +1,8 @@
 //! Hord command-line interface (`hord`).
 //!
-//! Commands: `init`, `ws new`, `status`, `log`, `blame`, `query`,
-//! `git import`, `git export`.
+//! Commands: `init`, `ws new`, `status`, `propose`, `submit`, `queue`,
+//! `land --local`, `conflicts`, `log`, `blame`, `query`, `git import`,
+//! `git export`.
 //! `--json` is the canonical agent output; human-oriented text is secondary.
 
 #![forbid(unsafe_code)]
@@ -9,9 +10,11 @@
 mod cli;
 mod cmd;
 mod git_bridge;
+mod intent;
 mod output;
 mod repo;
 mod resolve;
+mod txn;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -38,9 +41,19 @@ fn run_blocking(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init { from_git } => cmd::init::run(cli.json, from_git),
         Command::Ws { command } => match command {
-            WsCommand::New { base } => cmd::ws::run_new(cli.json, base),
+            WsCommand::New { base, materialize } => cmd::ws::run_new(cli.json, base, materialize),
+            WsCommand::Rm { id } => cmd::ws::run_rm(cli.json, id),
+            WsCommand::Gc => cmd::ws::run_gc(cli.json),
         },
-        Command::Status { workspace } => cmd::status::run(cli.json, workspace),
+        Command::Status {
+            workspace,
+            paranoid,
+        } => cmd::status::run(cli.json, workspace, paranoid),
+        Command::Propose { workspace, intent } => cmd::propose::run(cli.json, workspace, intent),
+        Command::Submit { change } => cmd::lander::run_submit(cli.json, change),
+        Command::Queue { mine } => cmd::lander::run_queue(cli.json, mine),
+        Command::Land { local, change } => cmd::lander::run_land(cli.json, local, change),
+        Command::Conflicts { change } => cmd::lander::run_conflicts(cli.json, change),
         Command::Log {
             node,
             path,

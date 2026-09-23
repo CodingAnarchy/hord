@@ -11,9 +11,11 @@ members = [
     "crates/hord-lang-toml",
     "crates/hord-diff",
     "crates/hord-identity",
+    "crates/hord-txn",
     "bench/m0-eval",
     "bench/m1-eval",
     "bench/m2-eval",
+    "bench/m3-eval",
 ]
 
 [workspace.package]
@@ -38,8 +40,10 @@ hord-lang = { path = "crates/hord-lang" }
 hord-lang-rust = { path = "crates/hord-lang-rust" }
 hord-lang-toml = { path = "crates/hord-lang-toml" }
 hord-store = { path = "crates/hord-store" }
+hord-txn = { path = "crates/hord-txn" }
 lasso = { version = "0.7", features = ["multi-threaded"] }
 proptest = "1"
+semver = "1"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 # crates.io `tree-sitter-toml` is frozen at 0.20 (tree-sitter 0.20). The
@@ -47,9 +51,12 @@ tree-sitter-rust = "0.24"
 # `tree-sitter-toml-ng` 0.7, which matches this pin and tree-sitter 0.25.
 tree-sitter-toml = { package = "tree-sitter-toml-ng", version = "0.7" }
 redb = "2"
+reflink-copy = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 thiserror = "2"
+toml = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync"] }
 ulid = "3"
 zstd = "0.13"

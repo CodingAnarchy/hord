@@ -77,8 +77,8 @@ proptest! {
         let adapter = RustAdapter;
         let base = parse_identified(&adapter, base_src.as_bytes());
         let (result, mapping) = identify_result(&adapter, &base, result_src.as_bytes());
-        let ops = diff(&base, &result, &mapping);
-        let applied = apply(&base, &ops, &result).map_err(|e| {
+        let ops = diff(&common::file(), &base, &result, &mapping);
+        let applied = apply(&common::file(), &base, &ops, &result).map_err(|e| {
             TestCaseError::fail(format!("apply: {e}; ops={ops:?}"))
         })?;
         let projected = adapter.project(&applied.tree);
@@ -117,8 +117,8 @@ proptest! {
         let adapter = TomlAdapter;
         let base = parse_identified(&adapter, base_src.as_bytes());
         let (result, mapping) = identify_result(&adapter, &base, result_src.as_bytes());
-        let ops = diff(&base, &result, &mapping);
-        let applied = apply(&base, &ops, &result).map_err(|e| {
+        let ops = diff(&common::file(), &base, &result, &mapping);
+        let applied = apply(&common::file(), &base, &ops, &result).map_err(|e| {
             TestCaseError::fail(format!("apply: {e}; ops={ops:?}"))
         })?;
         let projected = adapter.project(&applied.tree);

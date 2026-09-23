@@ -14,6 +14,10 @@
 //! `node_history`, `edges`, and `identity` cache facts that also live in
 //! stored objects (spec §8.1). [`Store::rebuild_index`] reconstructs them.
 //! `evidence_by_snapshot` is created empty.
+//!
+//! `hord-txn` keeps two more tables here: the persistent lander queue
+//! ([`Store::queue_push`]) and a per-snapshot identity index pointer
+//! ([`Store::set_identity_index`]). The store does not interpret either value.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

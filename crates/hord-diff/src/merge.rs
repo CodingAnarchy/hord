@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use hord_core::{Bytes, NodeId, ObjectId, Op};
+use hord_core::{Bytes, NodeId, ObjectId, Op, RepoPath};
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree};
 
-use crate::apply::apply;
+use crate::apply::apply_internal;
+use crate::defs::{file_parent, mentions, root_sentinel, swap_root};
 
 use crate::graft::union_trees;
 
@@ -72,6 +73,25 @@ impl std::fmt::Display for Conflict {
     }
 }
 
+/// Which caller a merge serves (ADR 0014).
+///
+/// Both modes run the same compose, positional CST merge, and line merges,
+/// and compose equal-`normalized` and disjoint edits alike. They differ only
+/// where ADR 0005 falls back to landing order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum MergeMode {
+    /// The M1 merge corpus (ADR 0005, ADR 0006). A same-node edit that the
+    /// CST and line merges cannot combine keeps ours (landing order) plus
+    /// theirs' new named children, and `git merge-file --ours` resolves
+    /// overlapping hunks. Scores match git's `--ours` labels.
+    #[default]
+    Corpus,
+    /// The lander (spec §6.4 rung 1). Nothing is resolved by keeping one
+    /// side: a same-node edit the CST and line merges cannot combine is a
+    /// hard [`Conflict`] naming the node, and no `--ours` hunk is used.
+    Lander,
+}
+
 /// Successful merge: tree plus any auto-resolved soft conflicts.
 #[derive(Clone, Debug)]
 pub struct MergeResult {
@@ -86,12 +106,14 @@ pub struct MergeResult {
 /// `ours` is the landed head; `theirs` is the proposed change. Both are
 /// identified against `base`. Blob-tier files use [`crate::merge_blob`];
 /// this function is the structural path. An unparseable result is a hard
-/// conflict.
+/// conflict. `mode` picks what happens when both sides edit one node and
+/// the edits do not combine ([`MergeMode`], ADR 0014).
 pub fn merge<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
     ours: &IdentifiedTree,
     theirs: &IdentifiedTree,
+    mode: MergeMode,
 ) -> Result<MergeResult, Conflict> {
     let ours_map = crate::defs::mapping_between(base, ours);
     let theirs_map = crate::defs::mapping_between(base, theirs);
@@ -101,47 +123,75 @@ pub fn merge<A: LangAdapter + ?Sized>(
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
     store = union_trees(&store, &theirs.tree)
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
-    match merge_ops(adapter, base, &ours_ops, &theirs_ops, &store) {
+    let result = match merge_ops_internal(adapter, base, &ours_ops, &theirs_ops, &store, mode) {
         // Delete vs anything else must not fall through to an auto-merge.
         Err(conflict) if conflict.delete_vs => Err(conflict),
-        Ok(ok) => accept_composed(adapter, base, ours, theirs, ok),
+        Ok(ok) => accept_composed(adapter, base, ours, theirs, ok, mode),
         Err(structural) => {
-            overlap_fallback(adapter, base, ours, theirs, &mut store).ok_or(structural)
+            overlap_fallback(adapter, base, ours, theirs, &mut store, mode).ok_or(structural)
         }
-    }
+    };
+    // `merge` has no path: a file-root conflict names no definition.
+    result.map_err(|mut conflict| {
+        conflict.nodes.retain(|n| *n != root_sentinel());
+        conflict
+    })
 }
 
-/// Keep a structural compose unless it invented a line. Landing order is git's.
+/// Keep a structural compose unless it invented a line. In
+/// [`MergeMode::Corpus`] git's `--ours` merge replaces it. In
+/// [`MergeMode::Lander`] (ADR 0014 amendment) only a line merge that keeps
+/// both sides replaces it: it must re-parse and is flagged soft. With no
+/// such merge the result is a hard conflict.
 fn accept_composed<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
     ours: &IdentifiedTree,
     theirs: &IdentifiedTree,
     ok: MergeResult,
+    mode: MergeMode,
 ) -> Result<MergeResult, Conflict> {
     let projected = adapter.project(&ok.tree.tree);
     let src = sources(adapter, base, ours, theirs);
     // A line in none of the three inputs was invented by the merge
     // (a comma glued onto the wrong token, a hand-style rewrite).
-    if projection_invents_line(&src, projected.as_slice())
-        && let Some(git) = git_ours_result(adapter, base, &src)
-    {
-        return Ok(git);
+    if !projection_invents_line(&src, projected.as_slice()) {
+        return Ok(ok);
     }
-    Ok(ok)
+    match mode {
+        MergeMode::Corpus => Ok(git_ours_result(adapter, base, &src).unwrap_or(ok)),
+        MergeMode::Lander => text_merge_result(adapter, base, &src)
+            .or_else(|| blob_file_fallback(adapter, base, &src))
+            .filter(|merged| {
+                !projection_invents_line(&src, adapter.project(&merged.tree.tree).as_slice())
+            })
+            .ok_or_else(|| {
+                Conflict::hard(
+                    Vec::new(),
+                    "the structural merge invented a line and no line merge keeps both sides \
+                     (ADR 0014)",
+                )
+            }),
+    }
 }
 
-/// Overlapping edits. Keep non-conflicting edits from both sides and ours'
-/// side of each conflict hunk.
+/// Overlapping edits. Keep non-conflicting edits from both sides. In
+/// [`MergeMode::Corpus`], try git's merge with ours' side of each conflict
+/// hunk first; [`MergeMode::Lander`] never takes a side.
 fn overlap_fallback<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
     ours: &IdentifiedTree,
     theirs: &IdentifiedTree,
     store: &mut NodeTree,
+    mode: MergeMode,
 ) -> Option<MergeResult> {
     let src = sources(adapter, base, ours, theirs);
-    git_ours_result(adapter, base, &src)
+    let git_ours = match mode {
+        MergeMode::Corpus => git_ours_result(adapter, base, &src),
+        MergeMode::Lander => None,
+    };
+    git_ours
         .or_else(|| text_merge_result(adapter, base, &src))
         .or_else(|| cst_file_fallback(adapter, base, ours, theirs, store))
         .or_else(|| blob_file_fallback(adapter, base, &src))
@@ -275,7 +325,16 @@ fn blob_file_fallback<A: LangAdapter + ?Sized>(
         src.theirs.as_slice(),
     )
     .ok()?;
-    reparse(adapter, base, merged.as_slice(), false, Vec::new())
+    reparse(
+        adapter,
+        base,
+        merged.as_slice(),
+        false,
+        vec![Conflict::soft(
+            Vec::new(),
+            "whole-file line merge kept both sides' edits",
+        )],
+    )
 }
 
 fn reparse<A: LangAdapter + ?Sized>(
@@ -296,25 +355,62 @@ fn reparse<A: LangAdapter + ?Sized>(
     })
 }
 
-/// Compose two edit scripts against `base` and apply them.
+/// Compose two edit scripts against `base` (the file at `path`) and apply
+/// them.
 ///
 /// `store` must intern every Insert/Replace `to` ObjectId from both sides.
+/// File-level ops name [`file_parent`]`(path)` (ADR 0015). `mode` decides a
+/// same-node edit that does not combine ([`MergeMode`]).
+#[allow(clippy::too_many_arguments)]
 pub fn merge_ops<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    path: &RepoPath,
+    base: &IdentifiedTree,
+    ours: &[Op],
+    theirs: &[Op],
+    store: &NodeTree,
+    mode: MergeMode,
+) -> Result<MergeResult, Conflict> {
+    if ours
+        .iter()
+        .chain(theirs)
+        .any(|op| mentions(op, root_sentinel()))
+    {
+        return Err(Conflict::hard(
+            Vec::new(),
+            "an op names the nil NodeId; the file parent is file_parent(path) (ADR 0015)",
+        ));
+    }
+    let root = file_parent(path);
+    let ours = swap_root(ours, root, root_sentinel());
+    let theirs = swap_root(theirs, root, root_sentinel());
+    merge_ops_internal(adapter, base, &ours, &theirs, store, mode).map_err(|mut conflict| {
+        for node in &mut conflict.nodes {
+            if *node == root_sentinel() {
+                *node = root;
+            }
+        }
+        conflict
+    })
+}
+
+fn merge_ops_internal<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
     ours: &[Op],
     theirs: &[Op],
     store: &NodeTree,
+    mode: MergeMode,
 ) -> Result<MergeResult, Conflict> {
     let mut store = store.clone();
-    let (composed, soft) = compose(ours, theirs, &mut store)?;
+    let (composed, soft) = compose(ours, theirs, &mut store, mode)?;
     if composed.is_empty() && (!ours.is_empty() || !theirs.is_empty()) {
         return Err(Conflict::hard(
             Vec::new(),
             "structural compose dropped all ops; refusing a silent base (spec §5.2)",
         ));
     }
-    let applied = apply(base, &composed, &store)
+    let applied = apply_internal(base, &composed, &store)
         .map_err(|e| Conflict::hard(Vec::new(), format!("apply composed ops: {e}")))?;
     let bytes = adapter.project(&applied.tree);
     let parsed = adapter
@@ -331,6 +427,7 @@ fn compose(
     ours: &[Op],
     theirs: &[Op],
     store: &mut NodeTree,
+    mode: MergeMode,
 ) -> Result<(Vec<Op>, Vec<Conflict>), Conflict> {
     if ours
         .iter()
@@ -368,7 +465,7 @@ fn compose(
         } else if t.is_empty() {
             out.extend(o.iter().cloned());
         } else {
-            out.extend(resolve_same_node(nid, o, t, store)?);
+            out.extend(resolve_same_node(nid, o, t, store, mode, &mut soft)?);
         }
     }
 
@@ -414,6 +511,8 @@ fn resolve_same_node(
     ours: &[Op],
     theirs: &[Op],
     store: &mut NodeTree,
+    mode: MergeMode,
+    soft: &mut Vec<Conflict>,
 ) -> Result<Vec<Op>, Conflict> {
     let o_del = ours.iter().any(|o| matches!(o, Op::Delete { .. }));
     let t_del = theirs.iter().any(|o| matches!(o, Op::Delete { .. }));
@@ -435,7 +534,21 @@ fn resolve_same_node(
                 return Ok(assemble(vec![o.clone()], ours, theirs));
             }
             if let Some(merged) = merge_replace_via_cst(nid, o, t, store) {
+                if mode == MergeMode::Lander {
+                    // Both sides edited this definition; the verifier re-checks.
+                    soft.push(Conflict::soft(
+                        vec![nid],
+                        "both sides edited this definition; merged inside it",
+                    ));
+                }
                 return Ok(assemble(vec![merged], ours, theirs));
+            }
+            if mode == MergeMode::Lander {
+                return Err(Conflict::hard(
+                    vec![nid],
+                    "both sides replaced this definition and the edits do not combine \
+                     (spec §5.2 rule 2, ADR 0014)",
+                ));
             }
             // Landing order: keep ours, then insert named child defs that
             // exist only on theirs (fields, methods, uses).

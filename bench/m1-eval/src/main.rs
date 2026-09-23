@@ -16,7 +16,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use gix::bstr::ByteSlice;
-use hord_diff::{diff, merge, merge_blob};
+use hord_diff::{MergeMode, diff, merge, merge_blob};
 use hord_lang::{IdentifiedTree, LangAdapter, default_identify};
 use hord_lang_rust::RustAdapter;
 use hord_lang_toml::TomlAdapter;
@@ -461,7 +461,15 @@ fn side_spans<A: LangAdapter>(
 fn def_spans<A: LangAdapter>(adapter: &A, tree: &IdentifiedTree) -> Vec<DefSpan> {
     let mut out = Vec::new();
     if let Some(root) = tree.tree.root() {
-        walk_defs(adapter, &tree.tree, &tree.ids, root, 0, &mut out);
+        walk_defs(
+            adapter,
+            &tree.tree,
+            &tree.ids,
+            root,
+            &mut Vec::new(),
+            0,
+            &mut out,
+        );
     }
     out
 }
@@ -469,8 +477,9 @@ fn def_spans<A: LangAdapter>(adapter: &A, tree: &IdentifiedTree) -> Vec<DefSpan>
 fn walk_defs<A: LangAdapter>(
     adapter: &A,
     tree: &hord_lang::NodeTree,
-    ids: &BTreeMap<hord_core::ObjectId, hord_core::NodeId>,
+    ids: &BTreeMap<Vec<u32>, hord_core::NodeId>,
     id: hord_core::ObjectId,
+    site: &mut Vec<u32>,
     offset: usize,
     out: &mut Vec<DefSpan>,
 ) -> usize {
@@ -479,7 +488,7 @@ fn walk_defs<A: LangAdapter>(
     };
     let end = offset + node.raw.len();
     if adapter.is_definition(&node.kind)
-        && let Some(nid) = ids.get(&id)
+        && let Some(nid) = ids.get(site.as_slice())
     {
         out.push(DefSpan {
             id: *nid,
@@ -493,8 +502,10 @@ fn walk_defs<A: LangAdapter>(
         });
     }
     let mut child_at = offset;
-    for child in &node.children {
-        child_at = walk_defs(adapter, tree, ids, *child, child_at, out);
+    for (i, child) in node.children.iter().enumerate() {
+        site.push(u32::try_from(i).unwrap_or(u32::MAX));
+        child_at = walk_defs(adapter, tree, ids, *child, site, child_at, out);
+        site.pop();
     }
     end
 }
@@ -676,7 +687,7 @@ fn eval_merge_pair<A: LangAdapter>(
     let theirs_tree = adapter.parse(theirs_src).context("parse theirs")?;
     let theirs_map = default_identify(adapter, &base, &theirs_tree);
     let theirs = IdentifiedTree::new(theirs_tree, theirs_map.nodes);
-    match merge(adapter, &base, &ours, &theirs) {
+    match merge(adapter, &base, &ours, &theirs, MergeMode::Corpus) {
         Ok(merged) => {
             let got = adapter.project(&merged.tree.tree);
             Ok(MergeOut::Match {
@@ -1099,13 +1110,18 @@ fn check_apply_pair<A: LangAdapter>(
     let base = IdentifiedTree::new(base_tree, base_map.nodes);
     let mapping = default_identify(adapter, &base, &result_tree);
     let want = result_tree.root();
-    let ops = diff(&base, &result_tree, &mapping);
+    let file: hord_core::RepoPath = path
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad path {path}"))?;
+    let ops = diff(&file, &base, &result_tree, &mapping);
     // `diff` verifies apply identity (file Replace fallback if needed).
     let got = match ops.first() {
-        Some(hord_core::Op::Replace { node, to, .. }) if *node == hord_diff::file_parent() => {
+        Some(hord_core::Op::Replace { node, to, .. })
+            if *node == hord_diff::file_parent(&file) && ops.len() == 1 =>
+        {
             Some(*to)
         }
-        _ => hord_diff::apply(&base, &ops, &result_tree)
+        _ => hord_diff::apply(&file, &base, &ops, &result_tree)
             .context("apply")?
             .tree
             .root(),

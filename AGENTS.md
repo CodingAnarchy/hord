@@ -10,7 +10,16 @@ Semantic VCS. The spec is the contract: `docs/spec.md`.
 
 ## Current target
 
-M0 acceptance is green. Current work is **M1** (structural tier: `hord-lang*`, `hord-diff`). Do not start M2+ crates except as a documented, required dependency of an M1 deliverable.
+M0–M3 acceptance is green. Current work is **M4** (verification and policy: `hord-verify`, `hord-verify-rust`, `hord-policy`, and the server foundation `hord-api`, `hord-remote`, `hord-server`). Do not start M5+ crates except as a documented, required dependency of an M4 deliverable.
+
+Acceptance harnesses (release mode; corpora in `$HORD_CORPORA` or `~/.cache/hord/corpora`) must stay green:
+
+- M0: `cargo run -p hord-eval --release`
+- M1: `cargo run -p hord-eval-m1 --release`
+- M2: `cargo run -p hord-eval-m2 --release`
+- M3: `cargo run -p hord-eval-m3 --release` (100-agent concurrency simulation, workspaces, `Cargo.lock`)
+
+M3 decisions that constrain later work: read sets (ADR 0012), lander merge mode (0014), file-root ids and content-derived write sets (0015), copy-on-write directory workspaces (0016), and the `Cargo.lock` bridge living in `hord-lang-rust` (0013). Language-specific logic belongs only in its language adapter crate.
 
 ## Engineering (spec §11.1)
 

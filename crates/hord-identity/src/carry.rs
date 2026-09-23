@@ -2,8 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hord_core::{IdentityDelta, NodeId, ObjectId, Op};
-use hord_lang::{IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, default_identify};
+use hord_core::{IdentityDelta, NodeId, ObjectId, Op, RepoPath};
+use hord_lang::{
+    IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, default_identify, oid_at,
+};
 
 use crate::Result;
 use crate::error::Error;
@@ -87,14 +89,43 @@ pub fn carry<A: LangAdapter + ?Sized>(
     result: &NodeTree,
     declarations: &[Declaration],
 ) -> Result<IdentityMapping> {
+    carry_with_scope(adapter, base, result, declarations, 0)
+}
+
+/// [`carry`] for the file at `path`: birth ids also depend on the path, so
+/// identical definitions born in two files of one snapshot get different
+/// ids (see [`crate::assign_in`]).
+pub fn carry_in<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    path: &RepoPath,
+    base: &IdentifiedTree,
+    result: &NodeTree,
+    declarations: &[Declaration],
+) -> Result<IdentityMapping> {
+    carry_with_scope(
+        adapter,
+        base,
+        result,
+        declarations,
+        crate::assign::path_salt(path),
+    )
+}
+
+fn carry_with_scope<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    result: &NodeTree,
+    declarations: &[Declaration],
+    scope: u128,
+) -> Result<IdentityMapping> {
     let mut mapping = default_identify(adapter, base, result);
     // Births from `default_identify` are random ULIDs. Replace them before
     // declarations so a copy of a birth, and every other new id, stays a
     // function of that definition's content.
-    crate::assign::stabilize_births(&mut mapping);
+    crate::assign::stabilize_births(&mut mapping, result, scope);
     if !declarations.is_empty() {
         check_unique_targets(declarations)?;
-        apply_declarations(&mut mapping, declarations)?;
+        apply_declarations(&mut mapping, result, declarations)?;
         ensure_unique(&mapping.nodes)?;
     }
     // Moves name the ids after declarations. With no declarations this
@@ -124,17 +155,46 @@ fn result_targets(decl: &Declaration) -> &[ObjectId] {
     }
 }
 
-fn apply_declarations(mapping: &mut IdentityMapping, declarations: &[Declaration]) -> Result<()> {
+/// The site of the definition a declaration names by content id. Two
+/// identical definitions share a content id; the first in preorder is named.
+fn site_for(mapping: &IdentityMapping, tree: &NodeTree, oid: ObjectId) -> Result<Site> {
+    mapping
+        .nodes
+        .keys()
+        .find(|site| oid_at(tree, site) == Some(oid))
+        .cloned()
+        .ok_or(Error::UnknownResult(oid))
+}
+
+fn apply_declarations(
+    mapping: &mut IdentityMapping,
+    tree: &NodeTree,
+    declarations: &[Declaration],
+) -> Result<()> {
     let heuristic_held: BTreeSet<NodeId> = mapping.nodes.values().copied().collect();
     let mut claimed = BTreeSet::new();
     for decl in declarations {
         match decl {
             Declaration::DerivedFrom { result, from } => {
-                apply_derived_from(mapping, &heuristic_held, &mut claimed, *result, *from)?;
+                let site = site_for(mapping, tree, *result)?;
+                apply_derived_from(
+                    mapping,
+                    &heuristic_held,
+                    &mut claimed,
+                    (&site, *result),
+                    *from,
+                )?;
             }
-            Declaration::SplitInto { node, into } => apply_split(mapping, *node, into)?,
+            Declaration::SplitInto { node, into } => {
+                let sites = into
+                    .iter()
+                    .map(|oid| site_for(mapping, tree, *oid))
+                    .collect::<Result<Vec<_>>>()?;
+                apply_split(mapping, *node, &sites)?;
+            }
             Declaration::MergedFrom { result, from } => {
-                apply_merge(mapping, &mut claimed, *result, from)?;
+                let site = site_for(mapping, tree, *result)?;
+                apply_merge(mapping, &mut claimed, (&site, *result), from)?;
             }
         }
     }
@@ -145,29 +205,29 @@ fn apply_derived_from(
     mapping: &mut IdentityMapping,
     heuristic_held: &BTreeSet<NodeId>,
     claimed: &mut BTreeSet<NodeId>,
-    result: ObjectId,
+    (site, oid): (&Site, ObjectId),
     from: NodeId,
 ) -> Result<()> {
-    let Some(&current) = mapping.nodes.get(&result) else {
-        return Err(Error::UnknownResult(result));
+    let Some(&current) = mapping.nodes.get(site) else {
+        return Err(Error::UnknownResult(oid));
     };
     if current == from {
         return Ok(());
     }
-    if held_elsewhere(&mapping.nodes, result, from) {
+    if held_elsewhere(&mapping.nodes, site, from) {
         // Held by a declaration in this pass, not by the heuristic match.
         if !heuristic_held.contains(&from) {
             return Err(Error::Claimed(from));
         }
-        apply_copy(mapping, result, current, from);
+        apply_copy(mapping, (site, oid), current, from);
         return Ok(());
     }
     if claimed.contains(&from) {
         return Err(Error::Claimed(from));
     }
-    detach(mapping, result, current);
+    detach(mapping, site, current);
     remove_death(&mut mapping.deltas, from);
-    mapping.nodes.insert(result, from);
+    mapping.nodes.insert(site.clone(), from);
     claimed.insert(from);
     // `node == from`: the declaration continued the base identity, so the
     // result id is that id. A copy uses a distinct result id.
@@ -220,29 +280,34 @@ fn delta_mentions(delta: &IdentityDelta, id: NodeId) -> bool {
     }
 }
 
-fn apply_copy(mapping: &mut IdentityMapping, result: ObjectId, current: NodeId, from: NodeId) {
+fn apply_copy(
+    mapping: &mut IdentityMapping,
+    (site, oid): (&Site, ObjectId),
+    current: NodeId,
+    from: NodeId,
+) {
     let was_birth = remove_birth(&mut mapping.deltas, current);
     let copy_id = if was_birth {
         current
     } else {
-        release_unmatched(mapping, result, current);
-        unused_copy_id(mapping, result, from)
+        release_unmatched(mapping, site, current);
+        unused_copy_id(mapping, oid, from)
     };
-    mapping.nodes.insert(result, copy_id);
+    mapping.nodes.insert(site.clone(), copy_id);
     mapping.deltas.push(IdentityDelta::DerivedFrom {
         node: copy_id,
         from,
     });
 }
 
-fn apply_split(mapping: &mut IdentityMapping, node: NodeId, into: &[ObjectId]) -> Result<()> {
+fn apply_split(mapping: &mut IdentityMapping, node: NodeId, into: &[Site]) -> Result<()> {
     if into.is_empty() {
         return Err(Error::EmptySplit(node));
     }
     let mut into_ids = Vec::with_capacity(into.len());
-    for oid in into {
-        let Some(&current) = mapping.nodes.get(oid) else {
-            return Err(Error::UnknownResult(*oid));
+    for site in into {
+        let Some(&current) = mapping.nodes.get(site) else {
+            return Err(Error::EmptySplit(node));
         };
         into_ids.push(current);
     }
@@ -265,21 +330,21 @@ fn apply_split(mapping: &mut IdentityMapping, node: NodeId, into: &[ObjectId]) -
 fn apply_merge(
     mapping: &mut IdentityMapping,
     claimed: &mut BTreeSet<NodeId>,
-    result: ObjectId,
+    (site, oid): (&Site, ObjectId),
     from: &[NodeId],
 ) -> Result<()> {
     if from.is_empty() {
-        return Err(Error::EmptyMerge(result));
+        return Err(Error::EmptyMerge(oid));
     }
-    let Some(&current) = mapping.nodes.get(&result) else {
-        return Err(Error::UnknownResult(result));
+    let Some(&current) = mapping.nodes.get(site) else {
+        return Err(Error::UnknownResult(oid));
     };
-    let chosen = choose_merge_id(mapping, claimed, result, current, from)?;
+    let chosen = choose_merge_id(mapping, claimed, site, current, from)?;
     if chosen == current {
         remove_birth(&mut mapping.deltas, current);
     } else {
-        detach(mapping, result, current);
-        mapping.nodes.insert(result, chosen);
+        detach(mapping, site, current);
+        mapping.nodes.insert(site.clone(), chosen);
         claimed.insert(chosen);
     }
     for src in from {
@@ -295,7 +360,7 @@ fn apply_merge(
 fn choose_merge_id(
     mapping: &IdentityMapping,
     claimed: &BTreeSet<NodeId>,
-    result: ObjectId,
+    result: &Site,
     current: NodeId,
     from: &[NodeId],
 ) -> Result<NodeId> {
@@ -314,15 +379,15 @@ fn choose_merge_id(
     Ok(current)
 }
 
-fn detach(mapping: &mut IdentityMapping, oid: ObjectId, id: NodeId) {
+fn detach(mapping: &mut IdentityMapping, site: &Site, id: NodeId) {
     let was_birth = remove_birth(&mut mapping.deltas, id);
     if !was_birth {
-        release_unmatched(mapping, oid, id);
+        release_unmatched(mapping, site, id);
     }
 }
 
-fn release_unmatched(mapping: &mut IdentityMapping, oid: ObjectId, id: NodeId) {
-    if held_elsewhere(&mapping.nodes, oid, id) {
+fn release_unmatched(mapping: &mut IdentityMapping, site: &Site, id: NodeId) {
+    if held_elsewhere(&mapping.nodes, site, id) {
         return;
     }
     if mapping
@@ -335,17 +400,17 @@ fn release_unmatched(mapping: &mut IdentityMapping, oid: ObjectId, id: NodeId) {
     mapping.deltas.push(IdentityDelta::Death { node: id });
 }
 
-fn held_elsewhere(nodes: &BTreeMap<ObjectId, NodeId>, except: ObjectId, id: NodeId) -> bool {
-    nodes.iter().any(|(oid, nid)| *oid != except && *nid == id)
+fn held_elsewhere(nodes: &BTreeMap<Site, NodeId>, except: &Site, id: NodeId) -> bool {
+    nodes.iter().any(|(site, nid)| site != except && *nid == id)
 }
 
-fn holder(nodes: &BTreeMap<ObjectId, NodeId>, id: NodeId) -> Option<ObjectId> {
+fn holder(nodes: &BTreeMap<Site, NodeId>, id: NodeId) -> Option<Site> {
     nodes
         .iter()
-        .find_map(|(oid, nid)| (*nid == id).then_some(*oid))
+        .find_map(|(site, nid)| (*nid == id).then(|| site.clone()))
 }
 
-fn ensure_unique(nodes: &BTreeMap<ObjectId, NodeId>) -> Result<()> {
+fn ensure_unique(nodes: &BTreeMap<Site, NodeId>) -> Result<()> {
     let mut seen = BTreeSet::new();
     for id in nodes.values() {
         if !seen.insert(*id) {
@@ -378,7 +443,7 @@ fn remove_delta(deltas: &mut Vec<IdentityDelta>, pred: impl Fn(&IdentityDelta) -
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Site {
+struct Placement {
     parent: Option<NodeId>,
     index: u32,
 }
@@ -412,41 +477,43 @@ fn recompute_moves(mapping: &mut IdentityMapping, base: &IdentifiedTree, result:
     mapping.moves = moves;
 }
 
-fn site_index(tree: &NodeTree, ids: &BTreeMap<ObjectId, NodeId>) -> BTreeMap<NodeId, Site> {
+fn site_index(tree: &NodeTree, ids: &BTreeMap<Site, NodeId>) -> BTreeMap<NodeId, Placement> {
     let mut map = BTreeMap::new();
-    for (id, site) in sites(tree, ids) {
-        map.entry(id).or_insert(site);
+    for (id, placement) in sites(tree, ids) {
+        map.entry(id).or_insert(placement);
     }
     map
 }
 
-fn sites(tree: &NodeTree, ids: &BTreeMap<ObjectId, NodeId>) -> Vec<(NodeId, Site)> {
+fn sites(tree: &NodeTree, ids: &BTreeMap<Site, NodeId>) -> Vec<(NodeId, Placement)> {
     let Some(root) = tree.root() else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    walk_sites(tree, ids, root, None, 0, &mut out);
+    walk_sites(tree, ids, root, None, &mut Vec::new(), &mut out);
     out
 }
 
 fn walk_sites(
     tree: &NodeTree,
-    ids: &BTreeMap<ObjectId, NodeId>,
+    ids: &BTreeMap<Site, NodeId>,
     oid: ObjectId,
     parent: Option<NodeId>,
-    index: u32,
-    out: &mut Vec<(NodeId, Site)>,
+    site: &mut Site,
+    out: &mut Vec<(NodeId, Placement)>,
 ) {
     let Some(node) = tree.get(oid) else {
         return;
     };
     let mut child_parent = parent;
-    if let Some(&node_id) = ids.get(&oid) {
-        out.push((node_id, Site { parent, index }));
+    if let Some(&node_id) = ids.get(site.as_slice()) {
+        let index = site.last().copied().unwrap_or(0);
+        out.push((node_id, Placement { parent, index }));
         child_parent = Some(node_id);
     }
     for (i, child) in node.children.iter().enumerate() {
-        let child_index = u32::try_from(i).unwrap_or(u32::MAX);
-        walk_sites(tree, ids, *child, child_parent, child_index, out);
+        site.push(u32::try_from(i).unwrap_or(u32::MAX));
+        walk_sites(tree, ids, *child, child_parent, site, out);
+        site.pop();
     }
 }

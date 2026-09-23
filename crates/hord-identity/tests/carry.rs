@@ -11,7 +11,7 @@ use hord_core::{
 };
 use hord_identity::{Declaration, Error, SnapshotFile, assign, carry, identity_map};
 use hord_lang::{
-    AttachedToken, IdentifiedTree, LangAdapter, NodeTree, ParseError, Tier, default_identify,
+    AttachedToken, IdentifiedTree, LangAdapter, NodeTree, ParseError, Site, Tier, default_identify,
 };
 
 struct TestAdapter;
@@ -88,9 +88,35 @@ fn finish(tree: &mut NodeTree, children: Vec<ObjectId>) {
 fn identified(tree: NodeTree, ids: &[(ObjectId, u128)]) -> IdentifiedTree {
     let mut map = BTreeMap::new();
     for (oid, id) in ids {
-        map.insert(*oid, nid(*id));
+        map.insert(site(&tree, *oid), nid(*id));
     }
     IdentifiedTree::new(tree, map)
+}
+
+/// First site of `oid` in `tree`, in preorder.
+fn site(tree: &NodeTree, oid: ObjectId) -> Site {
+    fn walk(tree: &NodeTree, at: ObjectId, want: ObjectId, path: &mut Site) -> bool {
+        if at == want {
+            return true;
+        }
+        let Some(node) = tree.get(at) else {
+            return false;
+        };
+        for (i, child) in node.children.iter().enumerate() {
+            path.push(u32::try_from(i).unwrap());
+            if walk(tree, *child, want, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    assert!(
+        walk(tree, tree.root().expect("root"), oid, &mut path),
+        "{oid} not in tree"
+    );
+    path
 }
 
 fn path() -> RepoPath {
@@ -113,7 +139,7 @@ fn exact_carry_keeps_id() {
     let carried = carry(&adapter, &base, &tree, &[]).unwrap();
     let direct = default_identify(&adapter, &base, &tree);
     assert_eq!(carried, direct);
-    assert_eq!(carried.nodes.get(&foo).copied(), Some(nid(1)));
+    assert_eq!(carried.nodes.get(&site(&tree, foo)).copied(), Some(nid(1)));
     assert!(carried.deltas.is_empty());
     assert!(carried.moves.is_empty());
 }
@@ -129,7 +155,10 @@ fn named_carry_keeps_id_when_body_changes() {
     let direct = default_identify(&adapter, &base, &result);
     assert_eq!(carried, direct);
     assert_ne!(foo_old, foo_new);
-    assert_eq!(carried.nodes.get(&foo_new).copied(), Some(nid(1)));
+    assert_eq!(
+        carried.nodes.get(&site(&result, foo_new)).copied(),
+        Some(nid(1))
+    );
     assert!(carried.deltas.is_empty());
     assert!(carried.moves.is_empty());
 }
@@ -145,9 +174,18 @@ fn moved_carry_keeps_id_and_emits_move() {
     let carried = carry(&adapter, &base, &result, &[]).unwrap();
     let direct = default_identify(&adapter, &base, &result);
     assert_eq!(carried, direct);
-    assert_eq!(carried.nodes.get(&foo_r).copied(), Some(nid(1)));
-    assert_eq!(carried.nodes.get(&mod_a_r).copied(), Some(nid(2)));
-    assert_eq!(carried.nodes.get(&mod_b_r).copied(), Some(nid(3)));
+    assert_eq!(
+        carried.nodes.get(&site(&result, foo_r)).copied(),
+        Some(nid(1))
+    );
+    assert_eq!(
+        carried.nodes.get(&site(&result, mod_a_r)).copied(),
+        Some(nid(2))
+    );
+    assert_eq!(
+        carried.nodes.get(&site(&result, mod_b_r)).copied(),
+        Some(nid(3))
+    );
     assert!(carried.deltas.is_empty());
     assert_eq!(
         carried.moves,
@@ -199,7 +237,7 @@ fn derived_from_overrides_birth() {
     let (result, new) = fn_file("new_body", "new");
 
     let without = carry(&adapter, &base, &result, &[]).unwrap();
-    let born = without.nodes.get(&new).copied().unwrap();
+    let born = without.nodes.get(&site(&result, new)).copied().unwrap();
     assert_ne!(born, nid(1));
     assert!(
         without
@@ -224,7 +262,7 @@ fn derived_from_overrides_birth() {
         }],
     )
     .unwrap();
-    assert_eq!(with.nodes.get(&new).copied(), Some(nid(1)));
+    assert_eq!(with.nodes.get(&site(&result, new)).copied(), Some(nid(1)));
     assert_eq!(
         with.deltas,
         vec![IdentityDelta::DerivedFrom {
@@ -268,9 +306,18 @@ fn derived_from_across_parents_emits_move() {
         }],
     )
     .unwrap();
-    assert_eq!(carried.nodes.get(&renamed).copied(), Some(nid(1)));
-    assert_eq!(carried.nodes.get(&mod_a_r).copied(), Some(nid(2)));
-    assert_eq!(carried.nodes.get(&mod_b_r).copied(), Some(nid(3)));
+    assert_eq!(
+        carried.nodes.get(&site(&result, renamed)).copied(),
+        Some(nid(1))
+    );
+    assert_eq!(
+        carried.nodes.get(&site(&result, mod_a_r)).copied(),
+        Some(nid(2))
+    );
+    assert_eq!(
+        carried.nodes.get(&site(&result, mod_b_r)).copied(),
+        Some(nid(3))
+    );
     assert_eq!(
         carried.deltas,
         vec![IdentityDelta::DerivedFrom {
@@ -312,8 +359,11 @@ fn derived_from_copies_when_source_remains() {
         }],
     )
     .unwrap();
-    assert_eq!(carried.nodes.get(&foo_r).copied(), Some(nid(1)));
-    let copy = carried.nodes.get(&bar).copied().unwrap();
+    assert_eq!(
+        carried.nodes.get(&site(&result, foo_r)).copied(),
+        Some(nid(1))
+    );
+    let copy = carried.nodes.get(&site(&result, bar)).copied().unwrap();
     assert_ne!(copy, nid(1));
     assert_eq!(
         carried.deltas,
@@ -346,8 +396,8 @@ fn split_into_replaces_births_and_death() {
         }],
     )
     .unwrap();
-    let left_id = carried.nodes.get(&left).copied().unwrap();
-    let right_id = carried.nodes.get(&right).copied().unwrap();
+    let left_id = carried.nodes.get(&site(&result, left)).copied().unwrap();
+    let right_id = carried.nodes.get(&site(&result, right)).copied().unwrap();
     assert_ne!(left_id, nid(1));
     assert_ne!(right_id, nid(1));
     assert_ne!(left_id, right_id);
@@ -380,7 +430,10 @@ fn merged_from_adopts_first_free_source() {
         }],
     )
     .unwrap();
-    assert_eq!(carried.nodes.get(&merged).copied(), Some(nid(1)));
+    assert_eq!(
+        carried.nodes.get(&site(&result, merged)).copied(),
+        Some(nid(1))
+    );
     assert_eq!(
         carried.deltas,
         vec![IdentityDelta::MergedFrom {
@@ -399,7 +452,10 @@ fn different_name_and_body_is_not_a_rename() {
     let (result, new) = fn_file("beta_body", "beta");
 
     let carried = carry(&adapter, &base, &result, &[]).unwrap();
-    assert_ne!(carried.nodes.get(&new).copied(), Some(nid(1)));
+    assert_ne!(
+        carried.nodes.get(&site(&result, new)).copied(),
+        Some(nid(1))
+    );
     assert!(carried.moves.is_empty());
     assert!(
         carried
@@ -426,8 +482,8 @@ fn assign_births_each_definition_and_locates_it() {
     let mapping = assign(&adapter, &tree);
     assert_eq!(mapping.nodes.len(), 2);
     assert!(mapping.moves.is_empty());
-    let foo_id = mapping.nodes.get(&foo).copied().unwrap();
-    let bar_id = mapping.nodes.get(&bar).copied().unwrap();
+    let foo_id = mapping.nodes.get(&site(&tree, foo)).copied().unwrap();
+    let bar_id = mapping.nodes.get(&site(&tree, bar)).copied().unwrap();
     assert_ne!(foo_id, bar_id);
     assert_ne!(foo_id, NodeId::nil());
     assert_eq!(
@@ -460,8 +516,8 @@ fn identity_map_root_definition_has_empty_pointer() {
     tree.set_root(root).unwrap();
 
     let mapping = assign(&adapter, &tree);
-    let root_id = mapping.nodes.get(&root).copied().unwrap();
-    let foo_id = mapping.nodes.get(&foo).copied().unwrap();
+    let root_id = mapping.nodes.get(&site(&tree, root)).copied().unwrap();
+    let foo_id = mapping.nodes.get(&site(&tree, foo)).copied().unwrap();
     let view = identity_map(
         &[SnapshotFile {
             path: path(),
@@ -493,27 +549,13 @@ fn identity_map_rejects_duplicate_node_id() {
 }
 
 #[test]
-fn identity_map_rejects_missing_and_unreachable_ids() {
+fn identity_map_rejects_ids_at_sites_not_in_the_tree() {
+    // Ids are keyed by site: an id whose site does not exist in the tree
+    // (a stale or foreign site) is unmapped.
     let (tree, _foo) = fn_file("foo_body", "foo");
-    let mut missing = BTreeMap::new();
-    missing.insert(ObjectId::from_bytes([9; 32]), nid(4));
-    let missing_err = identity_map(
-        &[SnapshotFile {
-            path: path(),
-            identified: IdentifiedTree::new(tree, missing),
-        }],
-        Vec::new(),
-    )
-    .unwrap_err();
-    assert!(matches!(missing_err, Error::MissingNode(_)));
-
-    let mut tree = NodeTree::new();
-    let foo = leaf(&mut tree, "fn", "foo_body", Some("foo"));
-    let orphan = leaf(&mut tree, "fn", "orphan_body", Some("orphan"));
-    finish(&mut tree, vec![foo]);
     let mut ids = BTreeMap::new();
-    ids.insert(orphan, nid(5));
-    let unmapped = identity_map(
+    ids.insert(vec![9], nid(4));
+    let err = identity_map(
         &[SnapshotFile {
             path: path(),
             identified: IdentifiedTree::new(tree, ids),
@@ -521,7 +563,40 @@ fn identity_map_rejects_missing_and_unreachable_ids() {
         Vec::new(),
     )
     .unwrap_err();
-    assert!(matches!(unmapped, Error::Unmapped(id) if id == nid(5)));
+    assert!(matches!(err, Error::Unmapped(id) if id == nid(4)));
+}
+
+/// Two definitions with the same text under different parents are one
+/// interned node but two sites; each keeps its own id (spec §3.4).
+#[test]
+fn identical_definitions_at_two_sites_keep_distinct_ids() {
+    let adapter = TestAdapter;
+    let mut tree = NodeTree::new();
+    let dup = leaf(&mut tree, "fn", "same_body", Some("same"));
+    let mod_a = branch(&mut tree, "mod", vec![dup], Some("a"));
+    let mod_b = branch(&mut tree, "mod", vec![dup], Some("b"));
+    finish(&mut tree, vec![mod_a, mod_b]);
+    let mapping = assign(&adapter, &tree);
+    let first = mapping.nodes.get(&vec![0, 0]).copied().unwrap();
+    let second = mapping.nodes.get(&vec![1, 0]).copied().unwrap();
+    assert_ne!(first, second);
+    // Deterministic, and carried unchanged with no spurious move.
+    assert_eq!(assign(&adapter, &tree).nodes, mapping.nodes);
+    let base = IdentifiedTree::new(tree.clone(), mapping.nodes.clone());
+    let carried = carry(&adapter, &base, &tree, &[]).unwrap();
+    assert_eq!(carried.nodes, mapping.nodes);
+    assert!(carried.moves.is_empty(), "{:?}", carried.moves);
+    assert!(carried.deltas.is_empty(), "{:?}", carried.deltas);
+    let view = identity_map(
+        &[SnapshotFile {
+            path: path(),
+            identified: base,
+        }],
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(view.nodes.get(&first).unwrap().pointer, vec![0, 0]);
+    assert_eq!(view.nodes.get(&second).unwrap().pointer, vec![1, 0]);
 }
 
 #[test]
@@ -611,15 +686,21 @@ fn birth_ids_are_stable_and_ignore_unrelated_nodes() {
     let once = assign(&adapter, &tree);
     let twice = assign(&adapter, &tree);
     assert_eq!(once, twice);
-    let foo_id = once.nodes.get(&foo).copied().unwrap();
+    let foo_id = once.nodes.get(&site(&tree, foo)).copied().unwrap();
 
     let mut with_extra = NodeTree::new();
     let extra = leaf(&mut with_extra, "fn", "zzz_body", Some("zzz"));
     let foo2 = leaf(&mut with_extra, "fn", "foo_body", Some("foo"));
     finish(&mut with_extra, vec![extra, foo2]);
     let mapping = assign(&adapter, &with_extra);
-    assert_eq!(mapping.nodes.get(&foo2).copied(), Some(foo_id));
-    assert_ne!(mapping.nodes.get(&extra).copied(), Some(foo_id));
+    assert_eq!(
+        mapping.nodes.get(&site(&with_extra, foo2)).copied(),
+        Some(foo_id)
+    );
+    assert_ne!(
+        mapping.nodes.get(&site(&with_extra, extra)).copied(),
+        Some(foo_id)
+    );
 }
 
 #[test]
@@ -651,7 +732,7 @@ fn copy_id_is_stable_and_ignores_unrelated_nodes() {
             }],
         )
         .unwrap();
-        carried.nodes.get(&other_r).copied().unwrap()
+        carried.nodes.get(&site(&result, other_r)).copied().unwrap()
     };
 
     let first = copy_of(false);
@@ -677,4 +758,30 @@ fn moved_result() -> (NodeTree, ObjectId, ObjectId, ObjectId) {
     let mod_b = branch(&mut tree, "mod", vec![fun], Some("B"));
     finish(&mut tree, vec![mod_a, mod_b]);
     (tree, fun, mod_a, mod_b)
+}
+
+/// Identical files at two paths: `assign` gives both the same (content-
+/// derived) ids; `assign_in` keeps them apart per path, deterministically.
+/// `carry_in` births follow the same rule.
+#[test]
+fn assign_in_keeps_identical_files_apart() {
+    let adapter = TestAdapter;
+    let (tree, _) = fn_file("same_body", "same");
+    let a = RepoPath::from_str("src/a.t").unwrap();
+    let b = RepoPath::from_str("src/b.t").unwrap();
+    assert_eq!(assign(&adapter, &tree).nodes, assign(&adapter, &tree).nodes);
+    let in_a = hord_identity::assign_in(&adapter, &a, &tree);
+    let in_b = hord_identity::assign_in(&adapter, &b, &tree);
+    assert_eq!(
+        in_a.nodes,
+        hord_identity::assign_in(&adapter, &a, &tree).nodes
+    );
+    let ids = |m: &hord_lang::IdentityMapping| m.nodes.values().copied().collect::<Vec<_>>();
+    assert!(ids(&in_a).iter().all(|id| !ids(&in_b).contains(id)));
+
+    let empty = IdentifiedTree::default();
+    let born_a = hord_identity::carry_in(&adapter, &a, &empty, &tree, &[]).unwrap();
+    let born_b = hord_identity::carry_in(&adapter, &b, &empty, &tree, &[]).unwrap();
+    assert_eq!(born_a.nodes, in_a.nodes);
+    assert_ne!(born_a.nodes, born_b.nodes);
 }
