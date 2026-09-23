@@ -88,6 +88,29 @@ pub struct Layout {
     pub trim_trailing_blank_lines: bool,
 }
 
+/// Line terminator of a document. The merge keeps it, so a file checked out
+/// with CRLF (Windows `core.autocrlf`) re-emits with CRLF.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LineEnding {
+    /// `\n`.
+    #[default]
+    Lf,
+    /// `\r\n`.
+    CrLf,
+}
+
+impl LineEnding {
+    /// The terminator of the first line in `text`, or [`Self::Lf`] when
+    /// `text` has no line break.
+    #[must_use]
+    pub fn detect(text: &str) -> Self {
+        match text.find('\n') {
+            Some(i) if text[..i].ends_with('\r') => Self::CrLf,
+            _ => Self::Lf,
+        }
+    }
+}
+
 /// A decoded TOML document: its leading comment block and its table.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TomlDoc {
@@ -95,6 +118,8 @@ pub struct TomlDoc {
     pub header: Vec<String>,
     /// The document's root table, in document order.
     pub table: Table,
+    /// Line terminator [`Self::emit`] writes.
+    pub line_ending: LineEnding,
 }
 
 impl TomlDoc {
@@ -107,12 +132,24 @@ impl TomlDoc {
             .take_while(|l| l.starts_with('#'))
             .map(str::to_owned)
             .collect();
-        Ok(Self { header, table })
+        Ok(Self {
+            header,
+            table,
+            line_ending: LineEnding::detect(text),
+        })
     }
 
-    /// Print in `layout`.
+    /// Print in `layout`, ending lines with [`Self::line_ending`].
     #[must_use]
     pub fn emit(&self, layout: &Layout) -> String {
+        let out = self.emit_lf(layout);
+        match self.line_ending {
+            LineEnding::Lf => out,
+            LineEnding::CrLf => out.replace('\n', "\r\n"),
+        }
+    }
+
+    fn emit_lf(&self, layout: &Layout) -> String {
         let mut out = String::new();
         for line in &self.header {
             out.push_str(line);
@@ -363,6 +400,12 @@ pub fn merge_docs(
             ours.header.clone()
         }
     };
+    // Two values, so a side that changed it wins and the sides never disagree.
+    let line_ending = if ours.line_ending == base.line_ending {
+        theirs.line_ending
+    } else {
+        ours.line_ending
+    };
     let table = m.table(
         &Path::root(),
         Some(&base.table),
@@ -371,7 +414,11 @@ pub fn merge_docs(
         &[],
     );
     if m.conflicts.is_empty() {
-        Ok(TomlDoc { header, table })
+        Ok(TomlDoc {
+            header,
+            table,
+            line_ending,
+        })
     } else {
         Err(m.conflicts)
     }
@@ -788,6 +835,23 @@ mod tests {
     #[test]
     fn unchanged_round_trips_canonical_input() {
         assert_eq!(merge(BASE, BASE, BASE).unwrap(), BASE);
+    }
+
+    #[test]
+    fn line_endings_are_kept() {
+        let crlf = |s: &str| s.replace('\n', "\r\n");
+        let ours = format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n");
+        let theirs = format!("{BASE}\n[[item]]\nid = \"c\"\nrev = 1\n");
+        let want =
+            format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n\n[[item]]\nid = \"c\"\nrev = 1\n");
+        // Every input CRLF: the output is CRLF.
+        assert_eq!(
+            merge(&crlf(BASE), &crlf(&ours), &crlf(&theirs)).unwrap(),
+            crlf(&want)
+        );
+        // One side switched to CRLF: that side's ending wins.
+        assert_eq!(merge(BASE, &crlf(&ours), &theirs).unwrap(), crlf(&want));
+        assert_eq!(LineEnding::detect("a = 1"), LineEnding::Lf);
     }
 
     #[test]

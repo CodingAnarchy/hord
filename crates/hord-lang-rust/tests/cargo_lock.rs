@@ -32,12 +32,21 @@ fn fixtures() -> Vec<(String, String)> {
         .filter(|p| p.extension().is_some_and(|e| e == "lock"))
         .map(|p| {
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            (name, fs::read_to_string(&p).expect("read"))
+            // Normalize, so the tests do not depend on how git checked the
+            // fixtures out (`core.autocrlf` on Windows). CRLF is covered by
+            // `crlf` below.
+            let text = fs::read_to_string(&p).expect("read").replace("\r\n", "\n");
+            (name, text)
         })
         .collect();
     out.sort();
     assert!(out.len() >= 3, "expected the real lockfile fixtures");
     out
+}
+
+/// `text` with every line ending in CRLF.
+fn crlf(text: &str) -> String {
+    text.replace('\n', "\r\n")
 }
 
 fn merge(base: &str, ours: &str, theirs: &str) -> Result<String, CargoLockMergeError> {
@@ -221,12 +230,14 @@ fn ambiguous_versions_are_named_with_source() {
 
 #[test]
 fn unchanged_merge_is_byte_identical_on_real_lockfiles() {
-    for (name, text) in fixtures() {
-        let merged = merge(&text, &text, &text).expect(&name);
-        assert!(
-            merged == text,
-            "{name}: re-emission differs from Cargo's bytes"
-        );
+    for (name, lf) in fixtures() {
+        for text in [lf.clone(), crlf(&lf)] {
+            let merged = merge(&text, &text, &text).expect(&name);
+            assert!(
+                merged == text,
+                "{name}: re-emission differs from Cargo's bytes"
+            );
+        }
     }
 }
 
@@ -590,6 +601,7 @@ proptest! {
         pick in any::<prop::sample::Index>(),
         a in any::<prop::sample::Index>(),
         b in any::<prop::sample::Index>(),
+        windows in any::<bool>(),
     ) {
         let fixtures = fixtures();
         let (name, full) = &fixtures[pick.index(fixtures.len())];
@@ -605,11 +617,13 @@ proptest! {
         };
         prop_assume!(!block(x).contains(&format!(" \"{y}\",")));
         prop_assume!(!block(y).contains(&format!(" \"{x}\",")));
-        let base = without(full, &[x, y]);
-        let ours = without(full, &[y]);
-        let theirs = without(full, &[x]);
+        let ending = |t: String| if windows { crlf(&t) } else { t };
+        let base = ending(without(full, &[x, y]));
+        let ours = ending(without(full, &[y]));
+        let theirs = ending(without(full, &[x]));
+        let full = ending(full.clone());
         let merged = merge_both(&base, &ours, &theirs);
-        prop_assert!(merged.as_ref() == Ok(full), "{name}: adding {x} and {y}");
+        prop_assert!(merged.as_ref() == Ok(&full), "{name}: adding {x} and {y}");
     }
 }
 
@@ -671,4 +685,21 @@ proptest! {
         prop_assert_eq!(merge(&base, &ours, &base).unwrap(), canon(&ours));
         prop_assert_eq!(merge(&base, &base, &ours).unwrap(), canon(&ours));
     }
+}
+
+/// A side that switched line endings (a Windows checkout of head) keeps its
+/// ending; the other side's additions still merge.
+#[test]
+fn a_side_that_changed_line_endings_keeps_them() {
+    let (name, full) = fixtures().into_iter().next().expect("fixture");
+    let names = removable(&full);
+    let (x, y) = (&names[0], &names[names.len() - 1]);
+    let base = without(&full, &[x, y]);
+    let ours = crlf(&without(&full, &[y]));
+    let theirs = without(&full, &[x]);
+    assert_eq!(
+        merge_both(&base, &ours, &theirs),
+        Ok(crlf(&full)),
+        "{name}: adding {x} and {y}"
+    );
 }
