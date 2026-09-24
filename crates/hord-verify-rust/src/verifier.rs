@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use hord_core::{Evidence, EvidenceKind, ObjectId, RepoPath, SnapshotId};
 use hord_verify::{
-    Check, Checkout, CoverageRecord, Error, EvidenceIndex, ImpactSet, Result, TestRef, Toolchain,
-    Verifier, VerifyPlan, VerifyPolicy,
+    Check, Checkout, CoverageRecord, Drift, Error, EvidenceIndex, ImpactSet, Result, TestRef,
+    Toolchain, Verifier, VerifyPlan, VerifyPolicy,
 };
 
 use crate::select::{SelectInput, Selection, select};
@@ -34,6 +34,7 @@ pub struct RustVerifier {
     toolchain_id: ObjectId,
     workspace: CargoWorkspace,
     coverage: Option<Arc<CoverageRecord>>,
+    drift: Option<Arc<Drift>>,
     /// Runs the planned commands.
     pub runner: CargoRunner,
     /// Quarantined tests, skipped by every test command.
@@ -48,6 +49,7 @@ impl RustVerifier {
             toolchain,
             workspace,
             coverage: None,
+            drift: None,
             runner: CargoRunner::default(),
             quarantine: BTreeSet::new(),
         })
@@ -58,6 +60,16 @@ impl RustVerifier {
     #[must_use]
     pub fn with_coverage(mut self, record: Option<Arc<CoverageRecord>>) -> Self {
         self.coverage = record;
+        self
+    }
+
+    /// Apply coverage freshness per test (ADR 0022, amendments after the
+    /// 50-commit measurement): `drift` chains the landed changes from the
+    /// oldest test snapshot in the coverage record to the snapshot being
+    /// verified, whose own change is the impact set's facts.
+    #[must_use]
+    pub fn with_drift(mut self, drift: Option<Arc<Drift>>) -> Self {
+        self.drift = drift;
         self
     }
 
@@ -76,6 +88,7 @@ impl RustVerifier {
             workspace: &self.workspace,
             impact,
             max_impact: policy.max_impact,
+            drift: self.drift.as_deref(),
         })
     }
 
@@ -233,6 +246,135 @@ impl RustVerifier {
     }
 }
 
+/// What [`RustVerifier::run_instrumented`] produced.
+#[derive(Clone, Debug)]
+pub struct InstrumentedRun {
+    /// Evidence: one `test:selected` (or `test:full`) object for the
+    /// instrumented tests, then one per doctest run.
+    pub evidence: Vec<Evidence>,
+    /// The coverage of every test that ran, on the checkout's snapshot:
+    /// merge it into the record ([`CoverageRecord::merge`]) and store it
+    /// as coverage evidence.
+    pub coverage: crate::CoverageRun,
+}
+
+impl RustVerifier {
+    /// Verify the selected tests of `impact` in one instrumented run (ADR
+    /// 0022, amendments after the 50-commit measurement: every verification
+    /// run is instrumented and refreshes the coverage of each test it ran).
+    ///
+    /// Each selected test runs alone under coverage ([`crate::coverage::collect`]
+    /// with [`crate::TestFilter::from_selection`]); a failing or timed-out
+    /// test fails the evidence. Doctests, which coverage cannot attribute,
+    /// run with plain `cargo test --doc`. `defs` are the checkout's
+    /// definitions; `options.only` is replaced by the selection.
+    pub fn run_instrumented(
+        &self,
+        checkout: &Checkout,
+        impact: &ImpactSet,
+        policy: &VerifyPolicy,
+        defs: &crate::DefinitionIndex,
+        options: &crate::CoverageOptions,
+        logs: &dyn EvidenceIndex,
+    ) -> Result<InstrumentedRun> {
+        let selection = self.selection(impact, policy);
+        let filter = crate::TestFilter::from_selection(&selection);
+        let mut options = options.clone();
+        options.only = Some(filter);
+        options.skip.extend(self.quarantine.iter().cloned());
+        let coverage = crate::coverage::collect(checkout, &self.toolchain, defs, &options)?;
+        let failed: Vec<&str> = coverage
+            .record
+            .tests
+            .iter()
+            .filter(|t| t.failed)
+            .map(|t| t.test.name.as_str())
+            .collect();
+        let qualifier = if selection.full { "full" } else { "selected" };
+        let requirement = if selection.full {
+            requirement::TEST_FULL
+        } else {
+            requirement::TEST_SELECTED
+        };
+        let mut names: Vec<String> = coverage
+            .record
+            .tests
+            .iter()
+            .map(|t| format!("{}/{}/{}", t.test.package, t.test.target.name, t.test.name))
+            .collect();
+        names.sort();
+        let listed = ObjectId::of(&names)?;
+        let check = Check {
+            requirement: requirement.to_owned(),
+            kind: EvidenceKind::Test,
+            qualifier: Some(qualifier.to_owned()),
+            program: "hord-coverage".into(),
+            args: vec![
+                "per-test".into(),
+                format!("{} tests", names.len()),
+                listed.to_string(),
+            ],
+            env: BTreeMap::new(),
+            dir: RepoPath::default(),
+            scope: if selection.full {
+                None
+            } else {
+                Some(impact.node_set())
+            },
+        };
+        let log = hord_verify::put_log(
+            logs,
+            format!("{}\n{}", coverage.log, names.join("\n")).as_bytes(),
+        )?;
+        let mut evidence = vec![
+            hord_verify::EvidenceFields {
+                kind: EvidenceKind::Test,
+                qualifier: check.qualifier.clone(),
+                snapshot: checkout.snapshot,
+                toolchain: self.toolchain_id,
+                command: check.command(),
+                scope: check.scope.clone(),
+                result: if failed.is_empty() {
+                    hord_core::EvidenceResult::Pass
+                } else {
+                    hord_core::EvidenceResult::Fail {
+                        summary: format!(
+                            "{} failed: {}",
+                            failed.len(),
+                            failed
+                                .iter()
+                                .take(20)
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    }
+                },
+                log: Some(log),
+                cost_ms: coverage.elapsed_ms,
+                produced_by: self.runner.actor.clone(),
+                produced_at: crate::runner::now(),
+            }
+            .build(),
+        ];
+        let docs = Selection {
+            doc: selection.doc.clone(),
+            ..Selection::default()
+        };
+        for check in self.test_checks(&docs, requirement, Some(impact.node_set())) {
+            let out = self.runner.run(&checkout.root, &check)?;
+            evidence.push(self.runner.evidence(
+                checkout.snapshot,
+                self.toolchain_id,
+                &check,
+                &out,
+                logs,
+            )?);
+        }
+        Ok(InstrumentedRun { evidence, coverage })
+    }
+}
+
 impl Verifier for RustVerifier {
     fn lang(&self) -> &str {
         hord_lang_rust::LANG
@@ -343,13 +485,13 @@ mod tests {
     fn verifier(record: Option<CoverageRecord>) -> RustVerifier {
         let tc = Toolchain::new("rust").with("rustc", "x");
         RustVerifier::new(tc, sample())
-            .unwrap()
+            .expect("build a verifier")
             .with_coverage(record.map(Arc::new))
     }
 
     fn impact_in(path: &str, node: u128) -> ImpactSet {
         let mut facts = ChangeFacts::default();
-        let path = RepoPath::from_str(path).unwrap();
+        let path = RepoPath::from_str(path).expect("parse test path");
         facts.paths.insert(path.clone());
         facts.touched.push(TouchedDef {
             node: NodeId::from_u128(node),
@@ -379,7 +521,7 @@ mod tests {
                 &impact_in("crates/b/src/lib.rs", 5),
                 &policy,
             )
-            .unwrap();
+            .expect("plan the checks");
         let commands: Vec<String> = plan.checks.iter().map(Check::command).collect();
         assert_eq!(
             commands,
@@ -409,7 +551,7 @@ mod tests {
         };
         let record = CoverageRecord::new(
             ObjectId::from_bytes([1; 32]),
-            tc.id().unwrap(),
+            tc.id().expect("compute toolchain id"),
             BTreeSet::new(),
             vec![
                 (
@@ -435,7 +577,7 @@ mod tests {
                 &impact_in("src/x.rs", 5),
                 &policy,
             )
-            .unwrap();
+            .expect("plan the checks");
         let commands: Vec<String> = plan.checks.iter().map(Check::command).collect();
         assert_eq!(
             commands,

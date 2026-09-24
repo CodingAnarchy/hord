@@ -23,13 +23,14 @@ mod cargo;
 pub mod coverage;
 mod facts;
 pub mod libtest;
+pub mod narrow;
 mod runner;
 mod select;
 mod verifier;
 
 pub use cargo::{CargoWorkspace, Package, Target};
-pub use coverage::{CoverageOptions, CoverageRun, DefinitionIndex};
+pub use coverage::{CoverageOptions, CoverageRun, DefinitionIndex, TestFilter};
 pub use facts::{diff_rust_file, rust_traits};
 pub use runner::{CargoRunner, RunOutput, detect_toolchain};
 pub use select::{Fallback, SelectInput, Selection, select, select_ignoring};
-pub use verifier::{RustVerifier, requirement};
+pub use verifier::{InstrumentedRun, RustVerifier, requirement};
