@@ -20,10 +20,10 @@ struct Fixture {
     object_id: String,
 }
 
-fn vectors() -> Vectors {
+fn vectors() -> Result<Vectors, Box<dyn std::error::Error>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/vectors.json");
-    let json = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&json).expect("parse testdata/vectors.json")
+    let json = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(serde_json::from_str(&json).map_err(|e| format!("parse testdata/vectors.json: {e}"))?)
 }
 
 fn sample_blob() -> Blob {
@@ -73,7 +73,7 @@ where
 
 #[test]
 fn blob_golden() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = vectors().blob;
+    let fixture = vectors()?.blob;
     let blob = sample_blob();
     assert_fixture("blob", &blob, &fixture)?;
     let encoded = encode(&blob)?;
@@ -88,5 +88,5 @@ fn blob_golden() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn snapshot_golden() -> Result<(), Box<dyn std::error::Error>> {
-    assert_fixture("snapshot", &sample_snapshot(), &vectors().snapshot)
+    assert_fixture("snapshot", &sample_snapshot(), &vectors()?.snapshot)
 }
