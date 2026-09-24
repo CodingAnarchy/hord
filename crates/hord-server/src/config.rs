@@ -91,13 +91,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_webhooks_and_rejects_unknown_kinds_and_tls() {
+    fn parses_webhooks_and_rejects_unknown_kinds_and_tls() -> Result<(), Box<dyn std::error::Error>>
+    {
         let path = Path::new("server.toml");
         let config = ServerConfig::parse(
             path,
             "bind = \"127.0.0.1:1\"\n[[webhook]]\nurl = \"http://h/x\"\nkinds = [\"landed\"]\n",
-        )
-        .unwrap();
+        )?;
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:1"));
         assert_eq!(config.webhooks[0].kinds, ["landed"]);
         for bad in [
@@ -108,8 +108,9 @@ mod tests {
             assert!(ServerConfig::parse(path, bad).is_err(), "{bad}");
         }
         assert_eq!(
-            ServerConfig::load(Path::new("/no/such/server.toml")).unwrap(),
+            ServerConfig::load(Path::new("/no/such/server.toml"))?,
             ServerConfig::default()
         );
+        Ok(())
     }
 }

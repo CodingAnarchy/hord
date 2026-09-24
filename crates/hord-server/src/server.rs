@@ -213,10 +213,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_loopback_binds_without_the_flag() {
-        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let v6: SocketAddr = "[::1]:0".parse().unwrap();
-        let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    fn only_loopback_binds_without_the_flag() -> Result<(), Box<dyn std::error::Error>> {
+        let local: SocketAddr = "127.0.0.1:0".parse()?;
+        let v6: SocketAddr = "[::1]:0".parse()?;
+        let any: SocketAddr = "0.0.0.0:0".parse()?;
         assert!(check_bind(local, false).is_ok());
         assert!(check_bind(v6, false).is_ok());
         assert!(matches!(
@@ -224,5 +224,6 @@ mod tests {
             Err(Error::InsecureBind(_))
         ));
         assert!(check_bind(any, true).is_ok());
+        Ok(())
     }
 }
