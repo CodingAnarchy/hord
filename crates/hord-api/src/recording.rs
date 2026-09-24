@@ -40,12 +40,6 @@ impl<W: Write> Recorder<W> {
         line(&mut self.out, event)
     }
 
-    /// Cursor of the last event recorded.
-    #[must_use]
-    pub fn last_cursor(&self) -> u64 {
-        self.last
-    }
-
     /// Flush and return the writer.
     pub fn finish(mut self) -> ApiResult<W> {
         self.out.flush().map_err(io)?;
