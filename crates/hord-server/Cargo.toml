@@ -17,14 +17,12 @@ hord-store.workspace = true
 hord-txn.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper.workspace = true
 hyper-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
-tokio-util.workspace = true
 toml.workspace = true
 tonic.workspace = true
 tonic-web.workspace = true
