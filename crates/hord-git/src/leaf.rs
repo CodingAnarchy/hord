@@ -45,11 +45,13 @@ mod tests {
         let mode: EntryMode = kind.into();
         let mut buf = [0u8; 6];
         let bytes: &[u8] = mode.as_bytes(&mut buf).as_ref();
-        std::str::from_utf8(bytes).unwrap().to_owned()
+        std::str::from_utf8(bytes)
+            .expect("an entry mode is ASCII octal")
+            .to_owned()
     }
 
     #[test]
-    fn parse_round_trips_kind_octals() {
+    fn parse_round_trips_kind_octals() -> Result<(), Box<dyn std::error::Error>> {
         for kind in [
             EntryKind::Tree,
             EntryKind::Blob,
@@ -58,8 +60,9 @@ mod tests {
             EntryKind::Commit,
         ] {
             let s = octal(kind);
-            let parsed = parse_mode(&s).unwrap_or_else(|| panic!("parse {s}"));
+            let parsed = parse_mode(&s).ok_or(format!("parse {s}"))?;
             assert_eq!(parsed.kind(), kind, "{s}");
         }
+        Ok(())
     }
 }
