@@ -58,20 +58,36 @@ fn merge(base: &str, ours: &str, theirs: &str) -> Result<String, CargoLockMergeE
         .map(|b| String::from_utf8(b).expect("utf-8"))
 }
 
+/// The two merge orders disagreed: one merged and the other conflicted or failed.
+#[derive(Debug)]
+struct Asymmetric(String);
+
+impl std::fmt::Display for Asymmetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Asymmetric {}
+
 /// Merge both ways and require the same answer (spec §11.1 commutativity).
-fn merge_both(base: &str, ours: &str, theirs: &str) -> Result<String, Vec<CargoLockConflict>> {
+fn merge_both(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+) -> Result<Result<String, Vec<CargoLockConflict>>, Asymmetric> {
     let a = merge(base, ours, theirs);
     let b = merge(base, theirs, ours);
     match (a, b) {
         (Ok(a), Ok(b)) => {
             assert_eq!(a, b, "merge is not commutative");
-            Ok(a)
+            Ok(Ok(a))
         }
         (Err(CargoLockMergeError::Conflict(a)), Err(CargoLockMergeError::Conflict(b))) => {
             assert_eq!(a, b, "conflicts are not commutative");
-            Err(a)
+            Ok(Err(a))
         }
-        (a, b) => panic!("asymmetric merge: {a:?} vs {b:?}"),
+        (a, b) => Err(Asymmetric(format!("asymmetric merge: {a:?} vs {b:?}"))),
     }
 }
 
@@ -259,7 +275,7 @@ fn unchanged_merge_is_byte_identical_on_real_lockfiles() {
 /// M3 acceptance: two sides each add a new package and list it in the root
 /// package's dependencies.
 #[test]
-fn concurrent_dependency_additions_merge_cleanly() {
+fn concurrent_dependency_additions_merge_cleanly() -> Result<(), Box<dyn std::error::Error>> {
     let base = lockfile(&[root("app", &["log"]), pkg("log", "0.4.0", &[])]);
     let ours = lockfile(&[
         root("app", &["anyhow", "log"]),
@@ -277,15 +293,16 @@ fn concurrent_dependency_additions_merge_cleanly() {
         pkg("log", "0.4.0", &[]),
         pkg("serde", "1.0.0", &[]),
     ]);
-    assert_eq!(merge_both(&base, &ours, &theirs), Ok(want.clone()));
+    assert_eq!(merge_both(&base, &ours, &theirs)?, Ok(want.clone()));
     let tree = CargoLockAdapter
         .parse(want.as_bytes())
         .expect("parse merged lockfile");
     assert_eq!(CargoLockAdapter.project(&tree).as_slice(), want.as_bytes());
+    Ok(())
 }
 
 #[test]
-fn additions_with_shared_transitive_dependency() {
+fn additions_with_shared_transitive_dependency() -> Result<(), Box<dyn std::error::Error>> {
     // Both sides pull in `itoa` through different new crates.
     let base = lockfile(&[root("app", &[])]);
     let ours = lockfile(&[
@@ -304,11 +321,12 @@ fn additions_with_shared_transitive_dependency() {
         pkg("ryu", "1.0.0", &["itoa"]),
         pkg("serde_json", "1.0.0", &["itoa"]),
     ]);
-    assert_eq!(merge_both(&base, &ours, &theirs), Ok(want));
+    assert_eq!(merge_both(&base, &ours, &theirs)?, Ok(want));
+    Ok(())
 }
 
 #[test]
-fn addition_and_removal_compose() {
+fn addition_and_removal_compose() -> Result<(), Box<dyn std::error::Error>> {
     let base = lockfile(&[
         root("app", &["log", "rand"]),
         pkg("log", "0.4.0", &[]),
@@ -326,11 +344,12 @@ fn addition_and_removal_compose() {
         pkg("log", "0.4.0", &[]),
         pkg("serde", "1.0.0", &[]),
     ]);
-    assert_eq!(merge_both(&base, &ours, &theirs), Ok(want));
+    assert_eq!(merge_both(&base, &ours, &theirs)?, Ok(want));
+    Ok(())
 }
 
 #[test]
-fn second_version_respells_dependencies() {
+fn second_version_respells_dependencies() -> Result<(), Box<dyn std::error::Error>> {
     // Ours adds a second `syn`; `syn` alone becomes ambiguous and Cargo
     // spells both with versions.
     let base = lockfile(&[root("app", &["syn"]), pkg("syn", "2.0.0", &[])]);
@@ -350,11 +369,12 @@ fn second_version_respells_dependencies() {
         pkg("syn", "1.0.0", &[]),
         pkg("syn", "2.0.0", &[]),
     ]);
-    assert_eq!(merge_both(&base, &ours, &theirs), Ok(want));
+    assert_eq!(merge_both(&base, &ours, &theirs)?, Ok(want));
+    Ok(())
 }
 
 #[test]
-fn packages_sort_by_semver_not_text() {
+fn packages_sort_by_semver_not_text() -> Result<(), Box<dyn std::error::Error>> {
     let base = lockfile(&[root("app", &[])]);
     let ours = lockfile(&[root("app", &["foo 0.9.0"]), pkg("foo", "0.9.0", &[])]);
     let ours = ours.replace("\"foo 0.9.0\"", "\"foo\"");
@@ -368,7 +388,7 @@ fn packages_sort_by_semver_not_text() {
         root("lib", &["foo"]),
         pkg("foo", "0.10.0", &[]),
     ]);
-    let got = merge_both(&base, &ours, &theirs).expect("merge both version additions");
+    let got = merge_both(&base, &ours, &theirs)?.expect("merge both version additions");
     let nine = got
         .find("version = \"0.9.0\"")
         .expect("merged lockfile has 0.9.0");
@@ -376,14 +396,15 @@ fn packages_sort_by_semver_not_text() {
         .find("version = \"0.10.0\"")
         .expect("merged lockfile has 0.10.0");
     assert!(nine < ten, "0.9.0 sorts before 0.10.0");
+    Ok(())
 }
 
 #[test]
-fn version_conflict_is_reported() {
+fn version_conflict_is_reported() -> Result<(), Box<dyn std::error::Error>> {
     let base = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.0", &[])]);
     let ours = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.1", &[])]);
     let theirs = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.2", &[])]);
-    let conflicts = merge_both(&base, &ours, &theirs)
+    let conflicts = merge_both(&base, &ours, &theirs)?
         .expect_err("both sides changing serde's version conflicts");
     assert_eq!(
         conflicts[0],
@@ -398,19 +419,20 @@ fn version_conflict_is_reported() {
     let ours = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.1", &[])]);
     let theirs = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.2", &[])]);
     let conflicts =
-        merge_both(&base, &ours, &theirs).expect_err("adding serde at two versions conflicts");
+        merge_both(&base, &ours, &theirs)?.expect_err("adding serde at two versions conflicts");
     assert!(matches!(
         conflicts.as_slice(),
         [CargoLockConflict::AmbiguousDependency { package, dependency }]
             if package == "app 0.1.0" && dependency == "serde"
     ));
+    Ok(())
 }
 
 #[test]
-fn same_upgrade_on_both_sides_composes() {
+fn same_upgrade_on_both_sides_composes() -> Result<(), Box<dyn std::error::Error>> {
     let base = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.0", &[])]);
     let both = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.1", &[])]);
-    assert_eq!(merge_both(&base, &both, &both), Ok(both.clone()));
+    assert_eq!(merge_both(&base, &both, &both)?, Ok(both.clone()));
     // One side upgrades, the other adds an unrelated crate.
     let theirs = lockfile(&[
         root("app", &["log", "serde"]),
@@ -422,11 +444,12 @@ fn same_upgrade_on_both_sides_composes() {
         pkg("log", "0.4.0", &[]),
         pkg("serde", "1.0.1", &[]),
     ]);
-    assert_eq!(merge_both(&base, &both, &theirs), Ok(want));
+    assert_eq!(merge_both(&base, &both, &theirs)?, Ok(want));
+    Ok(())
 }
 
 #[test]
-fn field_and_delete_modify_conflicts() {
+fn field_and_delete_modify_conflicts() -> Result<(), Box<dyn std::error::Error>> {
     let base = lockfile(&[root("app", &["log"]), pkg("log", "0.4.0", &[])]);
     let mut ours = base.clone();
     ours = ours.replacen(&format!("{:0>64}", 8), &format!("{:1>64}", 8), 1);
@@ -439,7 +462,7 @@ fn field_and_delete_modify_conflicts() {
         })
     };
     assert_eq!(
-        merge_both(&base, &ours, &theirs),
+        merge_both(&base, &ours, &theirs)?,
         Err(vec![conflict(
             "package[log].checksum",
             ConflictKind::BothChanged
@@ -447,13 +470,14 @@ fn field_and_delete_modify_conflicts() {
     );
     let removed = lockfile(&[root("app", &[])]);
     assert_eq!(
-        merge_both(&base, &ours, &removed),
+        merge_both(&base, &ours, &removed)?,
         Err(vec![conflict("package[log]", ConflictKind::DeleteModify)])
     );
+    Ok(())
 }
 
 #[test]
-fn dangling_dependency_is_a_conflict() {
+fn dangling_dependency_is_a_conflict() -> Result<(), Box<dyn std::error::Error>> {
     let base = lockfile(&[root("app", &["log"]), pkg("log", "0.4.0", &[])]);
     let ours = lockfile(&[root("app", &[])]);
     let theirs = lockfile(&[
@@ -461,17 +485,18 @@ fn dangling_dependency_is_a_conflict() {
         root("tool", &["log"]),
         pkg("log", "0.4.0", &[]),
     ]);
-    let conflicts = merge_both(&base, &ours, &theirs)
+    let conflicts = merge_both(&base, &ours, &theirs)?
         .expect_err("removing a dependency another side uses conflicts");
     assert!(matches!(
         conflicts.as_slice(),
         [CargoLockConflict::DanglingDependency { package, dependency }]
             if package == "tool 0.1.0" && dependency == "log"
     ));
+    Ok(())
 }
 
 #[test]
-fn empty_base_means_both_added_the_file() {
+fn empty_base_means_both_added_the_file() -> Result<(), Box<dyn std::error::Error>> {
     let ours = lockfile(&[root("app", &["log"]), pkg("log", "0.4.0", &[])]);
     let theirs = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.0", &[])]);
     let want = lockfile(&[
@@ -479,7 +504,8 @@ fn empty_base_means_both_added_the_file() {
         pkg("log", "0.4.0", &[]),
         pkg("serde", "1.0.0", &[]),
     ]);
-    assert_eq!(merge_both("", &ours, &theirs), Ok(want));
+    assert_eq!(merge_both("", &ours, &theirs)?, Ok(want));
+    Ok(())
 }
 
 #[test]
@@ -502,7 +528,7 @@ fn unsupported_inputs_are_reported_not_merged() {
 }
 
 #[test]
-fn upgrade_composes_with_other_side_edit() {
+fn upgrade_composes_with_other_side_edit() -> Result<(), Box<dyn std::error::Error>> {
     // Ours bumps `cc`; theirs bumps `shlex`, which `cc` depends on by name.
     let base = lockfile(&[
         root("app", &["cc"]),
@@ -524,11 +550,13 @@ fn upgrade_composes_with_other_side_edit() {
         pkg("cc", "1.2.36", &["shlex"]),
         pkg("shlex", "1.3.0", &[]),
     ]);
-    assert_eq!(merge_both(&base, &ours, &theirs), Ok(want));
+    assert_eq!(merge_both(&base, &ours, &theirs)?, Ok(want));
+    Ok(())
 }
 
 #[test]
-fn workspace_version_bump_composes_with_dependency_addition() {
+fn workspace_version_bump_composes_with_dependency_addition()
+-> Result<(), Box<dyn std::error::Error>> {
     let bump = |deps: &[&str]| root("app", deps).replace("0.1.0", "0.2.0");
     let base = lockfile(&[root("app", &["log"]), pkg("log", "0.4.0", &[])]);
     let ours = lockfile(&[bump(&["log"]), pkg("log", "0.4.0", &[])]);
@@ -542,11 +570,13 @@ fn workspace_version_bump_composes_with_dependency_addition() {
         pkg("log", "0.4.0", &[]),
         pkg("serde", "1.0.0", &[]),
     ]);
-    assert_eq!(merge_both(&base, &ours, &theirs), Ok(want));
+    assert_eq!(merge_both(&base, &ours, &theirs)?, Ok(want));
+    Ok(())
 }
 
 #[test]
-fn name_spelled_dependency_is_respelled_when_it_becomes_ambiguous() {
+fn name_spelled_dependency_is_respelled_when_it_becomes_ambiguous()
+-> Result<(), Box<dyn std::error::Error>> {
     // Ours adds `syn 1.0.0`, so `syn` alone becomes ambiguous; theirs adds a
     // new dependent spelled `syn`, meaning 2.0.0.
     let base = lockfile(&[root("app", &["syn"]), pkg("syn", "2.0.0", &[])]);
@@ -566,7 +596,8 @@ fn name_spelled_dependency_is_respelled_when_it_becomes_ambiguous() {
         pkg("syn", "2.0.0", &[]),
         root("tool", &["syn 2.0.0"]),
     ]);
-    assert_eq!(merge_both(&base, &ours, &theirs), Ok(want));
+    assert_eq!(merge_both(&base, &ours, &theirs)?, Ok(want));
+    Ok(())
 }
 
 // ------------------------------------------------ real-lockfile proptests
@@ -648,7 +679,7 @@ proptest! {
         let ours = ending(without(full, &[y]));
         let theirs = ending(without(full, &[x]));
         let full = ending(full.clone());
-        let merged = merge_both(&base, &ours, &theirs);
+        let merged = merge_both(&base, &ours, &theirs)?;
         prop_assert!(merged.as_ref() == Ok(&full), "{name}: adding {x} and {y}");
     }
 }
@@ -696,7 +727,7 @@ proptest! {
     #[test]
     fn merge_is_commutative(base in arb_lock(), ours in arb_lock(), theirs in arb_lock()) {
         // merge_both asserts commutativity of both results and conflicts.
-        if let Ok(merged) = merge_both(&base, &ours, &theirs) {
+        if let Ok(merged) = merge_both(&base, &ours, &theirs)? {
             let tree = CargoLockAdapter.parse(merged.as_bytes()).expect("re-parses");
             let projected = CargoLockAdapter.project(&tree);
             prop_assert_eq!(projected.as_slice(), merged.as_bytes());
@@ -716,7 +747,7 @@ proptest! {
 /// A side that switched line endings (a Windows checkout of head) keeps its
 /// ending; the other side's additions still merge.
 #[test]
-fn a_side_that_changed_line_endings_keeps_them() {
+fn a_side_that_changed_line_endings_keeps_them() -> Result<(), Box<dyn std::error::Error>> {
     let (name, full) = fixtures().into_iter().next().expect("fixture");
     let names = removable(&full);
     let (x, y) = (&names[0], &names[names.len() - 1]);
@@ -724,8 +755,9 @@ fn a_side_that_changed_line_endings_keeps_them() {
     let ours = crlf(&without(&full, &[y]));
     let theirs = without(&full, &[x]);
     assert_eq!(
-        merge_both(&base, &ours, &theirs),
+        merge_both(&base, &ours, &theirs)?,
         Ok(crlf(&full)),
         "{name}: adding {x} and {y}"
     );
+    Ok(())
 }

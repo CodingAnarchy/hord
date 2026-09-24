@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(top.entries.len(), 2);
         assert_eq!(top.entries["z.rs"], IdentityEntry::File(a));
         let Some(IdentityEntry::Dir(src)) = top.entries.get("src").cloned() else {
-            panic!("src is a directory");
+            return Err("src is a directory".into());
         };
         assert_eq!(trees.0[&src].entries["x.rs"], IdentityEntry::File(a));
 
