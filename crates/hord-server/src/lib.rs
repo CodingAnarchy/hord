@@ -31,11 +31,8 @@ mod server;
 mod service;
 mod webhook;
 
-pub use activity::{Activity, ActivityLayer};
+pub use activity::Activity;
 pub use config::{ServerConfig, WebhookConfig};
 pub use error::{Error, Result};
 pub use hosts::Hosts;
-pub use route::{RepoName, RepoPrefixLayer, split_repo_prefix};
 pub use server::{ServeOptions, Server, check_bind};
-pub use service::{GrpcRepoBackend, GrpcSchema, GrpcWorkspaces};
-pub use webhook::{EVENT_KINDS, event_kind_name};

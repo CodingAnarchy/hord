@@ -34,10 +34,7 @@ impl Hosts {
     /// Host one repository at `root` with a lander task (`--repo`). Its
     /// name is the directory name.
     pub async fn open_repo(root: &Path, options: RepoOptions) -> Result<Self> {
-        let name = root
-            .canonicalize()?
-            .file_name()
-            .map_or_else(|| "repo".to_owned(), |n| n.to_string_lossy().into_owned());
+        let name = dir_name(&root.canonicalize()?);
         let local = open_local(root, options).await?;
         let mut hosts = Self::empty();
         hosts.insert_local(name.clone(), local);
@@ -45,9 +42,11 @@ impl Hosts {
         Ok(hosts)
     }
 
-    /// Host an open repository under `name`, with a lander task.
-    pub fn from_repo(name: String, repo: Repo) -> Result<Self> {
+    /// Host an open repository, named by its directory, with a lander
+    /// task.
+    pub fn from_repo(repo: Repo) -> Result<Self> {
         let path = repo.store().repo_root().to_path_buf();
+        let name = dir_name(&path);
         let local = LocalRepo::new(repo).map_err(|source| Error::Repo { path, source })?;
         let mut hosts = Self::empty();
         hosts.insert_local(name.clone(), Arc::new(local));
@@ -106,12 +105,15 @@ impl Hosts {
 
     /// Every hosted backend by name.
     #[must_use]
-    pub fn backends(&self) -> &BTreeMap<String, Arc<dyn RepoBackend>> {
+    pub(crate) fn backends(&self) -> &BTreeMap<String, Arc<dyn RepoBackend>> {
         &self.repos
     }
 
     /// The backend a request names, or the only one when it names none.
-    pub fn resolve(&self, name: Option<&RepoName>) -> Result<Arc<dyn RepoBackend>, ApiError> {
+    pub(crate) fn resolve(
+        &self,
+        name: Option<&RepoName>,
+    ) -> Result<Arc<dyn RepoBackend>, ApiError> {
         let name = match (name, &self.single) {
             (Some(RepoName(name)), _) => name,
             (None, Some(single)) => single,
@@ -133,6 +135,13 @@ impl Hosts {
             local.shutdown().await;
         }
     }
+}
+
+/// A repository's name from its directory: the last component, else
+/// `repo`.
+fn dir_name(dir: &Path) -> String {
+    dir.file_name()
+        .map_or_else(|| "repo".to_owned(), |n| n.to_string_lossy().into_owned())
 }
 
 async fn open_local(root: &Path, options: RepoOptions) -> Result<Arc<LocalRepo>> {
@@ -158,12 +167,7 @@ fn find_repos(
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        let name = if name.is_empty() {
-            dir.file_name()
-                .map_or_else(|| "repo".to_owned(), |n| n.to_string_lossy().into_owned())
-        } else {
-            name
-        };
+        let name = if name.is_empty() { dir_name(dir) } else { name };
         out.push((name, dir.to_path_buf()));
         return Ok(());
     }

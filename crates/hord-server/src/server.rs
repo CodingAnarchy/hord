@@ -83,12 +83,6 @@ impl Server {
         Arc::clone(&self.activity)
     }
 
-    /// The hosted repositories.
-    #[must_use]
-    pub fn hosts(&self) -> &Arc<Hosts> {
-        &self.hosts
-    }
-
     /// Bind a TCP listener at `addr`, checked with [`check_bind`].
     pub async fn bind(addr: SocketAddr, options: &ServeOptions) -> Result<TcpListener> {
         check_bind(addr, options.insecure_bind)?;

@@ -125,15 +125,12 @@ pub async fn serve(root: &Path) -> Result<()> {
     })
     .await??;
     let repo = hord_txn::Repo::from_store(store, hord_txn::RepoOptions::default()).await?;
-    let name = root
-        .file_name()
-        .map_or_else(|| "repo".to_owned(), |n| n.to_string_lossy().into_owned());
     let stop = Arc::new(tokio::sync::Notify::new());
     let workspaces: Arc<dyn WorkspacesBackend> = Arc::new(LocalWorkspaces::local(
         repo.clone(),
         Some(Arc::clone(&stop)),
     ));
-    let hosts = hord_server::Hosts::from_repo(name, repo)?;
+    let hosts = hord_server::Hosts::from_repo(repo)?;
     let config =
         hord_server::ServerConfig::load(&root.join(hord_store::HORD_DIR).join("server.toml"))?;
     let server = hord_server::Server::new(hosts, config).with_workspaces(workspaces);

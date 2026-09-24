@@ -10,7 +10,7 @@ pub(crate) type Incoming = ReceiverStream<io::Result<Conn>>;
 
 /// Removes the socket file when the listener is done.
 #[derive(Debug)]
-pub(crate) struct Cleanup(#[allow(dead_code)] Option<std::path::PathBuf>);
+pub(crate) struct Cleanup(Option<std::path::PathBuf>);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {

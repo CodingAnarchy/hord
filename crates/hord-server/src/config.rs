@@ -35,7 +35,8 @@ pub struct WebhookConfig {
     /// `http://` URL to POST to. (`https` needs TLS, which M4 does not
     /// ship.)
     pub url: String,
-    /// Event kinds to send ([`EVENT_KINDS`]); empty sends every kind.
+    /// Event kinds to send, by their `Event` oneof field names in
+    /// `hord.proto` (`landed`, `parked`, …); empty sends every kind.
     #[serde(default)]
     pub kinds: Vec<String>,
     /// Hosted repository names to send for; empty sends for all.
