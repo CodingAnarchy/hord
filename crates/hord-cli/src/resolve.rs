@@ -5,14 +5,7 @@
 //! encoding of the same 128 bits.
 
 use anyhow::{Context, Result, bail};
-use hord_core::{Actor, NodeId, RepoPath};
-
-/// `Actor` id used by `log --actor` and blame output.
-pub(crate) fn actor_id(actor: &Actor) -> &str {
-    match actor {
-        Actor::Human { id } | Actor::Agent { id, .. } => id,
-    }
-}
+use hord_core::{NodeId, RepoPath};
 
 /// Parse a ULID or a 32-digit hex NodeId. `None` means the string is not an id.
 pub(crate) fn parse_node_id(spec: &str) -> Option<NodeId> {
@@ -85,7 +78,7 @@ fn split_path_line(spec: &str) -> Result<Option<(RepoPath, u32)>> {
 
 #[cfg(test)]
 mod tests {
-    use hord_core::{Actor, Bytes, NodeId};
+    use hord_core::NodeId;
 
     use super::*;
 
@@ -127,19 +120,5 @@ mod tests {
         ));
         assert!(parse_blame_target("src/lib.rs:0").is_err());
         assert!(parse_blame_target("/src/lib.rs:1").is_err());
-    }
-
-    #[test]
-    fn actor_id_is_the_id_field() {
-        assert_eq!(actor_id(&Actor::Human { id: "ada".into() }), "ada");
-        assert_eq!(
-            actor_id(&Actor::Agent {
-                id: "agent-7".into(),
-                model: "m".into(),
-                model_hash: Bytes::default(),
-                harness: "h".into(),
-            }),
-            "agent-7"
-        );
     }
 }

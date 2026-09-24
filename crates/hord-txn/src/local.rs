@@ -8,7 +8,7 @@ use hord_api::{
     ApiError, ApiResult, DEFAULT_LOG_LIMIT, EventStream, MAX_BATCH_BYTES, MAX_BATCH_IDS,
     RepoBackend, proto, wire,
 };
-use hord_core::{Actor, ChangeId, ChangeRecord, Evidence, NodeId, ObjectId};
+use hord_core::{ChangeId, ChangeRecord, Evidence, NodeId, ObjectId};
 use hord_store::EdgeKind;
 use tokio_util::sync::CancellationToken;
 
@@ -221,8 +221,7 @@ pub fn conflict_report_message(report: &ConflictReport) -> proto::ConflictReport
 }
 
 /// Wire form of a policy violation (ADR 0026).
-#[must_use]
-pub fn violation_message(v: &hord_policy::Violation) -> proto::PolicyViolation {
+fn violation_message(v: &hord_policy::Violation) -> proto::PolicyViolation {
     use hord_policy::{EvidenceState, Trigger, ViolationSource};
     proto::PolicyViolation {
         source: match v.source {
@@ -283,12 +282,6 @@ pub fn queue_entry_message(entry: &QueueEntry, record: Option<&ChangeRecord>) ->
         conflicts: u32::try_from(conflicts).unwrap_or(u32::MAX),
         hard: entry.report.as_ref().is_some_and(ConflictReport::has_hard),
         report: entry.report.as_ref().map(conflict_report_message),
-    }
-}
-
-fn actor_id(actor: &Actor) -> &str {
-    match actor {
-        Actor::Human { id } | Actor::Agent { id, .. } => id,
     }
 }
 
@@ -376,7 +369,7 @@ impl Inner {
                 Err(err) => return Err(err.into()),
             };
             if let Some(actor) = actor
-                && actor_id(&record.provenance.actor) != actor
+                && record.provenance.actor.id() != actor
             {
                 continue;
             }
@@ -412,12 +405,13 @@ impl Inner {
             if q.pending_only && entry.status != QueueStatus::Queued {
                 continue;
             }
-            let mut view = self.entry_with_record(&entry);
+            let record = self.change_record(entry.change).ok();
             if let Some(actor) = actor
-                && view.actor.as_ref().map(wire::actor_id) != Some(actor)
+                && record.as_ref().map(|r| r.provenance.actor.id()) != Some(actor)
             {
                 continue;
             }
+            let mut view = queue_entry_message(&entry, record.as_ref());
             // Asked about one change: name the report's nodes (`hord
             // conflicts`).
             if change.is_some()

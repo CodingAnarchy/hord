@@ -65,10 +65,7 @@ pub fn run_submit(json: bool, target: &Target, change: String) -> Result<()> {
 
 pub fn run_queue(json: bool, target: &Target, mine: bool) -> Result<()> {
     let session = Session::open(target)?;
-    let me = mine.then(|| {
-        let actor = txn::actor();
-        crate::resolve::actor_id(&actor).to_owned()
-    });
+    let me = mine.then(|| txn::actor().id().to_owned());
     let reply = block_on(session.backend().queue(proto::QueueQuery {
         actor: me,
         ..Default::default()

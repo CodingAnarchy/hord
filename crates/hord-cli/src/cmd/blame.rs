@@ -44,7 +44,7 @@ pub fn run(json: bool, target: &Target, spec: String) -> Result<()> {
         entries.push(proto::BlameEntry {
             change: summary.change.clone(),
             intent: record.intent.summary,
-            actor: resolve::actor_id(&record.provenance.actor).to_owned(),
+            actor: record.provenance.actor.id().to_owned(),
             evidence: record.evidence.iter().map(|e| e.to_hex()).collect(),
         });
     }
