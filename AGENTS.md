@@ -33,6 +33,7 @@ M3 decisions that constrain later work: read sets (ADR 0012), lander merge mode 
   - Code that can fail returns the error with `?`, adding context where the crate's error type allows.
   - `.expect("…")` is only for a true invariant, and its message says why the call cannot fail.
   - Tests return `Result` and use `?`, or use `.expect("…")` naming what was being attempted, so a failure says what broke.
+  - `unwrap_or_else(|e| panic!(…))` counts as an unwrap. A test that needs the error in its message returns `Result` and uses `map_err(|e| format!("{context}: {e}"))?`.
 - Imports go in `use` statements at the top of the file, or of the inline module (`mod tests { use … }`), not as full paths inline (`crate::a::b::f()`, `std::collections::BTreeMap::new()`). Exceptions:
   - a qualified path that disambiguates two items with the same name;
   - a path inside a macro body, where hygiene needs it.
