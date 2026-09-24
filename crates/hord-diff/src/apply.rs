@@ -180,31 +180,20 @@ pub(crate) fn apply_internal(
 
     for op in ops {
         match op {
-            Op::Replace { node, to, .. } => replaces.push(ReplaceEdit {
-                node: *node,
-                to: *to,
-            }),
+            Op::Replace { node, to, .. } => replaces.push((*node, *to)),
             Op::Insert {
                 parent,
                 index,
                 node,
-            } => inserts.push(InsertEdit {
-                parent: *parent,
-                index: *index,
-                node: *node,
-            }),
+            } => inserts.push((*parent, *index, *node)),
             Op::Move {
                 node,
                 to_parent,
                 index,
                 ..
-            } => moves.push(MoveEdit {
-                node: *node,
-                to_parent: *to_parent,
-                index: *index,
-            }),
+            } => moves.push((*node, *to_parent, *index)),
             Op::Delete { node } => deletes.push(*node),
-            // M1: name lives in source tokens; a paired Replace carries the
+            // A name lives in source tokens, so a paired Replace carries the
             // new body. Rename is recorded for merge rule 4.
             Op::Rename { .. } | Op::Blob { .. } | Op::Tree { .. } => {}
         }
@@ -212,11 +201,11 @@ pub(crate) fn apply_internal(
 
     // Ancestors first, then content id. `NodeId` is a random ULID and must
     // not decide which edit lands.
-    replaces.sort_by_key(|op| content_order(base, op.node, root));
+    replaces.sort_by_key(|&(node, _)| content_order(base, node, root));
 
-    for op in replaces {
-        graft(&mut working.tree, store, op.to)?;
-        apply_replace(&mut working, op.node, op.to, root)?;
+    for (node, to) in replaces {
+        graft(&mut working.tree, store, to)?;
+        apply_replace(&mut working, node, to, root)?;
     }
 
     deletes.sort_by_key(|node| {
@@ -228,20 +217,20 @@ pub(crate) fn apply_internal(
         apply_delete(&mut working, node, root)?;
     }
 
-    moves.sort_by_key(|op| {
-        let (_, oid) = content_order(&working, op.node, root);
-        let (_, parent) = content_order(&working, op.to_parent, root);
-        (op.index, parent, oid)
+    moves.sort_by_key(|&(node, to_parent, index)| {
+        let (_, oid) = content_order(&working, node, root);
+        let (_, parent) = content_order(&working, to_parent, root);
+        (index, parent, oid)
     });
 
-    for op in moves {
-        apply_move(&mut working, op.node, op.to_parent, op.index, root)?;
+    for (node, to_parent, index) in moves {
+        apply_move(&mut working, node, to_parent, index, root)?;
     }
 
     // Inserts last so `index` is the result-side CST index after deletes.
-    for op in inserts {
-        graft(&mut working.tree, store, op.node)?;
-        apply_insert(&mut working, op.parent, op.index, op.node, root)?;
+    for (parent, index, node) in inserts {
+        graft(&mut working.tree, store, node)?;
+        apply_insert(&mut working, parent, index, node, root)?;
     }
 
     let seps = trailing_commas(store);
@@ -328,23 +317,6 @@ fn restore_trailing_commas(
         moved_to.get(k as usize).copied()
     });
     intern_children(working, id, kids)
-}
-
-struct ReplaceEdit {
-    node: NodeId,
-    to: ObjectId,
-}
-
-struct MoveEdit {
-    node: NodeId,
-    to_parent: NodeId,
-    index: u32,
-}
-
-struct InsertEdit {
-    parent: NodeId,
-    index: u32,
-    node: ObjectId,
 }
 
 /// Tree depth, then the node's content id. Both come from the CST, not from
@@ -555,21 +527,14 @@ fn remove_at(working: &mut IdentifiedTree, site: &[u32]) -> Result<(), Error> {
     let Some((&index, parent_site)) = site.split_last() else {
         return Err(Error::apply("cannot delete the CST root"));
     };
-    let parent = working
-        .oid_at(parent_site)
-        .ok_or_else(|| Error::apply(format!("site {site:?} is not in the tree")))?;
-    let mut kids = working
-        .tree
-        .get(parent)
-        .ok_or(Error::MissingNode(parent))?
-        .children
-        .clone();
+    let (parent, mut kids) = children_at(working, parent_site, || {
+        Error::apply(format!("site {site:?} is not in the tree"))
+    })?;
     if index as usize >= kids.len() {
         return Ok(());
     }
     kids.remove(index as usize);
-    let new_parent = intern_children(working, parent, kids)?;
-    set_at(working, parent_site, new_parent)?;
+    set_children(working, parent_site, parent, kids)?;
     remap_children(&mut working.ids, parent_site, |k| match k.cmp(&index) {
         std::cmp::Ordering::Less => Some(k),
         std::cmp::Ordering::Equal => None,
@@ -586,19 +551,12 @@ fn insert_at(
     index: usize,
     node: ObjectId,
 ) -> Result<Site, Error> {
-    let parent = working
-        .oid_at(container)
-        .ok_or_else(|| Error::apply("insert container is not in the tree"))?;
-    let mut kids = working
-        .tree
-        .get(parent)
-        .ok_or(Error::MissingNode(parent))?
-        .children
-        .clone();
+    let (parent, mut kids) = children_at(working, container, || {
+        Error::apply("insert container is not in the tree")
+    })?;
     let at = index.min(kids.len());
     kids.insert(at, node);
-    let new_parent = intern_children(working, parent, kids)?;
-    set_at(working, container, new_parent)?;
+    set_children(working, container, parent, kids)?;
     let at = u32::try_from(at).unwrap_or(u32::MAX);
     remap_children(&mut working.ids, container, |k| {
         Some(if k >= at { k + 1 } else { k })
@@ -606,6 +564,34 @@ fn insert_at(
     let mut site = container.to_vec();
     site.push(at);
     Ok(site)
+}
+
+/// Content id and children of the node at `site`; `missing` when there is
+/// no node there.
+fn children_at(
+    working: &IdentifiedTree,
+    site: &[u32],
+    missing: impl FnOnce() -> Error,
+) -> Result<(ObjectId, Vec<ObjectId>), Error> {
+    let parent = working.oid_at(site).ok_or_else(missing)?;
+    let kids = working
+        .tree
+        .get(parent)
+        .ok_or(Error::MissingNode(parent))?
+        .children
+        .clone();
+    Ok((parent, kids))
+}
+
+/// Re-intern `parent`, the node at `site`, with `kids`, and put it back.
+fn set_children(
+    working: &mut IdentifiedTree,
+    site: &[u32],
+    parent: ObjectId,
+    kids: Vec<ObjectId>,
+) -> Result<(), Error> {
+    let new_parent = intern_children(working, parent, kids)?;
+    set_at(working, site, new_parent)
 }
 
 /// Re-key every id below `parent` by mapping its child index there through
@@ -634,6 +620,8 @@ fn remap_children(
     ids.extend(moved);
 }
 
+/// Swap `current` in along `path` (from [`chain`] on the same tree, so every
+/// index is in range), re-interning each ancestor up to the root.
 fn splice_up(
     working: &mut IdentifiedTree,
     path: &[(ObjectId, usize)],
@@ -646,12 +634,6 @@ fn splice_up(
             .ok_or(Error::MissingNode(old_parent))?
             .children
             .clone();
-        if index >= kids.len() {
-            return Err(Error::apply(format!(
-                "child index {index} out of range for {old_parent} ({} children)",
-                kids.len()
-            )));
-        }
         kids[index] = current;
         current = intern_children(working, old_parent, kids)?;
     }

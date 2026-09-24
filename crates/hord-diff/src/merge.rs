@@ -124,10 +124,12 @@ pub fn merge<A: LangAdapter + ?Sized>(
     let theirs_map = crate::defs::mapping_between(base, theirs, root);
     let ours_ops = crate::diff::diff_structural(base, &ours.tree, &ours_map, root);
     let theirs_ops = crate::diff::diff_structural(base, &theirs.tree, &theirs_map, root);
-    let mut store = union_trees(&base.tree, &ours.tree)
-        .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
-    store = union_trees(&store, &theirs.tree)
-        .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
+    let union = |a: &NodeTree, b: &NodeTree| {
+        union_trees(a, b)
+            .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))
+    };
+    let mut store = union(&base.tree, &ours.tree)?;
+    store = union(&store, &theirs.tree)?;
     let result = match merge_ops(adapter, base, &ours_ops, &theirs_ops, &store, mode, root) {
         // Delete vs anything else must not fall through to an auto-merge.
         Err(conflict) if conflict.delete_vs => Err(conflict),
@@ -257,10 +259,7 @@ fn git_ours_result<A: LangAdapter + ?Sized>(
         base,
         &merged,
         true,
-        vec![Conflict::soft(
-            Vec::new(),
-            "git auto-merge with landing-order (ours) conflict hunks",
-        )],
+        "git auto-merge with landing-order (ours) conflict hunks",
     )
 }
 
@@ -281,10 +280,7 @@ fn text_merge_result<A: LangAdapter + ?Sized>(
         base,
         merged.as_bytes(),
         true,
-        vec![Conflict::soft(
-            Vec::new(),
-            "line/token 3-way kept both sides' disjoint edits",
-        )],
+        "line/token 3-way kept both sides' disjoint edits",
     )
 }
 
@@ -310,10 +306,7 @@ fn cst_file_fallback<A: LangAdapter + ?Sized>(
         base,
         bytes.as_slice(),
         false,
-        vec![Conflict::soft(
-            Vec::new(),
-            "positional CST 3-way of the file (spec §3.4)",
-        )],
+        "positional CST 3-way of the file (spec §3.4)",
     )
 }
 
@@ -336,19 +329,18 @@ fn blob_file_fallback<A: LangAdapter + ?Sized>(
         base,
         merged.as_slice(),
         false,
-        vec![Conflict::soft(
-            Vec::new(),
-            "whole-file line merge kept both sides' edits",
-        )],
+        "whole-file line merge kept both sides' edits",
     )
 }
 
+/// Parse a whole-file merge (`lossless`: it must project back byte for byte)
+/// and identify it against `base`, flagged soft with `reason`.
 fn reparse<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
     merged: &[u8],
     lossless: bool,
-    soft: Vec<Conflict>,
+    reason: &str,
 ) -> Option<MergeResult> {
     let parsed = adapter.parse(merged).ok()?;
     if lossless && adapter.project(&parsed).as_slice() != merged {
@@ -357,7 +349,7 @@ fn reparse<A: LangAdapter + ?Sized>(
     let mapping = adapter.identify(base, &parsed);
     Some(MergeResult {
         tree: IdentifiedTree::new(parsed, mapping.nodes),
-        soft,
+        soft: vec![Conflict::soft(Vec::new(), reason)],
     })
 }
 
@@ -769,11 +761,17 @@ fn same_inserted_definition(store: &NodeTree, ours: &[InsertAt], theirs: &Insert
     })
 }
 
-fn same_after_leading_attrs(ours: &[u8], theirs: &[u8]) -> bool {
+/// True when two definition sources are equal once each drops its leading
+/// outer attributes and doc comments ([`without_leading_attrs`]). An outer
+/// attribute is part of the definition it precedes (ADR 0011), so two sides
+/// that differ only there are still the same definition.
+pub fn same_after_leading_attrs(ours: &[u8], theirs: &[u8]) -> bool {
     without_leading_attrs(ours) == without_leading_attrs(theirs)
 }
 
-fn without_leading_attrs(raw: &[u8]) -> &[u8] {
+/// `raw` without the leading whitespace, outer attributes (`#[...]`), and
+/// `///` / `//!` doc comment lines in front of a definition.
+pub fn without_leading_attrs(raw: &[u8]) -> &[u8] {
     let mut i = 0usize;
     loop {
         while i < raw.len() && raw[i].is_ascii_whitespace() {
@@ -799,6 +797,8 @@ fn without_leading_attrs(raw: &[u8]) -> &[u8] {
     &raw[i..]
 }
 
+/// Index just past the `]` that closes the attribute whose `#` is at `start`,
+/// or `None` when the brackets do not close.
 fn end_of_attribute(raw: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = start;

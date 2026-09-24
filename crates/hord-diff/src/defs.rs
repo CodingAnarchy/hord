@@ -162,8 +162,9 @@ pub(crate) fn chain(tree: &NodeTree, site: &[u32]) -> Option<Vec<(ObjectId, usiz
 /// (a file whose root id is `root`).
 ///
 /// [`LangAdapter::identify`] is not used: the caller owns carrying (tests
-/// pair by source label; M2 will pass names). Deltas and moves are
-/// recovered from the two id maps and CST parents.
+/// pair by source label; [`crate::merge`] passes the ids each side already
+/// carries). Deltas and moves are recovered from the two id maps and CST
+/// parents.
 pub(crate) fn mapping_between(
     base: &IdentifiedTree,
     side: &IdentifiedTree,
