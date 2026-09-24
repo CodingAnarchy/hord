@@ -79,7 +79,13 @@ fn main() {
     match run(&args) {
         Ok(report) => {
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                match serde_json::to_string_pretty(&report) {
+                    Ok(json) => println!("{json}"),
+                    Err(err) => {
+                        eprintln!("hord-eval: serialize report: {err}");
+                        std::process::exit(2);
+                    }
+                }
             }
             std::process::exit(if report.all_passed { 0 } else { 1 });
         }
