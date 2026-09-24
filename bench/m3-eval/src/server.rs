@@ -17,7 +17,8 @@
 //! here: the recording is stored as a `Blob` object (its id is in the
 //! report) and read back, and the queue goes through the M3 oracle
 //! ([`sim::analyze`]). Throughput is changes over the time from the first
-//! submission to the last settlement. Gates are M3's.
+//! agent's submission to the last settlement of an agent's change. Gates
+//! are M3's.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -53,23 +54,28 @@ pub(crate) struct ServerReport {
     pub sim: sim::SimReport,
 }
 
-fn options(strict_reads: bool) -> RepoOptions {
+fn options(strict_reads: bool, policy: bool) -> RepoOptions {
     RepoOptions {
         config: RepoConfig { strict_reads },
-        // Spec §12 M3: verification stubbed, as in the in-process run.
-        verifier: Some(Arc::new(StubVerifier)),
+        // Spec §12 M3: verification stubbed, as in the in-process run; with
+        // `--policy`, stubbed by evidence fixtures.
+        verifier: Some(if policy {
+            Arc::new(crate::policy::FixtureVerifier)
+        } else {
+            Arc::new(StubVerifier)
+        }),
         ..RepoOptions::default()
     }
 }
 
 /// The child process: serve `dir` on a loopback port, print
 /// `LISTENING <addr>`, and stop when stdin closes.
-pub(crate) fn serve_child(dir: &Path, strict_reads: bool) -> Result<()> {
+pub(crate) fn serve_child(dir: &Path, strict_reads: bool, policy: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let hosts = hord_server::Hosts::open_repo(dir, options(strict_reads)).await?;
+        let hosts = hord_server::Hosts::open_repo(dir, options(strict_reads, policy)).await?;
         let listener = hord_server::Server::bind(
             "127.0.0.1:0".parse()?,
             &hord_server::ServeOptions::default(),
@@ -99,7 +105,7 @@ struct ServerProcess {
 }
 
 impl ServerProcess {
-    fn spawn(dir: &Path, strict_reads: bool) -> Result<Self> {
+    fn spawn(dir: &Path, strict_reads: bool, policy: bool) -> Result<Self> {
         let exe = std::env::current_exe().context("current exe")?;
         let mut command = Command::new(exe);
         command
@@ -110,6 +116,9 @@ impl ServerProcess {
             .stderr(Stdio::inherit());
         if strict_reads {
             command.arg("--strict-reads");
+        }
+        if policy {
+            command.arg("--policy");
         }
         let mut child = command.spawn().context("spawn the server")?;
         let stdout = child.stdout.take().context("server stdout")?;
@@ -151,21 +160,28 @@ pub(crate) async fn run(
     config: &sim::SimConfig,
 ) -> Result<ServerReport> {
     let dir = scratch.join("server");
-    let (base, snapshot) = {
+    let (base, snapshot, plan, public_dir) = {
         let store = hord_store::Store::create(&dir).context("create store")?;
-        let repo = Repo::from_store(store, options(config.strict_reads)).await?;
+        let repo = Repo::from_store(store, options(config.strict_reads, config.policy)).await?;
         let base = repo
             .bootstrap(files, sim::intent("import cargo"), sim::actor("m3-seed"))
             .await?;
-        (base, sim::load_snapshot(&repo, corpus_files).await?)
+        let snapshot = sim::load_snapshot(&repo, corpus_files).await?;
+        let mut plan = sim::plan(
+            &snapshot,
+            config.agents,
+            config.overlap_percent,
+            config.seed,
+        )?;
+        let (base, public_dir) = if config.policy {
+            let (base, dir) = crate::policy::install(&repo, base, &mut plan, &snapshot).await?;
+            (base, Some(dir))
+        } else {
+            (base, None)
+        };
+        (base, snapshot, plan, public_dir)
     };
-    let plan = sim::plan(
-        &snapshot,
-        config.agents,
-        config.overlap_percent,
-        config.seed,
-    )?;
-    let server = ServerProcess::spawn(&dir, config.strict_reads)?;
+    let server = ServerProcess::spawn(&dir, config.strict_reads, config.policy)?;
     let url = server.url.clone();
     eprintln!(
         "[server] {} agents, one connection each, against {url}",
@@ -179,6 +195,10 @@ pub(crate) async fn run(
         .await?;
     let agents = config.agents;
     let (proposed_tx, mut proposed_rx) = tokio::sync::mpsc::unbounded_channel::<ChangeId>();
+    // When the first agent submits: the clock starts here, not at a
+    // `Submitted` event of the history the recording replays first.
+    let submitting: Arc<std::sync::OnceLock<Instant>> = Arc::default();
+    let started_submitting = Arc::clone(&submitting);
     let recorder = tokio::spawn(async move {
         let header = proto::RecordingHeader {
             repo: "m3-server".into(),
@@ -190,8 +210,8 @@ pub(crate) async fn run(
         let mut recording = hord_api::recording::Recorder::new(Vec::new(), header)?;
         let mut expected: HashSet<String> = HashSet::new();
         let mut settled: HashSet<String> = HashSet::new();
-        let mut first_submit: Option<Instant> = None;
-        let mut last_settle = Instant::now();
+        let mut settled_at: std::collections::HashMap<String, Instant> =
+            std::collections::HashMap::new();
         let mut count = 0;
         // Settled ids include the bootstrap's own landing, so only the
         // subset test below ends the loop.
@@ -206,10 +226,6 @@ pub(crate) async fn run(
             recording.record(&next)?;
             count += 1;
             let settled_change = match next.event.as_ref().and_then(|e| e.kind.as_ref()) {
-                Some(Kind::Submitted(_)) => {
-                    first_submit.get_or_insert_with(Instant::now);
-                    None
-                }
                 Some(Kind::Landed(l)) => {
                     Some(l.submitted.clone().unwrap_or_else(|| l.change.clone()))
                 }
@@ -218,9 +234,9 @@ pub(crate) async fn run(
                 _ => None,
             };
             if let Some(change) = settled_change
-                && settled.insert(change)
+                && settled.insert(change.clone())
             {
-                last_settle = Instant::now();
+                settled_at.insert(change, Instant::now());
             }
             while let Ok(change) = proposed_rx.try_recv() {
                 expected.insert(wire::id(change));
@@ -229,7 +245,14 @@ pub(crate) async fn run(
                 break;
             }
         }
-        let land = last_settle.duration_since(first_submit.unwrap_or(last_settle));
+        let last_settle = expected
+            .iter()
+            .filter_map(|c| settled_at.get(c))
+            .max()
+            .copied()
+            .unwrap_or_else(Instant::now);
+        let first_submit = started_submitting.get().copied().unwrap_or(last_settle);
+        let land = last_settle.duration_since(first_submit);
         anyhow::Ok((recording.finish()?, count, land))
     });
 
@@ -238,7 +261,7 @@ pub(crate) async fn run(
     let cache = open_cache(
         &scratch.join("client"),
         cache_remote,
-        options(config.strict_reads),
+        options(config.strict_reads, config.policy),
     )
     .await?;
     let started = Instant::now();
@@ -274,6 +297,7 @@ pub(crate) async fn run(
     let mut runs = Vec::with_capacity(config.agents);
     let mut objects_pushed = 0;
     let mut push_secs = 0.0;
+    submitting.get_or_init(Instant::now);
     for (_, run, change, remote, pushed, push) in done_agents {
         remote
             .submit(proto::SubmitRequest {
@@ -289,7 +313,7 @@ pub(crate) async fn run(
     server.stop()?;
 
     // The server is gone: open its store here for the oracle.
-    let repo = Repo::open_with(&dir, options(config.strict_reads)).await?;
+    let repo = Repo::open_with(&dir, options(config.strict_reads, config.policy)).await?;
     let mut done = repo.queue().await?;
     done.retain(|e| runs.iter().any(|r| r.change == e.change));
     if done.len() != config.agents {
@@ -342,6 +366,7 @@ pub(crate) async fn run(
         done,
         agents_secs,
         land,
+        public_dir.as_deref(),
     )
     .await?;
     Ok(ServerReport {

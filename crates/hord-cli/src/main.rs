@@ -1,6 +1,6 @@
 //! Hord command-line interface (`hord`).
 //!
-//! Commands: `init`, `ws new|list|rm|gc`, `status`, `propose`, `submit`,
+//! Commands: `init`, `ws new|list|rm|gc`, `status`, `verify`, `propose`, `submit`,
 //! `queue`, `land --local`, `conflicts`, `log`, `blame`, `query`, `watch`,
 //! `remote add|rm|list|set-default`, `serve`, `git import`, `git export`,
 //! `policy check`.
@@ -64,7 +64,7 @@ async fn run(cli: Cli) -> Result<()> {
 /// Commands that open the store in this process: a running daemon holds
 /// it, so it is asked to stop first.
 fn needs_store(command: &Command) -> bool {
-    matches!(command, Command::Git { .. } | Command::Policy { .. })
+    matches!(command, Command::Git { .. })
 }
 
 fn run_blocking(cli: Cli) -> Result<()> {
@@ -89,6 +89,10 @@ fn run_blocking(cli: Cli) -> Result<()> {
             workspace,
             paranoid,
         } => cmd::status::run(json, &target, workspace, paranoid),
+        Command::Verify {
+            workspace,
+            plan_only,
+        } => cmd::verify::run(json, &target, workspace, plan_only),
         Command::Propose { workspace, intent } => {
             cmd::propose::run(json, &target, workspace, intent)
         }
@@ -124,7 +128,7 @@ fn run_blocking(cli: Cli) -> Result<()> {
         },
         Command::Policy { command } => match command {
             PolicyCommand::Check { workspace, policy } => {
-                cmd::policy::run_check(cli.json, workspace, policy)
+                cmd::policy::run_check(json, &target, workspace, policy)
             }
         },
     }

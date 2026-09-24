@@ -2,11 +2,20 @@
 //!
 //! For each queued change: validate the ops (spec §3.5) unless this process
 //! proposed it, run the set check (§6.3), rebase structurally onto `head`
-//! (§6.4 rung 1), call the [`Verifier`], then append to the log, move
-//! `head`, and index the landed change. A hard merge conflict or a failed
-//! verification parks the change as [`QueueStatus::Conflicted`] (it needs a
-//! replay, M5). Set overlaps that rebase cleanly land with the report
-//! attached, flagged for the verifier (§6.4).
+//! (§6.4 rung 1), verify and apply head's policy ([`crate::gate`], §6.5,
+//! §7), then append to the log, move `head`, and index the landed change.
+//! A hard merge conflict or a failed verification parks the change as
+//! [`QueueStatus::Conflicted`] (it needs a replay, M5); a policy denial
+//! parks it as [`QueueStatus::Parked`] (missing evidence, such as a review)
+//! or rejects it (required evidence failed on its snapshot). Set overlaps
+//! that rebase cleanly land with the report attached, flagged for the
+//! verifier (§6.4).
+//!
+//! Verification is speculative (spec §6.7, ADR 0025): up to
+//! [`SPECULATIVE_WINDOW`] changes are prepared ahead, each stacked on the
+//! ones before it that are expected to land, and verified concurrently; the
+//! front lands first, and a front whose outcome differs from what was
+//! expected sends the rest back to be prepared again (see [`run`]).
 //!
 //! A change that lands on a head other than its base lands as a new record
 //! (ADR 0018): `base`, `result`, `parents`, `ops`, `write_set`, and
@@ -39,9 +48,7 @@
 //! changes this process proposed, and the lander checks queued changes from
 //! elsewhere a few entries ahead of itself, in parallel, off its own path.
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use hord_api::EventStream;
@@ -54,6 +61,10 @@ use serde::{Deserialize, Serialize};
 use crate::conflict::{ConflictReport, Footprint, check};
 use crate::events;
 use crate::files::{validate, validate_except};
+use crate::gate::{
+    CandidateContext, PolicySource, Verdict, VerifyContext, VerifyRequest, applicable_requirements,
+    has_requirements,
+};
 use crate::rebase::rebase;
 use crate::repo::{Head, Inner, Repo, blocking, lock, now};
 use crate::sets::sets_between;
@@ -74,9 +85,19 @@ pub enum QueueStatus {
     Conflicted,
     /// Not landed and not replayable as is: the record is missing, its ops
     /// do not reproduce its result, processing it failed deterministically,
-    /// or head already contains its result ("already applied").
+    /// head already contains its result ("already applied"), or head's
+    /// policy denies it on evidence that failed for its snapshot, which
+    /// cannot change (ADR 0025).
     Rejected {
         /// Why.
+        reason: String,
+    },
+    /// Not landed yet: head's policy (ADR 0026) requires evidence the
+    /// snapshot does not have, such as a review. The report's `policy`
+    /// lists the violations. Attach the evidence and submit again; nothing
+    /// that already ran is re-run.
+    Parked {
+        /// Why, in words.
         reason: String,
     },
 }
@@ -148,51 +169,6 @@ impl QueueEntry {
     }
 }
 
-/// Outcome of a [`Verifier`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Verdict {
-    /// Land it.
-    Pass,
-    /// Do not land it; a semantic conflict (spec §6.5).
-    Fail {
-        /// Why, for the conflict report.
-        reason: String,
-    },
-}
-
-/// What the lander asks a [`Verifier`] to check: the rebased change.
-#[derive(Clone, Copy, Debug)]
-pub struct VerifyRequest<'a> {
-    /// Id the change will land under.
-    pub change_id: ChangeId,
-    /// The record as it will land (base = current head snapshot).
-    pub change: &'a ChangeRecord,
-    /// Set overlaps and soft merge conflicts to re-check.
-    pub report: &'a ConflictReport,
-}
-
-/// Future returned by [`Verifier::verify`].
-pub type VerifyFuture<'a> = Pin<Box<dyn Future<Output = Verdict> + Send + 'a>>;
-
-/// Verification at landing (spec §6.5). M4 supplies the real engine.
-///
-/// The lander awaits this outside any lock on the store, so an
-/// implementation may run checks concurrently or speculatively.
-pub trait Verifier: Send + Sync {
-    /// Check `request.change` against its result snapshot.
-    fn verify<'a>(&'a self, request: VerifyRequest<'a>) -> VerifyFuture<'a>;
-}
-
-/// M3's verifier: always passes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StubVerifier;
-
-impl Verifier for StubVerifier {
-    fn verify<'a>(&'a self, _request: VerifyRequest<'a>) -> VerifyFuture<'a> {
-        Box::pin(async { Verdict::Pass })
-    }
-}
-
 /// The lander as a long-running task (spec §6.7, ADR 0024).
 ///
 /// [`Lander::spawn`] starts a tokio task that drains the queue, then sleeps
@@ -256,17 +232,47 @@ fn check_ahead() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16))
 }
 
+/// Candidates the lander prepares and verifies ahead of landing, each
+/// stacked on the ones before it (ADR 0025, spec §6.7: K = 4).
+pub const SPECULATIVE_WINDOW: usize = 4;
+
+/// Head's policy for a candidate, as read at its landing base.
+type HeadPolicy = std::result::Result<(Arc<hord_policy::CompiledPolicy>, PolicySource), String>;
+
 /// A change ready to verify and land.
 struct Candidate {
     entry: QueueEntry,
     landed_id: ChangeId,
-    landed: ChangeRecord,
+    landed: Arc<ChangeRecord>,
     report: ConflictReport,
     /// The rebase attestation, stored with a rebased record.
     attestation: Option<Evidence>,
+    /// Head's policy at the landing base (ADR 0026).
+    policy: HeadPolicy,
+    /// Policy facts without evidence; `None` when the policy requires
+    /// nothing.
+    facts: Option<hord_policy::Facts>,
+    /// What verification must produce.
+    verify: hord_verify::VerifyPolicy,
+    /// Where the candidate lands (for the next candidate to stack on).
+    footprint: Arc<Footprint>,
+    /// Whether it is expected to land ([`Inner::predict`]): later
+    /// candidates stack only on those that are.
+    predicted: bool,
+}
+
+impl Candidate {
+    fn head(&self) -> Head {
+        Head {
+            change: Some(self.landed_id),
+            snapshot: self.landed.result,
+        }
+    }
 }
 
 enum Step {
+    /// Settled without verification: its status and report, not yet
+    /// written.
     Done(Box<QueueEntry>),
     Candidate(Box<Candidate>),
 }
@@ -285,6 +291,27 @@ struct Ready {
     landed: ChangeRecord,
     report: ConflictReport,
     attestation: Option<Evidence>,
+    policy: HeadPolicy,
+}
+
+/// One place in the speculative window.
+enum Slot {
+    /// Settled at prepare; written when it reaches the front.
+    Done(Box<QueueEntry>),
+    /// Being verified.
+    Verifying {
+        candidate: Box<Candidate>,
+        verdict: tokio::task::JoinHandle<Verdict>,
+    },
+}
+
+impl Slot {
+    fn seq(&self) -> u64 {
+        match self {
+            Self::Done(entry) => entry.seq,
+            Self::Verifying { candidate, .. } => candidate.entry.seq,
+        }
+    }
 }
 
 /// Whether `err` is about the store or the machine rather than about the
@@ -307,51 +334,106 @@ pub(crate) fn is_transient(err: &Error) -> bool {
     }
 }
 
+/// Drain the queue with a speculative window (ADR 0025).
+///
+/// Up to [`SPECULATIVE_WINDOW`] queued changes are prepared ahead, each
+/// rebased onto the one before it as if it had landed, and verified
+/// concurrently. The front of the window lands (or parks) first. When a
+/// candidate does not land, everything behind it was prepared on a head
+/// that will not exist: its verification is abandoned (evidence it already
+/// indexed stays, a true fact about that snapshot) and it is prepared
+/// again. Outcomes decided at prepare (parks, rejections) are written only
+/// when they reach the front, for the same reason.
 pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
     let mut state = repo.inner.lander.lock().await;
     let mut processed = Vec::new();
     let ahead = check_ahead();
+    let mut window: VecDeque<Slot> = VecDeque::new();
     loop {
-        let cursor = state.cursor;
-        let next = blocking(&repo.inner, move |inner| inner.next_queued(cursor)).await?;
-        let Some(entry) = next else {
+        // Fill the window.
+        while window.len() < SPECULATIVE_WINDOW {
+            let from = match window.back() {
+                Some(slot) => Some(slot.seq() + 1),
+                None => state.cursor,
+            };
+            let next = blocking(&repo.inner, move |inner| inner.next_queued(from)).await?;
+            let Some(entry) = next else {
+                break;
+            };
+            if window.is_empty() {
+                state.cursor = Some(entry.seq);
+            }
+            let seq = entry.seq;
+            let unchecked =
+                blocking(&repo.inner, move |inner| inner.unchecked_after(seq, ahead)).await?;
+            for change in unchecked {
+                if state.checking.len() >= ahead {
+                    break;
+                }
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    state.checking.entry(change)
+                {
+                    let inner = Arc::clone(&repo.inner);
+                    slot.insert(tokio::task::spawn_blocking(move || {
+                        // A failure is found again, and classified, in `prepare`.
+                        let _ = inner.check_ops(change);
+                    }));
+                }
+            }
+            if let Some(task) = state.checking.remove(&entry.change) {
+                let _ = task.await;
+            }
+            // Stack on the candidates ahead in the window.
+            let stacked: Vec<(Head, Arc<Footprint>)> = window
+                .iter()
+                .filter_map(|slot| match slot {
+                    Slot::Verifying { candidate, .. } if candidate.predicted => {
+                        Some((candidate.head(), Arc::clone(&candidate.footprint)))
+                    }
+                    Slot::Verifying { .. } => None,
+                    Slot::Done(_) => None,
+                })
+                .collect();
+            let step = blocking(&repo.inner, move |inner| inner.prepare(entry, &stacked)).await?;
+            window.push_back(match step {
+                Step::Done(entry) => Slot::Done(entry),
+                Step::Candidate(candidate) => {
+                    let verdict = spawn_verify(repo, &candidate);
+                    Slot::Verifying { candidate, verdict }
+                }
+            });
+        }
+        let Some(front) = window.pop_front() else {
             break;
         };
-        state.cursor = Some(entry.seq);
-        let seq = entry.seq;
-        let unchecked =
-            blocking(&repo.inner, move |inner| inner.unchecked_after(seq, ahead)).await?;
-        for change in unchecked {
-            if state.checking.len() >= ahead {
-                break;
+        state.cursor = Some(front.seq());
+        let (done, mispredicted) = match front {
+            Slot::Done(entry) => {
+                let entry = blocking(&repo.inner, move |inner| inner.settle(*entry)).await?;
+                (entry, false)
             }
-            if let std::collections::hash_map::Entry::Vacant(slot) = state.checking.entry(change) {
-                let inner = Arc::clone(&repo.inner);
-                slot.insert(tokio::task::spawn_blocking(move || {
-                    // A failure is found again, and classified, in `prepare`.
-                    let _ = inner.check_ops(change);
-                }));
-            }
-        }
-        if let Some(task) = state.checking.remove(&entry.change) {
-            let _ = task.await;
-        }
-        let step = blocking(&repo.inner, move |inner| inner.prepare(entry)).await?;
-        let done = match step {
-            Step::Done(entry) => *entry,
-            Step::Candidate(candidate) => {
-                let verdict = repo
-                    .inner
-                    .verifier
-                    .verify(VerifyRequest {
-                        change_id: candidate.landed_id,
-                        change: &candidate.landed,
-                        report: &candidate.report,
-                    })
-                    .await;
-                blocking(&repo.inner, move |inner| inner.finish(*candidate, verdict)).await?
+            Slot::Verifying { candidate, verdict } => {
+                let predicted = candidate.predicted;
+                let verdict = verdict.await.unwrap_or_else(|err| Verdict::Fail {
+                    evidence: Vec::new(),
+                    reason: format!("verification task failed: {err}"),
+                });
+                let entry =
+                    blocking(&repo.inner, move |inner| inner.finish(*candidate, verdict)).await?;
+                let landed = matches!(entry.status, QueueStatus::Landed { .. });
+                (entry, landed != predicted)
             }
         };
+        if mispredicted {
+            // Everything behind was stacked on a head that does not exist
+            // (a landing that did not happen, or one that did but was not
+            // expected): abandon it and prepare it again.
+            for slot in window.drain(..) {
+                if let Slot::Verifying { verdict, .. } = slot {
+                    verdict.abort();
+                }
+            }
+        }
         processed.push(done);
     }
     // Idle: make the events of this run durable.
@@ -359,6 +441,29 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
         blocking(&repo.inner, |inner| inner.sync_events()).await?;
     }
     Ok(processed)
+}
+
+/// Start verifying `candidate` on the runtime.
+fn spawn_verify(repo: &Repo, candidate: &Candidate) -> tokio::task::JoinHandle<Verdict> {
+    let context: Arc<dyn VerifyContext> = Arc::new(CandidateContext {
+        inner: Arc::clone(&repo.inner),
+        change: candidate.landed_id,
+        record: Arc::clone(&candidate.landed),
+        history: Vec::new(),
+        emit: true,
+        plan: std::sync::Mutex::new(None),
+        slot: std::sync::Mutex::new(None),
+    });
+    let request = VerifyRequest {
+        change_id: candidate.landed_id,
+        change: Arc::clone(&candidate.landed),
+        report: candidate.report.clone(),
+        policy: candidate.verify.clone(),
+        context,
+        plan_only: false,
+    };
+    let verifier = Arc::clone(&repo.inner.verifier);
+    tokio::spawn(async move { verifier.verify(request).await })
 }
 
 impl Inner {
@@ -519,60 +624,121 @@ impl Inner {
         Ok(first.unwrap_or(next))
     }
 
-    fn park(
-        &self,
-        mut entry: QueueEntry,
-        status: QueueStatus,
-        report: Option<ConflictReport>,
-    ) -> Result<QueueEntry> {
-        entry.status = status;
-        entry.report = report;
-        entry.updated_at = now();
-        self.put_entry(&entry)?;
-        Ok(entry)
-    }
-
-    /// Check, rebase, and validate `entry`. A failure that is about the
-    /// change (a bad record, a merge or identity error) parks it as
+    /// Check, rebase, and validate `entry` on head, or on the last of
+    /// `stacked` (candidates ahead in the speculative window, with their
+    /// footprints, as if they had landed). A failure that is about the
+    /// change (a bad record, a merge or identity error) settles it as
     /// [`QueueStatus::Rejected`]; only transient store or I/O failures
-    /// propagate, so one bad change cannot wedge the queue ([`is_transient`]).
-    fn prepare(&self, entry: QueueEntry) -> Result<Step> {
+    /// propagate, so one bad change cannot wedge the queue
+    /// ([`is_transient`]). A settled entry is not written yet
+    /// ([`Self::settle`]).
+    fn prepare(&self, entry: QueueEntry, stacked: &[(Head, Arc<Footprint>)]) -> Result<Step> {
         let mut report = None;
-        let prepared = self.try_prepare(&entry, &mut report);
+        let base = match stacked.last() {
+            Some((head, _)) => *head,
+            None => self.head()?,
+        };
+        let staged: Vec<Arc<Footprint>> = stacked.iter().map(|(_, f)| Arc::clone(f)).collect();
+        let prepared = self.try_prepare(&entry, base, &staged, &mut report);
         if let Some(report) = &report
             && !matches!(&prepared, Err(err) if is_transient(err))
         {
             self.emit(vec![events::conflict_check(report)])?;
         }
+        let settled = |mut entry: QueueEntry, status, report| {
+            entry.status = status;
+            entry.report = report;
+            Ok(Step::Done(Box::new(entry)))
+        };
         match prepared {
-            Ok(Prepared::Park(status)) => {
-                let parked = self.park(entry, status, report)?;
-                self.emit(events::settled(&parked))?;
-                Ok(Step::Done(Box::new(parked)))
-            }
+            Ok(Prepared::Park(status)) => settled(entry, status, report),
             Ok(Prepared::Ready(ready)) => {
                 let Ready {
                     landed_id,
                     landed,
                     report,
                     attestation,
+                    policy,
                 } = *ready;
+                // What verification must produce: the requirements head's
+                // policy applies to this change (ADR 0026).
+                let (facts, require, max_impact) = match &policy {
+                    Ok((policy, _)) if has_requirements(policy) => {
+                        let facts = self.policy_facts(&landed, false)?;
+                        let require = applicable_requirements(policy, &facts);
+                        (Some(facts), require, policy.land().max_impact)
+                    }
+                    Ok((policy, _)) => (None, Default::default(), policy.land().max_impact),
+                    Err(_) => (None, Default::default(), None),
+                };
+                let footprint = Arc::new(self.footprint_of(landed_id, &landed)?);
+                let predicted = match (&policy, &facts) {
+                    (Ok((policy, _)), Some(facts)) => self.predict(policy, facts, &landed)?,
+                    (Ok(_), None) => true,
+                    (Err(_), _) => false,
+                };
                 Ok(Step::Candidate(Box::new(Candidate {
                     entry,
                     landed_id,
-                    landed,
+                    landed: Arc::new(landed),
                     report,
                     attestation,
+                    policy,
+                    facts,
+                    verify: hord_verify::VerifyPolicy {
+                        require,
+                        max_impact,
+                        ..hord_verify::VerifyPolicy::default()
+                    },
+                    footprint,
+                    predicted,
                 })))
             }
             Err(err) if is_transient(&err) => Err(err),
             Err(err) => {
                 let reason = err.to_string();
-                let parked = self.park(entry, QueueStatus::Rejected { reason }, report)?;
-                self.emit(events::settled(&parked))?;
-                Ok(Step::Done(Box::new(parked)))
+                settled(entry, QueueStatus::Rejected { reason }, report)
             }
         }
+    }
+
+    /// Whether head's policy is expected to let `landed` through: it would
+    /// with the evidence indexed for its snapshot now plus a pass for
+    /// every requirement a verifier can produce. Review evidence is signed
+    /// by a reviewer, not produced by verification, so it must be there
+    /// already. A guess for stacking only (ADR 0025): a wrong one costs a
+    /// re-preparation, never a wrong landing.
+    fn predict(
+        &self,
+        policy: &hord_policy::CompiledPolicy,
+        facts: &hord_policy::Facts,
+        landed: &ChangeRecord,
+    ) -> Result<bool> {
+        let mut evidence = self.evidence_facts(landed.result)?;
+        for requirement in applicable_requirements(policy, facts) {
+            let Ok(tag) = requirement.parse::<hord_policy::EvidenceTag>() else {
+                continue;
+            };
+            if tag.kind() != "review" {
+                evidence.push(hord_policy::EvidenceFact {
+                    tag,
+                    result: hord_core::EvidenceResult::Pass,
+                });
+            }
+        }
+        let assumed = hord_policy::Facts {
+            evidence,
+            ..facts.clone()
+        };
+        Ok(policy.evaluate(&assumed).is_allow())
+    }
+
+    /// Write an entry settled at prepare, and announce it.
+    fn settle(&self, mut entry: QueueEntry) -> Result<QueueEntry> {
+        entry.updated_at = now();
+        self.put_entry(&entry)?;
+        self.emit(events::settled(&entry))?;
+        Ok(entry)
     }
 
     /// [`Self::prepare`] before error classification. `report` is filled
@@ -580,6 +746,8 @@ impl Inner {
     fn try_prepare(
         &self,
         entry: &QueueEntry,
+        head: Head,
+        staged: &[Arc<Footprint>],
         report: &mut Option<ConflictReport>,
     ) -> Result<Prepared> {
         let record = match self.change_record(entry.change) {
@@ -594,9 +762,21 @@ impl Inner {
             validate(self, entry.change, &record)?;
             self.store.mark_checked(entry.change)?;
         }
-        let head = self.head()?;
-        let (set_report, landed_writes) = self.set_check(entry.change, &record, head)?;
+        // ADR 0026: the landing base's policy judges the change.
+        let policy = self.policy_at(head.snapshot)?;
+        let strict = self.config.strict_reads
+            || policy
+                .as_ref()
+                .is_ok_and(|(policy, _)| policy.land().strict_reads);
+        let (set_report, landed_writes) =
+            self.set_check(entry.change, &record, head, staged, strict)?;
         let report = report.insert(set_report);
+        if let Err(reason) = &policy {
+            // Nothing weaker than a readable policy judges a change.
+            return Ok(Prepared::Park(QueueStatus::Parked {
+                reason: format!("head's policy does not parse: {reason}"),
+            }));
+        }
         let rebased = match rebase(self, &record, head.snapshot, &landed_writes)? {
             Ok(rebased) => rebased,
             Err(merge) => {
@@ -667,6 +847,7 @@ impl Inner {
             landed,
             report: report.clone(),
             attestation,
+            policy,
         })))
     }
 
@@ -717,8 +898,15 @@ impl Inner {
         Ok(None)
     }
 
-    /// Land `candidate` unless the verifier failed it, in one durable
-    /// commit ([`hord_store::Store::land`]).
+    /// Land `candidate` unless the verifier failed it or head's policy
+    /// denies it, in one durable commit ([`hord_store::Store::land`]).
+    ///
+    /// The verdict's evidence is announced (`EvidenceAttached`) and listed
+    /// in `Landed`; it is indexed by snapshot, never written into the
+    /// record (ADR 0025). The policy is evaluated against every piece of
+    /// evidence indexed for the candidate snapshot. A denial parks the
+    /// change as [`QueueStatus::Parked`] with the violations in its report,
+    /// or rejects it when a required check failed on this very snapshot.
     fn finish(&self, candidate: Candidate, verdict: Verdict) -> Result<QueueEntry> {
         let Candidate {
             mut entry,
@@ -726,19 +914,60 @@ impl Inner {
             landed,
             mut report,
             attestation,
+            policy,
+            facts,
+            ..
         } = candidate;
-        if let Verdict::Fail { reason } = verdict {
-            report.verification = Some(reason);
-            let parked = self.park(entry, QueueStatus::Conflicted, Some(report))?;
-            self.emit(events::settled(&parked))?;
-            return Ok(parked);
+        let mut announced = Vec::new();
+        for id in verdict.evidence() {
+            if let Ok(evidence) = self.get_object::<Evidence>(*id) {
+                announced.push(events::evidence_attached(landed_id, *id, &evidence));
+            }
+        }
+        self.emit(announced)?;
+        let evidence = match verdict {
+            Verdict::Fail { reason, .. } => {
+                report.verification = Some(reason);
+                entry.status = QueueStatus::Conflicted;
+                entry.report = Some(report);
+                return self.settle(entry);
+            }
+            Verdict::Pass { evidence } => evidence,
+        };
+        if let (Ok((policy, _)), Some(mut facts)) = (&policy, facts) {
+            facts.evidence = self.evidence_facts(landed.result)?;
+            if let hord_policy::Decision::Deny { reasons } = policy.evaluate(&facts) {
+                let summary = reasons
+                    .iter()
+                    .map(|r| match &r.rule {
+                        Some(rule) => format!("{} ({rule})", r.requirement),
+                        None => r.requirement.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let failed = reasons
+                    .iter()
+                    .any(|r| r.evidence == hord_policy::EvidenceState::Failed);
+                report.policy = reasons;
+                entry.status = if failed {
+                    QueueStatus::Rejected {
+                        reason: format!("policy: required evidence failed: {summary}"),
+                    }
+                } else {
+                    QueueStatus::Parked {
+                        reason: format!("policy: missing {summary}"),
+                    }
+                };
+                entry.report = Some(report);
+                return self.settle(entry);
+            }
         }
         let previous = self.head()?.change;
         if let Some(attestation) = &attestation {
             self.store.put_object(attestation)?;
         }
         if landed_id != entry.change {
-            self.store.put_object(&landed)?;
+            self.store.put_object(landed.as_ref())?;
         }
         entry.status = QueueStatus::Landed { landed: landed_id };
         entry.report = Some(report);
@@ -751,7 +980,7 @@ impl Inner {
         };
         self.store.land(&hord_store::Landing {
             change: landed_id,
-            record: &landed,
+            record: landed.as_ref(),
             entry: (entry.seq, &bytes),
             names,
         })?;
@@ -764,11 +993,7 @@ impl Inner {
         let position = self.store.log_len()?.saturating_sub(1) as u64;
         let submitted = (landed_id != entry.change).then_some(entry.change);
         self.emit(events::landed(
-            landed_id,
-            position,
-            submitted,
-            &[],
-            previous,
+            landed_id, position, submitted, &evidence, previous,
         ))?;
         // The footprint is a cache (`footprint` recomputes it on a miss).
         if let Ok(footprint) = self.footprint_of(landed_id, &landed) {
@@ -785,7 +1010,11 @@ impl Inner {
         record: &ChangeRecord,
         head: Head,
     ) -> Result<ConflictReport> {
-        Ok(self.set_check(change, record, head)?.0)
+        let strict = self.config.strict_reads
+            || self
+                .policy_at(head.snapshot)?
+                .is_ok_and(|(policy, _)| policy.land().strict_reads);
+        Ok(self.set_check(change, record, head, &[], strict)?.0)
     }
 
     /// [`Self::set_report`] plus everything `L` wrote (write sets and coarse
@@ -795,13 +1024,16 @@ impl Inner {
         change: ChangeId,
         record: &ChangeRecord,
         head: Head,
+        staged: &[Arc<Footprint>],
+        strict_reads: bool,
     ) -> Result<(
         ConflictReport,
         std::collections::BTreeSet<hord_core::NodeId>,
     )> {
-        let landed = self.landed_since(record)?;
+        let mut landed = self.landed_since(record)?;
+        landed.extend(staged.iter().cloned());
         let own = self.footprint_of(change, record)?;
-        let conflicts = check(&own, &landed, self.config.strict_reads);
+        let conflicts = check(&own, &landed, strict_reads);
         let written = landed
             .iter()
             .flat_map(|f| f.writes.iter().copied())
@@ -811,11 +1043,12 @@ impl Inner {
             base: record.base,
             head: head.change,
             checked_against: landed.iter().map(|f| f.change).collect(),
-            strict_reads: self.config.strict_reads,
+            strict_reads,
             conflicts,
             merge: Vec::new(),
             verification: None,
             adapter_merged: Vec::new(),
+            policy: Vec::new(),
         };
         Ok((report, written))
     }

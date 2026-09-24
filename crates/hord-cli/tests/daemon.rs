@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIB: &str = "pub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n";
 const LANDED: &str = "QUEUE_STATUS_LANDED";
+/// Every change needs `cargo check` (ADR 0026).
+const POLICY: &str = "[land]\nrequire = [\"check\"]\n";
 
 struct TempDir(PathBuf);
 
@@ -90,6 +92,13 @@ fn setup() -> TempDir {
     let repo = TempDir::new("hord-daemon");
     fs::create_dir_all(repo.0.join("src")).unwrap();
     fs::write(repo.0.join("src/lib.rs"), LIB).unwrap();
+    fs::write(
+        repo.0.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(repo.0.join(".gitignore"), "target/\n*.md\n").unwrap();
+    fs::write(repo.0.join(".hord-policy.toml"), POLICY).unwrap();
     git(&repo.0, &["init", "-q", "-b", "main"]);
     git(&repo.0, &["add", "."]);
     git(&repo.0, &["commit", "-q", "-m", "fixture"]);
@@ -305,4 +314,67 @@ fn a_clone_works_against_its_default_upstream() {
             .contains("    10\n")
     );
     drop(server);
+}
+
+/// `hord verify` and `hord policy check` run in the daemon: the plan, then
+/// cargo in the workspace, evidence the policy then counts, and the lander
+/// reuses (ADR 0025).
+#[test]
+fn verify_and_policy_check_through_the_daemon() {
+    if Command::new("cargo").arg("-V").output().is_err() {
+        return;
+    }
+    let repo = setup();
+    let dir = &repo.0;
+    let ws = json(dir, &["ws", "new"]);
+    let id = ws["id"].as_str().unwrap().to_owned();
+    let checkout = PathBuf::from(ws["materialization"].as_str().unwrap());
+    edit(&checkout, "    2\n", "    20\n");
+    let out = hord(dir, &["policy", "check", "-w", &id, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "deny exits 1: {}",
+        describe(&out)
+    );
+    let before: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(before["decision"], "deny", "{before:#}");
+    let plan = json(dir, &["verify", "-w", &id, "--plan-only"]);
+    assert_eq!(
+        plan["requirements"],
+        serde_json::json!(["check"]),
+        "{plan:#}"
+    );
+    assert!(
+        plan["checks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("cargo check"),
+        "{plan:#}"
+    );
+    assert!(plan["passed"].is_null());
+    let ran = json(dir, &["verify", "-w", &id]);
+    assert_eq!(ran["passed"], true, "{ran:#}");
+    assert_eq!(ran["evidence"].as_array().unwrap().len(), 1);
+    let again = json(dir, &["verify", "-w", &id, "--plan-only"]);
+    assert_eq!(again["reused"].as_array().unwrap().len(), 1, "{again:#}");
+    let after = json(dir, &["policy", "check", "-w", &id]);
+    assert_eq!(after["decision"], "allow", "{after:#}");
+    let change = ok(
+        dir,
+        &[
+            "propose",
+            "-w",
+            &id,
+            "--intent",
+            &intent(dir, "beta twenty"),
+        ],
+    )
+    .trim()
+    .to_owned();
+    json(dir, &["submit", &change]);
+    let watched = ok(dir, &["watch", "--from", "0", "--change", &change]);
+    assert!(watched.contains("landed"), "{watched}");
 }

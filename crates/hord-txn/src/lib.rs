@@ -41,6 +41,8 @@ mod conflict;
 mod error;
 mod events;
 mod files;
+mod gate;
+mod graph;
 mod lander;
 mod local;
 mod materialize;
@@ -58,17 +60,18 @@ pub use conflict::{
     AdapterMerge, ConflictKind, ConflictReport, MergeConflict, MergeSeverity, SetConflict,
 };
 pub use error::{Error, Result};
-pub use hord_store::{EdgeKind, WorkspaceId};
-pub use lander::{
-    Lander, QueueEntry, QueueStatus, StubVerifier, Verdict, Verifier, VerifyFuture, VerifyRequest,
+pub use gate::{
+    EngineVerifier, FailClosedVerifier, PolicySource, RustFactory, StubVerifier, Verdict, Verifier,
+    VerifierFactory, VerifyContext, VerifyFuture, VerifyRequest, WorkspaceVerification,
+    applicable_requirements, unverified_overlap,
 };
+pub use hord_store::{EdgeKind, WorkspaceId};
+pub use lander::{Lander, QueueEntry, QueueStatus, SPECULATIVE_WINDOW};
 pub use local::{LocalRepo, conflict_report_message, queue_entry_message};
 pub use materialize::MaterializeMode;
 pub use propose::ReadDeclaration;
 pub use query::{Query, line_start, touches_node};
-pub use repo::{
-    Base, BeginOptions, FailClosedVerifier, Head, Repo, RepoConfig, RepoOptions, default_adapters,
-};
+pub use repo::{Base, BeginOptions, Head, Repo, RepoConfig, RepoOptions, default_adapters};
 pub use semantic::DefinitionInfo;
 pub use source::ObjectSource;
 pub use workspace::{AccessLog, Materialization, Proposal, Workspace};

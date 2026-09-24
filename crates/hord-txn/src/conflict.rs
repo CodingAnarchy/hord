@@ -89,13 +89,22 @@ pub struct ConflictReport {
     /// Empty for reports recorded before this field existed.
     #[serde(default)]
     pub adapter_merged: Vec<AdapterMerge>,
+    /// Why head's policy denied the change (ADR 0026): every unmet
+    /// requirement, machine-readable. Empty when it allowed it or was not
+    /// reached.
+    #[serde(default)]
+    pub policy: Vec<hord_policy::Violation>,
 }
 
 impl ConflictReport {
-    /// No set overlap, no merge conflict, no verification failure.
+    /// No set overlap, no merge conflict, no verification failure, no
+    /// policy denial.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.conflicts.is_empty() && self.merge.is_empty() && self.verification.is_none()
+        self.conflicts.is_empty()
+            && self.merge.is_empty()
+            && self.verification.is_none()
+            && self.policy.is_empty()
     }
 
     /// Whether any merge conflict is hard.

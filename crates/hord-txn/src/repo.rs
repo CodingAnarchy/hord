@@ -12,7 +12,8 @@ use hord_core::{
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
 
-use crate::lander::{QueueEntry, Verdict, Verifier, VerifyFuture, VerifyRequest};
+use crate::gate::Verifier;
+use crate::lander::QueueEntry;
 use crate::materialize::MaterializeMode;
 use crate::semantic::RustCtx;
 use crate::source::ObjectSource;
@@ -37,6 +38,10 @@ const MAX_CACHED_CTX: usize = 8;
 /// by one per landing forever before).
 pub(crate) const MAX_TRACKED_CHANGES: usize = 16_384;
 
+/// Locks that make fetching an object from the [`ObjectSource`] single
+/// flight, by the id's first byte.
+const FETCH_SHARDS: usize = 64;
+
 /// Objects fetched per [`ObjectSource::get_objects`] call when prefetching
 /// (the batch limit of ADR 0024).
 const PREFETCH_BATCH: usize = 1_000;
@@ -56,9 +61,11 @@ pub struct RepoOptions {
     pub config: RepoConfig,
     /// Language adapters. `None` registers [`default_adapters`].
     pub adapters: Option<AdapterRegistry>,
-    /// Verification step run by the lander. `None` uses
-    /// [`FailClosedVerifier`]: until M4's verifier exists, only clean
-    /// changes land. [`crate::StubVerifier`] (land everything) is opt-in.
+    /// Verification step run by the lander. `None` is
+    /// [`crate::EngineVerifier::rust`]: cargo, for the requirements head's
+    /// policy applies, and fail-closed ([`crate::FailClosedVerifier`]) with
+    /// no requirements or no toolchain. [`crate::StubVerifier`] (land
+    /// everything) is opt-in, for throughput simulations.
     pub verifier: Option<Arc<dyn Verifier>>,
     /// Where snapshots, trees, blobs, and records the store lacks are read
     /// from (ADR 0024). `None`: the store alone. A remote workspace passes
@@ -78,53 +85,6 @@ impl std::fmt::Debug for RepoOptions {
             .field("verifier", &self.verifier.is_some())
             .field("objects", &self.objects.is_some())
             .finish()
-    }
-}
-
-/// The default verifier until M4 (spec §15: never land an unverified merge).
-///
-/// Passes a change only when its report is clean: no set overlap with a
-/// landed change (spec §6.3) and no soft merge conflict from the structural
-/// rebase (§6.4 rung 1). One exemption (ADR 0013 amendment): overlaps whose
-/// every node and path lies in files a purpose-built adapter merge resolved
-/// with no conflict ([`crate::ConflictReport::only_adapter_merged`]).
-/// Anything else fails, so the lander parks it as
-/// [`crate::QueueStatus::Conflicted`] with the reason in
-/// [`crate::ConflictReport::verification`]. Disjoint, clean changes land
-/// without verification, as in M3.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FailClosedVerifier;
-
-impl Verifier for FailClosedVerifier {
-    fn verify<'a>(&'a self, request: VerifyRequest<'a>) -> VerifyFuture<'a> {
-        let report = request.report;
-        // ADR 0013 amendment: overlaps confined to files an adapter merge
-        // resolved (for example concurrent lockfile additions) land.
-        let verdict = if report.only_adapter_merged() {
-            Verdict::Pass
-        } else {
-            let mut kinds: Vec<&str> = report
-                .conflicts
-                .iter()
-                .map(|c| match c.kind {
-                    crate::ConflictKind::WriteWrite => "write-write",
-                    crate::ConflictKind::ReadWrite => "read-write",
-                    crate::ConflictKind::WriteRead => "write-read",
-                })
-                .collect();
-            kinds.sort_unstable();
-            kinds.dedup();
-            Verdict::Fail {
-                reason: format!(
-                    "unverified overlap: {} set conflict(s) [{}] and {} soft merge \
-                     conflict(s); no verifier is configured, so only clean changes land",
-                    report.conflicts.len(),
-                    kinds.join(", "),
-                    report.merge.len(),
-                ),
-            }
-        };
-        Box::pin(async move { verdict })
     }
 }
 
@@ -236,6 +196,14 @@ pub(crate) struct Inner {
     pub wake: tokio::sync::Notify,
     /// The persisted event log (spec §10.5.3), opened on first use.
     pub events: Mutex<Option<Arc<crate::events::EventLog>>>,
+    /// Reference indexes for impact sets ([`crate::graph`]).
+    pub refs: Mutex<crate::graph::RefCache>,
+    /// Checkout slots for verification ([`crate::gate`]).
+    pub slots: crate::gate::Slots,
+    /// Single-flight locks for fetching from [`Self::objects`].
+    pub fetching: [Mutex<()>; FETCH_SHARDS],
+    /// Parsed policies by blob (ADR 0026).
+    pub policies: Mutex<HashMap<ObjectId, Arc<hord_policy::CompiledPolicy>>>,
 }
 
 /// Identified trees keyed by (path, blob, carried identity object). The path
@@ -358,6 +326,7 @@ struct Toolchain<'a> {
 
 impl Inner {
     fn new(store: Store, options: RepoOptions) -> Result<Self> {
+        let root = store.repo_root().to_path_buf();
         let toolchain = store.put_object(&Toolchain {
             tool: "hord-txn",
             version: env!("CARGO_PKG_VERSION"),
@@ -372,7 +341,7 @@ impl Inner {
             config: options.config,
             verifier: options
                 .verifier
-                .unwrap_or_else(|| Arc::new(FailClosedVerifier)),
+                .unwrap_or_else(|| Arc::new(crate::gate::EngineVerifier::rust(root.clone()))),
             objects: options.objects,
             toolchain,
             empty_tree,
@@ -389,6 +358,10 @@ impl Inner {
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
             wake: tokio::sync::Notify::new(),
             events: Mutex::new(None),
+            refs: Mutex::new(crate::graph::RefCache::default()),
+            slots: crate::gate::Slots::default(),
+            fetching: std::array::from_fn(|_| Mutex::new(())),
+            policies: Mutex::new(HashMap::new()),
         })
     }
 
@@ -422,6 +395,10 @@ impl Inner {
         let Some(source) = &self.objects else {
             return Ok(self.store.get(id)?);
         };
+        // One fetch per object at a time: tasks sharing this cache must not
+        // write the same loose object concurrently (a reader would see it
+        // half written) or fetch it twice.
+        let _flight = lock(&self.fetching[usize::from(id.as_bytes()[0]) % FETCH_SHARDS]);
         match self.store.get(id) {
             Ok(bytes) => Ok(bytes),
             Err(hord_store::Error::MissingObject(_)) => {
@@ -455,6 +432,10 @@ impl Inner {
         }
         for batch in missing.chunks(PREFETCH_BATCH) {
             for (id, bytes) in batch.iter().zip(source.get_objects(batch)?) {
+                let _flight = lock(&self.fetching[usize::from(id.as_bytes()[0]) % FETCH_SHARDS]);
+                if self.store.contains(*id)? {
+                    continue;
+                }
                 if ObjectId::from_canonical(&bytes) != *id {
                     return Err(Error::Corrupt {
                         id: *id,

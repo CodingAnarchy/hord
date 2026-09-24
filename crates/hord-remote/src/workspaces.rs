@@ -69,6 +69,10 @@ impl WorkspacesBackend for RemoteWorkspaces {
         call!(self, policy_check, request)
     }
 
+    async fn verify(&self, request: proto::WsVerifyRequest) -> ApiResult<proto::WsVerifyResponse> {
+        call!(self, verify, request)
+    }
+
     async fn shutdown(
         &self,
         request: proto::ShutdownRequest,

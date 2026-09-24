@@ -281,6 +281,13 @@ impl WorkspacesTrait for GrpcWorkspaces {
         ws_call!(self, request, policy_check)
     }
 
+    async fn verify(
+        &self,
+        request: Request<proto::WsVerifyRequest>,
+    ) -> GrpcResult<proto::WsVerifyResponse> {
+        ws_call!(self, request, verify)
+    }
+
     async fn shutdown(
         &self,
         request: Request<proto::ShutdownRequest>,

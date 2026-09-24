@@ -399,16 +399,19 @@ struct FailRebased {
 }
 
 impl Verifier for FailRebased {
-    fn verify<'a>(&'a self, request: VerifyRequest<'a>) -> VerifyFuture<'a> {
+    fn verify(&self, request: VerifyRequest) -> VerifyFuture<'_> {
         let verdict = if request.change.rebased_from.is_some() {
             let mut failed = self.failed.lock().unwrap();
             failed.push(request.change_id);
             failed.extend(request.change.evidence.last().copied());
             Verdict::Fail {
+                evidence: Vec::new(),
                 reason: "rebased".into(),
             }
         } else {
-            Verdict::Pass
+            Verdict::Pass {
+                evidence: Vec::new(),
+            }
         };
         Box::pin(async move { verdict })
     }

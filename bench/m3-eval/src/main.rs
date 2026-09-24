@@ -22,6 +22,10 @@
 //! to and landed by a freshly opened repository that did not propose them
 //! (the M4 remote case, [`remote`]). Gate: throughput ≥ 20 changes/s.
 //!
+//! `--policy` lands spec §7.2's example policy before the agents work and
+//! checks the lander enforces it (spec §12 M4, [`policy`]); it combines
+//! with the in-process run and with `--server`.
+//!
 //! `--server` runs only the simulation, against a spawned `hord serve`
 //! with one client connection per agent, and writes a flight-recorder log
 //! of the event stream ([`server`]). Gates: M3's, plus the recording reads
@@ -44,6 +48,7 @@
 
 mod corpus;
 mod lock;
+mod policy;
 mod remote;
 mod rust;
 mod server;
@@ -96,6 +101,11 @@ struct Args {
     /// simulation.
     #[arg(long)]
     server: bool,
+    /// Land §7.2's example policy first and check the lander enforces it,
+    /// with verification stubbed by evidence fixtures (spec §12 M4,
+    /// [`policy`]). With `--server`, against the server.
+    #[arg(long)]
+    policy: bool,
     /// Internal: serve the repository at this path (the `--server` child).
     #[arg(long, hide = true, value_name = "DIR")]
     internal_serve: Option<PathBuf>,
@@ -151,7 +161,7 @@ fn main() {
 
 fn run(args: &Args) -> Result<bool> {
     if let Some(dir) = &args.internal_serve {
-        server::serve_child(dir, args.strict_reads)?;
+        server::serve_child(dir, args.strict_reads, args.policy)?;
         return Ok(true);
     }
     let git_dir = corpus::cache_dir(args.cache.as_deref())?.join("cargo.git");
@@ -205,6 +215,7 @@ async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> 
             seed: args.seed,
             strict_reads: args.strict_reads,
             racy_submit: false,
+            policy: false,
         },
     )
     .await?;
@@ -245,6 +256,7 @@ async fn server_run(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Res
             seed: args.seed,
             strict_reads: args.strict_reads,
             racy_submit: args.racy_submit,
+            policy: args.policy,
         },
     )
     .await?;
@@ -279,6 +291,7 @@ struct SimGates {
 }
 
 fn sim_gates(sim: &sim::SimReport) -> SimGates {
+    let policy = sim.policy.as_ref().is_none_or(|p| p.pass);
     let throughput = sim.throughput >= 20.0;
     let false_negatives = sim.false_negatives.is_empty();
     let false_positive_rate = sim.false_positive_rate <= 0.10;
@@ -288,7 +301,7 @@ fn sim_gates(sim: &sim::SimReport) -> SimGates {
         false_negatives,
         false_positive_rate,
         disjoint_landed,
-        all: throughput && false_negatives && false_positive_rate && disjoint_landed,
+        all: throughput && false_negatives && false_positive_rate && disjoint_landed && policy,
     }
 }
 
@@ -301,8 +314,13 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
                 strict_reads: args.strict_reads,
             },
             // Spec §12 M3: verification stubbed. Overlaps that rebase cleanly
-            // land flagged; the product default parks them.
-            verifier: Some(Arc::new(StubVerifier)),
+            // land flagged; the product default parks them. `--policy`
+            // stubs it with evidence fixtures.
+            verifier: Some(if args.policy {
+                Arc::new(policy::FixtureVerifier)
+            } else {
+                Arc::new(StubVerifier)
+            }),
             ..RepoOptions::default()
         },
     )
@@ -339,6 +357,7 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
             seed: args.seed,
             strict_reads: args.strict_reads,
             racy_submit: args.racy_submit,
+            policy: args.policy,
         },
     )
     .await?;
@@ -464,6 +483,20 @@ fn print_sim(sim: &sim::SimReport, gates: &SimGates) {
         "[sim] false positives not explained by identity loss {}/{} (diagnostic)",
         sim.false_positive_changes_clean_identity, sim.agents
     );
+    if let Some(policy) = &sim.policy {
+        println!(
+            "[policy] public API under {}; denied {} of {} the oracle polices; fired {:?}; parked {} {}",
+            policy.public_dir,
+            policy.denied,
+            policy.expected_denied,
+            policy.fired,
+            sim.parked,
+            pass_fail(policy.pass)
+        );
+        for m in &policy.mismatches {
+            println!("[policy] mismatch: {m}");
+        }
+    }
     println!(
         "[sim] structural rebase landed {}/{} oracle-disjoint changes without replay {}",
         sim.disjoint_landed,

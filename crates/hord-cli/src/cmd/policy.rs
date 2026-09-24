@@ -9,34 +9,34 @@
 //! landing base judges a change, never the change's own result. `--policy`
 //! evaluates a local file instead, for trying a policy edit out.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use hord_core::{ChangeRecord, Evidence, Intent, NodeId, Op, RepoPath};
-use hord_lang::AdapterRegistry;
-use hord_policy::{
-    ActorClass, CompiledPolicy, Decision, EvidenceFact, Facts, POLICY_PATH, TouchedDefinition,
-};
-use hord_txn::{Base, BeginOptions, DefinitionInfo, Repo, Workspace};
-use serde::Serialize;
+use hord_api::proto;
+use hord_core::{Actor, Intent};
+use hord_policy::{ActorClass, CompiledPolicy, Decision, EvidenceFact, POLICY_PATH};
+use hord_txn::Repo;
+use serde::{Deserialize, Serialize};
 
+use crate::output;
+use crate::session::{Session, Target};
 use crate::txn::{self, block_on};
-use crate::{output, repo};
+use crate::workspaces::this_caller;
 
-#[derive(Debug, Serialize)]
+/// The `hord policy check --json` document (hord-policy's shapes, ADR
+/// 0026). It travels as `PolicyCheckResponse.result_json`.
+#[derive(Debug, Serialize, Deserialize)]
 struct CheckResult {
     workspace: String,
     /// Where the policy came from: `head`, `file`, or `default` (head has
     /// no policy file, so only the `[land]` defaults apply).
-    policy_source: &'static str,
+    policy_source: String,
     /// The policy file: `.hord-policy.toml` or the `--policy` path.
     policy: String,
     /// `false` when the workspace has nothing to propose; no decision then.
     changes: bool,
     /// The proposal's result snapshot, whose evidence is checked.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     snapshot: Option<String>,
     actor: ActorClass,
     write_set_size: usize,
@@ -46,27 +46,27 @@ struct CheckResult {
     decision: Option<Decision>,
 }
 
-pub fn run_check(
-    json: bool,
-    workspace: Option<String>,
-    policy_file: Option<PathBuf>,
-) -> Result<()> {
-    let store = repo::discover()?;
-    let meta = repo::resolve_workspace(&store, workspace.as_deref())?;
-    let repo = txn::open_store(store)?;
-    let (policy, policy_source, policy_name) = match policy_file {
-        Some(path) => {
-            let source = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading policy {}", path.display()))?;
-            let name = path.display().to_string();
-            (parse(&source, &name)?, "file", name)
-        }
+/// The library entry point: evaluate `policy` (a file's name and text),
+/// else head's policy, against the proposal of `workspace` in `repo`, as
+/// `actor`. Returns the `--json` document and whether the policy denies.
+/// Runs in the repository's daemon, or in this process with
+/// `--no-daemon` or against a remote.
+pub fn check(
+    repo: &Repo,
+    workspace: Option<&str>,
+    policy: Option<(&str, &str)>,
+    actor: Actor,
+    session: Option<String>,
+) -> Result<(serde_json::Value, bool)> {
+    let meta = crate::repo::resolve_workspace(repo.store(), workspace)?;
+    let (policy, policy_source, policy_name) = match policy {
+        Some((name, text)) => (parse(text, name)?, "file", name.to_owned()),
         None => {
-            let (policy, source) = head_policy(&repo)?;
-            (policy, source, POLICY_PATH.to_owned())
+            let (policy, source) = block_on(repo.head_policy())?;
+            (policy, source.as_str(), POLICY_PATH.to_owned())
         }
     };
-    let mut ws = block_on(repo.open_workspace(meta.id, txn::actor(), txn::session()))?;
+    let mut ws = block_on(repo.open_workspace(meta.id, actor, session))?;
     let actor = ActorClass::from(ws.actor());
     let preview = Intent {
         summary: "(policy check preview)".into(),
@@ -81,7 +81,7 @@ pub fn run_check(
     };
     let mut result = CheckResult {
         workspace: meta.id.to_string(),
-        policy_source,
+        policy_source: policy_source.to_owned(),
         policy: policy_name,
         changes: record.is_some(),
         snapshot: record.as_ref().map(|r| txn::hex(r.result)),
@@ -90,19 +90,48 @@ pub fn run_check(
         evidence: Vec::new(),
         decision: None,
     };
-    if let Some(record) = &record {
-        let facts = facts(&repo, &mut ws, record, actor)?;
+    if let Some(record) = record {
+        let facts = block_on(repo.policy_facts(record))?;
         result.write_set_size = facts.write_set_len;
         result.evidence = facts.evidence.clone();
         result.decision = Some(policy.evaluate(&facts));
     }
     let deny = result.decision.as_ref().is_some_and(|d| !d.is_allow());
+    Ok((serde_json::to_value(&result)?, deny))
+}
+
+pub fn run_check(
+    json: bool,
+    target: &Target,
+    workspace: Option<String>,
+    policy_file: Option<PathBuf>,
+) -> Result<()> {
+    let policy = match &policy_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading policy {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let session = Session::open(target)?;
+    let reply = block_on(
+        session
+            .workspaces()
+            .policy_check(proto::PolicyCheckRequest {
+                caller: Some(this_caller()),
+                workspace,
+                policy_path: policy_file.map(|p| p.display().to_string()),
+                policy,
+            }),
+    )?;
+    let result: CheckResult =
+        serde_json::from_str(&reply.result_json).context("policy check result")?;
     if json {
         output::print_json(&result)?;
     } else {
         print_text(&result);
     }
-    if deny {
+    if reply.deny {
         std::process::exit(1);
     }
     Ok(())
@@ -110,112 +139,6 @@ pub fn run_check(
 
 fn parse(source: &str, name: &str) -> Result<CompiledPolicy> {
     hord_policy::parse(source).map_err(|e| anyhow::anyhow!("{name}:{e}"))
-}
-
-/// Head's `.hord-policy.toml`, or the defaults when head has none.
-fn head_policy(repo: &Repo) -> Result<(CompiledPolicy, &'static str)> {
-    let mut head = block_on(repo.begin(BeginOptions::at_head(txn::actor())))?;
-    let path: RepoPath = POLICY_PATH.parse()?;
-    match block_on(head.read_file(&path))? {
-        Some(bytes) => {
-            let source = std::str::from_utf8(&bytes)
-                .with_context(|| format!("{POLICY_PATH} at head is not UTF-8"))?;
-            Ok((parse(source, POLICY_PATH)?, "head"))
-        }
-        None => Ok((CompiledPolicy::default(), "default")),
-    }
-}
-
-/// Evidence indexed for `record`'s result snapshot (ADR 0025).
-fn indexed_evidence(repo: &Repo, record: &ChangeRecord) -> Result<Vec<EvidenceFact>> {
-    let store = repo.store();
-    let mut facts = Vec::new();
-    for id in store.evidence_at(record.result)? {
-        let evidence: Evidence = store.get_object(id)?;
-        facts.extend(EvidenceFact::of(&evidence));
-    }
-    Ok(facts)
-}
-
-/// Facts for `record`: its write set, the files it touches, and the
-/// write-set definitions in those files with the adapter's kinds and
-/// visibility (ADR 0026). A definition is read from the workspace, or from
-/// the base when the change deletes it.
-fn facts(
-    repo: &Repo,
-    ws: &mut Workspace,
-    record: &ChangeRecord,
-    actor: ActorClass,
-) -> Result<Facts> {
-    let mut paths: BTreeSet<RepoPath> = ws.access_log().written_paths.clone();
-    for op in &record.ops {
-        if let Op::Blob { path, .. } | Op::Tree { path, .. } = op {
-            paths.insert(path.clone());
-        }
-    }
-    let adapters = hord_txn::default_adapters();
-    let mut base = block_on(repo.begin(BeginOptions {
-        base: Base::Snapshot(ws.base()),
-        actor: ws.actor().clone(),
-        session: None,
-    }))?;
-    let mut definitions: BTreeMap<NodeId, TouchedDefinition> = BTreeMap::new();
-    for path in &paths {
-        for side in [&mut *ws, &mut base] {
-            for def in touched_in(side, path, record, &adapters)? {
-                definitions.entry(def.node).or_insert(def);
-            }
-        }
-    }
-    Ok(Facts {
-        actor,
-        write_set_len: record.write_set.len(),
-        definitions: definitions.into_values().collect(),
-        paths: paths.into_iter().collect(),
-        evidence: indexed_evidence(repo, record)?,
-    })
-}
-
-/// Definitions of `path` in `ws` that are in `record`'s write set.
-fn touched_in(
-    ws: &mut Workspace,
-    path: &RepoPath,
-    record: &ChangeRecord,
-    adapters: &AdapterRegistry,
-) -> Result<Vec<TouchedDefinition>> {
-    let defs: Vec<DefinitionInfo> = match block_on(ws.definitions(path)) {
-        Ok(defs) => defs
-            .into_iter()
-            .filter(|d| record.write_set.contains(&d.node))
-            .collect(),
-        Err(hord_txn::Error::MissingFile(_) | hord_txn::Error::NotParsed(_)) => Vec::new(),
-        Err(err) => return Err(err.into()),
-    };
-    if defs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let bytes = block_on(ws.read_file(path))?.unwrap_or_default();
-    let bytes = bytes.as_slice();
-    let spans: Vec<Range<usize>> = defs.iter().map(|d| d.span.clone()).collect();
-    let head = &bytes[..bytes.len().min(512)];
-    let adapter_facts = match adapters.get(path, head) {
-        Some(adapter) => adapter.definition_facts(bytes, &spans),
-        None => vec![hord_lang::DefinitionFacts::default(); spans.len()],
-    };
-    Ok(defs
-        .into_iter()
-        .zip(adapter_facts)
-        .map(|(def, facts)| {
-            let mut kinds = facts.inner_kinds;
-            kinds.insert(def.kind.as_str().to_owned());
-            TouchedDefinition {
-                node: def.node,
-                path: def.path,
-                kinds,
-                visibility: facts.visibility,
-            }
-        })
-        .collect())
 }
 
 fn print_text(result: &CheckResult) {

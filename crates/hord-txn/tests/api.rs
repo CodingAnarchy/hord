@@ -125,15 +125,17 @@ async fn events_persist_across_a_reopen() {
             "head_moved",
             "submitted",
             "submitted",
+            // The speculative window (ADR 0025) prepares the second change
+            // on the first before the first lands.
+            "conflict_check",
             "conflict_check",
             "landed",
             "head_moved",
-            "conflict_check",
             "landed",
             "head_moved",
         ]
     );
-    let Kind::Landed(landed) = &kinds[5] else {
+    let Kind::Landed(landed) = &kinds[6] else {
         unreachable!()
     };
     assert_eq!(

@@ -79,6 +79,9 @@ service Workspaces {
   rpc Propose(ProposeRequest) returns (ProposeResponse);
   // Dry-run policy against a workspace (`hord policy check`).
   rpc PolicyCheck(PolicyCheckRequest) returns (PolicyCheckResponse);
+  // Plan, reuse, and run the checks head's policy requires for a
+  // workspace's proposal, and index the evidence (`hord verify`).
+  rpc Verify(WsVerifyRequest) returns (WsVerifyResponse);
   // Stop the daemon, releasing the store (for commands it does not serve).
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
@@ -300,6 +303,10 @@ enum QueueStatus {
   QUEUE_STATUS_CONFLICTED = 3;
   // Not landed and not replayable as is.
   QUEUE_STATUS_REJECTED = 4;
+  // Not landed yet: head's policy requires evidence the snapshot lacks
+  // (such as a review); see the report's `policy`. Attach it and submit
+  // again.
+  QUEUE_STATUS_PARKED = 5;
 }
 
 // One submission in the lander queue (`hord queue`).
@@ -406,6 +413,24 @@ message ConflictReport {
   optional string verification = 9;
   // Files resolved by an adapter merge with no conflict.
   repeated AdapterMerge adapter_merged = 10;
+  // Why head's policy denied the change (ADR 0026), one per unmet
+  // requirement.
+  repeated PolicyViolation policy = 11;
+}
+
+// One unmet policy requirement (ADR 0026).
+message PolicyViolation {
+  // `land` (`[land] require`), `max_write_set`, or `rule`.
+  string source = 1;
+  // The rule's name, for a rule.
+  optional string rule = 2;
+  // The required evidence, `kind` or `kind:qualifier`.
+  string requirement = 3;
+  // `absent`, `failed`, or `skipped`.
+  string evidence = 4;
+  // What made it apply: `definition <node> <path>`, `path <path>`,
+  // `actor <class>`, or `write_set <size> > <limit>`.
+  repeated string triggers = 5;
 }
 
 // How to resolve a parked change (spec §10.5.2).
@@ -659,6 +684,8 @@ enum ParkReason {
   PARK_REASON_NEEDS_ARBITRATION = 3;
   // Waiting for review required by policy.
   PARK_REASON_NEEDS_REVIEW = 4;
+  // Head's policy requires evidence the snapshot lacks (other than review).
+  PARK_REASON_POLICY = 5;
 }
 
 // A change was parked, not landed.
@@ -911,6 +938,60 @@ message PolicyCheckResponse {
   string result_json = 1;
   // Whether the policy denies the change.
   bool deny = 2;
+}
+
+// Arguments to Verify.
+message WsVerifyRequest {
+  // Who asks.
+  Caller caller = 1;
+  // Workspace id; unset: the current, else the only one.
+  optional string workspace = 2;
+  // Plan (with reuse) without running anything.
+  bool plan_only = 3;
+}
+
+// A check a verification plan will run.
+message PlannedCheck {
+  // The requirement it satisfies, such as `test:selected`.
+  string requirement = 1;
+  // The command.
+  string command = 2;
+}
+
+// A check whose evidence is reused instead of run (ADR 0025).
+message ReusedCheck {
+  // The requirement it satisfies.
+  string requirement = 1;
+  // The command.
+  string command = 2;
+  // The reused Evidence object.
+  string evidence = 3;
+  // Whether it passed.
+  bool passed = 4;
+}
+
+// `hord verify`.
+message WsVerifyResponse {
+  // Workspace id.
+  string workspace = 1;
+  // The proposal's result snapshot, which the evidence is for.
+  string snapshot = 2;
+  // `head` or `default` (ADR 0026).
+  string policy_source = 3;
+  // The requirements head's policy applies to the proposal.
+  repeated string requirements = 4;
+  // Checks to run (with --plan-only) or that ran.
+  repeated PlannedCheck checks = 5;
+  // Checks whose evidence was reused.
+  repeated ReusedCheck reused = 6;
+  // The verifier's notes (selection fallbacks and counts).
+  repeated string notes = 7;
+  // Unset with --plan-only.
+  optional bool passed = 8;
+  // Evidence objects, run and reused, indexed under `snapshot`.
+  repeated string evidence = 9;
+  // Why verification failed.
+  optional string reason = 10;
 }
 
 // Arguments to Shutdown.

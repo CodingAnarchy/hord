@@ -11,5 +11,6 @@ pub mod query;
 pub mod remote;
 pub mod serve;
 pub mod status;
+pub mod verify;
 pub mod watch;
 pub mod ws;

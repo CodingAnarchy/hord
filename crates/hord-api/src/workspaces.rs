@@ -28,6 +28,8 @@ pub trait WorkspacesBackend: Send + Sync {
         &self,
         request: proto::PolicyCheckRequest,
     ) -> ApiResult<proto::PolicyCheckResponse>;
+    /// `hord verify`.
+    async fn verify(&self, request: proto::WsVerifyRequest) -> ApiResult<proto::WsVerifyResponse>;
     /// Stop serving and release the store. Only a daemon implements it; an
     /// in-process backend returns [`crate::ApiError::Unimplemented`].
     async fn shutdown(&self, request: proto::ShutdownRequest)

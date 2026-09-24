@@ -34,6 +34,9 @@ fn hord(dir: &Path, args: &[&str]) -> Output {
         .current_dir(dir)
         .env("HORD_ACTOR", "tester")
         .env("HORD_AGENT_MODEL", "test-model")
+        // These tests open the store themselves; see `daemon.rs` for the
+        // daemon path.
+        .env("HORD_NO_DAEMON", "1")
         .output()
         .unwrap()
 }

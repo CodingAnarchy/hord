@@ -55,6 +55,16 @@ pub enum Command {
         #[arg(long)]
         paranoid: bool,
     },
+    /// Run the checks head's policy requires for a workspace's proposal and
+    /// attach the evidence to its snapshot (spec §10.2, §10.3).
+    Verify {
+        /// Workspace id.
+        #[arg(short = 'w', long = "workspace", value_name = "WS")]
+        workspace: Option<String>,
+        /// Print the plan (with reuse) without running anything.
+        #[arg(long)]
+        plan_only: bool,
+    },
     /// Build a change record from a workspace (spec §6.2) and print its id.
     Propose {
         /// Workspace id.

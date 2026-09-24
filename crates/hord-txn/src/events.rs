@@ -343,6 +343,21 @@ pub(crate) fn settled(entry: &QueueEntry) -> Vec<Kind> {
             change,
             reason: reason.clone(),
         })],
+        QueueStatus::Parked { reason } => {
+            let review = entry.report.as_ref().is_some_and(|r| {
+                !r.policy.is_empty() && r.policy.iter().all(|v| v.requirement.kind() == "review")
+            });
+            vec![Kind::Parked(proto::Parked {
+                change,
+                reason: if review {
+                    proto::ParkReason::NeedsReview
+                } else {
+                    proto::ParkReason::Policy
+                }
+                .into(),
+                detail: reason.clone(),
+            })]
+        }
         QueueStatus::Queued | QueueStatus::Landed { .. } => Vec::new(),
     }
 }

@@ -387,6 +387,49 @@ fn propose(
     })
 }
 
+fn verify(repo: &Repo, request: &proto::WsVerifyRequest) -> Result<proto::WsVerifyResponse> {
+    let (actor, session) = caller(request.caller.as_ref())?;
+    let meta = repo::resolve_workspace(repo.store(), request.workspace.as_deref())?;
+    let mut ws = block_on(repo.open_workspace(meta.id, actor, session))?;
+    let found = block_on(repo.verify_workspace(&mut ws, request.plan_only))?;
+    let mut response = proto::WsVerifyResponse {
+        workspace: meta.id.to_string(),
+        snapshot: hex(found.snapshot),
+        policy_source: found.policy_source.as_str().to_owned(),
+        requirements: found.requirements.iter().cloned().collect(),
+        ..Default::default()
+    };
+    if let Some(plan) = &found.plan {
+        response.checks = plan
+            .checks
+            .iter()
+            .map(|c| proto::PlannedCheck {
+                requirement: c.requirement.clone(),
+                command: c.command(),
+            })
+            .collect();
+        response.reused = plan
+            .reused
+            .iter()
+            .map(|r| proto::ReusedCheck {
+                requirement: r.check.requirement.clone(),
+                command: r.check.command(),
+                evidence: hex(r.evidence),
+                passed: r.passed,
+            })
+            .collect();
+        response.notes.clone_from(&plan.notes);
+    }
+    if !request.plan_only {
+        response.passed = Some(found.verdict.passed());
+        response.evidence = found.verdict.evidence().iter().map(|e| hex(*e)).collect();
+        if let hord_txn::Verdict::Fail { reason, .. } = &found.verdict {
+            response.reason = Some(reason.clone());
+        }
+    }
+    Ok(response)
+}
+
 #[async_trait]
 impl WorkspacesBackend for LocalWorkspaces {
     async fn ws_new(&self, request: proto::WsNewRequest) -> ApiResult<proto::WsNewResponse> {
@@ -415,19 +458,33 @@ impl WorkspacesBackend for LocalWorkspaces {
             .await
     }
 
-    /// SEAM (policy agent): `hord policy check` is implemented in
-    /// `cmd/policy.rs`, which does not expose a library entry point yet.
-    /// Until it does, the daemon does not serve it, and the CLI runs the
-    /// command in-process after stopping the daemon.
     async fn policy_check(
         &self,
-        _request: proto::PolicyCheckRequest,
+        request: proto::PolicyCheckRequest,
     ) -> ApiResult<proto::PolicyCheckResponse> {
-        Err(ApiError::Unimplemented(
-            "policy check runs in the CLI process until hord-cli's policy command exposes a \
-             library entry point"
-                .into(),
-        ))
+        self.run(move |repo, _| {
+            let (actor, session) = caller(request.caller.as_ref())?;
+            let policy = request
+                .policy
+                .as_deref()
+                .map(|text| (request.policy_path.as_deref().unwrap_or("(policy)"), text));
+            let (result, deny) = crate::cmd::policy::check(
+                repo,
+                request.workspace.as_deref(),
+                policy,
+                actor,
+                session,
+            )?;
+            Ok(proto::PolicyCheckResponse {
+                result_json: result.to_string(),
+                deny,
+            })
+        })
+        .await
+    }
+
+    async fn verify(&self, request: proto::WsVerifyRequest) -> ApiResult<proto::WsVerifyResponse> {
+        self.run(move |repo, _| verify(repo, &request)).await
     }
 
     async fn shutdown(

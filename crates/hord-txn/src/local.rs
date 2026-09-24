@@ -216,6 +216,39 @@ pub fn conflict_report_message(report: &ConflictReport) -> proto::ConflictReport
                 nodes: m.nodes.iter().map(ToString::to_string).collect(),
             })
             .collect(),
+        policy: report.policy.iter().map(violation_message).collect(),
+    }
+}
+
+/// Wire form of a policy violation (ADR 0026).
+#[must_use]
+pub fn violation_message(v: &hord_policy::Violation) -> proto::PolicyViolation {
+    use hord_policy::{EvidenceState, Trigger, ViolationSource};
+    proto::PolicyViolation {
+        source: match v.source {
+            ViolationSource::Land => "land",
+            ViolationSource::MaxWriteSet => "max_write_set",
+            ViolationSource::Rule => "rule",
+        }
+        .into(),
+        rule: v.rule.clone(),
+        requirement: v.requirement.to_string(),
+        evidence: match v.evidence {
+            EvidenceState::Absent => "absent",
+            EvidenceState::Failed => "failed",
+            EvidenceState::Skipped => "skipped",
+        }
+        .into(),
+        triggers: v
+            .triggers
+            .iter()
+            .map(|t| match t {
+                Trigger::Definition { node, path } => format!("definition {node} {path}"),
+                Trigger::Path { path } => format!("path {path}"),
+                Trigger::Actor { actor } => format!("actor {}", actor.as_str()),
+                Trigger::WriteSet { size, limit } => format!("write_set {size} > {limit}"),
+            })
+            .collect(),
     }
 }
 
@@ -231,6 +264,7 @@ pub fn queue_entry_message(entry: &QueueEntry, record: Option<&ChangeRecord>) ->
         QueueStatus::Rejected { reason } => {
             (proto::QueueStatus::Rejected, None, Some(reason.clone()))
         }
+        QueueStatus::Parked { reason } => (proto::QueueStatus::Parked, None, Some(reason.clone())),
     };
     let conflicts = entry
         .report
@@ -485,7 +519,9 @@ impl Inner {
                 evidence.snapshot
             )));
         }
-        let id = self.store.put(bytes).map_err(Error::from)?;
+        // Stored and indexed under its snapshot (ADR 0025), where reuse
+        // and policy find it.
+        let id = self.store.put_evidence(&evidence).map_err(Error::from)?;
         self.emit(vec![crate::events::evidence_attached(
             change, id, &evidence,
         )])?;

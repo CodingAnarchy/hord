@@ -18,6 +18,7 @@ fn status_name(entry: &proto::QueueEntry) -> &'static str {
         proto::QueueStatus::Landed => "landed",
         proto::QueueStatus::Conflicted => "conflicted",
         proto::QueueStatus::Rejected => "rejected",
+        proto::QueueStatus::Parked => "parked",
         proto::QueueStatus::Unspecified => "unknown",
     }
 }
@@ -306,8 +307,22 @@ fn print_report(result: &proto::ConflictsResult) {
     if let Some(reason) = &report.verification {
         println!("verification failed: {reason}");
     }
+    for violation in &report.policy {
+        let source = match &violation.rule {
+            Some(rule) => format!("rule {rule:?}"),
+            None => format!("[land] {}", violation.source),
+        };
+        println!(
+            "policy: {source} requires {} ({})",
+            violation.requirement, violation.evidence
+        );
+        for trigger in &violation.triggers {
+            println!("  because {trigger}");
+        }
+    }
     match result.entry.as_ref().map(status_name) {
         Some("conflicted") => println!("parked: needs replay (spec §6.4)"),
+        Some("parked") => println!("parked: attach the evidence policy requires and submit again"),
         Some("landed") if !report.clean => println!("landed, flagged for re-verification"),
         _ => {}
     }
