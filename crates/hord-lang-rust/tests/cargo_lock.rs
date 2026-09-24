@@ -143,7 +143,7 @@ fn matches_only_cargo_lock() {
 }
 
 #[test]
-fn real_lockfiles_are_lossless() {
+fn real_lockfiles_are_lossless() -> Result<(), Box<dyn std::error::Error>> {
     for (name, text) in fixtures() {
         let tree = CargoLockAdapter.parse(text.as_bytes()).expect(&name);
         assert_eq!(
@@ -151,9 +151,9 @@ fn real_lockfiles_are_lossless() {
             text.as_bytes(),
             "lossless {name}"
         );
-        tree.check_concat()
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        tree.check_concat().map_err(|e| format!("{name}: {e}"))?;
     }
+    Ok(())
 }
 
 #[test]
