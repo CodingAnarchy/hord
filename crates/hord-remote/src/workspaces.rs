@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use hord_api::proto::workspaces_client::WorkspacesClient;
-use hord_api::{ApiError, ApiResult, MAX_MESSAGE_BYTES, WorkspacesBackend, proto};
+use hord_api::{ApiResult, MAX_MESSAGE_BYTES, WorkspacesBackend, proto};
 
 use crate::transport::Transport;
 
@@ -22,18 +22,6 @@ impl RemoteWorkspaces {
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         }
     }
-}
-
-macro_rules! call {
-    ($self:ident, $method:ident, $request:ident) => {
-        $self
-            .client
-            .clone()
-            .$method($request)
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(ApiError::from)
-    };
 }
 
 #[async_trait]

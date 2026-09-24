@@ -52,7 +52,7 @@ impl RemoteRepo {
 
     /// Connect to a local endpoint by name: a Unix socket path, or a pipe
     /// name on Windows.
-    pub async fn connect_endpoint(name: &str) -> Result<Self, Error> {
+    async fn connect_endpoint(name: &str) -> Result<Self, Error> {
         let target = name.to_owned();
         // The URI is required by the API but unused: the connector ignores it.
         let channel = Endpoint::from_static("http://localhost")
@@ -197,18 +197,6 @@ impl ObjectSource for RemoteRepo {
         self.block(self.has_all(ids))
             .map_err(|e| txn_error(e, None))
     }
-}
-
-macro_rules! call {
-    ($self:ident, $method:ident, $request:ident) => {
-        $self
-            .client
-            .clone()
-            .$method($request)
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(ApiError::from)
-    };
 }
 
 #[async_trait]

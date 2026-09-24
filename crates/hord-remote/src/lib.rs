@@ -16,6 +16,20 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+/// One unary call on a generated client: `$self.client.$method($request)`,
+/// unwrapped, with the status as an [`hord_api::ApiError`].
+macro_rules! call {
+    ($self:ident, $method:ident, $request:ident) => {
+        $self
+            .client
+            .clone()
+            .$method($request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(hord_api::ApiError::from)
+    };
+}
+
 mod client;
 mod push;
 mod transport;
@@ -23,7 +37,6 @@ mod workspaces;
 
 pub use client::{RemoteRepo, open_cache};
 pub use push::push_change;
-pub use transport::Transport;
 pub use workspaces::RemoteWorkspaces;
 
 /// Failure to connect to a server.

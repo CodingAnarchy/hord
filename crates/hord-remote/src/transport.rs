@@ -11,7 +11,7 @@ use tower::Service;
 
 /// A [`Channel`] that prefixes request paths with `/r/<name>`, if any.
 #[derive(Clone, Debug)]
-pub struct Transport {
+pub(crate) struct Transport {
     channel: Channel,
     prefix: Option<Arc<str>>,
 }
