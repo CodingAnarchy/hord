@@ -32,7 +32,7 @@ use hord_api::proto::event::Kind;
 use hord_api::{RepoBackend, proto, wire};
 use hord_core::{ChangeId, RepoPath};
 use hord_remote::{RemoteRepo, open_cache, push_change};
-use hord_txn::{Repo, RepoConfig, RepoOptions, StubVerifier};
+use hord_txn::Repo;
 use serde::Serialize;
 use tokio_stream::StreamExt;
 
@@ -54,20 +54,6 @@ pub(crate) struct ServerReport {
     pub sim: sim::SimReport,
 }
 
-fn options(strict_reads: bool, policy: bool) -> RepoOptions {
-    RepoOptions {
-        config: RepoConfig { strict_reads },
-        // Spec §12 M3: verification stubbed, as in the in-process run; with
-        // `--policy`, stubbed by evidence fixtures.
-        verifier: Some(if policy {
-            Arc::new(crate::policy::FixtureVerifier)
-        } else {
-            Arc::new(StubVerifier)
-        }),
-        ..RepoOptions::default()
-    }
-}
-
 /// The child process: serve `dir` on a loopback port, print
 /// `LISTENING <addr>`, and stop when stdin closes.
 pub(crate) fn serve_child(dir: &Path, strict_reads: bool, policy: bool) -> Result<()> {
@@ -75,7 +61,8 @@ pub(crate) fn serve_child(dir: &Path, strict_reads: bool, policy: bool) -> Resul
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let hosts = hord_server::Hosts::open_repo(dir, options(strict_reads, policy)).await?;
+        let hosts =
+            hord_server::Hosts::open_repo(dir, sim::repo_options(strict_reads, policy)).await?;
         let listener = hord_server::Server::bind(
             "127.0.0.1:0".parse()?,
             &hord_server::ServeOptions::default(),
@@ -162,7 +149,8 @@ pub(crate) async fn run(
     let dir = scratch.join("server");
     let (base, snapshot, plan, public_dir) = {
         let store = hord_store::Store::create(&dir).context("create store")?;
-        let repo = Repo::from_store(store, options(config.strict_reads, config.policy)).await?;
+        let repo =
+            Repo::from_store(store, sim::repo_options(config.strict_reads, config.policy)).await?;
         let base = repo
             .bootstrap(files, sim::intent("import cargo"), sim::actor("m3-seed"))
             .await?;
@@ -261,7 +249,7 @@ pub(crate) async fn run(
     let cache = open_cache(
         &scratch.join("client"),
         cache_remote,
-        options(config.strict_reads, config.policy),
+        sim::repo_options(config.strict_reads, config.policy),
     )
     .await?;
     let started = Instant::now();
@@ -313,7 +301,7 @@ pub(crate) async fn run(
     server.stop()?;
 
     // The server is gone: open its store here for the oracle.
-    let repo = Repo::open_with(&dir, options(config.strict_reads, config.policy)).await?;
+    let repo = Repo::open_with(&dir, sim::repo_options(config.strict_reads, config.policy)).await?;
     let mut done = repo.queue().await?;
     done.retain(|e| runs.iter().any(|r| r.change == e.change));
     if done.len() != config.agents {

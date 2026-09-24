@@ -56,13 +56,11 @@ mod sim;
 mod workspaces;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use hord_core::RepoPath;
-use hord_txn::{Repo, RepoConfig, RepoOptions, StubVerifier};
+use hord_txn::Repo;
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -138,6 +136,19 @@ struct Gates {
     all: bool,
 }
 
+impl Args {
+    fn sim_config(&self) -> sim::SimConfig {
+        sim::SimConfig {
+            agents: self.agents,
+            overlap_percent: self.overlap_percent,
+            seed: self.seed,
+            strict_reads: self.strict_reads,
+            racy_submit: self.racy_submit,
+            policy: self.policy,
+        }
+    }
+}
+
 /// Scratch directory, removed on drop.
 struct Scratch(PathBuf);
 
@@ -191,31 +202,19 @@ fn run(args: &Args) -> Result<bool> {
     }
     let report = runtime.block_on(evaluate(args, &corpus, &scratch.0))?;
     print(&report, args);
-    if let Some(path) = &args.json {
-        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
-            .with_context(|| format!("write {}", path.display()))?;
-        eprintln!("[report] wrote {}", path.display());
-    }
+    write_json(args, &report)?;
     Ok(report.gates.all)
 }
 
 async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<bool> {
-    let files: Vec<(RepoPath, Vec<u8>)> = corpus
-        .files
-        .iter()
-        .filter_map(|(p, b)| p.parse::<RepoPath>().ok().map(|p| (p, b.clone())))
-        .collect();
     let report = remote::run(
         &scratch.join("remote"),
-        files,
+        corpus.repo_files(),
         &corpus.files,
         &sim::SimConfig {
-            agents: args.agents,
-            overlap_percent: args.overlap_percent,
-            seed: args.seed,
-            strict_reads: args.strict_reads,
             racy_submit: false,
             policy: false,
+            ..args.sim_config()
         },
     )
     .await?;
@@ -233,31 +232,16 @@ async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> 
         report.rejected,
         pass_fail(report.pass)
     );
-    if let Some(path) = &args.json {
-        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
-            .with_context(|| format!("write {}", path.display()))?;
-    }
+    write_json(args, &report)?;
     Ok(report.pass)
 }
 
 async fn server_run(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<bool> {
-    let files: Vec<(RepoPath, Vec<u8>)> = corpus
-        .files
-        .iter()
-        .filter_map(|(p, b)| p.parse::<RepoPath>().ok().map(|p| (p, b.clone())))
-        .collect();
     let report = server::run(
         scratch,
-        files,
+        corpus.repo_files(),
         &corpus.files,
-        &sim::SimConfig {
-            agents: args.agents,
-            overlap_percent: args.overlap_percent,
-            seed: args.seed,
-            strict_reads: args.strict_reads,
-            racy_submit: args.racy_submit,
-            policy: args.policy,
-        },
+        &args.sim_config(),
     )
     .await?;
     let gates = sim_gates(&report.sim);
@@ -274,10 +258,7 @@ async fn server_run(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Res
     );
     let all = gates.all && report.recording_replays;
     println!("m3 --server {}", pass_fail(all));
-    if let Some(path) = &args.json {
-        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
-            .with_context(|| format!("write {}", path.display()))?;
-    }
+    write_json(args, &report)?;
     Ok(all)
 }
 
@@ -307,29 +288,8 @@ fn sim_gates(sim: &sim::SimReport) -> SimGates {
 
 async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<Report> {
     let store = hord_store::Store::create(scratch.join("sim")).context("create store")?;
-    let repo = Repo::from_store(
-        store,
-        RepoOptions {
-            config: RepoConfig {
-                strict_reads: args.strict_reads,
-            },
-            // Spec §12 M3: verification stubbed. Overlaps that rebase cleanly
-            // land flagged; the product default parks them. `--policy`
-            // stubs it with evidence fixtures.
-            verifier: Some(if args.policy {
-                Arc::new(policy::FixtureVerifier)
-            } else {
-                Arc::new(StubVerifier)
-            }),
-            ..RepoOptions::default()
-        },
-    )
-    .await?;
-    let files: Vec<(RepoPath, Vec<u8>)> = corpus
-        .files
-        .iter()
-        .filter_map(|(p, b)| p.parse::<RepoPath>().ok().map(|p| (p, b.clone())))
-        .collect();
+    let repo = Repo::from_store(store, sim::repo_options(args.strict_reads, args.policy)).await?;
+    let files = corpus.repo_files();
     let file_count = files.len();
     let started = Instant::now();
     let base = repo
@@ -347,20 +307,7 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
         snapshot.defs.len(),
         args.agents
     );
-    let sim = sim::run(
-        &repo,
-        base,
-        &snapshot,
-        &sim::SimConfig {
-            agents: args.agents,
-            overlap_percent: args.overlap_percent,
-            seed: args.seed,
-            strict_reads: args.strict_reads,
-            racy_submit: args.racy_submit,
-            policy: args.policy,
-        },
-    )
-    .await?;
+    let sim = sim::run(&repo, base, &snapshot, &args.sim_config()).await?;
 
     eprintln!("[workspaces] {} live", args.workspaces);
     let workspaces = workspaces::run(&repo, args.workspaces, &sim.target_files).await?;
@@ -396,6 +343,16 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
         cargo_lock,
         gates,
     })
+}
+
+/// Write `report` to `--json`, if given.
+fn write_json(args: &Args, report: &impl Serialize) -> Result<()> {
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_vec_pretty(report)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        eprintln!("[report] wrote {}", path.display());
+    }
+    Ok(())
 }
 
 fn pass_fail(ok: bool) -> &'static str {

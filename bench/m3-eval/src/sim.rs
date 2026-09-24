@@ -39,11 +39,15 @@
 //! that overlaps nothing landed before it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use hord_core::{Actor, ChangeId, Intent, NodeId, RepoPath};
-use hord_txn::{Base, BeginOptions, ConflictKind, DefinitionInfo, QueueStatus, Repo};
+use hord_txn::{
+    Base, BeginOptions, ConflictKind, DefinitionInfo, QueueStatus, Repo, RepoConfig, RepoOptions,
+    StubVerifier,
+};
 use serde::Serialize;
 
 use crate::rust;
@@ -574,6 +578,22 @@ pub(crate) struct SimReport {
     /// Files the targets live in, for the workspace run.
     #[serde(skip)]
     pub target_files: Vec<RepoPath>,
+}
+
+/// Repository options for a run: verification stubbed (spec §12 M3), and
+/// with `policy` stubbed by evidence fixtures ([`crate::policy`]).
+/// Overlaps that rebase cleanly land flagged; the product default parks
+/// them.
+pub(crate) fn repo_options(strict_reads: bool, policy: bool) -> RepoOptions {
+    RepoOptions {
+        config: RepoConfig { strict_reads },
+        verifier: Some(if policy {
+            Arc::new(crate::policy::FixtureVerifier)
+        } else {
+            Arc::new(StubVerifier)
+        }),
+        ..RepoOptions::default()
+    }
 }
 
 /// Simulation parameters.
