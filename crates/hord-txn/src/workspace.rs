@@ -194,6 +194,14 @@ impl Workspace {
         &self.materialization
     }
 
+    /// Where this workspace reads objects from: its repository's
+    /// [`ObjectSource`](crate::ObjectSource) (ADR 0024), the local store
+    /// or a remote source that fetches on demand.
+    #[must_use]
+    pub fn objects(&self) -> &dyn crate::ObjectSource {
+        &self.repo
+    }
+
     /// Reads and writes so far.
     #[must_use]
     pub fn access_log(&self) -> &AccessLog {

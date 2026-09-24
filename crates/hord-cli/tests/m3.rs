@@ -1,5 +1,10 @@
 //! M3 commands end to end: `ws new` → edit → `status` → `propose` →
 //! `submit` → `queue` → `land --local` → `conflicts`.
+//!
+//! Single-user mode: `--no-daemon`, so a submitted change stays queued until
+//! `land --local` (a daemon's lander lands it at once; see `daemon.rs`).
+//! `--json` is the protobuf JSON mapping (ADR 0024): lowerCamelCase keys,
+//! enums by value name.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +29,20 @@ pub fn delta() -> u32 {
     4
 }
 ";
+
+const QUEUED: &str = "QUEUE_STATUS_QUEUED";
+const LANDED: &str = "QUEUE_STATUS_LANDED";
+const CONFLICTED: &str = "QUEUE_STATUS_CONFLICTED";
+
+/// Ids of `hord log --json`'s changes, oldest first.
+fn log_ids(value: &serde_json::Value) -> Vec<String> {
+    value["changes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing changes in {value}"))
+        .iter()
+        .map(|c| c["change"].as_str().unwrap().to_owned())
+        .collect()
+}
 
 struct TempDir(PathBuf);
 
@@ -55,6 +74,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("HORD_ACTOR", "tester")
+        .env("HORD_NO_DAEMON", "1")
         .env_remove("HORD_AGENT_MODEL")
         .output()
         .unwrap_or_else(|err| panic!("run hord {args:?}: {err}"))
@@ -164,7 +184,7 @@ fn propose_submit_land_round_trip() {
     let status = json(dir, &["status", "-w", &ws]);
     assert_eq!(status["reads"], "unobserved");
     assert_eq!(
-        status["write_set"].as_array().unwrap().len(),
+        status["writeSet"].as_array().unwrap().len(),
         1,
         "{status:#}"
     );
@@ -182,19 +202,25 @@ fn propose_submit_land_round_trip() {
     assert_eq!(change.len(), 64, "{text}");
 
     let submitted = json(dir, &["submit", &change]);
-    assert_eq!(submitted["status"], "queued");
+    assert_eq!(submitted["entry"]["status"], QUEUED);
     let queue = json(dir, &["queue"]);
-    assert_eq!(queue[0]["change"], change.as_str());
-    assert_eq!(queue[0]["summary"], "beta returns 20");
-    assert_eq!(json(dir, &["queue", "--mine"]).as_array().unwrap().len(), 1);
+    assert_eq!(queue["entries"][0]["change"], change.as_str());
+    assert_eq!(queue["entries"][0]["summary"], "beta returns 20");
+    assert_eq!(
+        json(dir, &["queue", "--mine"])["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 
     let landed = json(dir, &["land", "--local"]);
-    assert_eq!(landed["processed"][0]["status"], "landed");
+    assert_eq!(landed["processed"][0]["status"], LANDED);
     assert_eq!(landed["head"], change.as_str());
 
     let report = json(dir, &["conflicts", &change]);
-    assert_eq!(report["clean"], true);
-    assert_eq!(report["status"], "landed");
+    assert_eq!(report["report"]["clean"], true);
+    assert_eq!(report["entry"]["status"], LANDED);
 
     // A new workspace sees the landed edit.
     let (_, after) = ws_new(dir);
@@ -220,7 +246,7 @@ fn land_local_with_a_change_submits_it() {
     json(dir, &["submit", &first]);
     let out = json(dir, &["land", "--local", &second]);
     assert_eq!(out["processed"].as_array().unwrap().len(), 2);
-    assert_eq!(out["change"]["status"], "landed");
+    assert_eq!(out["change"]["status"], LANDED);
     // Rebased onto the first: lands under a new id with both edits.
     let landed = out["change"]["landed"].as_str().unwrap();
     assert_ne!(landed, second);
@@ -250,27 +276,28 @@ fn a_conflicting_pair_is_parked_and_explained() {
     json(dir, &["submit", &first]);
     json(dir, &["submit", &second]);
     let out = json(dir, &["land", "--local"]);
-    assert_eq!(out["processed"][0]["status"], "landed");
-    assert_eq!(out["processed"][1]["status"], "conflicted");
+    assert_eq!(out["processed"][0]["status"], LANDED);
+    assert_eq!(out["processed"][1]["status"], CONFLICTED);
     assert_eq!(out["processed"][1]["hard"], true);
 
-    let report = json(dir, &["conflicts", &second]);
-    assert_eq!(report["status"], "conflicted");
+    let result = json(dir, &["conflicts", &second]);
+    assert_eq!(result["entry"]["status"], CONFLICTED);
+    let report = &result["report"];
     assert_eq!(report["clean"], false);
     let ww = report["conflicts"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["kind"] == "write-write")
+        .find(|c| c["kind"] == "CONFLICT_KIND_WRITE_WRITE")
         .expect("write-write");
     assert_eq!(ww["landed"], first.as_str());
-    assert_eq!(ww["landed_summary"], "gamma plus two");
+    assert_eq!(ww["landedSummary"], "gamma plus two");
     assert!(
         ww["nodes"][0]["name"].as_str().unwrap().ends_with("gamma"),
         "{ww:#}"
     );
     assert_eq!(ww["nodes"][0]["path"], "src/lib.rs");
-    assert_eq!(report["merge"][0]["severity"], "hard");
+    assert_eq!(report["merge"][0]["severity"], "MERGE_SEVERITY_HARD");
 
     let text = ok(dir, &["conflicts", &second]);
     assert!(text.contains("write-write with"), "{text}");
@@ -292,15 +319,16 @@ fn read_write_through_references_is_explained() {
     let first = propose(dir, &a, &intent(dir, "a", "alpha ten", ""));
     let second = propose(dir, &b, &intent(dir, "b", "gamma five", ""));
     // Before landing, `conflicts` checks against head: nothing landed yet.
-    assert_eq!(json(dir, &["conflicts", &second])["clean"], true);
+    assert_eq!(json(dir, &["conflicts", &second])["report"]["clean"], true);
     json(dir, &["submit", &first]);
     json(dir, &["submit", &second]);
     let landed = json(dir, &["land", "--local"]);
     // No verifier until M4, so the default fails closed (spec §15): the
     // overlap parks instead of landing flagged.
     assert_eq!(landed["head"], first.as_str());
-    let report = json(dir, &["conflicts", &second]);
-    assert_eq!(report["status"], "conflicted");
+    let result = json(dir, &["conflicts", &second]);
+    assert_eq!(result["entry"]["status"], CONFLICTED);
+    let report = &result["report"];
     assert_eq!(report["clean"], false);
     assert!(
         report["verification"]
@@ -310,7 +338,7 @@ fn read_write_through_references_is_explained() {
         "{report:#}"
     );
     let rw = &report["conflicts"][0];
-    assert_eq!(rw["kind"], "read-write");
+    assert_eq!(rw["kind"], "CONFLICT_KIND_READ_WRITE");
     assert!(
         rw["nodes"][0]["name"].as_str().unwrap().ends_with("alpha"),
         "{rw:#}"
@@ -366,7 +394,7 @@ fn ws_materialize_modes_rm_gc_and_paranoid_status() {
     edit(&checkout, "    2\n", "    20\n");
     let status = json(dir, &["status", "-w", id, "--paranoid"]);
     assert_eq!(
-        status["write_set"].as_array().unwrap().len(),
+        status["writeSet"].as_array().unwrap().len(),
         1,
         "{status:#}"
     );
@@ -384,11 +412,7 @@ fn ws_materialize_modes_rm_gc_and_paranoid_status() {
     json(dir, &["ws", "rm", cloned["id"].as_str().unwrap()]);
     assert!(!checkout.exists());
     let gc = json(dir, &["ws", "gc"]);
-    assert_eq!(
-        gc["removed_pristine"].as_array().unwrap().len(),
-        1,
-        "{gc:#}"
-    );
+    assert_eq!(gc["removedPristine"].as_array().unwrap().len(), 1, "{gc:#}");
     assert!(
         !run(dir, &["ws", "rm", id]).status.success(),
         "already removed"
@@ -449,13 +473,17 @@ fn concurrent_lockfile_additions_land_under_the_default_verifier() {
         .iter()
         .map(|e| e["status"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(statuses, ["landed", "landed"], "{landed:#}");
+    assert_eq!(statuses, [LANDED, LANDED], "{landed:#}");
 
-    let report = json(dir, &["conflicts", &second]);
-    assert_eq!(report["status"], "landed");
-    assert_eq!(report["conflicts"][0]["kind"], "write-write", "{report:#}");
-    assert_eq!(report["adapter_merged"], serde_json::json!(["Cargo.lock"]));
-    assert!(report.get("verification").is_none(), "{report:#}");
+    let result = json(dir, &["conflicts", &second]);
+    assert_eq!(result["entry"]["status"], LANDED);
+    let report = &result["report"];
+    assert_eq!(
+        report["conflicts"][0]["kind"], "CONFLICT_KIND_WRITE_WRITE",
+        "{report:#}"
+    );
+    assert_eq!(report["adapterMerged"][0]["path"], "Cargo.lock");
+    assert!(report["verification"].is_null(), "{report:#}");
     let text = ok(dir, &["conflicts", &second]);
     assert!(text.contains("merged by adapter: Cargo.lock"), "{text}");
 }
@@ -473,7 +501,7 @@ fn blame_and_log_resolve_after_land_local() {
     let change = propose(dir, &ws, &file);
     json(dir, &["submit", &change]);
     let landed = json(dir, &["land", "--local"]);
-    assert_eq!(landed["processed"][0]["status"], "landed");
+    assert_eq!(landed["processed"][0]["status"], LANDED);
 
     let by_name = json(dir, &["blame", "beta"]);
     let node = by_name["node"].as_str().unwrap().to_owned();
@@ -488,12 +516,12 @@ fn blame_and_log_resolve_after_land_local() {
     assert_eq!(by_line["node"], node.as_str());
     assert_eq!(by_line["history"], by_name["history"]);
 
-    let log = json(dir, &["log", "--node", "beta"]);
-    assert_eq!(log["log"], serde_json::json!([change]));
-    let by_id = json(dir, &["log", "--node", &node]);
-    assert_eq!(by_id["log"], log["log"]);
-    let by_path = json(dir, &["log", "--path", "src"]);
-    assert_eq!(by_path["log"], log["log"]);
+    let log = log_ids(&json(dir, &["log", "--node", "beta"]));
+    assert_eq!(log, std::slice::from_ref(&change));
+    let by_id = log_ids(&json(dir, &["log", "--node", &node]));
+    assert_eq!(by_id, log);
+    let by_path = log_ids(&json(dir, &["log", "--path", "src"]));
+    assert_eq!(by_path, log);
 
     // An untouched definition resolves too; it has no landed history.
     let alpha = json(dir, &["blame", "alpha"]);

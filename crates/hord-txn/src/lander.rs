@@ -44,6 +44,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use hord_api::EventStream;
 use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IdentityDelta,
     ObjectId, SnapshotId, Timestamp,
@@ -51,6 +52,7 @@ use hord_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::conflict::{ConflictReport, Footprint, check};
+use crate::events;
 use crate::files::{validate, validate_except};
 use crate::rebase::rebase;
 use crate::repo::{Head, Inner, Repo, blocking, lock, now};
@@ -191,6 +193,54 @@ impl Verifier for StubVerifier {
     }
 }
 
+/// The lander as a long-running task (spec §6.7, ADR 0024).
+///
+/// [`Lander::spawn`] starts a tokio task that drains the queue, then sleeps
+/// until [`Repo::submit`] wakes it or the cancellation token fires. It is
+/// the only writer of the log and head: the repository's lander lock
+/// serializes it with [`Repo::land_local`], which runs the same drain
+/// inline ([`Lander::drain`]). A transient store or I/O failure is retried
+/// after a pause; the entry stays queued.
+#[derive(Debug)]
+pub struct Lander;
+
+/// Pause before retrying after a transient failure.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl Lander {
+    /// Start the lander for `repo` on the current tokio runtime. Returns its
+    /// task, which ends when `cancel` fires, and a live [`EventStream`] of
+    /// the events it emits from now on (spec §10.5.3). Must be called from
+    /// within a runtime.
+    pub fn spawn(
+        repo: Repo,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(tokio::task::JoinHandle<()>, EventStream)> {
+        let log = repo.inner.event_log()?;
+        let stream = log.subscribe(None);
+        let task = tokio::spawn(async move {
+            loop {
+                let pause = match Self::drain(&repo).await {
+                    Ok(_) => None,
+                    Err(_) => Some(RETRY_AFTER),
+                };
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = repo.inner.wake.notified(), if pause.is_none() => {}
+                    () = tokio::time::sleep(pause.unwrap_or_default()), if pause.is_some() => {}
+                }
+            }
+        });
+        Ok((task, stream))
+    }
+
+    /// Process queued changes until none is left (one lander pass).
+    /// Returns the entries processed, in order.
+    pub async fn drain(repo: &Repo) -> Result<Vec<QueueEntry>> {
+        run(repo).await
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct LanderState {
     /// Lowest sequence number that may still be queued; `None` before the
@@ -245,7 +295,7 @@ struct Ready {
 /// record and parks it.
 pub(crate) fn is_transient(err: &Error) -> bool {
     match err {
-        Error::Io(_) | Error::Task(_) => true,
+        Error::Io(_) | Error::Task(_) | Error::EventLog(_) => true,
         Error::Store(store) => matches!(
             store,
             hord_store::Error::Io(_)
@@ -304,12 +354,16 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
         };
         processed.push(done);
     }
+    // Idle: make the events of this run durable.
+    if !processed.is_empty() {
+        blocking(&repo.inner, |inner| inner.sync_events()).await?;
+    }
     Ok(processed)
 }
 
 impl Inner {
     pub(crate) fn submit(&self, change: ChangeId) -> Result<QueueEntry> {
-        self.change_record(change)?;
+        let record = self.change_record(change)?;
         // Queued already, or landed already: submitting again is a no-op.
         if let Some(entry) = self
             .named_entries(change)?
@@ -336,6 +390,12 @@ impl Inner {
         let seq = self
             .store
             .queue_push(&hord_encoding::encode(&stored)?, &[change], checked)?;
+        self.wake.notify_one();
+        self.emit(vec![events::submitted(
+            seq,
+            change,
+            &record.provenance.actor,
+        )])?;
         Ok(QueueEntry::from_stored(seq, stored))
     }
 
@@ -355,7 +415,7 @@ impl Inner {
 
     /// Queue entries that name `id` ([`QueueEntry::names`]), in sequence
     /// order: point lookups through the store's name index.
-    fn named_entries(&self, id: ChangeId) -> Result<Vec<QueueEntry>> {
+    pub(crate) fn named_entries(&self, id: ChangeId) -> Result<Vec<QueueEntry>> {
         if !self.store.queue_names_indexed()? {
             // A queue from before the name index: index it once.
             let rows: Vec<_> = self
@@ -478,9 +538,17 @@ impl Inner {
     /// propagate, so one bad change cannot wedge the queue ([`is_transient`]).
     fn prepare(&self, entry: QueueEntry) -> Result<Step> {
         let mut report = None;
-        match self.try_prepare(&entry, &mut report) {
+        let prepared = self.try_prepare(&entry, &mut report);
+        if let Some(report) = &report
+            && !matches!(&prepared, Err(err) if is_transient(err))
+        {
+            self.emit(vec![events::conflict_check(report)])?;
+        }
+        match prepared {
             Ok(Prepared::Park(status)) => {
-                Ok(Step::Done(Box::new(self.park(entry, status, report)?)))
+                let parked = self.park(entry, status, report)?;
+                self.emit(events::settled(&parked))?;
+                Ok(Step::Done(Box::new(parked)))
             }
             Ok(Prepared::Ready(ready)) => {
                 let Ready {
@@ -500,11 +568,9 @@ impl Inner {
             Err(err) if is_transient(&err) => Err(err),
             Err(err) => {
                 let reason = err.to_string();
-                Ok(Step::Done(Box::new(self.park(
-                    entry,
-                    QueueStatus::Rejected { reason },
-                    report,
-                )?)))
+                let parked = self.park(entry, QueueStatus::Rejected { reason }, report)?;
+                self.emit(events::settled(&parked))?;
+                Ok(Step::Done(Box::new(parked)))
             }
         }
     }
@@ -616,6 +682,7 @@ impl Inner {
     ) -> Evidence {
         Evidence {
             kind: EvidenceKind::Rebase { submitted },
+            qualifier: None,
             snapshot: result,
             toolchain: self.toolchain,
             command: "hord lander: structural rebase (spec §6.4 rung 1)".into(),
@@ -635,7 +702,7 @@ impl Inner {
 
     /// The id `change` landed under, if it is in the log (as submitted, or
     /// as its rebased record per a landed queue entry).
-    fn landed_as(&self, change: ChangeId) -> Result<Option<ChangeId>> {
+    pub(crate) fn landed_as(&self, change: ChangeId) -> Result<Option<ChangeId>> {
         if self.store.log_contains(change)? {
             return Ok(Some(change));
         }
@@ -662,8 +729,11 @@ impl Inner {
         } = candidate;
         if let Verdict::Fail { reason } = verdict {
             report.verification = Some(reason);
-            return self.park(entry, QueueStatus::Conflicted, Some(report));
+            let parked = self.park(entry, QueueStatus::Conflicted, Some(report))?;
+            self.emit(events::settled(&parked))?;
+            return Ok(parked);
         }
+        let previous = self.head()?.change;
         if let Some(attestation) = &attestation {
             self.store.put_object(attestation)?;
         }
@@ -691,6 +761,15 @@ impl Inner {
             change: Some(landed_id),
             snapshot: landed.result,
         });
+        let position = self.store.log_len()?.saturating_sub(1) as u64;
+        let submitted = (landed_id != entry.change).then_some(entry.change);
+        self.emit(events::landed(
+            landed_id,
+            position,
+            submitted,
+            &[],
+            previous,
+        ))?;
         // The footprint is a cache (`footprint` recomputes it on a miss).
         if let Ok(footprint) = self.footprint_of(landed_id, &landed) {
             lock(&self.footprints).insert(landed_id, Arc::new(footprint), 1);

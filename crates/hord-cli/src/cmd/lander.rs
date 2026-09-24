@@ -1,81 +1,124 @@
 //! `hord submit`, `hord queue`, `hord land --local`, `hord conflicts`
-//! (spec §6.7, §10.2).
+//! (spec §6.7, §10.2), over the session's [`hord_api::RepoBackend`].
+
+use std::time::Duration;
 
 use anyhow::{Result, bail};
-use serde::Serialize;
+use hord_api::proto::event::Kind;
+use hord_api::{RepoBackend, proto, wire};
+use tokio_stream::StreamExt;
 
 use crate::output;
-use crate::txn::{self, EntryView, block_on, entry_view, print_entry};
+use crate::session::{Session, Target};
+use crate::txn::{self, block_on};
 
-fn view(repo: &hord_txn::Repo, entry: &hord_txn::QueueEntry) -> EntryView {
-    let record = block_on(repo.change(entry.change)).ok();
-    entry_view(entry, record.as_ref())
+fn status_name(entry: &proto::QueueEntry) -> &'static str {
+    match entry.status() {
+        proto::QueueStatus::Queued => "queued",
+        proto::QueueStatus::Landed => "landed",
+        proto::QueueStatus::Conflicted => "conflicted",
+        proto::QueueStatus::Rejected => "rejected",
+        proto::QueueStatus::Unspecified => "unknown",
+    }
 }
 
-pub fn run_submit(json: bool, change: String) -> Result<()> {
-    let change = txn::parse_change(&change)?;
-    let repo = txn::open()?;
-    let entry = block_on(repo.submit(change))?;
-    let view = view(&repo, &entry);
+/// One line for a queue entry.
+fn print_entry(entry: &proto::QueueEntry) {
+    let mut line = format!(
+        "{:>4} {} {:<10} {}",
+        entry.seq,
+        &entry.change[..12.min(entry.change.len())],
+        status_name(entry),
+        entry.summary
+    );
+    if let Some(landed) = &entry.landed
+        && landed != &entry.change
+    {
+        line.push_str(&format!(" (landed as {})", &landed[..12.min(landed.len())]));
+    }
+    if entry.conflicts > 0 {
+        line.push_str(&format!(
+            " [{} conflict{}{}]",
+            entry.conflicts,
+            if entry.conflicts == 1 { "" } else { "s" },
+            if entry.hard { ", hard" } else { "" }
+        ));
+    }
+    if let Some(reason) = &entry.reason {
+        line.push_str(&format!(" ({reason})"));
+    }
+    println!("{line}");
+}
+
+pub fn run_submit(json: bool, target: &Target, change: String) -> Result<()> {
+    txn::parse_change(&change)?;
+    let session = Session::open(target)?;
+    let reply = block_on(session.backend().submit(proto::SubmitRequest { change }))?;
     if json {
-        output::print_json(&view)?;
-    } else {
-        println!("queued {} at position {}", view.change, view.seq);
+        output::print_json(&reply)?;
+    } else if let Some(entry) = &reply.entry {
+        println!("queued {} at position {}", entry.change, entry.seq);
     }
     Ok(())
 }
 
-pub fn run_queue(json: bool, mine: bool) -> Result<()> {
-    let repo = txn::open()?;
-    let me = txn::actor();
-    let me = crate::resolve::actor_id(&me).to_owned();
-    let entries: Vec<EntryView> = block_on(repo.queue())?
-        .iter()
-        .map(|entry| view(&repo, entry))
-        .filter(|view| !mine || view.actor == me)
-        .collect();
+pub fn run_queue(json: bool, target: &Target, mine: bool) -> Result<()> {
+    let session = Session::open(target)?;
+    let me = mine.then(|| {
+        let actor = txn::actor();
+        crate::resolve::actor_id(&actor).to_owned()
+    });
+    let reply = block_on(session.backend().queue(proto::QueueQuery {
+        actor: me,
+        ..Default::default()
+    }))?;
     if json {
-        output::print_json(&entries)?;
-    } else if entries.is_empty() {
+        output::print_json(&reply)?;
+    } else if reply.entries.is_empty() {
         println!("queue is empty");
     } else {
-        for entry in &entries {
+        for entry in &reply.entries {
             print_entry(entry);
         }
     }
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct LandResult {
-    processed: Vec<EntryView>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    change: Option<EntryView>,
-    head: Option<String>,
-}
-
-pub fn run_land(json: bool, local: bool, change: Option<String>) -> Result<()> {
+/// `hord land --local`: in this process with `--no-daemon`; otherwise the
+/// daemon's (or remote's) lander runs on its own, so this submits the
+/// change, if given, and waits until nothing is queued.
+pub fn run_land(json: bool, target: &Target, local: bool, change: Option<String>) -> Result<()> {
     if !local {
-        bail!("only `hord land --local` is available: no remote lander is configured");
+        bail!("pass --local: `hord land` lands in this repository (see `hord submit` for remotes)");
     }
     let change = change.as_deref().map(txn::parse_change).transpose()?;
-    let repo = txn::open()?;
-    if let Some(change) = change {
-        block_on(repo.submit(change))?;
-    }
-    let processed: Vec<EntryView> = block_on(repo.land_local())?
-        .iter()
-        .map(|entry| view(&repo, entry))
-        .collect();
-    let target = match change {
-        Some(change) => Some(view(&repo, &block_on(repo.status(change))?)),
-        None => None,
-    };
-    let head = block_on(repo.head())?.change.map(txn::hex);
-    let result = LandResult {
-        processed,
-        change: target,
-        head,
+    let session = Session::open(target)?;
+    let result = match &session {
+        Session::Direct { repo } => {
+            if let Some(change) = change {
+                block_on(repo.submit(change))?;
+            }
+            let processed: Vec<proto::QueueEntry> = block_on(repo.land_local())?
+                .iter()
+                .map(|entry| {
+                    let record = block_on(repo.change(entry.change)).ok();
+                    hord_txn::queue_entry_message(entry, record.as_ref())
+                })
+                .collect();
+            let target = match change {
+                Some(change) => Some(hord_txn::queue_entry_message(
+                    &block_on(repo.status(change))?,
+                    block_on(repo.change(change)).ok().as_ref(),
+                )),
+                None => None,
+            };
+            proto::LandResult {
+                processed,
+                change: target,
+                head: block_on(repo.head())?.change.map(txn::hex),
+            }
+        }
+        _ => wait_for_lander(session.backend().as_ref(), change)?,
     };
     if json {
         output::print_json(&result)?;
@@ -94,16 +137,178 @@ pub fn run_land(json: bool, local: bool, change: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn run_conflicts(json: bool, change: String) -> Result<()> {
-    let change = txn::parse_change(&change)?;
-    let repo = txn::open()?;
-    let report = block_on(repo.conflicts(change))?;
-    let entry = block_on(repo.status(change)).ok();
-    let view = txn::report_view(&repo, &report, entry.as_ref())?;
+/// Submit `change` (if any) and wait until the backend's queue is empty.
+/// `processed` is every entry that settled meanwhile.
+fn wait_for_lander(
+    backend: &dyn RepoBackend,
+    change: Option<hord_core::ChangeId>,
+) -> Result<proto::LandResult> {
+    let pending = |backend: &dyn RepoBackend| -> Result<Vec<proto::QueueEntry>> {
+        Ok(block_on(backend.queue(proto::QueueQuery {
+            pending_only: true,
+            ..Default::default()
+        }))?
+        .entries)
+    };
+    let mut events = block_on(backend.events(proto::EventsRequest { from: None }))?;
+    if let Some(change) = change {
+        block_on(backend.submit(proto::SubmitRequest {
+            change: wire::id(change),
+        }))?;
+    }
+    let mut waiting: Vec<String> = pending(backend)?.into_iter().map(|e| e.change).collect();
+    let mut settled = Vec::new();
+    while !waiting.is_empty() {
+        let next =
+            block_on(async { tokio::time::timeout(Duration::from_secs(1), events.next()).await });
+        match next {
+            Ok(Some(Ok(envelope))) => {
+                let id = match envelope.event.and_then(|e| e.kind) {
+                    Some(Kind::Landed(l)) => l.submitted.unwrap_or(l.change),
+                    Some(Kind::Parked(p)) => p.change,
+                    Some(Kind::Rejected(r)) => r.change,
+                    _ => continue,
+                };
+                if waiting.contains(&id) {
+                    settled.push(id);
+                }
+            }
+            Ok(Some(Err(err))) => return Err(err.into()),
+            Ok(None) => bail!("the lander's event stream ended"),
+            // Re-check the queue now and then, in case an event was missed.
+            Err(_) => {}
+        }
+        waiting = pending(backend)?.into_iter().map(|e| e.change).collect();
+    }
+    let all = block_on(backend.queue(proto::QueueQuery::default()))?.entries;
+    let processed = settled
+        .iter()
+        .filter_map(|id| all.iter().rev().find(|e| &e.change == id).cloned())
+        .collect();
+    let target = change.and_then(|change| {
+        let id = wire::id(change);
+        all.iter()
+            .rev()
+            .find(|e| e.change == id || e.landed.as_deref() == Some(id.as_str()))
+            .cloned()
+    });
+    let head = block_on(backend.head(proto::HeadRequest {}))?.change;
+    Ok(proto::LandResult {
+        processed,
+        change: target,
+        head,
+    })
+}
+
+pub fn run_conflicts(json: bool, target: &Target, change: String) -> Result<()> {
+    txn::parse_change(&change)?;
+    let session = Session::open(target)?;
+    let entries = block_on(session.backend().queue(proto::QueueQuery {
+        change: Some(change.clone()),
+        ..Default::default()
+    }))?
+    .entries;
+    let entry = entries.last().cloned();
+    let report = match entry.as_ref().and_then(|e| e.report.clone()) {
+        Some(report) => report,
+        // Not processed yet: the set check against head, computed where the
+        // store is.
+        None => match &session {
+            Session::Direct { repo } => {
+                let id = txn::parse_change(&change)?;
+                let report = block_on(repo.conflicts(id))?;
+                hord_txn::conflict_report_message(&report)
+            }
+            _ => bail!(
+                "change {change} has not been processed by the lander; `hord conflicts` \
+                 explains a change once it has (see `hord queue`)"
+            ),
+        },
+    };
+    let result = proto::ConflictsResult {
+        report: Some(report),
+        entry,
+    };
     if json {
-        output::print_json(&view)?;
+        output::print_json(&result)?;
     } else {
-        txn::print_report(&view);
+        print_report(&result);
     }
     Ok(())
+}
+
+fn node_text(node: &proto::NodeRef) -> String {
+    match (&node.name, &node.path) {
+        (Some(name), Some(path)) => format!("{name} ({path})"),
+        (None, Some(path)) => format!("{} ({path})", node.id),
+        _ => node.id.clone(),
+    }
+}
+
+fn kind_name(kind: proto::ConflictKind) -> &'static str {
+    match kind {
+        proto::ConflictKind::WriteWrite => "write-write",
+        proto::ConflictKind::ReadWrite => "read-write",
+        proto::ConflictKind::WriteRead => "write-read",
+        proto::ConflictKind::Unspecified => "conflict",
+    }
+}
+
+fn print_report(result: &proto::ConflictsResult) {
+    let Some(report) = &result.report else {
+        return;
+    };
+    let status = result.entry.as_ref().map_or("not submitted", status_name);
+    println!(
+        "change {} ({status})",
+        &report.change[..12.min(report.change.len())]
+    );
+    let n = report.checked_against.len();
+    println!(
+        "checked against {n} landed change{} since its base",
+        if n == 1 { "" } else { "s" }
+    );
+    if report.clean {
+        println!("no conflicts");
+    }
+    for c in &report.conflicts {
+        let mut what: Vec<String> = c.nodes.iter().map(node_text).collect();
+        what.extend(c.paths.iter().map(|p| format!("file {p}")));
+        println!(
+            "{} with {} \"{}\": {}",
+            kind_name(c.kind()),
+            &c.landed[..12.min(c.landed.len())],
+            c.landed_summary,
+            what.join(", ")
+        );
+    }
+    for m in &report.merge {
+        let nodes: Vec<String> = m.nodes.iter().map(node_text).collect();
+        let nodes = if nodes.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", nodes.join(", "))
+        };
+        let severity = match m.severity() {
+            proto::MergeSeverity::Hard => "hard",
+            _ => "soft",
+        };
+        println!("merge {severity} {}: {}{nodes}", m.path, m.reason);
+    }
+    if !report.adapter_merged.is_empty() {
+        let paths: Vec<&str> = report
+            .adapter_merged
+            .iter()
+            .map(|m| m.path.as_str())
+            .collect();
+        println!("merged by adapter: {}", paths.join(", "));
+    }
+    if let Some(reason) = &report.verification {
+        println!("verification failed: {reason}");
+    }
+    match result.entry.as_ref().map(status_name) {
+        Some("conflicted") => println!("parked: needs replay (spec §6.4)"),
+        Some("landed") if !report.clean => println!("landed, flagged for re-verification"),
+        _ => {}
+    }
 }

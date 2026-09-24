@@ -22,7 +22,10 @@ const BODY_SECRET: &str = "INTENT-BODY-SECRET";
 const EVIDENCE_SECRET: &str = "EVIDENCE-BYTES-SECRET";
 
 fn hord_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_hord"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hord"));
+    // Daemons these tests start exit soon after (ADR 0021).
+    cmd.env("HORD_DAEMON_IDLE_SECS", "5");
+    cmd
 }
 
 fn hord_in(dir: &Path, args: &[&str]) -> Output {
@@ -85,6 +88,16 @@ fn strings(value: &serde_json::Value, key: &str) -> Vec<String> {
                 .unwrap_or_else(|| panic!("non-string in {key}: {item}"))
                 .to_owned()
         })
+        .collect()
+}
+
+/// Ids of `hord log --json`'s changes (`LogResult`), oldest first.
+fn log_ids(value: &serde_json::Value) -> Vec<String> {
+    value["changes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing changes in {value}"))
+        .iter()
+        .map(|c| c["change"].as_str().unwrap().to_owned())
         .collect()
 }
 
@@ -461,7 +474,7 @@ fn unfiltered_log_lists_every_landed_id() {
     let value = json_stdout(&out, &["log", "--json"]);
     let mut expected = id_list(&seed.changes());
     expected.push(seed.blob.to_string());
-    assert_eq!(strings(&value, "log"), expected);
+    assert_eq!(log_ids(&value), expected);
     let head = seed.read_alpha.to_string();
     assert_eq!(value["head"].as_str(), Some(head.as_str()));
 }
@@ -490,16 +503,12 @@ fn log_filters_by_node_path_actor_and_since() {
         (&by_upper, "--node HEX"),
         (&by_name, "--node name"),
     ] {
-        assert_eq!(
-            strings(&json_stdout(out, &[args]), "log"),
-            expected,
-            "{args}"
-        );
+        assert_eq!(log_ids(&json_stdout(out, &[args])), expected, "{args}");
     }
 
     let beta = hord_in(dir, &["log", "--json", "--node", &seed.beta.to_string()]);
     assert_eq!(
-        strings(&json_stdout(&beta, &["log", "--node", "beta"]), "log"),
+        log_ids(&json_stdout(&beta, &["log", "--node", "beta"])),
         id_list(&[&seed.edit_both, &seed.edit_beta, &seed.delete_beta])
     );
 
@@ -510,45 +519,42 @@ fn log_filters_by_node_path_actor_and_since() {
         &seed.edit_both,
         &seed.edit_beta,
     ]);
-    assert_eq!(
-        strings(&json_stdout(&path, &["log", "--path"]), "log"),
-        path_ids
-    );
+    assert_eq!(log_ids(&json_stdout(&path, &["log", "--path"])), path_ids);
     let dir_path = hord_in(dir, &["log", "--json", "--path", "src"]);
     assert_eq!(
-        strings(&json_stdout(&dir_path, &["log", "--path", "src"]), "log"),
+        log_ids(&json_stdout(&dir_path, &["log", "--path", "src"])),
         path_ids
     );
     let missed = hord_in(dir, &["log", "--json", "--path", "src/lib"]);
     assert_eq!(
-        strings(&json_stdout(&missed, &["log", "--path", "src/lib"]), "log"),
+        log_ids(&json_stdout(&missed, &["log", "--path", "src/lib"])),
         Vec::<String>::new()
     );
 
     let actor = hord_in(dir, &["log", "--json", "--actor", AGENT]);
     assert_eq!(
-        strings(&json_stdout(&actor, &["log", "--actor"]), "log"),
+        log_ids(&json_stdout(&actor, &["log", "--actor"])),
         id_list(&[&seed.edit_both])
     );
     let model = hord_in(dir, &["log", "--json", "--actor", "model"]);
     assert_eq!(
-        strings(&json_stdout(&model, &["log", "--actor", "model"]), "log"),
+        log_ids(&json_stdout(&model, &["log", "--actor", "model"])),
         Vec::<String>::new()
     );
 
     let since = hord_in(dir, &["log", "--json", "--since", "5000"]);
     assert_eq!(
-        strings(&json_stdout(&since, &["log", "--since"]), "log"),
+        log_ids(&json_stdout(&since, &["log", "--since"])),
         id_list(&[&seed.edit_both, &seed.edit_beta, &seed.delete_beta])
     );
     let boundary = hord_in(dir, &["log", "--json", "--since", "9000"]);
     assert_eq!(
-        strings(&json_stdout(&boundary, &["log", "--since", "9000"]), "log"),
+        log_ids(&json_stdout(&boundary, &["log", "--since", "9000"])),
         id_list(&[&seed.edit_beta, &seed.delete_beta])
     );
     let all_changes = hord_in(dir, &["log", "--json", "--since", "0"]);
     assert_eq!(
-        strings(&json_stdout(&all_changes, &["log", "--since", "0"]), "log"),
+        log_ids(&json_stdout(&all_changes, &["log", "--since", "0"])),
         id_list(&seed.changes())
     );
 
@@ -568,7 +574,7 @@ fn log_filters_by_node_path_actor_and_since() {
         ],
     );
     assert_eq!(
-        strings(&json_stdout(&combined, &["log", "combined"]), "log"),
+        log_ids(&json_stdout(&combined, &["log", "combined"])),
         id_list(&[&seed.edit_both])
     );
 
@@ -768,13 +774,13 @@ fn qualified_name_uses_the_newest_identity_snapshot() {
     };
     let out = hord_in(dir.path(), &["log", "--json", "--node", "alpha"]);
     let value = json_stdout(&out, &["log", "--node", "alpha"]);
-    assert_eq!(strings(&value, "log"), vec![c_new.to_string()]);
+    assert_eq!(log_ids(&value), vec![c_new.to_string()]);
     let by_old = hord_in(
         dir.path(),
         &["log", "--json", "--node", &old_node.to_string()],
     );
     let by_old = json_stdout(&by_old, &["log", "--node", "old"]);
-    assert_eq!(strings(&by_old, "log"), vec![c_old.to_string()]);
+    assert_eq!(log_ids(&by_old), vec![c_old.to_string()]);
 }
 
 #[test]
@@ -823,17 +829,11 @@ fn log_path_uses_the_result_location_when_the_node_moved() {
 
     let at_old = hord_in(dir.path(), &["log", "--json", "--path", "src/old.rs"]);
     assert_eq!(
-        strings(
-            &json_stdout(&at_old, &["log", "--path", "src/old.rs"]),
-            "log"
-        ),
+        log_ids(&json_stdout(&at_old, &["log", "--path", "src/old.rs"])),
         Vec::<String>::new()
     );
     let at_new = hord_in(dir.path(), &["log", "--json", "--path", "src/new.rs"]);
-    let ids = strings(
-        &json_stdout(&at_new, &["log", "--path", "src/new.rs"]),
-        "log",
-    );
+    let ids = log_ids(&json_stdout(&at_new, &["log", "--path", "src/new.rs"]));
     assert_eq!(ids.len(), 2, "{ids:?}");
     assert_eq!(ids[0], moved.to_string());
 }
@@ -859,7 +859,7 @@ fn query_without_a_snapshot_fails() {
         &["log", "--json", "--node", "01ARZ3NDEKTSV4RRFFQ69G5FAV"],
     );
     let log = json_stdout(&log, &["log", "--node"]);
-    assert_eq!(strings(&log, "log"), Vec::<String>::new());
+    assert_eq!(log_ids(&log), Vec::<String>::new());
 
     let bad = hord_in(dir.path(), &["query", "--json", "references", "not-a-node"]);
     let err = json_error(&bad, &["query", "not-a-node"]);

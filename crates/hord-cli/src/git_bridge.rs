@@ -40,6 +40,30 @@ pub struct ExportReport {
     pub git_commit: Option<String>,
 }
 
+impl ImportReport {
+    /// The `hord.proto` message.
+    pub fn message(&self) -> hord_api::proto::GitImportResult {
+        hord_api::proto::GitImportResult {
+            git_path: self.git_path.clone(),
+            git_ref: self.git_ref.clone(),
+            head: self.head.clone(),
+            changes: self.changes,
+        }
+    }
+}
+
+impl ExportReport {
+    /// The `hord.proto` message.
+    pub fn message(&self) -> hord_api::proto::GitExportResult {
+        hord_api::proto::GitExportResult {
+            r#ref: self.hord_ref.clone(),
+            git_path: self.git_path.clone(),
+            git_tree: self.git_tree.clone(),
+            git_commit: self.git_commit.clone(),
+        }
+    }
+}
+
 /// Fail if the git path is not a repository.
 pub fn ensure_git_repo(path: &Path) -> Result<()> {
     if !path.exists() {

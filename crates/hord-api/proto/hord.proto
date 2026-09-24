@@ -1,0 +1,1076 @@
+// The Hord API (ADR 0024): the one schema for the remote protocol, the web
+// UI, and `hord --json` (the canonical protobuf JSON mapping of these
+// messages).
+//
+// Conventions:
+// - An ObjectId (ChangeId, SnapshotId, evidence and blob ids) is a string of
+//   64 lowercase hex digits: the BLAKE3-256 of the object's canonical CBOR
+//   (spec §3.1, §3.9).
+// - A NodeId is a string of 26 Crockford Base32 characters (ULID text).
+// - An object travels as `bytes` holding its canonical CBOR; hashing and
+//   object encoding are unchanged (spec §3.9).
+// - Times are milliseconds since the Unix epoch.
+// - `RepoBackend` is spec §10.5.2, method for method.
+syntax = "proto3";
+
+package hord.v1;
+
+// ---------------------------------------------------------------- services
+
+// One repository: spec §10.5.2 `RepoBackend`, method for method.
+service RepoBackend {
+  // Objects by id, in request order. At most 1,000 ids, and a response of
+  // at most 16 MiB. A missing id is NOT_FOUND.
+  rpc GetObjects(GetObjectsRequest) returns (GetObjectsResponse);
+  // Store objects. Each id must be the hash of its bytes. At most 1,000
+  // objects or 16 MiB per request.
+  rpc PutObjects(PutObjectsRequest) returns (PutObjectsResponse);
+  // Whether each id is stored, in request order. At most 1,000 ids.
+  rpc Has(HasRequest) returns (HasResponse);
+  // Streaming form of GetObjects for large sets; no per-call id limit.
+  rpc StreamObjects(GetObjectsRequest) returns (stream Object);
+
+  // The latest landed change (spec §3.7).
+  rpc Head(HeadRequest) returns (HeadResponse);
+  // Landed changes, newest first.
+  rpc Log(LogQuery) returns (LogPage);
+  // Named refs (spec §3.7).
+  rpc Refs(RefsRequest) returns (RefsResponse);
+
+  // Hand a proposed change to the lander (spec §6.2).
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  // Lander queue entries, in submission order.
+  rpc Queue(QueueQuery) returns (QueueResponse);
+  // Resolve a parked change (spec §6.4 rung 3). UNIMPLEMENTED until M5.
+  rpc Arbitrate(ArbitrateRequest) returns (ArbitrateResponse);
+
+  // Landed changes that touched a node, in landing order.
+  rpc NodeHistory(NodeHistoryRequest) returns (NodeHistoryResponse);
+  // Targets of one kind of edge leaving a node in a snapshot (spec §3.8).
+  rpc Edges(EdgesRequest) returns (EdgesResponse);
+  // Definitions in a snapshot with this qualified name (exact matches, or
+  // else those whose name ends in `::name`).
+  rpc ResolveName(ResolveNameRequest) returns (ResolveNameResponse);
+
+  // Attach evidence to a change's result snapshot (ADR 0025).
+  rpc AttachEvidence(AttachEvidenceRequest) returns (AttachEvidenceResponse);
+
+  // The event stream (spec §10.5.3), resumable from a cursor.
+  rpc Events(EventsRequest) returns (stream EventEnvelope);
+}
+
+// Workspace commands, served only by a repository's local daemon (ADR 0024
+// amendment, ADR 0021): the daemon owns the store, so it parses, carries
+// identity, and proposes with warm caches on the caller's behalf. `hord
+// serve` for true remotes does not serve it in M4; against a remote, the CLI
+// runs these commands itself over a local cache store.
+service Workspaces {
+  // Create a directory workspace (`hord ws new`).
+  rpc WsNew(WsNewRequest) returns (WsNewResponse);
+  // List workspaces (`hord ws list`).
+  rpc WsList(WsListRequest) returns (WsListResponse);
+  // Delete a workspace (`hord ws rm`).
+  rpc WsRm(WsRmRequest) returns (WsRmResponse);
+  // Remove unused pristine checkouts (`hord ws gc`).
+  rpc WsGc(WsGcRequest) returns (WsGcResponse);
+  // What `propose` would record now (`hord status`).
+  rpc Status(StatusRequest) returns (StatusResponse);
+  // Build a change record from a workspace (`hord propose`).
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+  // Dry-run policy against a workspace (`hord policy check`).
+  rpc PolicyCheck(PolicyCheckRequest) returns (PolicyCheckResponse);
+  // Stop the daemon, releasing the store (for commands it does not serve).
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+// The schema itself, for agent harnesses and the web UI (ADR 0024).
+service Schema {
+  // This file's descriptor set and a JSON Schema generated from it.
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+}
+
+// ---------------------------------------------------------------- common
+
+// Who did something (spec §3.5 `Actor`).
+message Actor {
+  oneof kind {
+    // A human author.
+    Human human = 1;
+    // An agent author with its model and harness.
+    Agent agent = 2;
+  }
+}
+
+// A human author.
+message Human {
+  // Stable identifier for this person in the repository.
+  string id = 1;
+}
+
+// An agent author.
+message Agent {
+  // Stable identifier for this agent identity.
+  string id = 1;
+  // Model name as reported by the harness.
+  string model = 2;
+  // Hash of the model artifact or weights, if known.
+  bytes model_hash = 3;
+  // Harness that invoked the model.
+  string harness = 4;
+}
+
+// A definition id, with its name and file when the backend resolved them.
+message NodeRef {
+  // The NodeId.
+  string id = 1;
+  // Qualified name, when known.
+  optional string name = 2;
+  // File it lives in, when known.
+  optional string path = 3;
+}
+
+// A landed change in brief, for log and history listings.
+message ChangeSummary {
+  // The landed ChangeId.
+  string change = 1;
+  // Position in the landing log, from 0.
+  uint64 position = 2;
+  // Base snapshot.
+  string base = 3;
+  // Result snapshot.
+  string result = 4;
+  // Parent changes.
+  repeated string parents = 5;
+  // One-line intent summary.
+  string summary = 6;
+  // Author.
+  Actor actor = 7;
+  // When the record was created.
+  uint64 created_at_ms = 8;
+  // The submitted record this landed record was rebased from (ADR 0018).
+  optional string rebased_from = 9;
+}
+
+// Kinds of edges between nodes (spec §3.8).
+enum EdgeKind {
+  EDGE_KIND_UNSPECIFIED = 0;
+  // Structural parent/child between definitions.
+  EDGE_KIND_CONTAINS = 1;
+  // The source's body names the target.
+  EDGE_KIND_REFERENCES = 2;
+  // Build or type dependency, coarser than References.
+  EDGE_KIND_DEPENDS = 3;
+  // Test source exercises target.
+  EDGE_KIND_TESTS = 4;
+  // Source was split, renamed, or copied from target.
+  EDGE_KIND_DERIVED_FROM = 5;
+}
+
+// ---------------------------------------------------------------- objects
+
+// A stored object: its id and canonical CBOR.
+message Object {
+  // ObjectId: BLAKE3-256 of `cbor`.
+  string id = 1;
+  // Canonical CBOR (spec §3.9).
+  bytes cbor = 2;
+}
+
+// Ids to fetch.
+message GetObjectsRequest {
+  // ObjectIds.
+  repeated string ids = 1;
+}
+
+// Fetched objects, in request order.
+message GetObjectsResponse {
+  // One per requested id.
+  repeated Object objects = 1;
+}
+
+// Objects to store.
+message PutObjectsRequest {
+  // Each id must be the hash of its bytes.
+  repeated Object objects = 1;
+}
+
+// Objects stored.
+message PutObjectsResponse {}
+
+// Ids to probe.
+message HasRequest {
+  // ObjectIds.
+  repeated string ids = 1;
+}
+
+// Presence of each probed id.
+message HasResponse {
+  // One per requested id, in order.
+  repeated bool present = 1;
+}
+
+// ---------------------------------------------------------------- log & refs
+
+// Arguments to Head.
+message HeadRequest {}
+
+// The latest landed change.
+message HeadResponse {
+  // Unset before anything lands.
+  optional string change = 1;
+}
+
+// Filters and paging for Log.
+message LogQuery {
+  // Continue after (older than) this landed change: the previous page's
+  // `next`.
+  optional string after = 1;
+  // Only changes by this actor id.
+  optional string actor = 2;
+  // Only changes that touched this NodeId.
+  optional string node = 3;
+  // Only changes that wrote something at or under this path.
+  optional string path = 4;
+  // Page size; 0 means the default (100).
+  uint32 limit = 5;
+  // Only changes created at or after this time.
+  optional uint64 since_ms = 6;
+}
+
+// One page of the log, newest first.
+message LogPage {
+  // Landed changes.
+  repeated ChangeSummary items = 1;
+  // Pass as `after` for the next page; unset on the last page.
+  optional string next = 2;
+}
+
+// Arguments to Refs.
+message RefsRequest {
+  // Only refs whose name starts with this; empty for all.
+  string prefix = 1;
+}
+
+// Named refs.
+message RefsResponse {
+  // Ref name to the ObjectId it names (a change or a snapshot).
+  map<string, string> refs = 1;
+}
+
+// ---------------------------------------------------------------- lander
+
+// Arguments to Submit.
+message SubmitRequest {
+  // The proposed ChangeId.
+  string change = 1;
+}
+
+// The submission.
+message SubmitResponse {
+  // SubmissionId: the queue sequence number.
+  uint64 submission = 1;
+  // The queue entry, which may already exist (a resubmission).
+  QueueEntry entry = 2;
+}
+
+// Filters for Queue.
+message QueueQuery {
+  // Only entries whose change was authored by this actor id (`--mine`).
+  optional string actor = 1;
+  // Only entries that name this change (submitted or landed id).
+  optional string change = 2;
+  // Only entries still waiting for the lander.
+  bool pending_only = 3;
+}
+
+// Queue entries in submission order.
+message QueueResponse {
+  // Matching entries.
+  repeated QueueEntry entries = 1;
+}
+
+// Where a submission is in the lander (spec §6.2, §6.7).
+enum QueueStatus {
+  QUEUE_STATUS_UNSPECIFIED = 0;
+  // Waiting for the lander.
+  QUEUE_STATUS_QUEUED = 1;
+  // Appended to the log.
+  QUEUE_STATUS_LANDED = 2;
+  // Parked: a hard merge conflict or failed verification; needs a replay.
+  QUEUE_STATUS_CONFLICTED = 3;
+  // Not landed and not replayable as is.
+  QUEUE_STATUS_REJECTED = 4;
+}
+
+// One submission in the lander queue (`hord queue`).
+message QueueEntry {
+  // Position in the queue; submission order. Also the SubmissionId.
+  uint64 seq = 1;
+  // The submitted change.
+  string change = 2;
+  // Current status.
+  QueueStatus status = 3;
+  // The id it landed under, when landed.
+  optional string landed = 4;
+  // Why it was rejected, when rejected.
+  optional string reason = 5;
+  // One-line intent summary of the change.
+  string summary = 6;
+  // Author of the change.
+  Actor actor = 7;
+  // When it was submitted.
+  uint64 submitted_at_ms = 8;
+  // When the status last changed.
+  uint64 updated_at_ms = 9;
+  // Set overlaps plus merge conflicts in the report.
+  uint32 conflicts = 10;
+  // Whether any merge conflict is hard.
+  bool hard = 11;
+  // The lander's findings; unset while queued.
+  ConflictReport report = 12;
+}
+
+// Which rule of spec §6.3 a set conflict broke.
+enum ConflictKind {
+  CONFLICT_KIND_UNSPECIFIED = 0;
+  // Both wrote the same definition or path.
+  CONFLICT_KIND_WRITE_WRITE = 1;
+  // The change read something a landed change wrote.
+  CONFLICT_KIND_READ_WRITE = 2;
+  // The change wrote something a landed change read (strict reads only).
+  CONFLICT_KIND_WRITE_READ = 3;
+}
+
+// Overlap with one landed change (spec §6.3).
+message SetConflict {
+  // Rule that fired.
+  ConflictKind kind = 1;
+  // Landed change it collided with.
+  string landed = 2;
+  // Definitions in the intersection.
+  repeated NodeRef nodes = 3;
+  // Files in the intersection.
+  repeated string paths = 4;
+  // Intent summary of the landed change, when the backend resolved it.
+  string landed_summary = 5;
+}
+
+// Hard or soft structural-merge outcome (spec §5.2).
+enum MergeSeverity {
+  MERGE_SEVERITY_UNSPECIFIED = 0;
+  // Could not be merged; the change does not land.
+  MERGE_SEVERITY_HARD = 1;
+  // Merged by a deterministic tie-break; flagged for the verifier.
+  MERGE_SEVERITY_SOFT = 2;
+}
+
+// One file's structural-rebase conflict.
+message MergeConflict {
+  // File that was merged.
+  string path = 1;
+  // Hard or soft.
+  MergeSeverity severity = 2;
+  // Definitions in contention.
+  repeated NodeRef nodes = 3;
+  // Why, in words.
+  string reason = 4;
+}
+
+// A file an adapter merge resolved with no conflict (ADR 0013).
+message AdapterMerge {
+  // The merged file.
+  string path = 1;
+  // Ids that belong to the file.
+  repeated string nodes = 2;
+}
+
+// Machine-readable account of a change's conflicts (`hord conflicts`).
+message ConflictReport {
+  // The change that was checked (as submitted).
+  string change = 1;
+  // Its base snapshot.
+  string base = 2;
+  // Head the check ran against; unset on an empty log.
+  optional string head = 3;
+  // Changes landed after the base, in landing order.
+  repeated string checked_against = 4;
+  // Whether write-read conflicts were checked.
+  bool strict_reads = 5;
+  // No overlap, no merge conflict, no verification failure.
+  bool clean = 6;
+  // Set overlaps with landed changes.
+  repeated SetConflict conflicts = 7;
+  // Structural-rebase outcomes other than a clean merge.
+  repeated MergeConflict merge = 8;
+  // Why verification failed, if it did.
+  optional string verification = 9;
+  // Files resolved by an adapter merge with no conflict.
+  repeated AdapterMerge adapter_merged = 10;
+}
+
+// How to resolve a parked change (spec §10.5.2).
+message Arbitration {
+  oneof action {
+    // Keep what landed; drop the parked change.
+    bool pick_ours = 1;
+    // Take the parked change over what landed.
+    bool pick_theirs = 2;
+    // Hand it to the replay harness.
+    bool replay = 3;
+    // A ChangeId that resolves it.
+    string resolved = 4;
+  }
+}
+
+// Arguments to Arbitrate.
+message ArbitrateRequest {
+  // The parked change.
+  string change = 1;
+  // What to do.
+  Arbitration action = 2;
+}
+
+// The change that resolved it.
+message ArbitrateResponse {
+  // ChangeId of the resolution.
+  string change = 1;
+}
+
+// ---------------------------------------------------------------- queries
+
+// Arguments to NodeHistory.
+message NodeHistoryRequest {
+  // The NodeId.
+  string node = 1;
+}
+
+// Changes that touched a node, in landing order.
+message NodeHistoryResponse {
+  // Landed changes.
+  repeated ChangeSummary changes = 1;
+}
+
+// Arguments to Edges.
+message EdgesRequest {
+  // SnapshotId.
+  string snapshot = 1;
+  // Source NodeId.
+  string node = 2;
+  // Edge kind.
+  EdgeKind kind = 3;
+}
+
+// Edge targets, in id order.
+message EdgesResponse {
+  // Target NodeIds.
+  repeated string nodes = 1;
+}
+
+// Arguments to ResolveName.
+message ResolveNameRequest {
+  // SnapshotId.
+  string snapshot = 1;
+  // Qualified name, or its last segments.
+  string name = 2;
+}
+
+// Matching definitions, in id order.
+message ResolveNameResponse {
+  // NodeIds.
+  repeated string nodes = 1;
+}
+
+// ---------------------------------------------------------------- evidence
+
+// Arguments to AttachEvidence.
+message AttachEvidenceRequest {
+  // The change (submitted or landed id) whose result the evidence is for.
+  string change = 1;
+  // Canonical CBOR of an Evidence object (spec §3.6).
+  bytes evidence = 2;
+}
+
+// The stored evidence.
+message AttachEvidenceResponse {
+  // ObjectId of the Evidence object.
+  string evidence = 1;
+}
+
+// What kind of check a piece of evidence records (spec §3.6).
+message EvidenceKind {
+  oneof kind {
+    // Type-check / compile.
+    bool check = 1;
+    // Test run.
+    bool test = 2;
+    // Benchmark.
+    bool bench = 3;
+    // Linter.
+    bool lint = 4;
+    // Human or agent review.
+    bool review = 5;
+    // Adapter- or policy-defined kind.
+    string custom = 6;
+    // The lander's rebase attestation, naming the submitted change.
+    string rebase = 7;
+  }
+}
+
+// Outcome of a piece of evidence.
+message EvidenceResult {
+  oneof result {
+    // The check succeeded.
+    bool pass = 1;
+    // The check failed, with a summary.
+    string fail = 2;
+    // The check was not run, with the reason.
+    string skipped = 3;
+  }
+}
+
+// ---------------------------------------------------------------- events
+
+// Arguments to Events.
+message EventsRequest {
+  // Resume after this cursor: every event with a larger cursor, then live
+  // events. Unset: live events only. 0 replays the whole log.
+  optional uint64 from = 1;
+}
+
+// One event with its place in the repository's event log.
+message EventEnvelope {
+  // EventCursor: monotonic per repository, from 1.
+  uint64 cursor = 1;
+  // When it was recorded.
+  uint64 at_ms = 2;
+  // The event.
+  Event event = 3;
+}
+
+// A lander or verifier event (spec §10.5.3).
+message Event {
+  oneof kind {
+    // A change entered the queue.
+    Submitted submitted = 1;
+    // The lander checked a change for conflicts.
+    ConflictCheck conflict_check = 2;
+    // Verification started.
+    Verifying verifying = 3;
+    // Evidence was attached.
+    EvidenceAttached evidence_attached = 4;
+    // The replay harness is working on a change.
+    Replaying replaying = 5;
+    // A change was parked.
+    Parked parked = 6;
+    // A parked change was resolved.
+    Arbitrated arbitrated = 7;
+    // A change landed.
+    Landed landed = 8;
+    // A change was rejected.
+    Rejected rejected = 9;
+    // Head moved.
+    HeadMoved head_moved = 10;
+  }
+}
+
+// A change entered the lander queue.
+message Submitted {
+  // SubmissionId.
+  uint64 submission = 1;
+  // The submitted change.
+  string change = 2;
+  // Its author.
+  Actor actor = 3;
+}
+
+// Result of the serializability check and structural rebase.
+enum ConflictOutcome {
+  CONFLICT_OUTCOME_UNSPECIFIED = 0;
+  // No overlap with anything landed since the base.
+  CONFLICT_OUTCOME_CLEAN = 1;
+  // Overlaps or soft conflicts that the rebase resolved; flagged.
+  CONFLICT_OUTCOME_OVERLAP = 2;
+  // A hard merge conflict.
+  CONFLICT_OUTCOME_HARD = 3;
+}
+
+// The lander checked a change against what landed since its base.
+message ConflictCheck {
+  // The submitted change.
+  string change = 1;
+  // Outcome.
+  ConflictOutcome result = 2;
+  // Number of set conflicts.
+  uint32 set_conflicts = 3;
+  // Number of merge conflicts, hard or soft.
+  uint32 merge_conflicts = 4;
+}
+
+// What a verification plan will run, in brief.
+message VerifyPlanSummary {
+  // Commands to run.
+  repeated string commands = 1;
+  // Selected tests, when the plan selects.
+  uint32 selected_tests = 2;
+  // Evidence reused rather than re-run.
+  uint32 reused = 3;
+}
+
+// The lander started verifying a change.
+message Verifying {
+  // The change as it will land.
+  string change = 1;
+  // The plan.
+  VerifyPlanSummary plan = 2;
+}
+
+// Evidence was attached to a change's result snapshot.
+message EvidenceAttached {
+  // The change.
+  string change = 1;
+  // ObjectId of the Evidence object.
+  string evidence = 2;
+  // Its kind.
+  EvidenceKind kind = 3;
+  // Its result.
+  EvidenceResult result = 4;
+  // Its qualifier (ADR 0026), such as `selected` for a test run.
+  optional string qualifier = 5;
+}
+
+// The replay harness is working on a change.
+message Replaying {
+  // The change.
+  string change = 1;
+  // Attempt number, from 1.
+  uint32 attempt = 2;
+  // Harness name.
+  string harness = 3;
+}
+
+// Why a change was parked.
+enum ParkReason {
+  PARK_REASON_UNSPECIFIED = 0;
+  // A hard structural-merge conflict.
+  PARK_REASON_MERGE_CONFLICT = 1;
+  // Verification failed (a semantic conflict, spec §6.5).
+  PARK_REASON_VERIFICATION_FAILED = 2;
+  // Waiting for an arbiter.
+  PARK_REASON_NEEDS_ARBITRATION = 3;
+  // Waiting for review required by policy.
+  PARK_REASON_NEEDS_REVIEW = 4;
+}
+
+// A change was parked, not landed.
+message Parked {
+  // The submitted change.
+  string change = 1;
+  // Why.
+  ParkReason reason = 2;
+  // Details, in words.
+  string detail = 3;
+}
+
+// A parked change was resolved.
+message Arbitrated {
+  // The parked change.
+  string change = 1;
+  // Who resolved it.
+  Actor by = 2;
+  // The resolving change.
+  string result = 3;
+}
+
+// A change landed.
+message Landed {
+  // The id it landed under.
+  string change = 1;
+  // Its position in the landing log, from 0.
+  uint64 position = 2;
+  // The submitted id, when it landed as a rebased record (ADR 0018).
+  optional string submitted = 3;
+  // Evidence the lander attached to the landed snapshot (ADR 0025).
+  repeated string evidence = 4;
+}
+
+// A change was rejected.
+message Rejected {
+  // The submitted change.
+  string change = 1;
+  // Why.
+  string reason = 2;
+}
+
+// Head moved.
+message HeadMoved {
+  // Previous head; unset if nothing had landed.
+  optional string from = 1;
+  // New head.
+  string to = 2;
+}
+
+// ---------------------------------------------------------------- workspaces
+
+// Who a daemon acts for: the calling process's actor and session.
+message Caller {
+  // The actor (`HORD_ACTOR`, `HORD_AGENT_MODEL`).
+  Actor actor = 1;
+  // Harness session id (`HORD_SESSION`).
+  optional string session = 2;
+}
+
+// How a directory workspace is checked out (ADR 0016).
+enum Materialize {
+  MATERIALIZE_UNSPECIFIED = 0;
+  // Copy-on-write clone of the pristine checkout, else a copy.
+  MATERIALIZE_CLONE = 1;
+  // Plain copy.
+  MATERIALIZE_COPY = 2;
+}
+
+// Arguments to WsNew.
+message WsNewRequest {
+  // Who works in it.
+  Caller caller = 1;
+  // Base: a snapshot or change id, a ref name, or head (unset).
+  optional string base = 2;
+  // Checkout mode.
+  Materialize materialize = 3;
+}
+
+// A new workspace.
+message WsNewResponse {
+  // Workspace id (ULID).
+  string id = 1;
+  // Base snapshot.
+  string base = 2;
+  // Checkout directory.
+  string materialization = 3;
+  // Mode actually used: `clone` or `copy`.
+  string materialize = 4;
+}
+
+// Arguments to WsList.
+message WsListRequest {}
+
+// One workspace.
+message WorkspaceInfo {
+  // Workspace id.
+  string id = 1;
+  // Base snapshot.
+  string base = 2;
+  // Checkout directory.
+  string materialization = 3;
+}
+
+// Every workspace.
+message WsListResponse {
+  // In id order.
+  repeated WorkspaceInfo workspaces = 1;
+  // The current workspace (`hord status` without `-w`), if set.
+  optional string current = 2;
+}
+
+// Arguments to WsRm.
+message WsRmRequest {
+  // Workspace id.
+  string id = 1;
+}
+
+// A removed workspace.
+message WsRmResponse {
+  // Workspace id.
+  string id = 1;
+  // Whether it existed.
+  bool removed = 2;
+}
+
+// Arguments to WsGc.
+message WsGcRequest {}
+
+// Pristine checkouts removed.
+message WsGcResponse {
+  // Snapshots whose checkout was removed.
+  repeated string removed_pristine = 1;
+}
+
+// One operation of a change record (spec §3.5), flattened for display.
+message OpView {
+  // insert, delete, replace, move, rename, blob, or tree.
+  string op = 1;
+  // The node the op is about.
+  optional string node = 2;
+  // Parent (insert).
+  optional string parent = 3;
+  // Child index (insert, move).
+  optional uint32 index = 4;
+  // Previous object, name, or parent.
+  optional string from = 5;
+  // New object, name, or parent.
+  optional string to = 6;
+  // File (blob, tree).
+  optional string path = 7;
+  // Tree op kind (tree).
+  optional string kind = 8;
+  // One line, with names where known.
+  string text = 9;
+}
+
+// Arguments to Status.
+message StatusRequest {
+  // Who asks.
+  Caller caller = 1;
+  // Workspace id; unset: the current, else the only one.
+  optional string workspace = 2;
+  // Re-hash every file (ADR 0016).
+  bool paranoid = 3;
+}
+
+// What `propose` would record now (spec §10.3).
+message StatusResponse {
+  // Workspace id.
+  string workspace = 1;
+  // Base snapshot.
+  string base = 2;
+  // Head, if anything has landed.
+  optional string head = 3;
+  // Checkout directory.
+  string materialization = 4;
+  // `observed`, or `unobserved` for a directory workspace (ADR 0012).
+  string reads = 5;
+  // Whether there is anything to propose.
+  bool changes = 6;
+  // Operations.
+  repeated OpView ops = 7;
+  // Read set, with names.
+  repeated NodeRef read_set = 8;
+  // Write set, with names.
+  repeated NodeRef write_set = 9;
+  // Evidence ids.
+  repeated string evidence = 10;
+  // Whether that evidence is stale.
+  bool evidence_stale = 11;
+  // Untracked paths propose leaves out (a directory ends in `/`).
+  repeated string skipped = 12;
+}
+
+// Arguments to Propose.
+message ProposeRequest {
+  // Who proposes.
+  Caller caller = 1;
+  // Workspace id; unset: the current, else the only one.
+  optional string workspace = 2;
+  // The intent file's text: Markdown with YAML front matter.
+  string intent = 3;
+  // Where it was read, for errors.
+  string intent_path = 4;
+}
+
+// The proposed change.
+message ProposeResponse {
+  // ChangeId.
+  string change = 1;
+  // Workspace id.
+  string workspace = 2;
+  // Base snapshot.
+  string base = 3;
+  // Result snapshot.
+  string result = 4;
+  // Parent changes.
+  repeated string parents = 5;
+  // Intent summary.
+  string summary = 6;
+  // Number of ops.
+  uint32 ops = 7;
+  // Write set.
+  repeated string write_set = 8;
+  // Read set.
+  repeated string read_set = 9;
+  // `observed` or `unobserved`.
+  string reads = 10;
+  // Objects sent to the remote, when proposing against one.
+  optional uint32 pushed = 11;
+}
+
+// Arguments to PolicyCheck.
+message PolicyCheckRequest {
+  // Who asks.
+  Caller caller = 1;
+  // Workspace id; unset: the current, else the only one.
+  optional string workspace = 2;
+  // A policy file's path, to evaluate instead of head's.
+  optional string policy_path = 3;
+  // Its text.
+  optional string policy = 4;
+}
+
+// A policy decision. The result's shape is hord-policy's (ADR 0026), as
+// JSON, until it moves into this file.
+message PolicyCheckResponse {
+  // The `hord policy check --json` document.
+  string result_json = 1;
+  // Whether the policy denies the change.
+  bool deny = 2;
+}
+
+// Arguments to Shutdown.
+message ShutdownRequest {}
+
+// The daemon is stopping.
+message ShutdownResponse {}
+
+// ---------------------------------------------------------------- cli
+
+// `hord init`.
+message InitResult {
+  // The new `.hord/` directory.
+  string hord_dir = 1;
+  // Git repository imported from.
+  optional string from_git = 2;
+  // What was imported.
+  GitImportResult imported = 3;
+}
+
+// `hord git import`.
+message GitImportResult {
+  // The git repository.
+  string git_path = 1;
+  // Ref imported, when ref-scoped.
+  optional string git_ref = 2;
+  // Head after the import.
+  optional string head = 3;
+  // Changes in the log after the import.
+  uint64 changes = 4;
+}
+
+// `hord git export`.
+message GitExportResult {
+  // Hord ref or snapshot exported.
+  string ref = 1;
+  // Destination git repository.
+  string git_path = 2;
+  // Git tree written.
+  optional string git_tree = 3;
+  // Git commit written.
+  optional string git_commit = 4;
+}
+
+// `hord land --local`.
+message LandResult {
+  // Entries the lander processed, in order.
+  repeated QueueEntry processed = 1;
+  // The entry of the change given on the command line.
+  QueueEntry change = 2;
+  // Head afterwards.
+  optional string head = 3;
+}
+
+// `hord blame`.
+message BlameResult {
+  // The definition.
+  string node = 1;
+  // Changes that touched it, in landing order.
+  repeated BlameEntry history = 2;
+}
+
+// One change in a blame.
+message BlameEntry {
+  // ChangeId.
+  string change = 1;
+  // Intent summary.
+  string intent = 2;
+  // Actor id.
+  string actor = 3;
+  // Evidence ids in the record.
+  repeated string evidence = 4;
+}
+
+// `hord query`.
+message QueryResult {
+  // Snapshot queried (head's result).
+  string snapshot = 1;
+  // `references`, `dependents`, or `tests-of`.
+  string edge = 2;
+  // Source node.
+  string node = 3;
+  // Target nodes.
+  repeated string targets = 4;
+}
+
+// `hord conflicts`.
+message ConflictsResult {
+  // The report, with names where known.
+  ConflictReport report = 1;
+  // The change's queue entry, if it was submitted.
+  QueueEntry entry = 2;
+}
+
+// `hord log`.
+message LogResult {
+  // Head, if anything has landed.
+  optional string head = 1;
+  // Matching landed changes, oldest first.
+  repeated ChangeSummary changes = 2;
+}
+
+// One configured remote (`hord remote list`).
+message RemoteInfo {
+  // Its name.
+  string name = 1;
+  // Its address.
+  string url = 2;
+  // Whether it is the default upstream.
+  bool default = 3;
+}
+
+// `hord remote list`, `add`, `rm`, and `set-default`.
+message RemotesResult {
+  // Every remote, by name.
+  repeated RemoteInfo remotes = 1;
+}
+
+// A failed command (`--json` prints it on stderr).
+message ErrorResult {
+  // What went wrong.
+  string error = 1;
+  // A machine-readable kind, such as `store_locked`.
+  optional string kind = 2;
+  // The locked index file, for `store_locked`.
+  optional string lock = 3;
+  // The pid holding it, when known.
+  optional uint32 holder = 4;
+  // How long the command waited, in seconds.
+  optional double waited_secs = 5;
+}
+
+// ---------------------------------------------------------------- recordings
+
+// First line of a flight-recorder log (spec §10.4, M5 `GET
+// /api/v1/recordings/{id}`). The log is JSON Lines: this header, then one
+// EventEnvelope per line in cursor order, each in the canonical JSON
+// mapping. It is stored as a Blob object and named by that object's id.
+message RecordingHeader {
+  // Always "hord.recording.v1".
+  string format = 1;
+  // Repository the events came from.
+  string repo = 2;
+  // When recording started.
+  uint64 started_at_ms = 3;
+  // Events after this cursor were recorded.
+  uint64 from_cursor = 4;
+  // What was recorded, in words.
+  string description = 5;
+}
+
+// ---------------------------------------------------------------- schema
+
+// Arguments to GetSchema.
+message GetSchemaRequest {}
+
+// The published schema.
+message GetSchemaResponse {
+  // Serialized google.protobuf.FileDescriptorSet of hord.proto.
+  bytes descriptor_set = 1;
+  // JSON Schema (draft 2020-12) of the JSON mapping, generated from it.
+  string json_schema = 2;
+}

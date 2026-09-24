@@ -1,4 +1,6 @@
-//! Concurrent CLI processes on one repository wait for the store (ADR 0021).
+//! Concurrent CLI processes on one repository wait for the store (ADR 0021)
+//! when they open it themselves (`--no-daemon`). With the daemon, see
+//! `daemon.rs`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -40,6 +42,7 @@ fn hord(dir: &Path, args: &[&str], lock_timeout: Option<&str>) -> Command {
     cmd.args(args)
         .current_dir(dir)
         .env("HORD_ACTOR", "tester")
+        .env("HORD_NO_DAEMON", "1")
         .env_remove("HORD_AGENT_MODEL");
     match lock_timeout {
         Some(secs) => cmd.env("HORD_LOCK_TIMEOUT", secs),
@@ -140,7 +143,7 @@ fn zero_timeout_fails_fast_with_a_typed_json_error() {
     assert_eq!(v["kind"], "store_locked", "{v}");
     assert_eq!(v["holder"], std::process::id(), "{v}");
     assert!(v["lock"].as_str().unwrap().ends_with("index.redb"), "{v}");
-    assert!(v["waited_secs"].as_f64().unwrap() < 1.0, "{v}");
+    assert!(v["waitedSecs"].as_f64().unwrap() < 1.0, "{v}");
     let message = v["error"].as_str().unwrap();
     assert!(
         message.contains(&format!("locked by pid {}", std::process::id())),

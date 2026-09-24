@@ -22,6 +22,11 @@
 //! to and landed by a freshly opened repository that did not propose them
 //! (the M4 remote case, [`remote`]). Gate: throughput ≥ 20 changes/s.
 //!
+//! `--server` runs only the simulation, against a spawned `hord serve`
+//! with one client connection per agent, and writes a flight-recorder log
+//! of the event stream ([`server`]). Gates: M3's, plus the recording reads
+//! back.
+//!
 //! The process exits nonzero if any gate fails.
 //!
 //! ```text
@@ -29,6 +34,7 @@
 //! cargo run -p hord-eval-m3 --release --offline -- --json target/m3-eval.json
 //! cargo run -p hord-eval-m3 --release --offline -- --seed 7 --strict-reads
 //! cargo run -p hord-eval-m3 --release --offline -- --remote-submit
+//! cargo run -p hord-eval-m3 --release --offline -- --server
 //! ```
 //!
 //! The corpus is `cargo.git` under `--cache`, `$HORD_CORPORA`, or
@@ -40,6 +46,7 @@ mod corpus;
 mod lock;
 mod remote;
 mod rust;
+mod server;
 mod sim;
 mod workspaces;
 
@@ -84,6 +91,14 @@ struct Args {
     /// opened one (the M4 remote case). Runs only this simulation.
     #[arg(long)]
     remote_submit: bool,
+    /// Run the simulation against a spawned `hord serve`, one client
+    /// connection per agent, and record the event stream. Runs only this
+    /// simulation.
+    #[arg(long)]
+    server: bool,
+    /// Internal: serve the repository at this path (the `--server` child).
+    #[arg(long, hide = true, value_name = "DIR")]
+    internal_serve: Option<PathBuf>,
     /// Also write the full report as JSON to this path.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -135,6 +150,10 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<bool> {
+    if let Some(dir) = &args.internal_serve {
+        server::serve_child(dir, args.strict_reads)?;
+        return Ok(true);
+    }
     let git_dir = corpus::cache_dir(args.cache.as_deref())?.join("cargo.git");
     if !git_dir.is_dir() {
         anyhow::bail!("missing cargo corpus at {}", git_dir.display());
@@ -156,6 +175,9 @@ fn run(args: &Args) -> Result<bool> {
         .context("tokio runtime")?;
     if args.remote_submit {
         return runtime.block_on(remote_submit(args, &corpus, &scratch.0));
+    }
+    if args.server {
+        return runtime.block_on(server_run(args, &corpus, &scratch.0));
     }
     let report = runtime.block_on(evaluate(args, &corpus, &scratch.0))?;
     print(&report, args);
@@ -205,6 +227,69 @@ async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> 
             .with_context(|| format!("write {}", path.display()))?;
     }
     Ok(report.pass)
+}
+
+async fn server_run(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<bool> {
+    let files: Vec<(RepoPath, Vec<u8>)> = corpus
+        .files
+        .iter()
+        .filter_map(|(p, b)| p.parse::<RepoPath>().ok().map(|p| (p, b.clone())))
+        .collect();
+    let report = server::run(
+        scratch,
+        files,
+        &corpus.files,
+        &sim::SimConfig {
+            agents: args.agents,
+            overlap_percent: args.overlap_percent,
+            seed: args.seed,
+            strict_reads: args.strict_reads,
+            racy_submit: args.racy_submit,
+        },
+    )
+    .await?;
+    let gates = sim_gates(&report.sim);
+    println!(
+        "[server] {} over {} client connections; pushed {} objects ({:.2}s summed over agents)",
+        report.url, report.client_connections, report.objects_pushed, report.push_secs
+    );
+    print_sim(&report.sim, &gates);
+    println!(
+        "[server] flight recording {} ({} events) replays {}",
+        report.recording,
+        report.recorded_events,
+        pass_fail(report.recording_replays)
+    );
+    let all = gates.all && report.recording_replays;
+    println!("m3 --server {}", pass_fail(all));
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(all)
+}
+
+/// The simulation's gates.
+struct SimGates {
+    throughput: bool,
+    false_negatives: bool,
+    false_positive_rate: bool,
+    disjoint_landed: bool,
+    all: bool,
+}
+
+fn sim_gates(sim: &sim::SimReport) -> SimGates {
+    let throughput = sim.throughput >= 20.0;
+    let false_negatives = sim.false_negatives.is_empty();
+    let false_positive_rate = sim.false_positive_rate <= 0.10;
+    let disjoint_landed = sim.disjoint_not_landed.is_empty() && sim.disjoint > 0;
+    SimGates {
+        throughput,
+        false_negatives,
+        false_positive_rate,
+        disjoint_landed,
+        all: throughput && false_negatives && false_positive_rate && disjoint_landed,
+    }
 }
 
 async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<Report> {
@@ -268,25 +353,17 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
     let cargo_lock = lock::run(scratch, manifest, lockfile).await?;
 
     let gates = {
-        let throughput = sim.throughput >= 20.0;
-        let false_negatives = sim.false_negatives.is_empty();
-        let false_positive_rate = sim.false_positive_rate <= 0.10;
-        let disjoint_landed = sim.disjoint_not_landed.is_empty() && sim.disjoint > 0;
+        let sim_gates = sim_gates(&sim);
         let workspaces = workspaces::ok(&workspaces, args.workspaces);
         let cargo_lock = cargo_lock.iter().all(|c| c.pass);
         Gates {
-            throughput,
-            false_negatives,
-            false_positive_rate,
-            disjoint_landed,
+            throughput: sim_gates.throughput,
+            false_negatives: sim_gates.false_negatives,
+            false_positive_rate: sim_gates.false_positive_rate,
+            disjoint_landed: sim_gates.disjoint_landed,
             workspaces,
             cargo_lock,
-            all: throughput
-                && false_negatives
-                && false_positive_rate
-                && disjoint_landed
-                && workspaces
-                && cargo_lock,
+            all: sim_gates.all && workspaces && cargo_lock,
         }
     };
     Ok(Report {
@@ -306,9 +383,7 @@ fn pass_fail(ok: bool) -> &'static str {
     if ok { "PASS" } else { "FAIL" }
 }
 
-fn print(report: &Report, args: &Args) {
-    let sim = &report.sim;
-    let gates = &report.gates;
+fn print_sim(sim: &sim::SimReport, gates: &SimGates) {
     let kinds = |kind: sim::PairKind| sim.pairs.iter().filter(|p| p.2 == kind).count();
     println!(
         "[sim] seed {} agents {} (disjoint {}, overlapping {}: pairs write-write {} read-write {} name {}) target pool {} strict_reads {} racy_submit {}",
@@ -407,6 +482,11 @@ fn print(report: &Report, args: &Args) {
             sim.unknown_landed_refs
         );
     }
+}
+
+fn print(report: &Report, args: &Args) {
+    print_sim(&report.sim, &sim_gates(&report.sim));
+    let gates = &report.gates;
     let ws = &report.workspaces;
     println!(
         "[workspaces] begin p50 {:.1} µs p99 {:.1} µs max {:.1} µs over {} (target < 5 ms)",

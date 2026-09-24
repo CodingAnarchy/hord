@@ -19,6 +19,8 @@ use crate::pack::{self, PackWriter, PackedLocation, pack_path};
 use crate::workspace::WorkspaceRow;
 use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
 
+#[path = "evidence.rs"]
+mod evidence;
 #[path = "index.rs"]
 mod index;
 #[path = "lock.rs"]
@@ -398,6 +400,29 @@ impl Store {
             Some(v) => Ok(Some(object_id_from_value(v.value())?)),
             None => Ok(None),
         }
+    }
+
+    /// Named refs whose name starts with `prefix` (`""` for all), by name
+    /// (spec §3.7), including refs not yet flushed.
+    pub fn refs(&self, prefix: &str) -> Result<std::collections::BTreeMap<String, ObjectId>> {
+        let mut out = std::collections::BTreeMap::new();
+        let txn = self.db.begin_read().map_err(Error::index)?;
+        let table = txn.open_table(REFS).map_err(Error::index)?;
+        for row in table.range(prefix..).map_err(Error::index)? {
+            let (name, value) = row.map_err(Error::index)?;
+            let name = name.value();
+            if !name.starts_with(prefix) {
+                break;
+            }
+            out.insert(name.to_owned(), object_id_from_value(value.value())?);
+        }
+        let pending = lock_map(&self.pending_refs);
+        for (name, id) in pending.iter() {
+            if name.starts_with(prefix) {
+                out.insert(name.clone(), *id);
+            }
+        }
+        Ok(out)
     }
 
     /// Persist buffered refs and log entries to the redb index.
@@ -971,4 +996,37 @@ fn hex_encode(bytes: &[u8; ObjectId::LEN]) -> [u8; ObjectId::LEN * 2] {
         out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
     out
+}
+
+#[cfg(test)]
+mod refs_tests {
+    use hord_core::ObjectId;
+
+    use super::Store;
+
+    #[test]
+    fn refs_lists_flushed_and_pending_refs_by_prefix() {
+        let dir = std::env::temp_dir().join(format!("hord-store-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::create(&dir).unwrap();
+        let a = ObjectId::from_canonical(b"a");
+        let b = ObjectId::from_canonical(b"b");
+        store.set_ref("main", a).unwrap();
+        store.set_ref("release/1.0", b).unwrap();
+        store.flush().unwrap();
+        store.set_ref("release/1.1", a).unwrap();
+        store.set_ref("main", b).unwrap();
+        let all = store.refs("").unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all["main"], b, "a pending ref wins over the flushed one");
+        let release = store.refs("release/").unwrap();
+        assert_eq!(
+            release.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["release/1.0", "release/1.1"]
+        );
+        assert!(store.refs("zzz").unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

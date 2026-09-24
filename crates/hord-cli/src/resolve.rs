@@ -1,14 +1,11 @@
-//! Parse node specs and blame targets; resolution itself is
-//! [`hord_txn::Query`] (NodeIds read from the snapshots' identity, ADR 0017).
+//! Parse node specs and blame targets; resolution itself goes through the
+//! session's backend (NodeIds read from the snapshots' identity, ADR 0017).
 //!
 //! Node ids accept the ULID text [`NodeId`] displays and a 32-digit hex
 //! encoding of the same 128 bits.
 
 use anyhow::{Context, Result, bail};
 use hord_core::{Actor, NodeId, RepoPath};
-use hord_txn::Query;
-
-use crate::txn::block_on;
 
 /// `Actor` id used by `log --actor` and blame output.
 pub(crate) fn actor_id(actor: &Actor) -> &str {
@@ -25,19 +22,11 @@ pub(crate) fn parse_node_id(spec: &str) -> Option<NodeId> {
     parse_node_hex(spec)
 }
 
-/// NodeId for `log --node`: an id, or a qualified name.
-pub(crate) fn resolve_node_spec(query: &Query, spec: &str) -> Result<NodeId> {
-    if let Some(id) = parse_node_id(spec) {
-        return Ok(id);
-    }
-    Ok(block_on(query.resolve_name(spec))?)
-}
-
 /// A blame argument after it has been classified.
 pub(crate) enum BlameTarget {
     /// ULID or 32-digit hex. History is the store's `node_history`, no scan.
     Node(NodeId),
-    /// Qualified name resolved by [`Query::resolve_name`].
+    /// Qualified name, resolved at head (`RepoBackend::resolve_name`).
     Name(String),
     /// 1-based line in a repository path.
     Line { path: RepoPath, line: u32 },
@@ -55,15 +44,6 @@ pub(crate) fn parse_blame_target(spec: &str) -> Result<BlameTarget> {
         bail!("blame target is empty");
     }
     Ok(BlameTarget::Name(spec.to_owned()))
-}
-
-/// Resolve a blame argument to the definition it names.
-pub(crate) fn resolve_blame_target(query: &Query, spec: &str) -> Result<NodeId> {
-    Ok(match parse_blame_target(spec)? {
-        BlameTarget::Node(id) => id,
-        BlameTarget::Name(name) => block_on(query.resolve_name(&name))?,
-        BlameTarget::Line { path, line } => block_on(query.resolve_line(path, line))?,
-    })
 }
 
 fn parse_node_hex(spec: &str) -> Option<NodeId> {

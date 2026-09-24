@@ -15,6 +15,7 @@ use hord_store::{Store, WorkspaceId};
 use crate::lander::{QueueEntry, Verdict, Verifier, VerifyFuture, VerifyRequest};
 use crate::materialize::MaterializeMode;
 use crate::semantic::RustCtx;
+use crate::source::ObjectSource;
 use crate::workspace::{Materialization, Workspace};
 use crate::{Error, Result};
 
@@ -36,6 +37,10 @@ const MAX_CACHED_CTX: usize = 8;
 /// by one per landing forever before).
 pub(crate) const MAX_TRACKED_CHANGES: usize = 16_384;
 
+/// Objects fetched per [`ObjectSource::get_objects`] call when prefetching
+/// (the batch limit of ADR 0024).
+const PREFETCH_BATCH: usize = 1_000;
+
 /// Repository-wide settings for the lander (spec §6.3, §7.2).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RepoConfig {
@@ -55,6 +60,11 @@ pub struct RepoOptions {
     /// [`FailClosedVerifier`]: until M4's verifier exists, only clean
     /// changes land. [`crate::StubVerifier`] (land everything) is opt-in.
     pub verifier: Option<Arc<dyn Verifier>>,
+    /// Where snapshots, trees, blobs, and records the store lacks are read
+    /// from (ADR 0024). `None`: the store alone. A remote workspace passes
+    /// a source that fetches on demand (spec §8.3); what it fetches is kept
+    /// in the store, and writes go to the store.
+    pub objects: Option<Arc<dyn ObjectSource>>,
 }
 
 impl std::fmt::Debug for RepoOptions {
@@ -66,6 +76,7 @@ impl std::fmt::Debug for RepoOptions {
                 &self.adapters.as_ref().map(AdapterRegistry::len),
             )
             .field("verifier", &self.verifier.is_some())
+            .field("objects", &self.objects.is_some())
             .finish()
     }
 }
@@ -199,6 +210,8 @@ pub(crate) struct Inner {
     pub adapters: AdapterRegistry,
     pub config: RepoConfig,
     pub verifier: Arc<dyn Verifier>,
+    /// Object reads, when not the store ([`RepoOptions::objects`]).
+    pub objects: Option<Arc<dyn ObjectSource>>,
     pub toolchain: ObjectId,
     /// Root [`Tree`] with no entries.
     pub empty_tree: ObjectId,
@@ -219,6 +232,10 @@ pub(crate) struct Inner {
     pub proposed: Mutex<WeightedLru<ChangeId, ()>>,
     /// Serializes the lander (spec §6.7: one lander per repository).
     pub lander: tokio::sync::Mutex<crate::lander::LanderState>,
+    /// Wakes a spawned [`crate::Lander`] when a change is submitted.
+    pub wake: tokio::sync::Notify,
+    /// The persisted event log (spec §10.5.3), opened on first use.
+    pub events: Mutex<Option<Arc<crate::events::EventLog>>>,
 }
 
 /// Identified trees keyed by (path, blob, carried identity object). The path
@@ -356,6 +373,7 @@ impl Inner {
             verifier: options
                 .verifier
                 .unwrap_or_else(|| Arc::new(FailClosedVerifier)),
+            objects: options.objects,
             toolchain,
             empty_tree,
             empty_snapshot,
@@ -369,6 +387,8 @@ impl Inner {
             footprints: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
             proposed: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
+            wake: tokio::sync::Notify::new(),
+            events: Mutex::new(None),
         })
     }
 
@@ -394,13 +414,74 @@ impl Inner {
         *lock(&self.head) = Some(head);
     }
 
-    pub(crate) fn change_record(&self, id: ChangeId) -> Result<ChangeRecord> {
-        match self.store.get_object::<ChangeRecord>(id) {
-            Ok(record) => Ok(record),
-            Err(hord_store::Error::MissingObject(_) | hord_store::Error::Encoding(_)) => {
-                Err(Error::MissingChange(id))
+    /// Canonical bytes of `id`: from the local store, else from the
+    /// repository's [`ObjectSource`], whose answer is checked against the
+    /// id and kept in the store (the store is the source's local cache, and
+    /// holds everything this handle writes).
+    pub(crate) fn get_bytes(&self, id: ObjectId) -> Result<Vec<u8>> {
+        let Some(source) = &self.objects else {
+            return Ok(self.store.get(id)?);
+        };
+        match self.store.get(id) {
+            Ok(bytes) => Ok(bytes),
+            Err(hord_store::Error::MissingObject(_)) => {
+                let bytes = source.get(id)?;
+                if ObjectId::from_canonical(&bytes) != id {
+                    return Err(Error::Corrupt {
+                        id,
+                        reason: "the object source returned bytes with another hash".into(),
+                    });
+                }
+                self.store.put(&bytes)?;
+                Ok(bytes)
             }
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Fetch every id in `ids` the store lacks from the [`ObjectSource`],
+    /// [`PREFETCH_BATCH`] at a time, and keep them in the store. A no-op
+    /// without a source.
+    pub(crate) fn prefetch(&self, ids: &[ObjectId]) -> Result<()> {
+        let Some(source) = &self.objects else {
+            return Ok(());
+        };
+        let mut missing = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if seen.insert(*id) && !self.store.contains(*id)? {
+                missing.push(*id);
+            }
+        }
+        for batch in missing.chunks(PREFETCH_BATCH) {
+            for (id, bytes) in batch.iter().zip(source.get_objects(batch)?) {
+                if ObjectId::from_canonical(&bytes) != *id {
+                    return Err(Error::Corrupt {
+                        id: *id,
+                        reason: "the object source returned bytes with another hash".into(),
+                    });
+                }
+                self.store.put(&bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read and decode `id` from the repository's [`ObjectSource`]. A
+    /// decoding failure is `Error::Store(hord_store::Error::Encoding(_))`,
+    /// as the store reports it.
+    pub(crate) fn get_object<T: serde::de::DeserializeOwned>(&self, id: ObjectId) -> Result<T> {
+        let bytes = self.get_bytes(id)?;
+        hord_encoding::decode(&bytes).map_err(|err| Error::Store(err.into()))
+    }
+
+    pub(crate) fn change_record(&self, id: ChangeId) -> Result<ChangeRecord> {
+        match self.get_object::<ChangeRecord>(id) {
+            Ok(record) => Ok(record),
+            Err(Error::Store(
+                hord_store::Error::MissingObject(_) | hord_store::Error::Encoding(_),
+            )) => Err(Error::MissingChange(id)),
+            Err(err) => Err(err),
         }
     }
 
@@ -507,6 +588,7 @@ impl Inner {
             change: Some(change),
             snapshot: result,
         });
+        self.emit(crate::events::landed(change, 0, None, &[], None))?;
         Ok(change)
     }
 
@@ -785,11 +867,23 @@ impl Repo {
         blocking(&self.inner, move |inner| inner.queue_status(change)).await
     }
 
-    /// Run the lander inline until no entry is queued (`hord land --local`).
+    /// Run the lander inline until no entry is queued (`hord land --local`):
+    /// one [`crate::Lander::drain`] pass.
     ///
     /// Returns the entries processed by this call, in order.
     pub async fn land_local(&self) -> Result<Vec<QueueEntry>> {
-        crate::lander::run(self).await
+        crate::Lander::drain(self).await
+    }
+
+    /// The repository's event stream (spec §10.5.3): with `from`, every
+    /// recorded event after that cursor, then live ones; without, live
+    /// events only.
+    pub async fn events(
+        &self,
+        from: Option<hord_api::EventCursor>,
+    ) -> Result<hord_api::EventStream> {
+        let log = blocking(&self.inner, Inner::event_log).await?;
+        Ok(log.subscribe(from))
     }
 
     /// Explain a change's conflicts (`hord conflicts`).
@@ -802,9 +896,15 @@ impl Repo {
 }
 
 impl Inner {
-    /// Write every file of `snapshot` under `dir`.
+    /// Write every file of `snapshot` under `dir`. With an
+    /// [`ObjectSource`], the blobs the store lacks are fetched first, in
+    /// batches (a remote `Directory` workspace fetches its base's blobs when
+    /// its checkout is first written, ADR 0024).
     pub(crate) fn checkout(&self, snapshot: SnapshotId, dir: &Path) -> Result<()> {
-        for (path, blob) in self.list_files(snapshot)? {
+        let files = self.list_files(snapshot)?;
+        let blobs: Vec<ObjectId> = files.iter().map(|(_, blob)| *blob).collect();
+        self.prefetch(&blobs)?;
+        for (path, blob) in files {
             let target = fs_path(dir, &path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;

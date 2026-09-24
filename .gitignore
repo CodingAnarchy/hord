@@ -7,3 +7,6 @@
 .vscode/
 .hord/
 .cache/
+
+# LLVM coverage profiles from cargo llvm-cov runs.
+*.profraw

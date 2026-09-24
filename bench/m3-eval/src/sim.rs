@@ -367,7 +367,7 @@ pub(crate) fn intent(summary: &str) -> Intent {
 /// What one agent did, recorded by the harness.
 pub(crate) struct AgentRun {
     index: usize,
-    change: ChangeId,
+    pub change: ChangeId,
     begin: Duration,
     /// `(node, base text, edited text)` per written definition.
     written: Vec<(NodeId, Vec<u8>, Vec<u8>)>,
@@ -582,14 +582,69 @@ pub(crate) async fn run(
     snapshot: &Snapshot,
     config: &SimConfig,
 ) -> Result<SimReport> {
+    let plan = plan(snapshot, config.agents, config.overlap_percent, config.seed)?;
+    let started = Instant::now();
+    // Agents work concurrently; unless racy, they submit in a seeded order
+    // so a seed fixes the landing order too.
+    let positions = submit_positions(config);
+    let (turn, _) = tokio::sync::watch::channel(0usize);
+    let mut tasks = Vec::with_capacity(config.agents);
+    for agent in plan.agents.iter().cloned() {
+        let turns = (!config.racy_submit).then(|| (turn.clone(), positions[agent.index]));
+        tasks.push(tokio::spawn(run_agent(
+            repo.clone(),
+            base,
+            agent,
+            config.seed,
+            turns,
+        )));
+    }
+    let mut runs = Vec::with_capacity(config.agents);
+    for task in tasks {
+        runs.push(task.await.context("agent task")??);
+    }
+    let agents_secs = started.elapsed().as_secs_f64();
+
+    let started = Instant::now();
+    let done = repo.land_local().await?;
+    let land = started.elapsed();
+    if done.len() != config.agents {
+        bail!(
+            "land_local processed {} of {} changes",
+            done.len(),
+            config.agents
+        );
+    }
+    analyze(repo, snapshot, &plan, config, runs, done, agents_secs, land).await
+}
+
+/// Each agent's turn in the seeded submission order.
+pub(crate) fn submit_positions(config: &SimConfig) -> Vec<usize> {
+    let mut positions: Vec<usize> = (0..config.agents).collect();
+    Rng::new(config.seed.rotate_left(17)).shuffle(&mut positions);
+    positions
+}
+
+/// The oracle over a finished run: `done` is every agent's queue entry
+/// after landing, `land` the time landing took.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn analyze(
+    repo: &Repo,
+    snapshot: &Snapshot,
+    plan: &Plan,
+    config: &SimConfig,
+    runs: Vec<AgentRun>,
+    done: Vec<hord_txn::QueueEntry>,
+    agents_secs: f64,
+    land: Duration,
+) -> Result<SimReport> {
     let &SimConfig {
         agents,
-        overlap_percent,
         seed,
         strict_reads,
         racy_submit,
+        ..
     } = config;
-    let plan = plan(snapshot, agents, overlap_percent, seed)?;
     let planned_overlapping = plan.agents.iter().filter(|a| a.pair.is_some()).count();
     let target_files: Vec<RepoPath> = plan
         .agents
@@ -598,40 +653,10 @@ pub(crate) async fn run(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-
-    let started = Instant::now();
-    // Agents work concurrently; unless racy, they submit in a seeded order
-    // so a seed fixes the landing order too.
-    let mut positions: Vec<usize> = (0..agents).collect();
-    Rng::new(seed.rotate_left(17)).shuffle(&mut positions);
-    let (turn, _) = tokio::sync::watch::channel(0usize);
-    let mut tasks = Vec::with_capacity(agents);
-    for agent in plan.agents.iter().cloned() {
-        let turns = (!racy_submit).then(|| (turn.clone(), positions[agent.index]));
-        tasks.push(tokio::spawn(run_agent(
-            repo.clone(),
-            base,
-            agent,
-            seed,
-            turns,
-        )));
-    }
-    let mut runs = Vec::with_capacity(agents);
-    for task in tasks {
-        runs.push(task.await.context("agent task")??);
-    }
-    let agents_secs = started.elapsed().as_secs_f64();
     let agent_begin_max_ms = runs
         .iter()
         .map(|r| r.begin.as_secs_f64() * 1000.0)
         .fold(0.0, f64::max);
-
-    let started = Instant::now();
-    let done = repo.land_local().await?;
-    let land = started.elapsed();
-    if done.len() != agents {
-        bail!("land_local processed {} of {agents} changes", done.len());
-    }
 
     let by_change: HashMap<ChangeId, usize> = runs.iter().map(|r| (r.change, r.index)).collect();
     let runs_by_index: BTreeMap<usize, &AgentRun> = runs.iter().map(|r| (r.index, r)).collect();

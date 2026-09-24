@@ -33,6 +33,8 @@ fn ok(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .env("HORD_ACTOR", "tester")
+        // A daemon this test starts exits soon after (ADR 0021).
+        .env("HORD_DAEMON_IDLE_SECS", "5")
         .env_remove("HORD_AGENT_MODEL")
         .output()
         .unwrap();

@@ -16,6 +16,21 @@ pub fn create(repo_root: &Path) -> Result<Store> {
     Store::create(repo_root).map_err(Into::into)
 }
 
+/// The repository root: the nearest directory, from the current one up,
+/// that holds `.hord/`. Does not open the store.
+pub fn discover_root() -> Result<std::path::PathBuf> {
+    let cwd = std::env::current_dir().context("current directory")?;
+    let mut dir = cwd.as_path();
+    loop {
+        if dir.join(hord_store::HORD_DIR).is_dir() {
+            return Ok(dir.to_path_buf());
+        }
+        dir = dir
+            .parent()
+            .ok_or_else(|| anyhow!("no .hord directory found; run `hord init`"))?;
+    }
+}
+
 /// Walk from the current directory toward the filesystem root looking for `.hord/`.
 pub fn discover() -> Result<Store> {
     let cwd = std::env::current_dir().context("current directory")?;
@@ -87,7 +102,7 @@ pub fn set_current_workspace(store: &Store, id: WorkspaceId) -> Result<()> {
     Ok(())
 }
 
-fn current_workspace_id(store: &Store) -> Result<Option<WorkspaceId>> {
+pub fn current_workspace_id(store: &Store) -> Result<Option<WorkspaceId>> {
     let path = store.hord_dir().join(CURRENT_WORKSPACE);
     match fs::read_to_string(&path) {
         Ok(s) => {

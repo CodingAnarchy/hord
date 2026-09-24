@@ -1,4 +1,6 @@
-//! Smoke tests for M0 CLI commands.
+//! Smoke tests for M0 CLI commands. `--json` output is the protobuf JSON
+//! mapping of `hord.proto` (ADR 0024): lowerCamelCase keys, 64-bit
+//! integers as strings.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,7 +8,10 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn hord_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_hord"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hord"));
+    // Daemons these tests start exit soon after (ADR 0021).
+    cmd.env("HORD_DAEMON_IDLE_SECS", "5");
+    cmd
 }
 
 fn hord_in(dir: &Path, args: &[&str]) -> Output {
@@ -108,7 +113,7 @@ fn init_json_reports_hord_dir() {
     let out = hord_in(tmp.path(), &["init", "--json"]);
     assert_ok(&out, &["init", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
-    let hord_dir = v["hord_dir"].as_str().expect("hord_dir");
+    let hord_dir = v["hordDir"].as_str().expect("hord_dir");
     assert!(Path::new(hord_dir).is_dir());
     assert_eq!(
         Path::new(hord_dir).file_name().and_then(|n| n.to_str()),
@@ -149,8 +154,8 @@ fn log_after_init_is_empty() {
     let out = hord_in(tmp.path(), &["log", "--json"]);
     assert_ok(&out, &["log", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
-    assert!(v["head"].is_null());
-    assert_eq!(v["log"], serde_json::json!([]));
+    assert!(v.get("head").is_none_or(serde_json::Value::is_null));
+    assert_eq!(v["changes"], serde_json::json!([]));
 }
 
 #[test]
@@ -185,10 +190,10 @@ fn status_after_ws_new() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(v["workspace"], id);
     assert_eq!(v["ops"], serde_json::json!([]));
-    assert_eq!(v["read_set"], serde_json::json!([]));
-    assert_eq!(v["write_set"], serde_json::json!([]));
+    assert_eq!(v["readSet"], serde_json::json!([]));
+    assert_eq!(v["writeSet"], serde_json::json!([]));
     assert_eq!(v["evidence"], serde_json::json!([]));
-    assert_eq!(v["evidence_stale"], serde_json::json!(false));
+    assert_eq!(v["evidenceStale"], serde_json::json!(false));
 }
 
 #[test]
@@ -249,17 +254,22 @@ fn init_from_git_tiny_fixture() {
     let out = hord_in(tmp.path(), &["init", "--from-git", git_path, "--json"]);
     assert_ok(&out, &["init", "--from-git"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
-    assert!(Path::new(v["hord_dir"].as_str().unwrap()).is_dir());
+    assert!(Path::new(v["hordDir"].as_str().unwrap()).is_dir());
     let imported = v.get("imported").expect("imported");
     assert!(
-        imported["changes"].as_u64().unwrap() >= 1,
+        imported["changes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 1,
         "expected at least one imported change: {imported}"
     );
     let log = hord_in(tmp.path(), &["log", "--json"]);
     assert_ok(&log, &["log", "--json"]);
     let log: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
     assert!(
-        !log["log"].as_array().unwrap().is_empty(),
+        !log["changes"].as_array().unwrap().is_empty(),
         "log should be non-empty after --from-git"
     );
 }
@@ -276,16 +286,20 @@ fn git_export_import_after_init_in_git_repo() {
     let import = hord_in(tmp.path(), &["git", "import", "HEAD", "--json"]);
     assert_ok(&import, &["git", "import", "HEAD"]);
     let imported: serde_json::Value = serde_json::from_slice(&import.stdout).unwrap();
-    assert!(imported["changes"].as_u64().unwrap() >= 1);
+    assert!(
+        imported["changes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 1
+    );
 
     let export = hord_in(tmp.path(), &["git", "export", "head", "--json"]);
     assert_ok(&export, &["git", "export", "head"]);
     let exported: serde_json::Value = serde_json::from_slice(&export.stdout).unwrap();
     assert!(
-        exported
-            .get("git_commit")
-            .and_then(|v| v.as_str())
-            .is_some(),
+        exported.get("gitCommit").and_then(|v| v.as_str()).is_some(),
         "export should produce a git commit: {exported}"
     );
 }

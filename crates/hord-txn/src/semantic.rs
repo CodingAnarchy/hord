@@ -146,7 +146,7 @@ impl Inner {
         }
         let stored = match identity {
             Some(id) => {
-                let file: FileIdentity = self.store.get_object(id)?;
+                let file: FileIdentity = self.get_object(id)?;
                 if file.blob != blob {
                     return Err(Error::Corrupt {
                         id,

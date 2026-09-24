@@ -193,6 +193,29 @@ impl Inner {
         Err(Error::UnknownName(name.to_owned()))
     }
 
+    /// Definitions of `snapshot` named exactly `name`, else those whose
+    /// name ends in `::name`, in id order (the per-snapshot form of
+    /// [`Self::resolve_name`], for `RepoBackend::resolve_name`).
+    pub(crate) fn resolve_in(&self, snapshot: SnapshotId, name: &str) -> Result<Vec<NodeId>> {
+        let suffix = format!("::{name}");
+        let mut exact = BTreeSet::new();
+        let mut suffixed = BTreeSet::new();
+        for (path, _) in self.list_files(snapshot)? {
+            for def in self.definitions_at(snapshot, &path)? {
+                let Some(qualified) = &def.name else {
+                    continue;
+                };
+                if qualified.as_str() == name {
+                    exact.insert(def.node);
+                } else if qualified.as_str().ends_with(&suffix) {
+                    suffixed.insert(def.node);
+                }
+            }
+        }
+        let hits = if exact.is_empty() { suffixed } else { exact };
+        Ok(hits.into_iter().collect())
+    }
+
     fn resolve_line(&self, path: &RepoPath, line: u32) -> Result<NodeId> {
         let snapshot = self.head()?.snapshot;
         let Some(view) = self.file_view(snapshot, path)? else {
@@ -230,7 +253,7 @@ impl Inner {
         Ok(definitions(adapter, path, &parsed.tree))
     }
 
-    fn touches_path(&self, change: &ChangeRecord, filter: &RepoPath) -> Result<bool> {
+    pub(crate) fn touches_path(&self, change: &ChangeRecord, filter: &RepoPath) -> Result<bool> {
         let writes = &change.write_set;
         if writes.is_empty() {
             return Ok(false);
@@ -265,7 +288,12 @@ impl Inner {
         Ok(out)
     }
 
-    fn edges(&self, snapshot: SnapshotId, source: NodeId, kind: EdgeKind) -> Result<Vec<NodeId>> {
+    pub(crate) fn edges(
+        &self,
+        snapshot: SnapshotId,
+        source: NodeId,
+        kind: EdgeKind,
+    ) -> Result<Vec<NodeId>> {
         let mut out: BTreeSet<NodeId> = self
             .store
             .edges(snapshot, source, kind)?

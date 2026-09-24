@@ -51,15 +51,15 @@ impl Inner {
         if let Some(snapshot) = lock(&self.snapshots).get(&id) {
             return Ok(Arc::clone(snapshot));
         }
-        let snapshot: Snapshot = match self.store.get_object(id) {
+        let snapshot: Snapshot = match self.get_object(id) {
             Ok(snapshot) => snapshot,
-            Err(hord_store::Error::Encoding(err)) => {
+            Err(Error::Store(hord_store::Error::Encoding(err))) => {
                 return Err(Error::Corrupt {
                     id,
                     reason: format!("not a snapshot: {err}"),
                 });
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         };
         let snapshot = Arc::new(snapshot);
         let mut cache = lock(&self.snapshots);
@@ -88,12 +88,12 @@ impl Inner {
         if let Some(tree) = lock(&self.identity_trees).get(&id) {
             return Ok(Arc::clone(tree));
         }
-        let tree: IdentityTree = match self.store.get_object(id) {
+        let tree: IdentityTree = match self.get_object(id) {
             Ok(tree) => tree,
-            Err(hord_store::Error::MissingObject(_)) => {
+            Err(Error::Store(hord_store::Error::MissingObject(_))) => {
                 return Err(Error::MissingIdentity(snapshot));
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         };
         let tree = Arc::new(tree);
         let mut cache = lock(&self.identity_trees);
@@ -246,7 +246,7 @@ impl Inner {
         if let Some(tree) = lock(&self.trees).get(&id) {
             return Ok(Arc::clone(tree));
         }
-        let tree: Arc<Tree> = Arc::new(self.store.get_object(id)?);
+        let tree: Arc<Tree> = Arc::new(self.get_object(id)?);
         let mut cache = lock(&self.trees);
         if cache.len() >= MAX_CACHED_TREES {
             cache.clear();
@@ -287,7 +287,7 @@ impl Inner {
     }
 
     pub(crate) fn blob_bytes(&self, id: ObjectId) -> Result<Bytes> {
-        let blob: Blob = self.store.get_object(id)?;
+        let blob: Blob = self.get_object(id)?;
         Ok(blob.bytes)
     }
 

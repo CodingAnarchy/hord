@@ -53,3 +53,9 @@ Option 2. It has five parts.
 - **Auth is M5** (§10.5.4). In M4, `hord serve` binds loopback only and refuses another address without `--insecure-bind`. M5's bearer tokens go in gRPC metadata.
 - **New dependencies,** justified in the ADR log: `tonic`, `tonic-build`, `tonic-web`, `prost`, `prost-types`, `protoc-bin-vendored`, `pbjson` (for the canonical JSON mapping), `async-trait`, `tokio-stream`.
 - Choosing a different transport, keeping a second hand-written API surface, or letting a second writer touch the log needs a new ADR.
+
+## Amendments (2026-09-24, from implementation)
+
+- **A local-only `Workspaces` service.** `RepoBackend` (§10.5.2) has no workspace operations, and while a daemon holds the store no CLI process can open it. `hord.proto` gains a `Workspaces` service (`WsNew`, `WsList`, `WsRm`, `WsGc`, `Status`, `Propose`, `PolicyCheck`) that the per-repo daemon serves. The daemon therefore parses, carries identity, and proposes with warm, shared caches (ADR 0021). `hord serve` for true remotes does not serve it in M4. Against a true remote, the CLI runs these commands client-side over a local cache store, with `RemoteRepo` as the object source (§10.5.5: "builds ChangeRecord locally"). `RepoBackend` stays §10.5.2, method for method.
+- **Choosing a remote.** A global `--remote <name>` flag targets a configured remote. Each clone may set a default upstream (`hord remote set-default <name>`), used when `--remote` is absent and the command is not local-only. `ws new --base <remote>/<ref>` resolves the base from that remote (§10.5.5).
+- **When a remote directory workspace fetches.** Without a VFS, a `Directory` workspace's first materialization is `ws new`. A remote `Directory` workspace fetches only its base's blobs, batched and skipping cached objects, when it writes the pristine checkout at `ws new`, and nothing earlier. `InMemory` workspaces stay fully lazy. This replaces consequence 3's "not at `ws new`".

@@ -131,6 +131,9 @@ pub enum Error {
     /// A blocking task panicked or was cancelled.
     #[error("background task failed: {0}")]
     Task(String),
+    /// The event log (`.hord/events.redb`, spec §10.5.3) failed.
+    #[error("event log: {0}")]
+    EventLog(String),
 }
 
 fn list(nodes: &[NodeId]) -> String {

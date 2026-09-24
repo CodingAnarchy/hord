@@ -1,102 +1,111 @@
-//! `hord ws new [--base <snap|ref>] [--materialize clone|copy]`, `hord ws rm`,
-//! `hord ws gc`.
+//! `hord ws new [--base <snap|ref|remote/ref>] [--materialize clone|copy]`,
+//! `hord ws list`, `hord ws rm`, `hord ws gc` (the `Workspaces` service).
 
-use anyhow::{Result, anyhow};
-use hord_store::WorkspaceId;
-use hord_txn::{Base, BeginOptions, Materialization, MaterializeMode};
-use serde::Serialize;
+use anyhow::Result;
+use hord_api::proto;
 
 use crate::cli::Materialize;
-use crate::txn::{self, block_on};
-use crate::{output, repo};
-
-#[derive(Debug, Serialize)]
-struct WsNewResult {
-    id: String,
-    base: String,
-    materialization: String,
-    /// Mode actually used: `clone` or `copy` (ADR 0016).
-    materialize: &'static str,
-}
+use crate::output;
+use crate::remotes::Remotes;
+use crate::session::{Session, Target};
+use crate::txn::block_on;
+use crate::workspaces::this_caller;
 
 /// Create the workspace and check its base out into `.hord/ws/<id>/`.
-pub fn run_new(json: bool, base: Option<String>, materialize: Materialize) -> Result<()> {
-    let store = repo::discover()?;
-    let base_id = repo::resolve_base(&store, base.as_deref())?;
-    let repo_handle = txn::open_store(store)?;
-    let mode = match materialize {
-        Materialize::Clone => MaterializeMode::Clone,
-        Materialize::Copy => MaterializeMode::Copy,
-    };
-    let ws = block_on(repo_handle.begin_directory_with(
-        BeginOptions {
-            base: Base::Snapshot(base_id),
-            actor: txn::actor(),
-            session: txn::session(),
-        },
-        mode,
-    ))?;
-    repo::set_current_workspace(repo_handle.store(), ws.id())?;
-    let path = match ws.materialization() {
-        Materialization::Directory { path } => path.display().to_string(),
-        Materialization::InMemory => String::new(),
-    };
-    let result = WsNewResult {
-        id: ws.id().to_string(),
-        base: ws.base().to_hex(),
-        materialization: path,
-        materialize: ws.materialized_as().unwrap_or(mode).as_str(),
-    };
+///
+/// `--base <remote>/<ref>` resolves the base on that remote and works
+/// against it (ADR 0024 amendment).
+pub fn run_new(
+    json: bool,
+    target: &Target,
+    base: Option<String>,
+    materialize: Materialize,
+) -> Result<()> {
+    let (target, base) = split_remote_base(target, base)?;
+    let session = Session::open(&target)?;
+    let response = block_on(
+        session.workspaces().ws_new(proto::WsNewRequest {
+            caller: Some(this_caller()),
+            base,
+            materialize: match materialize {
+                Materialize::Clone => proto::Materialize::Clone,
+                Materialize::Copy => proto::Materialize::Copy,
+            }
+            .into(),
+        }),
+    )?;
     if json {
-        output::print_json(&result)?;
+        output::print_json(&response)?;
     } else {
-        println!("workspace {} ({})", result.id, result.materialize);
-        println!("{}", result.materialization);
+        println!("workspace {} ({})", response.id, response.materialize);
+        println!("{}", response.materialization);
     }
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct WsRmResult {
-    id: String,
-    removed: bool,
+/// `<remote>/<ref>` when `<remote>` is a configured remote: that remote,
+/// and the ref alone.
+fn split_remote_base(target: &Target, base: Option<String>) -> Result<(Target, Option<String>)> {
+    let Some(spec) = &base else {
+        return Ok((target.clone(), base));
+    };
+    let Some((name, rest)) = spec.split_once('/') else {
+        return Ok((target.clone(), base));
+    };
+    let Ok(root) = crate::repo::discover_root() else {
+        return Ok((target.clone(), base));
+    };
+    let remotes = Remotes::load(&root.join(hord_store::HORD_DIR))?;
+    if !remotes.remotes.contains_key(name) {
+        return Ok((target.clone(), base));
+    }
+    let target = Target {
+        remote: Some(name.to_owned()),
+        ..target.clone()
+    };
+    Ok((target, Some(rest.to_owned())))
 }
 
-pub fn run_rm(json: bool, id: String) -> Result<()> {
-    let parsed: WorkspaceId = id
-        .parse()
-        .map_err(|_| anyhow!("invalid workspace id {id:?}"))?;
-    let repo_handle = txn::open()?;
-    let removed = block_on(repo_handle.remove_workspace(parsed))?;
-    if !removed {
-        return Err(anyhow!("unknown workspace {id}"));
-    }
-    let result = WsRmResult { id, removed };
+pub fn run_list(json: bool, target: &Target) -> Result<()> {
+    let session = Session::open(target)?;
+    let response = block_on(session.workspaces().ws_list(proto::WsListRequest {}))?;
     if json {
-        output::print_json(&result)?;
+        output::print_json(&response)?;
+    } else if response.workspaces.is_empty() {
+        println!("no workspaces");
     } else {
-        println!("removed workspace {}", result.id);
+        for ws in &response.workspaces {
+            let mark = if response.current.as_deref() == Some(ws.id.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            println!("{mark} {} {} {}", ws.id, &ws.base[..12], ws.materialization);
+        }
     }
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct WsGcResult {
-    removed_pristine: Vec<String>,
+pub fn run_rm(json: bool, target: &Target, id: String) -> Result<()> {
+    let session = Session::open(target)?;
+    let response = block_on(session.workspaces().ws_rm(proto::WsRmRequest { id }))?;
+    if json {
+        output::print_json(&response)?;
+    } else {
+        println!("removed workspace {}", response.id);
+    }
+    Ok(())
 }
 
-pub fn run_gc(json: bool) -> Result<()> {
-    let repo_handle = txn::open()?;
-    let removed = block_on(repo_handle.gc_pristine())?;
-    let result = WsGcResult {
-        removed_pristine: removed.iter().map(|s| s.to_hex()).collect(),
-    };
+pub fn run_gc(json: bool, target: &Target) -> Result<()> {
+    let session = Session::open(target)?;
+    let response = block_on(session.workspaces().ws_gc(proto::WsGcRequest {}))?;
     if json {
-        output::print_json(&result)?;
-    } else if result.removed_pristine.is_empty() {
+        output::print_json(&response)?;
+    } else if response.removed_pristine.is_empty() {
         println!("nothing to collect");
     } else {
-        for snapshot in &result.removed_pristine {
+        for snapshot in &response.removed_pristine {
             println!("removed pristine {snapshot}");
         }
     }
