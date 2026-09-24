@@ -14,6 +14,13 @@ use crate::{Actor, NodeId, ObjectId, SnapshotId, Timestamp};
 pub struct Evidence {
     /// Kind of check this object records.
     pub kind: EvidenceKind,
+    /// Refinement of [`Self::kind`] that policy requirements name after a
+    /// `:` (ADR 0026): `selected` or `full` for a test run, the reviewer
+    /// kind from `hord review --as <kind>`, `no-regression` for a bench.
+    /// Omitted from the encoding when `None`, so evidence without one keeps
+    /// its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
     /// Snapshot that was verified.
     pub snapshot: SnapshotId,
     /// Toolchain the check ran under.
@@ -74,4 +81,72 @@ pub enum EvidenceResult {
         /// Why it was skipped.
         reason: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Evidence`] as it was before `qualifier` (ADR 0026).
+    #[derive(Serialize)]
+    struct EvidenceV0 {
+        kind: EvidenceKind,
+        snapshot: SnapshotId,
+        toolchain: ObjectId,
+        command: String,
+        scope: Option<BTreeSet<NodeId>>,
+        result: EvidenceResult,
+        log: Option<ObjectId>,
+        cost_ms: u64,
+        produced_by: Actor,
+        produced_at: Timestamp,
+    }
+
+    fn sample(qualifier: Option<&str>) -> Evidence {
+        Evidence {
+            kind: EvidenceKind::Test,
+            qualifier: qualifier.map(str::to_owned),
+            snapshot: ObjectId::from_canonical(b"snapshot"),
+            toolchain: ObjectId::from_canonical(b"toolchain"),
+            command: "cargo test".into(),
+            scope: Some(BTreeSet::from([NodeId::from_u128(7)])),
+            result: EvidenceResult::Pass,
+            log: None,
+            cost_ms: 12,
+            produced_by: Actor::Human { id: "ada".into() },
+            produced_at: Timestamp::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn no_qualifier_is_omitted_from_the_encoding() {
+        let ev = sample(None);
+        let v0 = EvidenceV0 {
+            kind: ev.kind.clone(),
+            snapshot: ev.snapshot,
+            toolchain: ev.toolchain,
+            command: ev.command.clone(),
+            scope: ev.scope.clone(),
+            result: ev.result.clone(),
+            log: ev.log,
+            cost_ms: ev.cost_ms,
+            produced_by: ev.produced_by.clone(),
+            produced_at: ev.produced_at,
+        };
+        let bytes = hord_encoding::encode(&ev).unwrap();
+        assert_eq!(bytes, hord_encoding::encode(&v0).unwrap());
+        let back: Evidence = hord_encoding::decode(&bytes).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn a_qualifier_is_encoded_and_changes_the_id() {
+        let plain = sample(None);
+        let selected = sample(Some("selected"));
+        let bytes = hord_encoding::encode(&selected).unwrap();
+        assert!(bytes.windows(9).any(|w| w == b"qualifier"));
+        assert_ne!(bytes, hord_encoding::encode(&plain).unwrap());
+        let back: Evidence = hord_encoding::decode(&bytes).unwrap();
+        assert_eq!(back, selected);
+    }
 }

@@ -21,11 +21,14 @@
 
 pub mod cargo_lock;
 mod cst;
+mod facts;
 mod manifest;
 mod resolve;
 
 use hord_core::{LangId, Node, NodeId, NodeKind, QualifiedName, RepoPath};
-use hord_lang::{Anchor, LangAdapter, NameRef, NodeTree, ParseError, ResolveCtx, Tier};
+use hord_lang::{
+    Anchor, DefinitionFacts, LangAdapter, NameRef, NodeTree, ParseError, ResolveCtx, Tier,
+};
 
 pub use cargo_lock::{
     CARGO_LOCK_LANG, CargoLockAdapter, CargoLockConflict, CargoLockMergeError, is_cargo_lock,
@@ -103,6 +106,16 @@ impl LangAdapter for RustAdapter {
 
     fn test_targets(&self, ctx: &ResolveCtx, test: &Node) -> Vec<NodeId> {
         resolve::test_targets(ctx, test)
+    }
+
+    fn definition_facts(
+        &self,
+        source: &[u8],
+        spans: &[std::ops::Range<usize>],
+    ) -> Vec<DefinitionFacts> {
+        facts::definition_facts(source, spans, |kind| {
+            self.is_definition(&NodeKind::new(kind))
+        })
     }
 }
 

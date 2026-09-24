@@ -168,6 +168,7 @@ fn sample_change() -> ChangeRecord {
 fn sample_evidence() -> Evidence {
     Evidence {
         kind: EvidenceKind::Check,
+        qualifier: None,
         snapshot: oid(0xaa),
         toolchain: oid(0x07),
         command: "cargo check".into(),
@@ -190,7 +191,8 @@ fn sample_policy() -> Policy {
         land: LandPolicy {
             require: vec!["check".into(), "test:selected".into(), "lint".into()],
             strict_reads: false,
-            max_write_set: 200,
+            max_write_set: Some(200),
+            max_impact: Some(50),
             max_replay_attempts: 2,
         },
         rules: vec![PolicyRule {

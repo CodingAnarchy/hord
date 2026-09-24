@@ -1,6 +1,8 @@
 //! [`LangAdapter`] trait and supporting types (spec §4.3).
 
 use std::any::Any;
+use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -489,6 +491,28 @@ pub trait LangAdapter: Send + Sync {
     fn identify(&self, base: &IdentifiedTree, result: &NodeTree) -> IdentityMapping {
         default_identify(self, base, result)
     }
+
+    /// Tier 2. What policy matches on for definitions in `source` (ADR
+    /// 0026): one [`DefinitionFacts`] per span, in order. A span is a
+    /// definition's byte range in `source`, attached trivia included, as
+    /// the definition listing reports it. The default reports nothing.
+    fn definition_facts(&self, source: &[u8], spans: &[Range<usize>]) -> Vec<DefinitionFacts> {
+        let _ = source;
+        vec![DefinitionFacts::default(); spans.len()]
+    }
+}
+
+/// Facts about one definition that policy rules match on (spec §7.2, ADR
+/// 0026), reported by [`LangAdapter::definition_facts`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DefinitionFacts {
+    /// Node kinds inside the definition, for `touches_kind` (for Rust,
+    /// `unsafe_block` inside a `function_item`). Adapter kind names, sorted.
+    pub inner_kinds: BTreeSet<String>,
+    /// The visibility modifier as written (`pub`, `pub(crate)`), for
+    /// `touches_visibility`. `None` when there is none or the language has
+    /// no such concept.
+    pub visibility: Option<String>,
 }
 
 /// Compiled-in adapter registry (spec §4.3). First match wins.
@@ -568,6 +592,10 @@ mod tests {
         assert!(a.references(&ctx, &node).is_empty());
         assert!(a.resolve(&ctx, &NameRef::new("foo")).is_none());
         assert!(a.test_targets(&ctx, &node).is_empty());
+        assert_eq!(
+            a.definition_facts(b"fn a", &[0..4, 0..2]),
+            vec![DefinitionFacts::default(); 2]
+        );
         assert_eq!(a.tier(), Tier::Syntax);
         assert_eq!(a.tier().as_u8(), 1);
     }

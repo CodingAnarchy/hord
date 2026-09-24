@@ -78,7 +78,8 @@ proptest! {
             land: LandPolicy {
                 require,
                 strict_reads,
-                max_write_set,
+                max_write_set: Some(max_write_set),
+                max_impact: None,
                 max_replay_attempts,
             },
             rules: vec![PolicyRule {
