@@ -402,15 +402,16 @@ fn project_case(case: &str) -> Vec<u8> {
 }
 
 #[test]
-fn apply_of_diff_used_by_merge_round_trip() {
+fn apply_of_diff_used_by_merge_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = rust();
     let base_src = b"fn a() {}\n";
     let ours_src = b"fn a() {}\nfn b() {}\n";
     let base = parse_identified(&adapter, base_src);
     let (ours_tree, ours_map) = identify_result(&adapter, &base, ours_src);
     let ops = diff(&common::file(), &base, &ours_tree, &ours_map);
-    let applied = apply(&common::file(), &base, &ops, &ours_tree).unwrap();
+    let applied = apply(&common::file(), &base, &ops, &ours_tree)?;
     assert_eq!(adapter.project(&applied.tree).as_slice(), ours_src);
+    Ok(())
 }
 
 /// ADR 0014: the same line changed two ways. Corpus mode keeps ours (git

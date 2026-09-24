@@ -3,7 +3,7 @@
 use hord_diff::{ConflictKind, merge_blob};
 
 #[test]
-fn blob_three_way_clean_merge() {
+fn blob_three_way_clean_merge() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"\
 alpha
 beta
@@ -22,10 +22,11 @@ beta
 gamma
 ";
     let merged = merge_blob(base, ours, theirs).expect("clean blob merge");
-    let text = String::from_utf8(merged).unwrap();
+    let text = String::from_utf8(merged)?;
     assert!(text.contains("omega"));
     assert!(text.contains("delta"));
     assert!(text.contains("beta"));
+    Ok(())
 }
 
 #[test]

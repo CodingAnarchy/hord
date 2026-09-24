@@ -132,14 +132,14 @@ fn toml_insert_table() {
 /// ADR 0015: file-level ops name the path-derived root, never nil, and the
 /// same edit in another file names that file's root.
 #[test]
-fn file_level_ops_name_the_path_derived_root() {
+fn file_level_ops_name_the_path_derived_root() -> Result<(), Box<dyn std::error::Error>> {
     use hord_core::{NodeId, Op, RepoPath};
 
     let adapter = rust();
     let base = parse_identified(&adapter, b"fn a() {}\n");
     let (result, mapping) = identify_result(&adapter, &base, b"fn a() {}\nfn b() {}\n");
-    let lib: RepoPath = "src/lib.rs".parse().unwrap();
-    let other: RepoPath = "src/other.rs".parse().unwrap();
+    let lib: RepoPath = "src/lib.rs".parse()?;
+    let other: RepoPath = "src/other.rs".parse()?;
     let ops = diff(&lib, &base, &result, &mapping);
     let root = NodeId::file_root(&lib);
     assert!(
@@ -165,7 +165,7 @@ fn file_level_ops_name_the_path_derived_root() {
     let nil = vec![Op::Insert {
         parent: NodeId::nil(),
         index: 0,
-        node: result.root().unwrap(),
+        node: result.root().ok_or("result tree has a root")?,
     }];
     assert!(apply(&lib, &base, &nil, &result).is_err());
     // A glue-only edit replaces the root id.
@@ -177,13 +177,14 @@ fn file_level_ops_name_the_path_derived_root() {
             .any(|op| matches!(op, Op::Replace { node, .. } if *node == NodeId::file_root(&lib))),
         "{glue_ops:?}"
     );
+    Ok(())
 }
 
 /// Identical definitions at two sites (the same `use` in two functions) are
 /// two identities. Editing a third function is a Replace of that function,
 /// not a whole-file replace, and apply reproduces the result.
 #[test]
-fn identical_definitions_do_not_collapse() {
+fn identical_definitions_do_not_collapse() -> Result<(), Box<dyn std::error::Error>> {
     use hord_core::Op;
     let adapter = rust();
     let src = "pub fn target(x: u32) -> u32 {\n    x + 1\n}\n\npub fn first(p: &str) -> usize {\n    #[cfg(unix)]\n    {\n        use std::os::unix::prelude::*;\n        p.len()\n    }\n}\n\npub fn second(p: &str) -> usize {\n    #[cfg(unix)]\n    {\n        use std::os::unix::prelude::*;\n        p.len() + 1\n    }\n}\n";
@@ -194,26 +195,27 @@ fn identical_definitions_do_not_collapse() {
     assert!(mapping.moves.is_empty(), "{:?}", mapping.moves);
     assert!(mapping.deltas.is_empty(), "{:?}", mapping.deltas);
     let ops = diff(&common::file(), &base, &result, &mapping);
-    let (_, target) = common::def_named(&base, "fn target").unwrap();
+    let (_, target) = common::def_named(&base, "fn target").ok_or("base defines fn target")?;
     assert_eq!(ops.len(), 1, "{ops:?}");
     assert!(
         matches!(ops[0], Op::Replace { node, .. } if node == target),
         "{ops:?}"
     );
-    let applied = apply(&common::file(), &base, &ops, &result).unwrap();
+    let applied = apply(&common::file(), &base, &ops, &result)?;
     assert_eq!(project(&adapter, &applied.tree), edited.as_bytes());
 
     // Editing the second copy of the duplicate edits `second`, not `first`.
     let edited = src.replace("p.len() + 1", "p.len() + 2");
     let (result, mapping) = identify_result(&adapter, &base, edited.as_bytes());
     let ops = diff(&common::file(), &base, &result, &mapping);
-    let (_, second) = common::def_named(&base, "fn second").unwrap();
+    let (_, second) = common::def_named(&base, "fn second").ok_or("base defines fn second")?;
     assert!(
         matches!(ops[..], [Op::Replace { node, .. }] if node == second),
         "{ops:?}"
     );
-    let applied = apply(&common::file(), &base, &ops, &result).unwrap();
+    let applied = apply(&common::file(), &base, &ops, &result)?;
     assert_eq!(project(&adapter, &applied.tree), edited.as_bytes());
+    Ok(())
 }
 
 /// `apply_identified` takes the ids of replaced and inserted content from
