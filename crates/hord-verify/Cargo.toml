@@ -1,0 +1,19 @@
+[package]
+name = "hord-verify"
+description = "Evidence, impact sets, plan/reuse, and Verifier orchestration for Hord (spec §7.1)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hord-core.workspace = true
+hord-encoding.workspace = true
+hord-store.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

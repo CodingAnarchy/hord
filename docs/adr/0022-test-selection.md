@@ -31,3 +31,14 @@ Option 3. Test selection runs individual tests (`--exact` per test binary) chose
 - **Coverage runs cost one instrumented full suite per refresh.** The M4 harness measures how stale coverage may get before fallback rates erase the gains.
 - **Fallback triggers are part of the safety argument, not tuning.** Removing one needs evidence from the ADR 0023 harness and a new ADR.
 - **Selection accuracy is tracked** (§13 "selection safety"). A miss is a P0 bug in the fallback rules.
+
+## Amendments (2026-09-24, from implementation)
+
+Every rule below takes the reading that runs more tests, never fewer.
+
+- **Coverage drift counts as part of the change.** A coverage record is usually older than a change's base. Everything that changed between the coverage snapshot and the snapshot being verified is looked up in coverage, and can trigger fallbacks, exactly like the change's own edits. As coverage ages, efficiency degrades toward the package fallback.
+- **Doctests.** Per-test coverage cannot attribute doctests on stable. A selection also runs `cargo test -p P --doc` for every package the change touches, and for their reverse dependencies.
+- **Files no adapter parses.** A changed file with no adapter inside a package (docs, fixtures, SVGs) falls back to that package and its reverse dependencies. Tests can read files by computed path at runtime, which cannot be detected, so this stays conservative for M4. `bench/m4-eval` reports how often it fires and what it costs. Narrowing it needs data and a new ADR.
+- **"No coverage record" applies to functions.** Coverage attributes code only to functions, so the fallback applies to `function_item`s: those born in the change, and edited ones coverage never instrumented. Type definitions reach tests through the impact set's `References` dependents and the other triggers.
+- **The impact bound.** Expansion stops at 2 hops or at the crate boundary, whichever comes first. Both are configurable.
+- **Size threshold (§7.1 item 4).** An optional `max_impact` key in `.hord-policy.toml`'s `[land]` table (ADR 0026). Unset, which is the default, means no size fallback.
