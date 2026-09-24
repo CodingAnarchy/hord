@@ -122,7 +122,25 @@ fn is_running(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn is_running(pid: u32) -> bool {
+    // As on unix, no `unsafe` process API: ask `tasklist` for that pid. With
+    // `/FO CSV /NH` a match is one row whose second field is `"<pid>"`; no
+    // match prints an `INFO:` line instead.
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|out| {
+            let quoted = format!("\"{pid}\"");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|row| row.split(',').nth(1) == Some(quoted.as_str()))
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn is_running(_pid: u32) -> bool {
     false
 }
