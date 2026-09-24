@@ -18,8 +18,9 @@ use crate::ParseError;
 /// children's `normalized` ids, in order (ADR 0008). A whitespace-only change
 /// therefore alters a leaf's `raw` and content [`ObjectId`], and every
 /// ancestor's content id, but no `normalized` id.
-pub fn normalized_hash(stripped: &[u8]) -> Result<ObjectId, ParseError> {
-    Ok(ObjectId::of_byte_string(stripped))
+#[must_use]
+pub fn normalized_hash(stripped: &[u8]) -> ObjectId {
+    ObjectId::of_byte_string(stripped)
 }
 
 /// `normalized` for an internal node: BLAKE3 of the canonical CBOR array of
@@ -35,9 +36,9 @@ mod tests {
 
     #[test]
     fn same_stripped_bytes_same_hash() {
-        let a = normalized_hash(b"fn foo").unwrap();
-        let b = normalized_hash(b"fn foo").unwrap();
-        let c = normalized_hash(b"fn bar").unwrap();
+        let a = normalized_hash(b"fn foo");
+        let b = normalized_hash(b"fn foo");
+        let c = normalized_hash(b"fn bar");
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
@@ -46,13 +47,13 @@ mod tests {
     fn hash_is_object_id_of_cbor_bytes() {
         let stripped = b"hello";
         let expected = ObjectId::of(&Bytes::from(stripped.as_slice())).unwrap();
-        assert_eq!(normalized_hash(stripped).unwrap(), expected);
+        assert_eq!(normalized_hash(stripped), expected);
     }
 
     #[test]
     fn empty_stripped_is_stable() {
-        let a = normalized_hash(b"").unwrap();
-        let b = normalized_hash(&[]).unwrap();
+        let a = normalized_hash(b"");
+        let b = normalized_hash(&[]);
         assert_eq!(a, b);
         assert_eq!(a, ObjectId::of(&Bytes::default()).unwrap());
     }
