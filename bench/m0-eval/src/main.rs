@@ -148,18 +148,23 @@ fn default_cache() -> PathBuf {
 fn eval_hord() -> CaseReport {
     match find_hord_git() {
         Ok(path) => eval_git("hord", &path, None, None),
-        Err(err) => CaseReport {
-            name: "hord".into(),
-            git_path: String::new(),
-            commits: 0,
-            import_secs: 0.0,
-            check_secs: 0.0,
-            commits_per_sec: 0.0,
-            tree_mismatches: 0,
-            throughput_ok: None,
-            passed: false,
-            error: Some(err.to_string()),
-        },
+        Err(err) => failed("hord", String::new(), err.to_string()),
+    }
+}
+
+/// A case that failed before measuring anything.
+fn failed(name: &str, git_path: String, error: String) -> CaseReport {
+    CaseReport {
+        name: name.into(),
+        git_path,
+        commits: 0,
+        import_secs: 0.0,
+        check_secs: 0.0,
+        commits_per_sec: 0.0,
+        tree_mismatches: 0,
+        throughput_ok: None,
+        passed: false,
+        error: Some(error),
     }
 }
 
@@ -172,18 +177,7 @@ fn eval_remote(
     offline: bool,
 ) -> CaseReport {
     if let Err(err) = ensure_bare_clone(url, dest, offline) {
-        return CaseReport {
-            name: name.into(),
-            git_path: dest.display().to_string(),
-            commits: 0,
-            import_secs: 0.0,
-            check_secs: 0.0,
-            commits_per_sec: 0.0,
-            tree_mismatches: 0,
-            throughput_ok: None,
-            passed: false,
-            error: Some(err.to_string()),
-        };
+        return failed(name, dest.display().to_string(), err.to_string());
     }
     eval_git(name, dest, window, throughput_target)
 }
@@ -194,7 +188,6 @@ fn eval_git(
     window: Option<usize>,
     throughput_target: Option<f64>,
 ) -> CaseReport {
-    let git_path_disp = git_path.display().to_string();
     match eval_git_inner(name, git_path, window) {
         Ok(mut report) => {
             if let Some(target) = throughput_target {
@@ -205,18 +198,7 @@ fn eval_git(
             }
             report
         }
-        Err(err) => CaseReport {
-            name: name.into(),
-            git_path: git_path_disp,
-            commits: 0,
-            import_secs: 0.0,
-            check_secs: 0.0,
-            commits_per_sec: 0.0,
-            tree_mismatches: 0,
-            throughput_ok: None,
-            passed: false,
-            error: Some(format!("{err:#}")),
-        },
+        Err(err) => failed(name, git_path.display().to_string(), format!("{err:#}")),
     }
 }
 

@@ -1,4 +1,4 @@
-//! The streamed node encoding equals the canonical one (perf review #4).
+//! The streamed node encoding equals the canonical one.
 //!
 //! [`Node::content_id`] and [`ObjectId::of_ordered`] skip cbor2's
 //! canonicalizing pass. That is only sound while the streamed bytes equal

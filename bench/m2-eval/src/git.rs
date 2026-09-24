@@ -67,11 +67,12 @@ pub(crate) fn blob(dir: &Path, commit: &str, path: &str) -> Result<Vec<u8>> {
     git(dir, &["cat-file", "blob", &format!("{commit}:{path}")])
 }
 
-pub(crate) fn head_rust_files(dir: &Path) -> Result<Vec<String>> {
+/// Paths at HEAD ending in `suffix`, in `ls-tree` order.
+pub(crate) fn head_files(dir: &Path, suffix: &str) -> Result<Vec<String>> {
     let raw = git(dir, &["ls-tree", "-r", "--name-only", "HEAD"])?;
     Ok(String::from_utf8(raw)?
         .lines()
-        .filter(|path| path.ends_with(".rs"))
+        .filter(|path| path.ends_with(suffix))
         .map(str::to_string)
         .collect())
 }
