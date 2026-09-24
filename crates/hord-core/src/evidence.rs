@@ -49,6 +49,14 @@ pub enum EvidenceKind {
     Review,
     /// Adapter- or policy-defined kind.
     Custom(String),
+    /// The lander's attestation that it rebased `submitted` onto the head
+    /// it landed on (ADR 0018). [`Evidence::snapshot`] is the landed result,
+    /// and the landed record, whose `rebased_from` is `submitted`, lists
+    /// this evidence. Unsigned until M5 adds lander keys.
+    Rebase {
+        /// The record the author submitted.
+        submitted: crate::ChangeId,
+    },
 }
 
 /// Outcome recorded on [`Evidence`].

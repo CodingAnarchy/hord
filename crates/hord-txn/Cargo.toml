@@ -17,6 +17,7 @@ hord-lang.workspace = true
 hord-lang-rust.workspace = true
 hord-lang-toml.workspace = true
 hord-store.workspace = true
+ignore.workspace = true
 reflink-copy.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -32,8 +32,21 @@ pub struct ChangeRecord {
     pub identity_deltas: Vec<IdentityDelta>,
     /// [`crate::Evidence`] object ids attached to this change.
     pub evidence: Vec<ObjectId>,
-    /// Optional signature over the change (spec §10.5.4).
+    /// Signature over the change (spec §10.5.4). An author signs the
+    /// record they submit; a record the lander rebased carries none
+    /// (ADR 0018).
     pub signature: Option<Signature>,
+    /// The submitted record this one was rebased from (ADR 0018).
+    ///
+    /// `Some` when the lander landed the change on a head other than its
+    /// base: `base`, `result`, `parents`, `ops`, `write_set`, and
+    /// `identity_deltas` were recomputed for that head, while `read_set`,
+    /// `intent`, `provenance`, and `evidence` are the submitted record's.
+    /// The author's signature stays valid on the submitted record, which
+    /// must be stored. Omitted from the encoding when `None`, so records
+    /// that were not rebased keep their ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebased_from: Option<ChangeId>,
 }
 
 /// One semantic operation derived by the diff engine (spec §3.5).
@@ -98,6 +111,28 @@ pub enum Op {
         /// Kind of tree mutation.
         kind: TreeOpKind,
     },
+}
+
+impl Op {
+    /// Every [`NodeId`] field of the op: an `Insert`'s parent, the node of a
+    /// `Delete`, `Replace`, or `Rename`, and a `Move`'s node and both
+    /// parents. `Blob` and `Tree` name none.
+    pub fn node_ids(&self) -> impl Iterator<Item = NodeId> {
+        let ids = match self {
+            Self::Insert { parent, .. } => [Some(*parent), None, None],
+            Self::Delete { node } | Self::Replace { node, .. } | Self::Rename { node, .. } => {
+                [Some(*node), None, None]
+            }
+            Self::Move {
+                node,
+                from_parent,
+                to_parent,
+                ..
+            } => [Some(*node), Some(*from_parent), Some(*to_parent)],
+            Self::Blob { .. } | Self::Tree { .. } => [None; 3],
+        };
+        ids.into_iter().flatten()
+    }
 }
 
 /// File/directory mutation used by [`Op::Tree`].

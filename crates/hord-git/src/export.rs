@@ -9,7 +9,7 @@ use gix::bstr::BString;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::objs::{Kind as GitKind, WriteTo};
 use hord_core::{
-    Actor, Blob, ChangeId, ChangeRecord, NodeFile, ObjectId, SnapshotId, Tree, TreeEntry,
+    Actor, Blob, ChangeId, ChangeRecord, NodeFile, ObjectId, Snapshot, SnapshotId, Tree, TreeEntry,
 };
 
 use crate::import::open_repo;
@@ -17,13 +17,13 @@ use crate::leaf::{GitLeaf, parse_mode};
 use crate::store::Store;
 use crate::{Error, GitOid};
 
-/// Project the snapshot root tree `snapshot_id` into `git_dir` and return the
-/// git tree SHA.
+/// Project the snapshot `snapshot_id` into `git_dir` and return the git tree
+/// SHA of its content root.
 ///
-/// `snapshot_id` is the [`ObjectId`] of the root [`Tree`] (spec §3.1), not of
-/// the [`hord_core::Snapshot`] wrapper. Exported trees are byte-identical to
-/// this projection. File modes other than `100644` are stored on the leaf
-/// object so chmod-only trees keep distinct ids.
+/// `snapshot_id` is a [`Snapshot`] id (ADR 0017); the git tree is the
+/// projection of [`Snapshot::tree`]. A root [`Tree`] id is accepted too. File
+/// modes other than `100644` are stored on the leaf object so chmod-only
+/// trees keep distinct ids.
 pub fn export_tree<S: Store>(
     store: &S,
     snapshot_id: SnapshotId,
@@ -31,7 +31,16 @@ pub fn export_tree<S: Store>(
 ) -> Result<GitOid, Error> {
     let repo = open_or_init(git_dir.as_ref())?;
     let cache = ExportCache::default();
-    walk_tree(store, snapshot_id, &Sink::Repo(&repo), &cache).map(GitOid::from_gix)
+    let root = snapshot_root(store, snapshot_id)?;
+    walk_tree(store, root, &Sink::Repo(&repo), &cache).map(GitOid::from_gix)
+}
+
+/// The content root of `snapshot`: [`Snapshot::tree`] when the object is a
+/// [`Snapshot`], else `snapshot` itself (a root [`Tree`] id). The git bridge
+/// maps only content, so identity plays no part (ADR 0017).
+pub fn snapshot_root<S: Store>(store: &S, snapshot: SnapshotId) -> Result<ObjectId, Error> {
+    let bytes = store.get(snapshot)?;
+    Ok(hord_encoding::decode::<Snapshot>(&bytes).map_or(snapshot, |s| s.tree))
 }
 
 /// Memoizes git object ids already projected from Hord [`ObjectId`]s.
@@ -48,7 +57,8 @@ fn lock_map<K, V>(mutex: &Mutex<HashMap<K, V>>) -> std::sync::MutexGuard<'_, Has
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Git tree SHA of a Hord tree, hashed in memory (no destination repository).
+/// Git tree SHA of a Hord snapshot's content root (see [`export_tree`]),
+/// hashed in memory (no destination repository).
 ///
 /// Same bytes as [`export_tree`], so `export(import(repo))` can be checked
 /// without writing a second git odb. `hash` must match the source repository
@@ -59,7 +69,8 @@ pub fn git_tree_sha<S: Store>(
     hash: gix::hash::Kind,
     cache: &ExportCache,
 ) -> Result<GitOid, Error> {
-    walk_tree(store, snapshot_id, &Sink::Hash(hash), cache).map(GitOid::from_gix)
+    let root = snapshot_root(store, snapshot_id)?;
+    walk_tree(store, root, &Sink::Hash(hash), cache).map(GitOid::from_gix)
 }
 
 /// Where projected git objects go: hashed only, or written to a repository.
@@ -177,7 +188,7 @@ fn walk_leaf<S: Store>(
 /// Hord-Actor: <actor>
 /// ```
 ///
-/// The commit tree is the projection of `change.result`. Each parent change is
+/// The commit tree is the projection of `change.result`'s content root. Each parent change is
 /// exported first unless `refs/hord/changes/<id>` already names its commit.
 /// Ancestors are exported iteratively, so long histories do not grow the stack.
 pub fn export_change<S: Store>(
@@ -255,7 +266,8 @@ fn write_commit<S: Store>(
     repo: &gix::Repository,
     cache: &ExportCache,
 ) -> Result<gix::ObjectId, Error> {
-    let tree = walk_tree(store, change.result, &Sink::Repo(repo), cache)?;
+    let root = snapshot_root(store, change.result)?;
+    let tree = walk_tree(store, root, &Sink::Repo(repo), cache)?;
     let parents = change
         .parents
         .iter()

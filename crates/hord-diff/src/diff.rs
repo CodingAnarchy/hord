@@ -5,17 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use hord_core::{IdentityDelta, NodeId, ObjectId, Op, RepoPath};
 use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree};
 
-use crate::defs::{
-    DefSite, collect_sites, file_parent, local_glue, root_glue, root_sentinel, sites_by_id,
-    swap_root,
-};
+use crate::defs::{DefSite, collect_sites, local_glue, root_glue, sites_by_id};
 
 /// Diff `base` → `result` at definition granularity.
 ///
 /// Matching uses [`IdentityMapping`] (exact, named, moved, and rename by
 /// tree-edit distance, ADR 0007). Sub-definition edits collapse to [`Op::Replace`] on
 /// the enclosing definition (ADR 0002). File-level non-definition glue
-/// (`use` items, …) collapses to [`Op::Replace`] on [`file_parent`].
+/// (`use` items, …) collapses to [`Op::Replace`] on [`NodeId::file_root`]`(path)`.
 ///
 /// `Op`s name new content by [`ObjectId`]; those nodes are interned in
 /// `result` and must be passed to [`crate::apply`] as `store`.
@@ -26,8 +23,9 @@ pub fn diff(
     result: &NodeTree,
     mapping: &IdentityMapping,
 ) -> Vec<Op> {
-    let ops = ensure_apply_identity(base, result, diff_structural(base, result, mapping));
-    swap_root(&ops, root_sentinel(), file_parent(path))
+    let root = NodeId::file_root(path);
+    let ops = diff_structural(base, result, mapping, root);
+    ensure_apply_identity(base, result, ops, root)
 }
 
 /// Definition-granularity script **without** a whole-file Replace fallback.
@@ -35,20 +33,21 @@ pub fn diff(
 /// [`diff`] adds that fallback so `apply(diff)` reconstructs `result`. [`crate::merge`]
 /// uses this form so two Git-conflicted sides are not collapsed to
 /// `Replace(file)` vs `Replace(file)` (which either hard-conflicts or
-/// picks one entire file).
+/// picks one entire file). `root` is the file root's id.
 pub(crate) fn diff_structural(
     base: &IdentifiedTree,
     result: &NodeTree,
     mapping: &IdentityMapping,
+    root: NodeId,
 ) -> Vec<Op> {
     if base.tree.root().is_none() {
-        return root_only(result);
+        return root_only(result, root);
     }
     if result.root().is_none() {
         return deaths_only(mapping);
     }
 
-    let ctx = DiffCtx::new(base, result, mapping);
+    let ctx = DiffCtx::new(base, result, mapping, root);
     let (replaces, replace_cover) = ctx.replaces();
     let mut ops = ctx.deletes(&replace_cover);
     ops.extend(replaces);
@@ -65,7 +64,7 @@ pub(crate) fn diff_structural(
         && let (Some(from), Some(to)) = (base.tree.root(), result.root())
     {
         return vec![Op::Replace {
-            node: root_sentinel(),
+            node: root,
             from,
             to,
         }];
@@ -77,6 +76,7 @@ struct DiffCtx<'a> {
     base: &'a IdentifiedTree,
     result: &'a NodeTree,
     mapping: &'a IdentityMapping,
+    root: NodeId,
     base_sites: Vec<DefSite>,
     result_sites: Vec<DefSite>,
     base_by_id: BTreeMap<NodeId, DefSite>,
@@ -87,16 +87,22 @@ struct DiffCtx<'a> {
 }
 
 impl<'a> DiffCtx<'a> {
-    fn new(base: &'a IdentifiedTree, result: &'a NodeTree, mapping: &'a IdentityMapping) -> Self {
+    fn new(
+        base: &'a IdentifiedTree,
+        result: &'a NodeTree,
+        mapping: &'a IdentityMapping,
+        root: NodeId,
+    ) -> Self {
         let result_ids = &mapping.nodes;
-        let base_sites = collect_sites(&base.tree, &base.ids);
-        let result_sites = collect_sites(result, result_ids);
+        let base_sites = collect_sites(&base.tree, &base.ids, root);
+        let result_sites = collect_sites(result, result_ids, root);
         let glue_changed = root_glue(&base.tree, &base.ids) != root_glue(result, result_ids);
         let (dead, born) = delta_sets(mapping);
         Self {
             base,
             result,
             mapping,
+            root,
             base_by_id: sites_by_id(&base_sites),
             result_by_id: sites_by_id(&result_sites),
             base_sites,
@@ -125,7 +131,7 @@ impl<'a> DiffCtx<'a> {
                 // Container header/braces unchanged: child def ops carry the edit.
                 continue;
             }
-            if covered(site.node_id, &self.result_by_id, &replace_cover) {
+            if covered(site.node_id, &self.result_by_id, &replace_cover, self.root) {
                 continue;
             }
             replaces.push(Op::Replace {
@@ -144,10 +150,10 @@ impl<'a> DiffCtx<'a> {
             if !self.dead.contains(&site.node_id) {
                 continue;
             }
-            if self.dead.contains(&site.parent_id) && site.parent_id != root_sentinel() {
+            if self.dead.contains(&site.parent_id) && site.parent_id != self.root {
                 continue;
             }
-            if covered(site.node_id, &self.base_by_id, replace_cover) {
+            if covered(site.node_id, &self.base_by_id, replace_cover, self.root) {
                 continue;
             }
             ops.push(Op::Delete { node: site.node_id });
@@ -170,11 +176,11 @@ impl<'a> DiffCtx<'a> {
             if self.dead.contains(node) || self.born.contains(node) {
                 continue;
             }
-            if covered(*node, &self.result_by_id, replace_cover) {
+            if covered(*node, &self.result_by_id, replace_cover, self.root) {
                 continue;
             }
-            if covered(*to_parent, &self.result_by_id, replace_cover)
-                || covered(*from_parent, &self.base_by_id, replace_cover)
+            if covered(*to_parent, &self.result_by_id, replace_cover, self.root)
+                || covered(*from_parent, &self.base_by_id, replace_cover, self.root)
             {
                 continue;
             }
@@ -189,14 +195,14 @@ impl<'a> DiffCtx<'a> {
             if !self.born.contains(&site.node_id) {
                 continue;
             }
-            if self.born.contains(&site.parent_id) && site.parent_id != root_sentinel() {
+            if self.born.contains(&site.parent_id) && site.parent_id != self.root {
                 continue;
             }
-            if covered(site.node_id, &self.result_by_id, replace_cover) {
+            if covered(site.node_id, &self.result_by_id, replace_cover, self.root) {
                 continue;
             }
-            if covered(site.parent_id, &self.result_by_id, replace_cover)
-                && site.parent_id != root_sentinel()
+            if covered(site.parent_id, &self.result_by_id, replace_cover, self.root)
+                && site.parent_id != self.root
             {
                 continue;
             }
@@ -227,7 +233,7 @@ impl<'a> DiffCtx<'a> {
             let (Some(from), Some(to)) = (base_node.name.clone(), result_node.name.clone()) else {
                 continue;
             };
-            if covered(*nid, &self.result_by_id, replace_cover) {
+            if covered(*nid, &self.result_by_id, replace_cover, self.root) {
                 continue;
             }
             ops.push(Op::Rename {
@@ -259,7 +265,12 @@ fn delta_sets(mapping: &IdentityMapping) -> (BTreeSet<NodeId>, BTreeSet<NodeId>)
 
 /// If the script does not reconstruct `result`'s root, fall back to a file-level
 /// Replace. Definition granularity is a quality metric; apply identity is the gate.
-fn ensure_apply_identity(base: &IdentifiedTree, result: &NodeTree, ops: Vec<Op>) -> Vec<Op> {
+fn ensure_apply_identity(
+    base: &IdentifiedTree,
+    result: &NodeTree,
+    ops: Vec<Op>,
+    root: NodeId,
+) -> Vec<Op> {
     let Some(to) = result.root() else {
         return ops;
     };
@@ -271,7 +282,7 @@ fn ensure_apply_identity(base: &IdentifiedTree, result: &NodeTree, ops: Vec<Op>)
     }
     let whole_file = || {
         vec![Op::Replace {
-            node: root_sentinel(),
+            node: root,
             from,
             to,
         }]
@@ -279,20 +290,20 @@ fn ensure_apply_identity(base: &IdentifiedTree, result: &NodeTree, ops: Vec<Op>)
     if ops.is_empty() {
         return whole_file();
     }
-    match crate::apply::apply_internal(base, &ops, result) {
+    match crate::apply::apply_internal(base, &ops, result, root) {
         Ok(applied) if applied.tree.root() == Some(to) => ops,
         _ => whole_file(),
     }
 }
 
-fn root_only(result: &NodeTree) -> Vec<Op> {
-    let Some(root) = result.root() else {
+fn root_only(result: &NodeTree, root: NodeId) -> Vec<Op> {
+    let Some(to) = result.root() else {
         return Vec::new();
     };
     vec![Op::Replace {
-        node: root_sentinel(),
+        node: root,
         from: ObjectId::from_bytes([0; 32]),
-        to: root,
+        to,
     }]
 }
 
@@ -311,6 +322,7 @@ fn covered(
     nid: NodeId,
     sites: &std::collections::BTreeMap<NodeId, crate::defs::DefSite>,
     replace_cover: &BTreeSet<NodeId>,
+    root: NodeId,
 ) -> bool {
     let mut cur = nid;
     loop {
@@ -320,8 +332,8 @@ fn covered(
         let Some(site) = sites.get(&cur) else {
             return false;
         };
-        if site.parent_id == root_sentinel() || site.parent_id == cur {
-            return replace_cover.contains(&root_sentinel());
+        if site.parent_id == root || site.parent_id == cur {
+            return replace_cover.contains(&root);
         }
         cur = site.parent_id;
     }

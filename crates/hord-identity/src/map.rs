@@ -24,7 +24,7 @@ pub struct SnapshotFile {
 /// that is itself the root has an empty pointer. `deltas` are stored unchanged
 /// (births, deaths, and derivations relative to the parent snapshot).
 ///
-/// Each file with a root also gets [`crate::file_root_id`] at an empty
+/// Each file with a root also gets [`NodeId::file_root`] at an empty
 /// pointer (ADR 0015), unless a definition is itself the root.
 ///
 /// # Errors
@@ -40,7 +40,7 @@ pub fn identity_map(files: &[SnapshotFile], deltas: Vec<IdentityDelta>) -> Resul
             .values()
             .any(|at| at.file == file.path && at.pointer.is_empty());
         if file.identified.tree.root().is_some() && !root_taken {
-            let root = crate::file_root_id(&file.path);
+            let root = NodeId::file_root(&file.path);
             if nodes.contains_key(&root) {
                 return Err(Error::DuplicateNode(root));
             }

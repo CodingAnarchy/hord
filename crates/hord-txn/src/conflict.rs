@@ -6,7 +6,6 @@ use hord_core::{ChangeId, ChangeRecord, NodeId, RepoPath, SnapshotId};
 use serde::{Deserialize, Serialize};
 
 use crate::files::coarse_paths;
-use crate::ids::path_node_id;
 
 /// Which rule of spec §6.3 a [`SetConflict`] broke.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -160,7 +159,7 @@ impl Footprint {
     pub fn of(change: ChangeId, record: &ChangeRecord, touched: &[RepoPath]) -> Self {
         let mut labels = BTreeMap::new();
         let mut ids = |path: &RepoPath| {
-            let id = path_node_id(path);
+            let id = NodeId::file_root(path);
             labels.insert(id, path.clone());
             id
         };
@@ -289,6 +288,7 @@ mod tests {
             identity_deltas: Vec::new(),
             evidence: Vec::new(),
             signature: None,
+            rebased_from: None,
         }
     }
 
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn glue_edits_conflict_only_with_glue_edits() {
         let path: RepoPath = "a.rs".parse().unwrap();
-        let root = path_node_id(&path);
+        let root = NodeId::file_root(&path);
         let glue = |n: u8| {
             let record = ChangeRecord {
                 write_set: [root].into(),

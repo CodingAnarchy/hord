@@ -23,6 +23,10 @@ struct StatusResult {
     write_set: Vec<String>,
     evidence: Vec<String>,
     evidence_stale: bool,
+    /// Untracked paths `propose` leaves out: ignored by a `.gitignore` of
+    /// the base or the built-in default, or not a regular file. A directory
+    /// ends in `/` and stands for everything under it.
+    skipped: Vec<String>,
 }
 
 pub fn run(json: bool, workspace: Option<String>, paranoid: bool) -> Result<()> {
@@ -44,6 +48,17 @@ pub fn run(json: bool, workspace: Option<String>, paranoid: bool) -> Result<()> 
         Err(err) => return Err(err.into()),
     };
     let reads = reads_label(ws.access_log().reads_observed);
+    let skipped = ws
+        .skipped()
+        .iter()
+        .map(|path| {
+            let mut shown = path.to_string();
+            if meta.path.join(&shown).is_dir() {
+                shown.push('/');
+            }
+            shown
+        })
+        .collect();
     let result = StatusResult {
         workspace: meta.id.to_string(),
         base: hex(meta.base),
@@ -64,6 +79,7 @@ pub fn run(json: bool, workspace: Option<String>, paranoid: bool) -> Result<()> 
             .collect(),
         evidence: Vec::new(),
         evidence_stale: false,
+        skipped,
     };
     if json {
         return output::print_json(&result);
@@ -76,6 +92,12 @@ pub fn run(json: bool, workspace: Option<String>, paranoid: bool) -> Result<()> 
     }
     println!("materialization {}", result.materialization);
     println!("reads: {reads}");
+    if !result.skipped.is_empty() {
+        println!("skipped (untracked, not proposed):");
+        for path in &result.skipped {
+            println!("  {path}");
+        }
+    }
     let Some(record) = record else {
         println!("no changes");
         return Ok(());

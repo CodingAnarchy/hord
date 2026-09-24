@@ -2,54 +2,51 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hord_core::{IdentityDelta, NodeId, ObjectId, RepoPath};
+use hord_core::{IdentityDelta, NodeId, ObjectId, RepoPath, SnapshotId};
 use hord_lang::{
     IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, default_identify, oid_at,
 };
 
-/// Assign a fresh [`hord_core::NodeId`] to every definition in `tree`.
+/// Assign a fresh [`hord_core::NodeId`] to every definition of the file at
+/// `path` (ADR 0019).
 ///
 /// This is [`default_identify`] against an empty base: each definition is an
 /// [`hord_core::IdentityDelta::Birth`]. Non-definitions are omitted. Rename
-/// detection is not involved.
-///
-/// Birth ids are a pure function of the definition's content [`ObjectId`].
-/// The same definition gets the same id on every call, and inserting an
-/// unrelated definition does not change it.
+/// detection is not involved. Each id is derived from the definition's content id, the file's root id
+/// ([`NodeId::file_root`]), its site, and `snapshot`: the base snapshot of
+/// the change that creates it. With `snapshot` `None` this is the *fresh
+/// assignment* that readers fall back to for a file whose identity a
+/// snapshot omits (ADR 0017). The same inputs give the same ids on every
+/// call.
 #[must_use]
-pub fn assign<A: LangAdapter + ?Sized>(adapter: &A, tree: &NodeTree) -> IdentityMapping {
-    let base = IdentifiedTree::default();
-    let mut mapping = default_identify(adapter, &base, tree);
-    stabilize_births(&mut mapping, tree, 0);
-    mapping
-}
-
-/// [`assign`] for the file at `path`. Birth ids also depend on the path, so
-/// identical definitions in two files of one snapshot get different ids
-/// ([`assign`] only keeps them apart within one file).
-#[must_use]
-pub fn assign_in<A: LangAdapter + ?Sized>(
+pub fn assign<A: LangAdapter + ?Sized>(
     adapter: &A,
     path: &RepoPath,
+    snapshot: Option<SnapshotId>,
     tree: &NodeTree,
 ) -> IdentityMapping {
     let base = IdentifiedTree::default();
     let mut mapping = default_identify(adapter, &base, tree);
-    stabilize_births(&mut mapping, tree, path_salt(path));
+    stabilize_births(&mut mapping, tree, &BirthScope { path, snapshot });
     mapping
 }
 
-/// Salt that makes content-derived ids distinct per file. Zero keeps the
-/// path-free derivation of [`assign`] and [`crate::carry`].
-pub(crate) fn path_salt(path: &RepoPath) -> u128 {
-    crate::file_root_id(path).as_u128()
+/// Where births happen: the file and the base snapshot of the change
+/// (ADR 0019).
+pub(crate) struct BirthScope<'a> {
+    pub path: &'a RepoPath,
+    pub snapshot: Option<SnapshotId>,
 }
 
 /// Replace [`IdentityDelta::Birth`] ids from [`NodeId::generate`] with ids
-/// derived from the definition content hash. Identical definitions born at
-/// two sites share a content hash; the later one in preorder takes the next
-/// salt, so each site keeps its own id.
-pub(crate) fn stabilize_births(mapping: &mut IdentityMapping, tree: &NodeTree, scope: u128) {
+/// derived per ADR 0019 from the definition's content id, file root, site,
+/// and base snapshot. A derived id that is already in use in `mapping` (a
+/// carried id, a death, or an earlier birth) takes the next occurrence salt.
+pub(crate) fn stabilize_births(
+    mapping: &mut IdentityMapping,
+    tree: &NodeTree,
+    scope: &BirthScope<'_>,
+) {
     let births: BTreeSet<NodeId> = mapping
         .deltas
         .iter()
@@ -61,17 +58,15 @@ pub(crate) fn stabilize_births(mapping: &mut IdentityMapping, tree: &NodeTree, s
     if births.is_empty() {
         return;
     }
-    let mut pairs: Vec<(ObjectId, &Site, NodeId)> = mapping
+    // Preorder (sites sort that way), so the result is independent of the
+    // random ids `default_identify` handed out.
+    let pairs: Vec<(ObjectId, Site, NodeId)> = mapping
         .nodes
         .iter()
         .filter(|(_, id)| births.contains(id))
-        .filter_map(|(site, id)| Some((oid_at(tree, site)?, site, *id)))
+        .filter_map(|(site, id)| Some((oid_at(tree, site)?, site.clone(), *id)))
         .collect();
-    // Content order, not source order: a sibling inserted earlier does not
-    // change which salt a definition receives. Sites break ties between
-    // identical definitions.
-    pairs.sort();
-    let pairs: Vec<(ObjectId, NodeId)> = pairs.into_iter().map(|(oid, _, id)| (oid, id)).collect();
+    let root = NodeId::file_root(scope.path);
 
     let mut reserved: BTreeSet<NodeId> = mapping
         .nodes
@@ -86,16 +81,16 @@ pub(crate) fn stabilize_births(mapping: &mut IdentityMapping, tree: &NodeTree, s
     }
 
     let mut replace: BTreeMap<NodeId, NodeId> = BTreeMap::new();
-    for (oid, old) in pairs {
-        let mut assigned = stable_birth_id(oid, 0, scope);
-        for salt in 1..64u32 {
+    for (oid, site, old) in pairs {
+        let mut assigned = birth_id(oid, root, &site, scope.snapshot, 0);
+        for occurrence in 1..64u32 {
             if assigned != NodeId::nil()
                 && !reserved.contains(&assigned)
                 && !replace.values().any(|id| *id == assigned)
             {
                 break;
             }
-            assigned = stable_birth_id(oid, salt, scope);
+            assigned = birth_id(oid, root, &site, scope.snapshot, occurrence);
         }
         reserved.insert(assigned);
         replace.insert(old, assigned);
@@ -115,17 +110,23 @@ pub(crate) fn stabilize_births(mapping: &mut IdentityMapping, tree: &NodeTree, s
     }
 }
 
-fn stable_birth_id(oid: ObjectId, salt: u32, scope: u128) -> NodeId {
-    let bytes = oid.as_bytes();
-    let hi = u128::from_be_bytes(bytes[..16].try_into().expect("16 bytes"));
-    let lo = u128::from_be_bytes(bytes[16..].try_into().expect("16 bytes"));
-    let mut mixed = hi
-        ^ lo.rotate_left(17)
-        ^ u128::from(salt).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ scope.rotate_left(41);
-    mixed ^= 0xB100_0000_0000_0000;
-    if mixed == 0 {
-        mixed = 1;
-    }
-    NodeId::from_u128(mixed)
+/// ADR 0019: `derive("hord/birth", content id, file root id, site, base
+/// snapshot)` plus an occurrence salt, as the high 128 bits of the BLAKE3
+/// hash of their canonical CBOR (injective, so distinct inputs hash
+/// distinct bytes). Never [`NodeId::nil`].
+#[must_use]
+pub fn birth_id(
+    content: ObjectId,
+    file_root: NodeId,
+    site: &[u32],
+    snapshot: Option<SnapshotId>,
+    occurrence: u32,
+) -> NodeId {
+    let input = ("hord/birth", content, file_root, site, snapshot, occurrence);
+    // Encoding a tuple of ids, integers, and a string cannot fail.
+    let id = ObjectId::of(&input).unwrap_or_else(|_| ObjectId::from_canonical(b"hord/birth"));
+    let mut high = [0u8; 16];
+    high.copy_from_slice(&id.as_bytes()[..16]);
+    let value = u128::from_be_bytes(high);
+    NodeId::from_u128(if value == 0 { 1 } else { value })
 }

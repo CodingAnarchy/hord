@@ -14,3 +14,5 @@ Dependency additions (one line each):
 - `semver` 1 (`hord-lang-rust`): orders `Cargo.lock` packages by semver version, as Cargo's `PackageId` does (ADR 0013).
 
 `reflink-copy` 0.1 (hord-txn only, ADR 0016): safe wrapper over `clonefile(2)` / `FICLONE` for copy-on-write workspace checkouts, so no hord crate needs `unsafe` outside `hord-vfs`.
+
+`ignore` 0.4 (hord-txn only, ADR 0016): git's `.gitignore` matching semantics (anchoring, `**`, negation, directory-only patterns) for walking a `Directory` checkout, plus its parallel directory walker for the propose `lstat` pass. It is ripgrep's crate; AGENTS.md forbids a hand-rolled glob parser.

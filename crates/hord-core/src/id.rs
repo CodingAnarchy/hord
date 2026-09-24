@@ -7,10 +7,13 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ulid::Ulid;
 
-use crate::ObjectId;
 use crate::error::Error;
+use crate::{ObjectId, RepoPath};
 
-/// A snapshot is identified by the [`ObjectId`] of its root tree object.
+/// A snapshot is identified by the [`ObjectId`] of its [`crate::Snapshot`]
+/// object, which names the root tree and the identity tree (ADR 0017,
+/// superseding spec §3.1's root-tree id). "Same content" is equal
+/// [`crate::Snapshot::tree`]s.
 pub type SnapshotId = ObjectId;
 
 /// A change record is identified by its own [`ObjectId`].
@@ -18,8 +21,11 @@ pub type ChangeId = ObjectId;
 
 /// Stable identity of a code node across edits.
 ///
-/// Assigned once and carried forward. Encoded as a ULID (26-character Crockford
-/// Base32). The timestamp component is informational only (spec §3.1).
+/// Assigned once and carried forward. A birth id is derived from the
+/// definition's content, file, site, and the base snapshot of the change that
+/// creates it (ADR 0019, superseding spec §3.1's random ULID), so it has no
+/// timestamp component. It is displayed and encoded in ULID text
+/// (26-character Crockford Base32).
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NodeId(u128);
 
@@ -49,6 +55,26 @@ impl NodeId {
     #[must_use]
     pub const fn as_u128(self) -> u128 {
         self.0
+    }
+
+    /// Id of the CST root of the file at `path` (ADR 0015).
+    ///
+    /// The root is not a definition, but top-level `Insert`/`Move` ops need a
+    /// parent and a `Replace` of file-level glue needs a node. Blob-tier files
+    /// and whole-file reads and writes use the same id. It is derived from
+    /// canonical CBOR of `("hord/file", path components)`, so every file has
+    /// its own and the same path always gets the same one. It never equals
+    /// [`NodeId::nil`]. A renamed file gets a new root id.
+    #[must_use]
+    pub fn file_root(path: &RepoPath) -> Self {
+        // Canonical CBOR of (domain, components) is injective, so distinct
+        // paths hash distinct inputs. Encoding a tuple of strings cannot fail.
+        let id = ObjectId::of(&("hord/file", path.components()))
+            .unwrap_or_else(|_| ObjectId::from_canonical(b"hord/file"));
+        let mut high = [0u8; 16];
+        high.copy_from_slice(&id.as_bytes()[..16]);
+        let value = u128::from_be_bytes(high);
+        Self(if value == 0 { 1 } else { value })
     }
 }
 
@@ -118,6 +144,16 @@ mod tests {
         let id: NodeId = EXAMPLE.parse().unwrap();
         assert_eq!(id.to_string(), EXAMPLE);
         assert_eq!(format!("{id}"), EXAMPLE);
+    }
+
+    #[test]
+    fn file_roots_are_stable_distinct_and_not_nil() {
+        let a: RepoPath = "src/lib.rs".parse().unwrap();
+        let b: RepoPath = "src/main.rs".parse().unwrap();
+        assert_eq!(NodeId::file_root(&a), NodeId::file_root(&a.clone()));
+        assert_ne!(NodeId::file_root(&a), NodeId::file_root(&b));
+        assert_ne!(NodeId::file_root(&a), NodeId::nil());
+        assert_ne!(NodeId::file_root(&RepoPath::default()), NodeId::nil());
     }
 
     #[test]

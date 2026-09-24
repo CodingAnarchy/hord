@@ -3,10 +3,8 @@
 mod common;
 
 use common::*;
-use hord_core::{ChangeRecord, Op};
-use hord_txn::{
-    ConflictKind, Error, QueueStatus, ReadDeclaration, RepoConfig, RepoOptions, path_node_id,
-};
+use hord_core::{ChangeRecord, NodeId, Op};
+use hord_txn::{ConflictKind, Error, QueueStatus, ReadDeclaration, RepoConfig, RepoOptions};
 
 fn landed(status: &QueueStatus) -> bool {
     matches!(status, QueueStatus::Landed { .. })
@@ -362,7 +360,11 @@ async fn new_and_deleted_files() {
     ws.delete_file(&path("README.md")).await.unwrap();
     let change = submit(&t.repo, &mut ws, "add and remove").await;
     let record = t.repo.change(change).await.unwrap();
-    assert!(record.write_set.contains(&path_node_id(&path("README.md"))));
+    assert!(
+        record
+            .write_set
+            .contains(&NodeId::file_root(&path("README.md")))
+    );
     let done = t.repo.land_local().await.unwrap();
     assert!(landed(&done[0].status));
     let mut after = begin(&t.repo, "b").await;
@@ -462,7 +464,7 @@ async fn directory_workspaces_find_writes_by_diffing() {
         proposal
             .record
             .write_set
-            .contains(&path_node_id(&path("notes.txt")))
+            .contains(&NodeId::file_root(&path("notes.txt")))
     );
     assert!(ws.access_log().written_paths.contains(&path("src/lib.rs")));
     t.repo.submit(proposal.change).await.unwrap();

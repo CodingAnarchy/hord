@@ -6,7 +6,6 @@ use hord_core::{Bytes, NodeId, ObjectId, Op, RepoPath};
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree};
 
 use crate::apply::apply_internal;
-use crate::defs::{file_parent, mentions, root_sentinel, swap_root};
 
 use crate::graft::union_trees;
 
@@ -108,22 +107,28 @@ pub struct MergeResult {
 /// this function is the structural path. An unparseable result is a hard
 /// conflict. `mode` picks what happens when both sides edit one node and
 /// the edits do not combine ([`MergeMode`], ADR 0014).
+///
+/// `path` is the file's path. Contention at file level, soft or hard, names
+/// its root [`NodeId::file_root`]`(path)`, and a hard conflict always names
+/// at least that (ADR 0015).
 pub fn merge<A: LangAdapter + ?Sized>(
     adapter: &A,
+    path: &RepoPath,
     base: &IdentifiedTree,
     ours: &IdentifiedTree,
     theirs: &IdentifiedTree,
     mode: MergeMode,
 ) -> Result<MergeResult, Conflict> {
-    let ours_map = crate::defs::mapping_between(base, ours);
-    let theirs_map = crate::defs::mapping_between(base, theirs);
-    let ours_ops = crate::diff::diff_structural(base, &ours.tree, &ours_map);
-    let theirs_ops = crate::diff::diff_structural(base, &theirs.tree, &theirs_map);
+    let root = NodeId::file_root(path);
+    let ours_map = crate::defs::mapping_between(base, ours, root);
+    let theirs_map = crate::defs::mapping_between(base, theirs, root);
+    let ours_ops = crate::diff::diff_structural(base, &ours.tree, &ours_map, root);
+    let theirs_ops = crate::diff::diff_structural(base, &theirs.tree, &theirs_map, root);
     let mut store = union_trees(&base.tree, &ours.tree)
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
     store = union_trees(&store, &theirs.tree)
         .map_err(|e| Conflict::hard(Vec::new(), format!("union interned nodes: {e}")))?;
-    let result = match merge_ops_internal(adapter, base, &ours_ops, &theirs_ops, &store, mode) {
+    let result = match merge_ops(adapter, base, &ours_ops, &theirs_ops, &store, mode, root) {
         // Delete vs anything else must not fall through to an auto-merge.
         Err(conflict) if conflict.delete_vs => Err(conflict),
         Ok(ok) => accept_composed(adapter, base, ours, theirs, ok, mode),
@@ -131,9 +136,10 @@ pub fn merge<A: LangAdapter + ?Sized>(
             overlap_fallback(adapter, base, ours, theirs, &mut store, mode).ok_or(structural)
         }
     };
-    // `merge` has no path: a file-root conflict names no definition.
     result.map_err(|mut conflict| {
-        conflict.nodes.retain(|n| *n != root_sentinel());
+        if conflict.nodes.is_empty() {
+            conflict.nodes.push(root);
+        }
         conflict
     })
 }
@@ -355,52 +361,18 @@ fn reparse<A: LangAdapter + ?Sized>(
     })
 }
 
-/// Compose two edit scripts against `base` (the file at `path`) and apply
-/// them.
-///
-/// `store` must intern every Insert/Replace `to` ObjectId from both sides.
-/// File-level ops name [`file_parent`]`(path)` (ADR 0015). `mode` decides a
-/// same-node edit that does not combine ([`MergeMode`]).
-#[allow(clippy::too_many_arguments)]
-pub fn merge_ops<A: LangAdapter + ?Sized>(
-    adapter: &A,
-    path: &RepoPath,
-    base: &IdentifiedTree,
-    ours: &[Op],
-    theirs: &[Op],
-    store: &NodeTree,
-    mode: MergeMode,
-) -> Result<MergeResult, Conflict> {
-    if ours
-        .iter()
-        .chain(theirs)
-        .any(|op| mentions(op, root_sentinel()))
-    {
-        return Err(Conflict::hard(
-            Vec::new(),
-            "an op names the nil NodeId; the file parent is file_parent(path) (ADR 0015)",
-        ));
-    }
-    let root = file_parent(path);
-    let ours = swap_root(ours, root, root_sentinel());
-    let theirs = swap_root(theirs, root, root_sentinel());
-    merge_ops_internal(adapter, base, &ours, &theirs, store, mode).map_err(|mut conflict| {
-        for node in &mut conflict.nodes {
-            if *node == root_sentinel() {
-                *node = root;
-            }
-        }
-        conflict
-    })
-}
-
-fn merge_ops_internal<A: LangAdapter + ?Sized>(
+/// Compose two edit scripts against `base`, whose file root is `root`, and
+/// apply them. `store` must intern every Insert/Replace `to` ObjectId from
+/// both sides. `mode` decides a same-node edit that does not combine
+/// ([`MergeMode`]).
+fn merge_ops<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
     ours: &[Op],
     theirs: &[Op],
     store: &NodeTree,
     mode: MergeMode,
+    root: NodeId,
 ) -> Result<MergeResult, Conflict> {
     let mut store = store.clone();
     let (composed, soft) = compose(ours, theirs, &mut store, mode)?;
@@ -410,7 +382,7 @@ fn merge_ops_internal<A: LangAdapter + ?Sized>(
             "structural compose dropped all ops; refusing a silent base (spec §5.2)",
         ));
     }
-    let applied = apply_internal(base, &composed, &store)
+    let applied = apply_internal(base, &composed, &store, root)
         .map_err(|e| Conflict::hard(Vec::new(), format!("apply composed ops: {e}")))?;
     let bytes = adapter.project(&applied.tree);
     let parsed = adapter

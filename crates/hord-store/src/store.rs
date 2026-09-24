@@ -8,6 +8,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use hord_core::{ChangeId, ObjectId, SnapshotId};
 use redb::{Database, Durability, ReadableTable, TableDefinition, WriteTransaction};
@@ -20,10 +21,13 @@ use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
 
 #[path = "index.rs"]
 mod index;
+#[path = "lock.rs"]
+mod lock;
 #[path = "queue.rs"]
 mod queue;
 
-pub use index::EdgeKind;
+pub use index::{EdgeKind, touched_nodes};
+pub use queue::Landing;
 
 /// Directory name of a Hord store, next to the repository root (spec §8.1).
 pub const HORD_DIR: &str = ".hord";
@@ -63,6 +67,8 @@ struct LandingLog {
     order: Vec<ChangeId>,
     /// First landing index of each id. A repeated id keeps the earlier index.
     first_pos: HashMap<ChangeId, usize>,
+    /// Last landing index of each id.
+    last_pos: HashMap<ChangeId, usize>,
 }
 
 impl LandingLog {
@@ -71,6 +77,7 @@ impl LandingLog {
             loaded: false,
             order: Vec::new(),
             first_pos: HashMap::new(),
+            last_pos: HashMap::new(),
         }
     }
 
@@ -80,6 +87,7 @@ impl LandingLog {
         }
         let pos = self.order.len();
         self.first_pos.entry(change).or_insert(pos);
+        self.last_pos.insert(change, pos);
         self.order.push(change);
     }
 }
@@ -87,8 +95,9 @@ impl LandingLog {
 /// Local content-addressed object store (spec §8.1).
 ///
 /// Layout under `<repo>/.hord/`:
-/// - `index.redb` — log, refs, workspaces, packed-object locations, and the
-///   rebuildable `node_history` / `edges` / `identity` caches
+/// - `index.redb` — format version, log, refs, workspaces, packed-object
+///   locations, and the rebuildable `node_history` / `edges` / `rebased`
+///   indexes
 /// - `objects/<ab>/<rest>` — uncompressed loose objects
 /// - `objects/pack/pack-<id>.pack` + `.idx` — zstd-compressed packs
 /// - `ws/<ulid>/` — workspace materialization directories
@@ -107,7 +116,7 @@ pub struct Store {
     /// Landed changes not yet written to the redb `log` table.
     pending_log: Mutex<Vec<ChangeId>>,
     has_packs: AtomicBool,
-    /// Serializes index updates so an identity supersede chain cannot fork.
+    /// Serializes index updates (edges, history, landings, rebuilds).
     index_lock: Mutex<()>,
     /// Objects this process has stored or fetched. Duplicate `put`s hit this
     /// instead of rewriting the loose file.
@@ -118,6 +127,8 @@ pub struct Store {
     landing_log: Mutex<LandingLog>,
     /// Edge keys inserted by this process. Duplicate `put_edge` skips the write.
     seen_edges: Mutex<HashSet<[u8; index::EDGE_KEY_LEN]>>,
+    /// Set once the queue name index is known to be complete.
+    queue_names_ready: AtomicBool,
 }
 
 impl std::fmt::Debug for Store {
@@ -131,7 +142,8 @@ impl std::fmt::Debug for Store {
 impl Store {
     /// Create `<repo>/.hord/` and an empty store.
     ///
-    /// Fails if `.hord/` already exists.
+    /// Fails if `.hord/` already exists. Waits for the index lock as
+    /// [`Store::open`] does.
     pub fn create(repo_root: impl AsRef<Path>) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let hord_dir = repo_root.join(HORD_DIR);
@@ -142,7 +154,10 @@ impl Store {
         let objects_dir = hord_dir.join("objects");
         create_shard_dirs(&objects_dir)?;
         fs::create_dir_all(hord_dir.join("ws"))?;
-        let db = Database::create(hord_dir.join("index.redb")).map_err(Error::index)?;
+        let index = hord_dir.join("index.redb");
+        let db = lock::acquire(&hord_dir, &index, lock::timeout_from_env()?, || {
+            Database::create(&index)
+        })?;
         init_tables(&db)?;
         Ok(Self {
             repo_root,
@@ -158,18 +173,29 @@ impl Store {
             pack_files: Mutex::new(HashMap::new()),
             landing_log: Mutex::new(LandingLog::empty()),
             seen_edges: Mutex::new(HashSet::new()),
+            queue_names_ready: AtomicBool::new(false),
         })
     }
 
     /// Open an existing store at `<repo>/.hord/`.
+    ///
+    /// One process at a time can hold a store (ADR 0021). If another process
+    /// holds it, this retries with backoff for `HORD_LOCK_TIMEOUT` seconds
+    /// (default 30; `0` fails at once), then returns [`Error::Locked`].
     pub fn open(repo_root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_lock_timeout(repo_root, lock::timeout_from_env()?)
+    }
+
+    /// [`Store::open`], waiting at most `timeout` for another process to
+    /// release the store instead of reading `HORD_LOCK_TIMEOUT`.
+    pub fn open_with_lock_timeout(repo_root: impl AsRef<Path>, timeout: Duration) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let hord_dir = repo_root.join(HORD_DIR);
         let index = hord_dir.join("index.redb");
         if !hord_dir.is_dir() || !index.is_file() {
             return Err(Error::MissingStore(hord_dir));
         }
-        let db = Database::open(index).map_err(Error::index)?;
+        let db = lock::acquire(&hord_dir, &index, timeout, || Database::open(&index))?;
         index::ensure_tables(&db)?;
         queue::ensure_tables(&db)?;
         let objects_dir = hord_dir.join("objects");
@@ -188,6 +214,7 @@ impl Store {
             pack_files: Mutex::new(HashMap::new()),
             landing_log: Mutex::new(LandingLog::empty()),
             seen_edges: Mutex::new(HashSet::new()),
+            queue_names_ready: AtomicBool::new(false),
         })
     }
 
@@ -297,6 +324,31 @@ impl Store {
     pub fn log(&self) -> Result<Vec<ChangeId>> {
         let log = self.ensure_landing_log()?;
         Ok(log.order.clone())
+    }
+
+    /// Number of entries in the landing log.
+    pub fn log_len(&self) -> Result<usize> {
+        Ok(self.ensure_landing_log()?.order.len())
+    }
+
+    /// Landing-log entries from index `start` on (empty past the end).
+    pub fn log_since(&self, start: usize) -> Result<Vec<ChangeId>> {
+        let log = self.ensure_landing_log()?;
+        Ok(log
+            .order
+            .get(start..)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default())
+    }
+
+    /// Index of the last landing-log entry equal to `change`, if any.
+    pub fn log_position(&self, change: ChangeId) -> Result<Option<usize>> {
+        Ok(self.ensure_landing_log()?.last_pos.get(&change).copied())
+    }
+
+    /// Whether `change` is in the landing log.
+    pub fn log_contains(&self, change: ChangeId) -> Result<bool> {
+        Ok(self.ensure_landing_log()?.first_pos.contains_key(&change))
     }
 
     /// Set `head` to the latest landed change (spec §3.7).
@@ -607,13 +659,16 @@ impl Store {
             let mut order = self.read_persisted_log()?;
             order.extend_from_slice(&pending);
             let mut first_pos = HashMap::with_capacity(order.len());
+            let mut last_pos = HashMap::with_capacity(order.len());
             for (index, id) in order.iter().enumerate() {
                 first_pos.entry(*id).or_insert(index);
+                last_pos.insert(*id, index);
             }
             *log = LandingLog {
                 loaded: true,
                 order,
                 first_pos,
+                last_pos,
             };
         }
         drop(pending);
@@ -757,6 +812,8 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         let _ = self.flush();
+        // Before `db` closes, so no later holder has written its pid yet.
+        lock::release(&self.hord_dir);
     }
 }
 
@@ -792,7 +849,9 @@ fn init_tables(db: &Database) -> Result<()> {
     txn.open_table(META).map_err(Error::index)?;
     txn.open_table(EVIDENCE_BY_SNAPSHOT).map_err(Error::index)?;
     index::open_tables(&txn)?;
+    index::write_format(&txn)?;
     queue::open_tables(&txn)?;
+    queue::mark_names_indexed(&txn)?;
     txn.commit().map_err(Error::index)?;
     Ok(())
 }

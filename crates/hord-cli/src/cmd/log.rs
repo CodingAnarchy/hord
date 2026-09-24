@@ -4,8 +4,8 @@
 //! Filters are combined: a change is kept only when every flag matches.
 //! `--node` uses the same touch rule as [`hord_store::Store::node_history`]
 //! (write set, ops, and identity deltas; not the read set). `--path` keeps a
-//! change when a write-set node is located at that path in the result
-//! identity map, or in the base map when the result map does not place it.
+//! change when it wrote a node in one of its changed files under that path
+//! ([`hord_txn::Query::touches_path`]).
 
 use anyhow::{Context, Result};
 use hord_core::RepoPath;
@@ -13,7 +13,8 @@ use serde::Serialize;
 
 use crate::output;
 use crate::repo;
-use crate::resolve::{self, IdentityCache};
+use crate::resolve;
+use crate::txn::{self, block_on};
 
 #[derive(Debug, Serialize)]
 struct LogResult {
@@ -31,13 +32,14 @@ pub fn run(
 ) -> Result<()> {
     let store = repo::discover()?;
     let ids = store.log()?;
+    let head = store.head()?.map(|id| id.to_hex());
     let filtered = if node.is_none() && path.is_none() && actor.is_none() && since.is_none() {
         ids.iter().map(ToString::to_string).collect()
     } else {
-        filter_log(&store, &ids, node, path, actor, since)?
+        filter_log(store, &ids, node, path, actor, since)?
     };
     let result = LogResult {
-        head: store.head()?.map(|id| id.to_hex()),
+        head,
         log: filtered,
     };
     if json {
@@ -53,15 +55,17 @@ pub fn run(
 }
 
 fn filter_log(
-    store: &hord_store::Store,
+    store: hord_store::Store,
     ids: &[hord_core::ChangeId],
     node: Option<String>,
     path: Option<String>,
     actor: Option<String>,
     since: Option<u64>,
 ) -> Result<Vec<String>> {
+    let repo = txn::open_store(store)?;
+    let query = repo.query();
     let node = match node {
-        Some(spec) => Some(resolve::resolve_node_spec(store, &spec)?),
+        Some(spec) => Some(resolve::resolve_node_spec(&query, &spec)?),
         None => None,
     };
     let path = match path {
@@ -71,10 +75,9 @@ fn filter_log(
         ),
         None => None,
     };
-    let mut cache = IdentityCache::new();
     let mut kept = Vec::new();
     for id in ids {
-        let Some(change) = repo::try_change(store, *id)? else {
+        let Some(change) = repo::try_change(repo.store(), *id)? else {
             continue;
         };
         if let Some(actor) = &actor
@@ -88,12 +91,12 @@ fn filter_log(
             continue;
         }
         if let Some(node) = node
-            && !resolve::touches_node(&change, node)
+            && !hord_txn::touches_node(&change, node)
         {
             continue;
         }
         if let Some(path) = &path
-            && !resolve::write_set_touches_path(store, &change, path, &mut cache)?
+            && !block_on(query.touches_path(change, path.clone()))?
         {
             continue;
         }

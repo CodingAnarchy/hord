@@ -33,6 +33,32 @@ impl ObjectId {
         Ok(Self::from_canonical(&encode(value)?))
     }
 
+    /// Hash `value`, whose `Serialize` already emits canonical form, without
+    /// buffering it as a CBOR value and sorting its keys.
+    ///
+    /// Equal to [`Self::of`] under the conditions of
+    /// [`encode_ordered_into`](crate::encode_ordered_into). The encoder
+    /// streams into BLAKE3, so nothing is allocated.
+    pub fn of_ordered<T: Serialize + ?Sized>(value: &T) -> Result<Self, Error> {
+        let mut hasher = blake3::Hasher::new();
+        cbor2::to_writer(value, &mut hasher).map_err(|e| Error::Encode(e.to_string()))?;
+        Ok(Self(*hasher.finalize().as_bytes()))
+    }
+
+    /// Hash `bytes` as a CBOR byte string (major type 2), without copying
+    /// them into an owned value first. Equal to `ObjectId::of` of any
+    /// `Serialize` type that calls `serialize_bytes` with the same slice.
+    #[must_use]
+    pub fn of_byte_string(bytes: &[u8]) -> Self {
+        struct ByteString<'a>(&'a [u8]);
+        impl Serialize for ByteString<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        Self::of_ordered(&ByteString(bytes)).expect("a byte string always encodes")
+    }
+
     /// Wrap a raw 32-byte digest.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {

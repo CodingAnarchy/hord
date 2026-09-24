@@ -459,3 +459,44 @@ fn concurrent_lockfile_additions_land_under_the_default_verifier() {
     let text = ok(dir, &["conflicts", &second]);
     assert!(text.contains("merged by adapter: Cargo.lock"), "{text}");
 }
+
+/// ADR 0017 (system review item 2): a change landed with `land --local` is
+/// visible to the M2 commands. `hord blame` by name and by `path:line`, and
+/// `hord log --node`, resolve through the snapshot's own identity.
+#[test]
+fn blame_and_log_resolve_after_land_local() {
+    let (_source, repo) = setup();
+    let dir = &repo.0;
+    let (ws, checkout) = ws_new(dir);
+    edit(&checkout, "    2\n", "    20\n");
+    let file = intent(dir, "beta", "beta returns 20", "");
+    let change = propose(dir, &ws, &file);
+    json(dir, &["submit", &change]);
+    let landed = json(dir, &["land", "--local"]);
+    assert_eq!(landed["processed"][0]["status"], "landed");
+
+    let by_name = json(dir, &["blame", "beta"]);
+    let node = by_name["node"].as_str().unwrap().to_owned();
+    let history = by_name["history"].as_array().unwrap();
+    assert_eq!(history.len(), 1, "{by_name:#}");
+    assert_eq!(history[0]["change"], change.as_str());
+    assert_eq!(history[0]["intent"], "beta returns 20");
+    assert_eq!(history[0]["actor"], "tester");
+
+    // Line 6 is `    20` inside `beta`.
+    let by_line = json(dir, &["blame", "src/lib.rs:6"]);
+    assert_eq!(by_line["node"], node.as_str());
+    assert_eq!(by_line["history"], by_name["history"]);
+
+    let log = json(dir, &["log", "--node", "beta"]);
+    assert_eq!(log["log"], serde_json::json!([change]));
+    let by_id = json(dir, &["log", "--node", &node]);
+    assert_eq!(by_id["log"], log["log"]);
+    let by_path = json(dir, &["log", "--path", "src"]);
+    assert_eq!(by_path["log"], log["log"]);
+
+    // An untouched definition resolves too; it has no landed history.
+    let alpha = json(dir, &["blame", "alpha"]);
+    assert_ne!(alpha["node"], node.as_str());
+    assert_eq!(alpha["history"], serde_json::json!([]));
+}

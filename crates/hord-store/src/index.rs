@@ -1,49 +1,47 @@
-//! Rebuildable caches for the spec §8.1 tables `node_history`, `edges`, and `identity`.
+//! Rebuildable indexes for the spec §8.1 tables `node_history` and `edges`,
+//! the `rebased` index (ADR 0018), and the store format version.
 //!
 //! Redb is not the only copy of a fact:
 //! - `node_history` is derived from landed [`hord_core::ChangeRecord`] objects.
+//! - `rebased` (submitted change → the id it landed under) is derived from
+//!   the `rebased_from` field of landed records.
 //! - each edge is its own content-addressed object.
-//! - each identity table is an [`hord_core::IdentityMap`] plus a binding object
-//!   that names the snapshot and the binding it replaces.
 //!
-//! [`Store::rebuild_index`] drops those caches and fills them from the objects.
-//! The longest identity supersede chain for a snapshot wins. Equal lengths break
-//! ties by the greater binding [`hord_core::ObjectId`].
+//! [`Store::rebuild_index`] drops those indexes and fills them from the
+//! objects. NodeIds are not here: a snapshot's identity lives in its
+//! [`hord_core::Snapshot`] object (ADR 0017), which `hord-txn` reads.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use hord_core::{
-    ChangeId, ChangeRecord, IdentityDelta, IdentityMap, NodeId, NodePath, ObjectId, Op, SnapshotId,
-};
-use redb::{Database, Durability, Table, TableDefinition, WriteTransaction};
+use hord_core::{ChangeId, ChangeRecord, IdentityDelta, NodeId, ObjectId, Op, SnapshotId};
+use redb::{Database, ReadableTable, Table, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
-use super::Store;
-use super::queue::IDENTITY_INDEX;
+use super::{META, Store};
 use crate::{Error, Result};
+
+/// Object format this build reads and writes. 2: snapshot ids are
+/// [`hord_core::Snapshot`] object ids (ADR 0017). Stores without a recorded
+/// format are format 1.
+pub(super) const STORE_FORMAT: u32 = 2;
+const META_FORMAT: &str = "format";
 
 const INDEX_FACT_FORMAT: u8 = 1;
 const PRESENT: &[u8] = &[0];
 
 /// Canonical CBOR prefix of [`IndexFact::Edge`]: a one-entry map keyed by `"Edge"`.
 const EDGE_FACT_PREFIX: &[u8] = b"\xa1\x64Edge";
-/// Canonical CBOR prefix of [`IndexFact::Identity`].
-const IDENTITY_FACT_PREFIX: &[u8] = b"\xa1\x68Identity";
-/// Canonical CBOR prefix of [`IndexFact::IdentityIndex`].
-const IDENTITY_INDEX_FACT_PREFIX: &[u8] = b"\xa1\x6dIdentityIndex";
-/// `identity_index` row value: `index || binding`.
-const IDENTITY_INDEX_ROW_LEN: usize = 2 * ObjectId::LEN;
 
 const SNAP_LEN: usize = ObjectId::LEN;
-const NODE_LEN: usize = 16;
+pub(super) const NODE_LEN: usize = 16;
 /// `snapshot || kind || source || target`
 pub(super) const EDGE_KEY_LEN: usize = SNAP_LEN + 1 + NODE_LEN + NODE_LEN;
 const EDGE_PREFIX_LEN: usize = SNAP_LEN + 1 + NODE_LEN;
 
 const NODE_HISTORY: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("node_history");
 const EDGES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("edges");
-const IDENTITY: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("identity");
-const INDEX_HEADS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("index_heads");
+/// Submitted change id → the id it landed under (ADR 0018).
+pub(super) const REBASED: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("rebased");
 
 /// Edge kinds stored per snapshot (spec §3.8).
 ///
@@ -85,21 +83,6 @@ enum IndexFact {
         source: NodeId,
         target: NodeId,
     },
-    Identity {
-        format: u8,
-        snapshot: SnapshotId,
-        map: ObjectId,
-        supersedes: Option<ObjectId>,
-    },
-    /// `hord-txn`'s identity index object for `snapshot`
-    /// ([`Store::set_identity_index`]). `supersedes` is the binding it
-    /// replaced for the same snapshot.
-    IdentityIndex {
-        format: u8,
-        snapshot: SnapshotId,
-        index: ObjectId,
-        supersedes: Option<ObjectId>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,23 +93,47 @@ struct StoredEdge {
     target: NodeId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FoundBinding {
-    id: ObjectId,
-    snapshot: SnapshotId,
-    map: ObjectId,
-    supersedes: Option<ObjectId>,
-}
-
 pub(super) fn open_tables(txn: &WriteTransaction) -> Result<()> {
     txn.open_table(NODE_HISTORY).map_err(Error::index)?;
     txn.open_table(EDGES).map_err(Error::index)?;
-    txn.open_table(IDENTITY).map_err(Error::index)?;
-    txn.open_table(INDEX_HEADS).map_err(Error::index)?;
+    txn.open_table(REBASED).map_err(Error::index)?;
     Ok(())
 }
 
+/// Record [`STORE_FORMAT`] in a new store.
+pub(super) fn write_format(txn: &WriteTransaction) -> Result<()> {
+    let mut meta = txn.open_table(META).map_err(Error::index)?;
+    meta.insert(META_FORMAT, STORE_FORMAT.to_be_bytes().as_slice())
+        .map_err(Error::index)?;
+    Ok(())
+}
+
+/// Refuse a store whose format is not [`STORE_FORMAT`] (ADR 0017: snapshot
+/// ids changed, and there is no migration), then create missing tables.
 pub(super) fn ensure_tables(db: &Database) -> Result<()> {
+    let found = {
+        let txn = db.begin_read().map_err(Error::index)?;
+        match txn.open_table(META) {
+            Ok(meta) => match meta.get(META_FORMAT).map_err(Error::index)? {
+                Some(value) => {
+                    let bytes: [u8; 4] = value
+                        .value()
+                        .try_into()
+                        .map_err(|_| Error::CorruptIndex("format"))?;
+                    Some(u32::from_be_bytes(bytes))
+                }
+                None => None,
+            },
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(err) => return Err(Error::index(err)),
+        }
+    };
+    if found != Some(STORE_FORMAT) {
+        return Err(Error::StoreFormat {
+            found,
+            expected: STORE_FORMAT,
+        });
+    }
     let txn = db.begin_write().map_err(Error::index)?;
     open_tables(&txn)?;
     txn.commit().map_err(Error::index)?;
@@ -206,61 +213,6 @@ impl Store {
         Ok(targets)
     }
 
-    /// Record which [`NodeId`] each definition had in `snapshot`.
-    ///
-    /// `map.nodes` is [`NodeId`] → location. The identity table answers the
-    /// inverse, location → [`NodeId`], via [`Self::identity_at`]. The stored
-    /// [`IdentityMap`] is the fact; redb is a cache. Returns that object's
-    /// [`ObjectId`] (the value [`hord_core::IndexPointers::identity`] holds).
-    ///
-    /// Replaces any identity previously recorded for `snapshot`. Fails if two
-    /// entries share a [`NodePath`].
-    pub fn put_identity(&self, snapshot: SnapshotId, map: &IdentityMap) -> Result<ObjectId> {
-        let _guard = self.lock_index();
-        let rows = identity_rows(snapshot, map)?;
-        let map_id = self.put_object(map)?;
-        let supersedes = self.identity_head(snapshot)?;
-        let binding_id = self.put_object(&IndexFact::Identity {
-            format: INDEX_FACT_FORMAT,
-            snapshot,
-            map: map_id,
-            supersedes,
-        })?;
-        self.commit_identity(snapshot, &rows, binding_id)?;
-        Ok(map_id)
-    }
-
-    /// [`NodeId`] recorded for the definition at `path` in `snapshot`.
-    pub fn identity_at(&self, snapshot: SnapshotId, path: &NodePath) -> Result<Option<NodeId>> {
-        let txn = self.db.begin_read().map_err(Error::index)?;
-        let table = txn.open_table(IDENTITY).map_err(Error::index)?;
-        let key = identity_key(snapshot, path)?;
-        match table.get(key.as_slice()).map_err(Error::index)? {
-            Some(value) => Ok(Some(node_from_bytes(value.value())?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Stored identity fact for `snapshot`, if [`Self::put_identity`] has run.
-    pub fn identity_map(&self, snapshot: SnapshotId) -> Result<Option<IdentityMap>> {
-        let Some(binding_id) = self.identity_head(snapshot)? else {
-            return Ok(None);
-        };
-        let IndexFact::Identity {
-            format,
-            snapshot: got,
-            map,
-            ..
-        } = self.get_object(binding_id)?
-        else {
-            return Err(Error::CorruptIndex("identity head"));
-        };
-        if format != INDEX_FACT_FORMAT || got != snapshot {
-            return Err(Error::CorruptIndex("identity head"));
-        }
-        Ok(Some(self.get_object(map)?))
-    }
-
     /// Landed [`ChangeId`]s that touched `node`, in landing order.
     ///
     /// A change touches a node when that [`NodeId`] is in its `write_set`, in an
@@ -295,134 +247,38 @@ impl Store {
         self.insert_history(change, &touched_nodes(&record))
     }
 
-    /// Point `snapshot` at `hord-txn`'s identity index object `index`.
-    ///
-    /// `hord-txn` stores, per snapshot, which files carry
-    /// [`hord_core::NodeId`]s that differ from a fresh assignment. Besides the
-    /// redb row, this writes a content-addressed binding object naming
-    /// `(snapshot, index)` and the binding it replaces, so
-    /// [`Self::rebuild_index`] restores the row. Replaces any previous
-    /// pointer.
-    ///
-    /// Like [`Store::queue_set`], the commit does not fsync. redb commits
-    /// are ordered, so the row is durable once any later durable commit is:
-    /// the lander writes it before [`Store::set_head`] of the same landing,
-    /// and `propose` before the durable [`Store::queue_push`] of `submit`. A
-    /// clean close is also durable.
-    pub fn set_identity_index(&self, snapshot: SnapshotId, index: ObjectId) -> Result<()> {
-        let _guard = self.lock_index();
-        let supersedes = self.identity_index_row(snapshot)?.and_then(|(_, b)| b);
-        let binding = self.put_object(&IndexFact::IdentityIndex {
-            format: INDEX_FACT_FORMAT,
-            snapshot,
-            index,
-            supersedes,
-        })?;
-        let mut txn = self.db.begin_write().map_err(Error::index)?;
-        txn.set_durability(Durability::None);
-        {
-            let mut table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
-            let row = identity_index_row(index, binding);
-            table
-                .insert(snapshot.as_bytes().as_slice(), row.as_slice())
-                .map_err(Error::index)?;
-        }
-        txn.commit().map_err(Error::index)?;
-        Ok(())
-    }
-
-    /// The identity index object recorded for `snapshot`, if any.
-    pub fn identity_index(&self, snapshot: SnapshotId) -> Result<Option<ObjectId>> {
-        Ok(self.identity_index_row(snapshot)?.map(|(index, _)| index))
-    }
-
-    /// `(index, binding)` for `snapshot`. Rows written before bindings
-    /// existed hold only the index.
-    fn identity_index_row(
-        &self,
-        snapshot: SnapshotId,
-    ) -> Result<Option<(ObjectId, Option<ObjectId>)>> {
+    /// The id `submitted` landed under when the lander rebased it
+    /// (ADR 0018), from the landed record's `rebased_from`.
+    pub fn rebased_to(&self, submitted: ChangeId) -> Result<Option<ChangeId>> {
         let txn = self.db.begin_read().map_err(Error::index)?;
-        let table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
-        let Some(value) = table
-            .get(snapshot.as_bytes().as_slice())
+        let table = txn.open_table(REBASED).map_err(Error::index)?;
+        match table
+            .get(submitted.as_bytes().as_slice())
             .map_err(Error::index)?
-        else {
-            return Ok(None);
-        };
-        let bytes = value.value();
-        match bytes.len() {
-            ObjectId::LEN => Ok(Some((ObjectId::try_from(bytes)?, None))),
-            IDENTITY_INDEX_ROW_LEN => Ok(Some((
-                ObjectId::try_from(&bytes[..ObjectId::LEN])?,
-                Some(ObjectId::try_from(&bytes[ObjectId::LEN..])?),
-            ))),
-            _ => Err(Error::CorruptIndex("identity_index")),
-        }
-    }
-
-    /// Replace `node_history`, `edges`, `identity`, and `identity_index`
-    /// from stored objects.
-    ///
-    /// Landing-log entries that are not [`ChangeRecord`]s are skipped. A log
-    /// entry with no stored object is an error, and the previous cache is left
-    /// in place. Edge and identity rows come from the objects written by
-    /// [`Self::put_edge`] and [`Self::put_identity`], and identity index
-    /// pointers from the bindings [`Self::set_identity_index`] writes (the
-    /// longest supersede chain per snapshot wins, as for identity).
-    pub fn rebuild_index(&self) -> Result<()> {
-        let _guard = self.lock_index();
-        self.flush()?;
-        let history = self.history_from_log()?;
-        let (edges, bindings, index_bindings) = self.scan_index_facts()?;
-        let heads = select_identity_heads(&bindings);
-        let index_heads = select_identity_heads(&index_bindings);
-        let mut identity = BTreeMap::new();
-        for (snapshot, binding) in heads {
-            let map: IdentityMap = self.get_object(binding.map)?;
-            let rows = identity_rows(snapshot, &map)?;
-            identity.insert(snapshot, (binding.id, rows));
-        }
-        self.write_rebuilt_index(&history, &edges, &identity, &index_heads)
-    }
-
-    fn lock_index(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.index_lock
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-    }
-
-    fn identity_head(&self, snapshot: SnapshotId) -> Result<Option<ObjectId>> {
-        let txn = self.db.begin_read().map_err(Error::index)?;
-        let table = txn.open_table(INDEX_HEADS).map_err(Error::index)?;
-        let key = identity_head_key(snapshot);
-        match table.get(key.as_slice()).map_err(Error::index)? {
+        {
             Some(value) => Ok(Some(ObjectId::try_from(value.value())?)),
             None => Ok(None),
         }
     }
 
-    fn commit_identity(
-        &self,
-        snapshot: SnapshotId,
-        rows: &BTreeMap<Vec<u8>, NodeId>,
-        binding_id: ObjectId,
-    ) -> Result<()> {
-        let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            let mut table = txn.open_table(IDENTITY).map_err(Error::index)?;
-            remove_snapshot_identity(&mut table, snapshot)?;
-            insert_identity_rows(&mut table, rows)?;
-        }
-        {
-            let mut heads = txn.open_table(INDEX_HEADS).map_err(Error::index)?;
-            let key = identity_head_key(snapshot);
-            heads
-                .insert(key.as_slice(), binding_id.as_bytes().as_slice())
-                .map_err(Error::index)?;
-        }
-        txn.commit().map_err(Error::index)?;
-        Ok(())
+    /// Replace `node_history`, `edges`, and `rebased` from stored objects.
+    ///
+    /// Landing-log entries that are not [`ChangeRecord`]s are skipped. A log
+    /// entry with no stored object is an error, and the previous index is
+    /// left in place. Edge rows come from the objects [`Self::put_edge`]
+    /// writes.
+    pub fn rebuild_index(&self) -> Result<()> {
+        let _guard = self.lock_index();
+        self.flush()?;
+        let (history, rebased) = self.history_from_log()?;
+        let edges = self.scan_edges()?;
+        self.write_rebuilt_index(&history, &edges, &rebased)
+    }
+
+    pub(super) fn lock_index(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.index_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 
     fn insert_history(&self, change: ChangeId, nodes: &BTreeSet<NodeId>) -> Result<()> {
@@ -435,7 +291,7 @@ impl Store {
         let mut updates = Vec::new();
         {
             let log = self.ensure_landing_log()?;
-            let pos_of = &log.first_pos;
+            let pos_of = |id: &ChangeId| log.first_pos.get(id).copied();
             let txn = self.db.begin_read().map_err(Error::index)?;
             let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
             for node in nodes {
@@ -444,7 +300,7 @@ impl Store {
                     .get(key.as_slice())
                     .map_err(Error::index)?
                     .map(|value| value.value().to_vec());
-                if let Some(encoded) = history_value(existing.as_deref(), change, pos_of)? {
+                if let Some(encoded) = history_value(existing.as_deref(), change, &pos_of)? {
                     updates.push((key, encoded));
                 }
             }
@@ -453,21 +309,16 @@ impl Store {
             return Ok(());
         }
         let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            let mut table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
-            for (key, encoded) in &updates {
-                table
-                    .insert(key.as_slice(), encoded.as_slice())
-                    .map_err(Error::index)?;
-            }
-        }
+        write_history_rows(&txn, &updates)?;
         txn.commit().map_err(Error::index)?;
         Ok(())
     }
 
-    fn history_from_log(&self) -> Result<BTreeMap<NodeId, Vec<ChangeId>>> {
+    /// `node_history` rows and `rebased` pairs of every landed record.
+    fn history_from_log(&self) -> Result<RebuiltHistory> {
         let log = self.log()?;
         let mut history: BTreeMap<NodeId, Vec<ChangeId>> = BTreeMap::new();
+        let mut rebased = BTreeMap::new();
         let mut seen = HashSet::with_capacity(log.len());
         for change in log {
             // A repeated ChangeId is the same record. One pass records every touch.
@@ -481,74 +332,45 @@ impl Store {
             for node in touched_nodes(&record) {
                 history.entry(node).or_default().push(change);
             }
+            if let Some(submitted) = record.rebased_from {
+                rebased.insert(submitted, change);
+            }
         }
-        Ok(history)
+        Ok((history, rebased))
     }
 
-    /// Edges, identity bindings, and identity index bindings (the latter
-    /// with the index object in `map`).
-    fn scan_index_facts(&self) -> Result<(Vec<StoredEdge>, Vec<FoundBinding>, Vec<FoundBinding>)> {
+    fn scan_edges(&self) -> Result<Vec<StoredEdge>> {
         let mut edges = Vec::new();
-        let mut bindings = Vec::new();
-        let mut index_bindings = Vec::new();
-        self.for_each_stored_object(|id, bytes| {
+        self.for_each_stored_object(|_, bytes| {
             if !looks_like_index_fact(bytes) {
                 return Ok(());
             }
-            match hord_encoding::decode::<IndexFact>(bytes) {
-                Ok(IndexFact::Edge {
-                    format,
+            if let Ok(IndexFact::Edge {
+                format,
+                snapshot,
+                kind,
+                source,
+                target,
+            }) = hord_encoding::decode::<IndexFact>(bytes)
+                && format == INDEX_FACT_FORMAT
+            {
+                edges.push(StoredEdge {
                     snapshot,
                     kind,
                     source,
                     target,
-                }) if format == INDEX_FACT_FORMAT => {
-                    edges.push(StoredEdge {
-                        snapshot,
-                        kind,
-                        source,
-                        target,
-                    });
-                }
-                Ok(IndexFact::Identity {
-                    format,
-                    snapshot,
-                    map,
-                    supersedes,
-                }) if format == INDEX_FACT_FORMAT => {
-                    bindings.push(FoundBinding {
-                        id,
-                        snapshot,
-                        map,
-                        supersedes,
-                    });
-                }
-                Ok(IndexFact::IdentityIndex {
-                    format,
-                    snapshot,
-                    index,
-                    supersedes,
-                }) if format == INDEX_FACT_FORMAT => {
-                    index_bindings.push(FoundBinding {
-                        id,
-                        snapshot,
-                        map: index,
-                        supersedes,
-                    });
-                }
-                _ => {}
+                });
             }
             Ok(())
         })?;
-        Ok((edges, bindings, index_bindings))
+        Ok(edges)
     }
 
     fn write_rebuilt_index(
         &self,
         history: &BTreeMap<NodeId, Vec<ChangeId>>,
         edges: &[StoredEdge],
-        identity: &BTreeMap<SnapshotId, (ObjectId, BTreeMap<Vec<u8>, NodeId>)>,
-        identity_index: &BTreeMap<SnapshotId, FoundBinding>,
+        rebased: &BTreeMap<ChangeId, ChangeId>,
     ) -> Result<()> {
         let txn = self.db.begin_write().map_err(Error::index)?;
         {
@@ -573,29 +395,14 @@ impl Store {
             }
         }
         {
-            let mut table = txn.open_table(IDENTITY).map_err(Error::index)?;
+            let mut table = txn.open_table(REBASED).map_err(Error::index)?;
             clear_table(&mut table)?;
-            for (_, rows) in identity.values() {
-                insert_identity_rows(&mut table, rows)?;
-            }
-        }
-        {
-            let mut heads = txn.open_table(INDEX_HEADS).map_err(Error::index)?;
-            clear_table(&mut heads)?;
-            for (snapshot, (binding_id, _)) in identity {
-                let key = identity_head_key(*snapshot);
-                heads
-                    .insert(key.as_slice(), binding_id.as_bytes().as_slice())
-                    .map_err(Error::index)?;
-            }
-        }
-        {
-            let mut table = txn.open_table(IDENTITY_INDEX).map_err(Error::index)?;
-            clear_table(&mut table)?;
-            for (snapshot, binding) in identity_index {
-                let row = identity_index_row(binding.map, binding.id);
+            for (submitted, landed) in rebased {
                 table
-                    .insert(snapshot.as_bytes().as_slice(), row.as_slice())
+                    .insert(
+                        submitted.as_bytes().as_slice(),
+                        landed.as_bytes().as_slice(),
+                    )
                     .map_err(Error::index)?;
             }
         }
@@ -604,145 +411,28 @@ impl Store {
     }
 }
 
-/// Node ids a change touched. `read_set` is a dependency, not an edit, so it
-/// is omitted. Every [`NodeId`] field on [`Op`] and [`IdentityDelta`] counts,
-/// plus `write_set`.
-fn touched_nodes(change: &ChangeRecord) -> BTreeSet<NodeId> {
+/// `node_history` rows and `rebased` pairs rebuilt from the log.
+type RebuiltHistory = (
+    BTreeMap<NodeId, Vec<ChangeId>>,
+    BTreeMap<ChangeId, ChangeId>,
+);
+
+/// Node ids a change touched, as [`crate::Store::node_history`] indexes
+/// them. `read_set` is a dependency, not an edit, so it is omitted. Every
+/// [`NodeId`] field on [`Op`] and [`IdentityDelta`] counts, plus
+/// `write_set`.
+#[must_use]
+pub fn touched_nodes(change: &ChangeRecord) -> BTreeSet<NodeId> {
     let mut nodes = BTreeSet::new();
     nodes.extend(change.write_set.iter().copied());
-    for op in &change.ops {
-        match op {
-            Op::Insert { parent, .. } => {
-                nodes.insert(*parent);
-            }
-            Op::Delete { node } | Op::Replace { node, .. } | Op::Rename { node, .. } => {
-                nodes.insert(*node);
-            }
-            Op::Move {
-                node,
-                from_parent,
-                to_parent,
-                ..
-            } => {
-                nodes.insert(*node);
-                nodes.insert(*from_parent);
-                nodes.insert(*to_parent);
-            }
-            Op::Blob { .. } | Op::Tree { .. } => {}
-        }
-    }
-    for delta in &change.identity_deltas {
-        match delta {
-            IdentityDelta::Birth { node } | IdentityDelta::Death { node } => {
-                nodes.insert(*node);
-            }
-            IdentityDelta::DerivedFrom { node, from } => {
-                nodes.insert(*node);
-                nodes.insert(*from);
-            }
-            IdentityDelta::SplitInto { node, into } => {
-                nodes.insert(*node);
-                nodes.extend(into.iter().copied());
-            }
-            IdentityDelta::MergedFrom { node, from } => {
-                nodes.insert(*node);
-                nodes.extend(from.iter().copied());
-            }
-        }
-    }
+    nodes.extend(change.ops.iter().flat_map(Op::node_ids));
+    nodes.extend(
+        change
+            .identity_deltas
+            .iter()
+            .flat_map(IdentityDelta::node_ids),
+    );
     nodes
-}
-
-fn select_identity_heads(bindings: &[FoundBinding]) -> BTreeMap<SnapshotId, FoundBinding> {
-    let by_id: HashMap<ObjectId, FoundBinding> =
-        bindings.iter().copied().map(|b| (b.id, b)).collect();
-    let mut memo = HashMap::new();
-    let mut best: BTreeMap<SnapshotId, (u32, FoundBinding)> = BTreeMap::new();
-    for binding in bindings {
-        let len = chain_len(binding.id, &by_id, &mut memo);
-        let replace = match best.get(&binding.snapshot) {
-            Some((best_len, best_binding)) => (len, binding.id) > (*best_len, best_binding.id),
-            None => true,
-        };
-        if replace {
-            best.insert(binding.snapshot, (len, *binding));
-        }
-    }
-    best.into_iter()
-        .map(|(snapshot, (_, binding))| (snapshot, binding))
-        .collect()
-}
-
-fn chain_len(
-    start: ObjectId,
-    by_id: &HashMap<ObjectId, FoundBinding>,
-    memo: &mut HashMap<ObjectId, u32>,
-) -> u32 {
-    let mut stack = vec![start];
-    while let Some(&id) = stack.last() {
-        if memo.contains_key(&id) {
-            stack.pop();
-            continue;
-        }
-        match by_id
-            .get(&id)
-            .and_then(|binding| binding.supersedes)
-            .filter(|parent| by_id.contains_key(parent))
-        {
-            Some(parent) if memo.contains_key(&parent) => {
-                let len = memo[&parent].saturating_add(1);
-                memo.insert(id, len);
-                stack.pop();
-            }
-            Some(parent) if stack.contains(&parent) => {
-                memo.insert(id, 0);
-                stack.pop();
-            }
-            Some(parent) => stack.push(parent),
-            None => {
-                memo.insert(id, 0);
-                stack.pop();
-            }
-        }
-    }
-    memo.get(&start).copied().unwrap_or(0)
-}
-
-fn identity_rows(snapshot: SnapshotId, map: &IdentityMap) -> Result<BTreeMap<Vec<u8>, NodeId>> {
-    let mut rows = BTreeMap::new();
-    for (node, path) in &map.nodes {
-        let key = identity_key(snapshot, path)?;
-        if rows.insert(key, *node).is_some() {
-            return Err(Error::DuplicateIdentity);
-        }
-    }
-    Ok(rows)
-}
-
-fn insert_identity_rows(
-    table: &mut Table<'_, &[u8], &[u8]>,
-    rows: &BTreeMap<Vec<u8>, NodeId>,
-) -> Result<()> {
-    for (key, node) in rows {
-        let value = node.as_u128().to_be_bytes();
-        table
-            .insert(key.as_slice(), value.as_slice())
-            .map_err(Error::index)?;
-    }
-    Ok(())
-}
-
-fn remove_snapshot_identity(
-    table: &mut Table<'_, &[u8], &[u8]>,
-    snapshot: SnapshotId,
-) -> Result<()> {
-    let prefix = *snapshot.as_bytes();
-    match prefix_successor(&prefix) {
-        Some(end) => table.retain_in(prefix.as_slice()..end.as_slice(), |_, _| false),
-        None => table.retain_in(prefix.as_slice().., |_, _| false),
-    }
-    .map_err(Error::index)?;
-    Ok(())
 }
 
 fn clear_table(table: &mut Table<'_, &[u8], &[u8]>) -> Result<()> {
@@ -750,10 +440,49 @@ fn clear_table(table: &mut Table<'_, &[u8], &[u8]>) -> Result<()> {
     Ok(())
 }
 
+/// `node_history` rows to write when `change` lands, read inside `txn`.
+/// `pos_of` gives landing positions, `change`'s included.
+pub(super) fn plan_history_rows(
+    txn: &WriteTransaction,
+    change: ChangeId,
+    nodes: &BTreeSet<NodeId>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
+) -> Result<Vec<([u8; NODE_LEN], Vec<u8>)>> {
+    let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
+    let mut updates = Vec::new();
+    for node in nodes {
+        let key = node_key(*node);
+        let existing = table
+            .get(key.as_slice())
+            .map_err(Error::index)?
+            .map(|value| value.value().to_vec());
+        if let Some(encoded) = history_value(existing.as_deref(), change, pos_of)? {
+            updates.push((key, encoded));
+        }
+    }
+    Ok(updates)
+}
+
+pub(super) fn write_history_rows(
+    txn: &WriteTransaction,
+    updates: &[([u8; NODE_LEN], Vec<u8>)],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
+    for (key, encoded) in updates {
+        table
+            .insert(key.as_slice(), encoded.as_slice())
+            .map_err(Error::index)?;
+    }
+    Ok(())
+}
+
 fn history_value(
     existing: Option<&[u8]>,
     change: ChangeId,
-    pos_of: &HashMap<ChangeId, usize>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
 ) -> Result<Option<Vec<u8>>> {
     let Some(bytes) = existing else {
         return Ok(Some(change.as_bytes().to_vec()));
@@ -785,7 +514,7 @@ enum HistoryPlan {
 fn plan_history_update(
     existing: &[u8],
     change: ChangeId,
-    pos_of: &HashMap<ChangeId, usize>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
 ) -> HistoryPlan {
     if existing.is_empty() || !existing.len().is_multiple_of(ObjectId::LEN) {
         return HistoryPlan::Resort;
@@ -794,8 +523,8 @@ fn plan_history_update(
     let Ok(last_id) = ObjectId::try_from(last) else {
         return HistoryPlan::Resort;
     };
-    let last_pos = pos_of.get(&last_id).copied().unwrap_or(usize::MAX);
-    let change_pos = pos_of.get(&change).copied().unwrap_or(usize::MAX);
+    let last_pos = pos_of(&last_id).unwrap_or(usize::MAX);
+    let change_pos = pos_of(&change).unwrap_or(usize::MAX);
     if change_pos < last_pos {
         return HistoryPlan::Resort;
     }
@@ -815,13 +544,12 @@ fn plan_history_update(
 fn insert_in_log_order(
     ids: &mut Vec<ChangeId>,
     change: ChangeId,
-    pos_of: &HashMap<ChangeId, usize>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
 ) {
-    let pos = pos_of.get(&change).copied().unwrap_or(usize::MAX);
-    let at =
-        ids.partition_point(|existing| pos_of.get(existing).copied().unwrap_or(usize::MAX) <= pos);
+    let pos = pos_of(&change).unwrap_or(usize::MAX);
+    let at = ids.partition_point(|existing| pos_of(existing).unwrap_or(usize::MAX) <= pos);
     let mut index = at;
-    while index > 0 && pos_of.get(&ids[index - 1]).copied().unwrap_or(usize::MAX) == pos {
+    while index > 0 && pos_of(&ids[index - 1]).unwrap_or(usize::MAX) == pos {
         if ids[index - 1] == change {
             return;
         }
@@ -832,27 +560,6 @@ fn insert_in_log_order(
 
 fn looks_like_index_fact(bytes: &[u8]) -> bool {
     bytes.starts_with(EDGE_FACT_PREFIX)
-        || bytes.starts_with(IDENTITY_FACT_PREFIX)
-        || bytes.starts_with(IDENTITY_INDEX_FACT_PREFIX)
-}
-
-fn identity_index_row(index: ObjectId, binding: ObjectId) -> [u8; IDENTITY_INDEX_ROW_LEN] {
-    let mut row = [0u8; IDENTITY_INDEX_ROW_LEN];
-    row[..ObjectId::LEN].copy_from_slice(index.as_bytes());
-    row[ObjectId::LEN..].copy_from_slice(binding.as_bytes());
-    row
-}
-
-/// Exclusive end of the key range that starts with `prefix`.
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.pop() {
-        if last != 0xff {
-            end.push(last + 1);
-            return Some(end);
-        }
-    }
-    None
 }
 
 fn edge_key(
@@ -878,21 +585,6 @@ fn edge_bounds(
         edge_key(snapshot, kind, source, NodeId::nil()),
         edge_key(snapshot, kind, source, NodeId::from_u128(u128::MAX)),
     )
-}
-
-fn identity_key(snapshot: SnapshotId, path: &NodePath) -> Result<Vec<u8>> {
-    let encoded = hord_encoding::encode(path)?;
-    let mut key = Vec::with_capacity(SNAP_LEN + encoded.len());
-    key.extend_from_slice(snapshot.as_bytes());
-    key.extend_from_slice(&encoded);
-    Ok(key)
-}
-
-fn identity_head_key(snapshot: SnapshotId) -> [u8; SNAP_LEN + 1] {
-    let mut key = [0u8; SNAP_LEN + 1];
-    key[0] = b'i';
-    key[1..].copy_from_slice(snapshot.as_bytes());
-    key
 }
 
 fn node_key(node: NodeId) -> [u8; NODE_LEN] {
@@ -936,10 +628,7 @@ mod tests {
     };
     use hord_encoding::{decode, encode};
 
-    use super::{
-        FoundBinding, IndexFact, chain_len, insert_in_log_order, looks_like_index_fact,
-        prefix_successor, select_identity_heads, touched_nodes,
-    };
+    use super::{IndexFact, insert_in_log_order, looks_like_index_fact, touched_nodes};
 
     fn nid(n: u128) -> NodeId {
         NodeId::from_u128(n)
@@ -949,15 +638,6 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[31] = n;
         ObjectId::from_bytes(bytes)
-    }
-
-    fn binding(id: u8, snapshot: u8, supersedes: Option<u8>) -> FoundBinding {
-        FoundBinding {
-            id: oid(id),
-            snapshot: oid(snapshot),
-            map: oid(id),
-            supersedes: supersedes.map(oid),
-        }
     }
 
     #[test]
@@ -975,21 +655,11 @@ mod tests {
         assert!(looks_like_index_fact(&bytes));
         assert_eq!(decode::<IndexFact>(&bytes).unwrap(), edge);
 
-        let identity = IndexFact::Identity {
-            format: super::INDEX_FACT_FORMAT,
-            snapshot: oid(1),
-            map: oid(4),
-            supersedes: Some(oid(5)),
-        };
-        let bytes = encode(&identity).unwrap();
-        assert!(bytes.starts_with(super::IDENTITY_FACT_PREFIX));
-        assert!(looks_like_index_fact(&bytes));
-        assert_eq!(decode::<IndexFact>(&bytes).unwrap(), identity);
-
         let blob = encode(&Blob::new(b"hi".to_vec())).unwrap();
         assert!(decode::<IndexFact>(&blob).is_err());
         let map = encode(&IdentityMap::default()).unwrap();
         assert!(decode::<IndexFact>(&map).is_err());
+        assert!(!looks_like_index_fact(&map));
     }
 
     #[test]
@@ -1082,6 +752,7 @@ mod tests {
             ],
             evidence: Vec::new(),
             signature: None,
+            rebased_from: None,
         };
         let got = touched_nodes(&record);
         assert_eq!(
@@ -1125,7 +796,7 @@ mod tests {
         let steps = [5u8, 1, 19, 0, 5, 7, 3, 2, 18, 4, 19, 23, 6, 1, 8];
         for step in steps {
             let change = oid(step);
-            insert_in_log_order(&mut got, change, &pos);
+            insert_in_log_order(&mut got, change, &|id: &ObjectId| pos.get(id).copied());
             insert_by_scanning(&mut expect, change, &log);
             assert_eq!(got, expect);
         }
@@ -1149,50 +820,5 @@ mod tests {
             })
             .unwrap_or(ids.len());
         ids.insert(at, change);
-    }
-
-    #[test]
-    fn prefix_successor_covers_exactly_the_prefix() {
-        assert_eq!(prefix_successor(&[0x01, 0x02]).unwrap(), vec![0x01, 0x03]);
-        assert_eq!(prefix_successor(&[0x01, 0xff]).unwrap(), vec![0x02]);
-        assert!(prefix_successor(&[0xff, 0xff]).is_none());
-        let prefix = [0x10u8, 0xff];
-        let end = prefix_successor(&prefix).unwrap();
-        assert!(prefix.as_slice() < end.as_slice());
-        let with_tail = [0x10u8, 0xff, 0x00];
-        assert!(with_tail.as_slice() < end.as_slice());
-        assert!(end.as_slice() <= [0x11].as_slice());
-    }
-
-    #[test]
-    fn identity_head_prefers_the_longest_chain_then_the_greater_id() {
-        // b1 <- b2 (id 4) and b1 <- b3 (id 2) <- b4 (id 3). b4 is longer than b2.
-        let bindings = vec![
-            binding(1, 1, None),
-            binding(4, 1, Some(1)),
-            binding(2, 1, Some(1)),
-            binding(3, 1, Some(2)),
-            binding(9, 2, None),
-        ];
-        let heads = select_identity_heads(&bindings);
-        assert_eq!(heads.get(&oid(1)).unwrap().id, oid(3));
-        assert_eq!(heads.get(&oid(2)).unwrap().id, oid(9));
-
-        let fork = vec![
-            binding(1, 1, None),
-            binding(4, 1, Some(1)),
-            binding(2, 1, Some(1)),
-        ];
-        let heads = select_identity_heads(&fork);
-        assert_eq!(heads.get(&oid(1)).unwrap().id, oid(4));
-    }
-
-    #[test]
-    fn chain_len_stops_on_a_cycle() {
-        let bindings = [binding(1, 1, Some(2)), binding(2, 1, Some(1))];
-        let by_id = bindings.into_iter().map(|b| (b.id, b)).collect();
-        let mut memo = HashMap::new();
-        let len = chain_len(oid(1), &by_id, &mut memo);
-        assert!(len < 3);
     }
 }

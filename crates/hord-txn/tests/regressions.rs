@@ -3,10 +3,8 @@
 mod common;
 
 use common::*;
-use hord_core::{ChangeId, Timestamp};
-use hord_txn::{
-    ConflictKind, ConflictReport, QueueStatus, ReadDeclaration, Repo, RepoOptions, path_node_id,
-};
+use hord_core::{ChangeId, NodeId, Timestamp};
+use hord_txn::{ConflictKind, ConflictReport, QueueStatus, ReadDeclaration, Repo, RepoOptions};
 use serde::{Deserialize, Serialize};
 
 fn landed(status: &QueueStatus) -> bool {
@@ -148,7 +146,10 @@ async fn reading_or_declaring_a_missing_file_conflicts_with_its_creation() {
             .unwrap();
         let cb = submit(&t.repo, &mut b, "b creates").await;
         let rb = t.repo.change(cb).await.unwrap();
-        assert!(rb.write_set.contains(&path_node_id(&path("src/new.rs"))));
+        assert!(
+            rb.write_set
+                .contains(&NodeId::file_root(&path("src/new.rs")))
+        );
         let ca = submit(&t.repo, &mut a, "a assumes absent").await;
         t.repo.land_local().await.unwrap();
         let report = t.repo.conflicts(ca).await.unwrap();
@@ -292,10 +293,10 @@ async fn a_landed_entry_missing_from_the_log_is_requeued_on_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Finding 6: a deterministic failure while rebasing one change (here head's
-/// identity-index pointer names an object that is not an index) parks that
-/// change as rejected,
-/// with its report. `land_local` does not fail, and the queue moves on.
+/// Finding 6: a deterministic failure while rebasing one change (here the
+/// identity object head records for the file is gone) parks that change as
+/// rejected, with its report. `land_local` does not fail, and the queue
+/// moves on.
 #[tokio::test]
 async fn a_deterministic_rebase_failure_parks_instead_of_wedging() {
     let dir = temp_dir("wedge");
@@ -309,13 +310,10 @@ async fn a_deterministic_rebase_failure_parks_instead_of_wedging() {
         repo.land_local().await.unwrap();
         let pb = b.propose(intent("b")).await.unwrap();
         repo.submit(pb.change).await.unwrap();
-        // Point head's identity index at an object that is not an index.
+        // Lose the identity object head records for the file b edits.
         let head = repo.head().await.unwrap().snapshot;
-        let wrong = pb.change;
-        repo.store().set_identity_index(head, wrong).unwrap();
-        // A durable commit makes the non-durable pointer write durable.
-        let head_change = repo.head().await.unwrap().change.unwrap();
-        repo.store().set_head(head_change).unwrap();
+        let lost = file_identity(repo.store(), head, "src/lib.rs").expect("a carried identity");
+        remove_loose_object(&dir, lost);
         // A later change to another file, queued behind b.
         let mut c = begin(&repo, "c").await;
         edit(&mut c, "README.md", README, "line one\n", "line 1\n").await;

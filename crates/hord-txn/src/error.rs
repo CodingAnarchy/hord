@@ -96,15 +96,49 @@ pub enum Error {
         /// What was wrong.
         reason: String,
     },
-    /// No identity index is recorded for the snapshot, and it is not the
-    /// result of a Tier 0 change in the log (whose index is derived). Its
-    /// NodeIds are unknown; they are never guessed by a fresh assignment.
-    /// `Store::rebuild_index` restores lost pointers.
-    #[error("no identity index recorded for snapshot {0}")]
+    /// The snapshot names no identity tree, or its identity tree is not
+    /// stored (ADR 0017). Its NodeIds are unknown; they are never guessed by
+    /// a fresh assignment.
+    #[error("no identity recorded for snapshot {0}")]
     MissingIdentity(SnapshotId),
+    /// No definition in the history has this qualified name.
+    #[error("cannot resolve node {0:?}")]
+    UnknownName(String),
+    /// Several definitions of one snapshot have this name.
+    #[error("qualified name {name:?} resolves to multiple nodes: {}", list(.nodes))]
+    AmbiguousName {
+        /// The name that was looked up.
+        name: String,
+        /// Every matching definition, in id order.
+        nodes: Vec<NodeId>,
+    },
+    /// The file has fewer lines.
+    #[error("line {line} is outside {path}")]
+    LineOutOfRange {
+        /// File that was read.
+        path: RepoPath,
+        /// Requested 1-based line.
+        line: u32,
+    },
+    /// No definition's span covers the line.
+    #[error("no definition covers {path}:{line}")]
+    NoDefinitionAt {
+        /// File that was read.
+        path: RepoPath,
+        /// Requested 1-based line.
+        line: u32,
+    },
     /// A blocking task panicked or was cancelled.
     #[error("background task failed: {0}")]
     Task(String),
+}
+
+fn list(nodes: &[NodeId]) -> String {
+    nodes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Result alias for this crate.

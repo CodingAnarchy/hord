@@ -35,7 +35,9 @@ pub use error::Error;
 pub use evidence::{Evidence, EvidenceKind, EvidenceResult};
 pub use hord_encoding::ObjectId;
 pub use id::{ChangeId, NodeId, SnapshotId};
-pub use identity::{IdentityDelta, IdentityMap, NodePath};
+pub use identity::{
+    FileIdentity, IdentityDelta, IdentityEntry, IdentityMap, IdentityTree, NodePath,
+};
 pub use node::{AdapterId, LangId, Node, NodeKind, QualifiedName};
 pub use policy::{LandPolicy, Policy, PolicyRule, PolicyWhen};
 pub use snapshot::{IndexPointers, Snapshot, SnapshotMetadata};

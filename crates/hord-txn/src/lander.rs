@@ -8,9 +8,16 @@
 //! replay, M5). Set overlaps that rebase cleanly land with the report
 //! attached, flagged for the verifier (§6.4).
 //!
-//! A change that lands on a head other than its base is stored again with
-//! `base`, `result`, `parents`, and `ops` rewritten for that head; it lands
-//! under that record's id. The queue entry keeps both ids.
+//! A change that lands on a head other than its base lands as a new record
+//! (ADR 0018): `base`, `result`, `parents`, `ops`, `write_set`, and
+//! `identity_deltas` are recomputed for that head (the sets exactly as
+//! `propose` computes them), `read_set`, `intent`, `provenance`, and
+//! `evidence` are kept, `signature` is cleared, `rebased_from` names the
+//! submitted record, and the lander's `Rebase { submitted }` attestation is
+//! appended to `evidence`. The rebased record and its attestation are
+//! stored only when it lands. The
+//! queue entry keeps both ids, and the store's `rebased` index maps the
+//! submitted id to the landed one.
 //!
 //! A failure that is about the change (its record, a merge, identity, or
 //! reproduction error) parks it as [`QueueStatus::Rejected`] with its
@@ -19,24 +26,35 @@
 //! appends nothing to the log, and submitting a landed change again returns
 //! its entry.
 //!
-//! Crash recovery: the queue status is written before the durable
-//! `set_head`. On the first run, an entry marked landed whose change is not
-//! in the log is queued again. The in-process head follows `set_head`
-//! before anything else can fail; a failed history-index update is retried
-//! on the next run and does not undo the landing.
+//! A landing is one durable commit ([`hord_store::Store::land`]): the queue
+//! entry, the log append, `head`, and the history index move together or not
+//! at all. The result snapshot, its identity tree, and the record are
+//! content-addressed objects stored before it. On the first run, an entry
+//! marked landed whose change is not in the log (a store written before
+//! landings were atomic, or forged) is queued again. The in-process head
+//! follows the commit before anything else can fail.
+//!
+//! Validation depends only on the record, so its outcome is stored by
+//! change id ([`hord_store::Store::mark_checked`]): `submit` records the
+//! changes this process proposed, and the lander checks queued changes from
+//! elsewhere a few entries ahead of itself, in parallel, off its own path.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use hord_core::{ChangeId, ChangeRecord, SnapshotId, Timestamp};
+use hord_core::{
+    Actor, Bytes, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IdentityDelta,
+    ObjectId, SnapshotId, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::conflict::{ConflictReport, Footprint, check};
 use crate::files::{validate, validate_except};
 use crate::rebase::rebase;
 use crate::repo::{Head, Inner, Repo, blocking, lock, now};
-use crate::semantic::IdentityIndex;
+use crate::sets::sets_between;
 use crate::{Error, Result};
 
 /// Where a submitted change is in the lander (spec §6.2, §6.7).
@@ -86,6 +104,17 @@ struct StoredEntry {
     submitted_at: Timestamp,
     updated_at: Timestamp,
     report: Option<ConflictReport>,
+}
+
+/// Ids that name `entry` ([`QueueEntry::names`]), for the store's index.
+fn entry_names(entry: &QueueEntry) -> Vec<ChangeId> {
+    let mut names = vec![entry.change];
+    if let QueueStatus::Landed { landed } = entry.status
+        && landed != entry.change
+    {
+        names.push(landed);
+    }
+    names
 }
 
 impl QueueEntry {
@@ -167,8 +196,14 @@ pub(crate) struct LanderState {
     /// Lowest sequence number that may still be queued; `None` before the
     /// first run's recovery.
     cursor: Option<u64>,
-    /// Landed changes whose history-index update failed; retried each run.
-    unindexed: Vec<ChangeId>,
+    /// Validation of queued changes ahead of the cursor, on blocking
+    /// threads. The lander awaits a change's task before preparing it.
+    checking: HashMap<ChangeId, tokio::task::JoinHandle<()>>,
+}
+
+/// How many queued changes ahead of the cursor the lander validates at once.
+fn check_ahead() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16))
 }
 
 /// A change ready to verify and land.
@@ -177,7 +212,8 @@ struct Candidate {
     landed_id: ChangeId,
     landed: ChangeRecord,
     report: ConflictReport,
-    index: IdentityIndex,
+    /// The rebase attestation, stored with a rebased record.
+    attestation: Option<Evidence>,
 }
 
 enum Step {
@@ -198,7 +234,7 @@ struct Ready {
     landed_id: ChangeId,
     landed: ChangeRecord,
     report: ConflictReport,
-    index: IdentityIndex,
+    attestation: Option<Evidence>,
 }
 
 /// Whether `err` is about the store or the machine rather than about the
@@ -224,16 +260,7 @@ pub(crate) fn is_transient(err: &Error) -> bool {
 pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
     let mut state = repo.inner.lander.lock().await;
     let mut processed = Vec::new();
-    if !state.unindexed.is_empty() {
-        let pending = std::mem::take(&mut state.unindexed);
-        state.unindexed = blocking(&repo.inner, move |inner| {
-            Ok(pending
-                .into_iter()
-                .filter(|c| inner.store.index_change(*c).is_err())
-                .collect())
-        })
-        .await?;
-    }
+    let ahead = check_ahead();
     loop {
         let cursor = state.cursor;
         let next = blocking(&repo.inner, move |inner| inner.next_queued(cursor)).await?;
@@ -241,6 +268,24 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
             break;
         };
         state.cursor = Some(entry.seq);
+        let seq = entry.seq;
+        let unchecked =
+            blocking(&repo.inner, move |inner| inner.unchecked_after(seq, ahead)).await?;
+        for change in unchecked {
+            if state.checking.len() >= ahead {
+                break;
+            }
+            if let std::collections::hash_map::Entry::Vacant(slot) = state.checking.entry(change) {
+                let inner = Arc::clone(&repo.inner);
+                slot.insert(tokio::task::spawn_blocking(move || {
+                    // A failure is found again, and classified, in `prepare`.
+                    let _ = inner.check_ops(change);
+                }));
+            }
+        }
+        if let Some(task) = state.checking.remove(&entry.change) {
+            let _ = task.await;
+        }
         let step = blocking(&repo.inner, move |inner| inner.prepare(entry)).await?;
         let done = match step {
             Step::Done(entry) => *entry,
@@ -254,12 +299,7 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                         report: &candidate.report,
                     })
                     .await;
-                let (entry, indexed) =
-                    blocking(&repo.inner, move |inner| inner.finish(*candidate, verdict)).await?;
-                if !indexed && let QueueStatus::Landed { landed } = entry.status {
-                    state.unindexed.push(landed);
-                }
-                entry
+                blocking(&repo.inner, move |inner| inner.finish(*candidate, verdict)).await?
             }
         };
         processed.push(done);
@@ -271,9 +311,12 @@ impl Inner {
     pub(crate) fn submit(&self, change: ChangeId) -> Result<QueueEntry> {
         self.change_record(change)?;
         // Queued already, or landed already: submitting again is a no-op.
-        if let Some(entry) = self.queue_entries()?.into_iter().rev().find(|e| {
-            e.names(change) && matches!(e.status, QueueStatus::Queued | QueueStatus::Landed { .. })
-        }) {
+        if let Some(entry) = self
+            .named_entries(change)?
+            .into_iter()
+            .rev()
+            .find(|e| matches!(e.status, QueueStatus::Queued | QueueStatus::Landed { .. }))
+        {
             return Ok(entry);
         }
         let at = now();
@@ -284,7 +327,15 @@ impl Inner {
             updated_at: at,
             report: None,
         };
-        let seq = self.store.queue_push(&hord_encoding::encode(&stored)?)?;
+        // `propose` checked the ops; record that for a lander in any process.
+        let checked: &[ChangeId] = if self.was_proposed(change) {
+            &[change]
+        } else {
+            &[]
+        };
+        let seq = self
+            .store
+            .queue_push(&hord_encoding::encode(&stored)?, &[change], checked)?;
         Ok(QueueEntry::from_stored(seq, stored))
     }
 
@@ -297,11 +348,71 @@ impl Inner {
     }
 
     pub(crate) fn queue_status(&self, change: ChangeId) -> Result<QueueEntry> {
-        self.queue_entries()?
-            .into_iter()
-            .rev()
-            .find(|e| e.names(change))
+        self.named_entries(change)?
+            .pop()
             .ok_or(Error::NotQueued(change))
+    }
+
+    /// Queue entries that name `id` ([`QueueEntry::names`]), in sequence
+    /// order: point lookups through the store's name index.
+    fn named_entries(&self, id: ChangeId) -> Result<Vec<QueueEntry>> {
+        if !self.store.queue_names_indexed()? {
+            // A queue from before the name index: index it once.
+            let rows: Vec<_> = self
+                .queue_entries()?
+                .iter()
+                .map(|e| (e.seq, entry_names(e)))
+                .collect();
+            self.store.index_queue_names(&rows)?;
+        }
+        let mut out = Vec::new();
+        for seq in self.store.queue_named(id)? {
+            if let Some(bytes) = self.store.queue_entry(seq)? {
+                let entry = QueueEntry::from_stored(seq, hord_encoding::decode(&bytes)?);
+                if entry.names(id) {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `change`'s ops are known to reproduce its result: this
+    /// process proposed it, or a check was recorded.
+    fn ops_checked(&self, change: ChangeId) -> Result<bool> {
+        Ok(self.was_proposed(change) || self.store.is_checked(change)?)
+    }
+
+    /// Validate `change` and record the outcome if it passes.
+    fn check_ops(&self, change: ChangeId) -> Result<()> {
+        if self.ops_checked(change)? {
+            return Ok(());
+        }
+        let record = self.change_record(change)?;
+        validate(self, change, &record)?;
+        self.store.mark_checked(change)?;
+        Ok(())
+    }
+
+    /// Up to `limit` queued changes after `seq` whose ops are not known to
+    /// be checked, in queue order.
+    fn unchecked_after(&self, seq: u64, limit: usize) -> Result<Vec<ChangeId>> {
+        let mut out = Vec::new();
+        let mut next = seq + 1;
+        // Look a bounded distance ahead: landed and parked entries are
+        // skipped, not counted, but the walk must stay cheap per landing.
+        let end = next + 4 * limit as u64;
+        while out.len() < limit && next < end {
+            let Some(bytes) = self.store.queue_entry(next)? else {
+                break;
+            };
+            let entry = QueueEntry::from_stored(next, hord_encoding::decode(&bytes)?);
+            if entry.status == QueueStatus::Queued && !self.ops_checked(entry.change)? {
+                out.push(entry.change);
+            }
+            next += 1;
+        }
+        Ok(out)
     }
 
     fn put_entry(&self, entry: &QueueEntry) -> Result<()> {
@@ -330,13 +441,12 @@ impl Inner {
     /// Returns the first queued sequence number, or the next one to be
     /// assigned.
     fn recover(&self) -> Result<u64> {
-        let log: std::collections::HashSet<ChangeId> = self.store.log()?.into_iter().collect();
         let mut first = None;
         let mut next = 0;
         for mut entry in self.queue_entries()? {
             next = entry.seq + 1;
             if let QueueStatus::Landed { landed } = entry.status
-                && !log.contains(&landed)
+                && !self.store.log_contains(landed)?
             {
                 entry.status = QueueStatus::Queued;
                 entry.report = None;
@@ -377,14 +487,14 @@ impl Inner {
                     landed_id,
                     landed,
                     report,
-                    index,
+                    attestation,
                 } = *ready;
                 Ok(Step::Candidate(Box::new(Candidate {
                     entry,
                     landed_id,
                     landed,
                     report,
-                    index,
+                    attestation,
                 })))
             }
             Err(err) if is_transient(&err) => Err(err),
@@ -414,8 +524,9 @@ impl Inner {
             }
             Err(err) => return Err(err),
         };
-        if !lock(&self.proposed).contains(&entry.change) {
+        if !self.ops_checked(entry.change)? {
             validate(self, entry.change, &record)?;
+            self.store.mark_checked(entry.change)?;
         }
         let head = self.head()?;
         let (set_report, landed_writes) = self.set_check(entry.change, &record, head)?;
@@ -441,29 +552,43 @@ impl Inner {
             return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
         }
         let checked_files = rebased.checked;
-        // The rebased result's NodeIds are the rebase's. Validation reads
-        // that snapshot, so stage them in this process; `finish` stores them
-        // only if the change lands.
-        if rebased.result != record.result {
-            self.stage_identity_index(rebased.result, rebased.index.clone());
-        }
-        let (landed_id, landed) = if rebased.result == record.result && record.base == head.snapshot
+        let (landed_id, landed, attestation) = if rebased.result == record.result
+            && record.base == head.snapshot
         {
-            (entry.change, record)
+            (entry.change, record, None)
         } else {
+            // ADR 0018: recompute what the landed record says it did from
+            // head → result; keep what the author depended on and why.
+            let declared: Vec<IdentityDelta> = record
+                .identity_deltas
+                .iter()
+                .filter(|d| !matches!(d, IdentityDelta::Birth { .. } | IdentityDelta::Death { .. }))
+                .cloned()
+                .collect();
+            let (write_set, identity_deltas) =
+                sets_between(self, head.snapshot, rebased.result, &rebased.ops, &declared)?;
+            let attestation = self.rebase_attestation(entry.change, &record, rebased.result);
+            let mut evidence = record.evidence.clone();
+            evidence.push(ObjectId::of(&attestation)?);
             let landed = ChangeRecord {
                 base: head.snapshot,
                 result: rebased.result,
                 parents: head.change.into_iter().collect(),
                 ops: rebased.ops,
+                write_set,
+                identity_deltas,
+                evidence,
+                signature: None,
+                rebased_from: Some(entry.change),
                 ..record
             };
-            (self.store.put_object(&landed)?, landed)
+            // Stored only when it lands (`finish`).
+            (ObjectId::of(&landed)?, landed, Some(attestation))
         };
-        // Spec §3.5: the record that lands must reproduce its result. A
-        // rebased record has rewritten ops, so it is checked even when the
-        // submitted one was checked at propose.
-        let checked = landed_id == entry.change && lock(&self.proposed).contains(&entry.change);
+        // Spec §3.5: the record that lands must reproduce its result. The
+        // submitted record was checked above; a rebased record has rewritten
+        // ops, so it is checked again.
+        let checked = landed_id == entry.change;
         if !checked && let Err(err) = validate_except(self, landed_id, &landed, &checked_files) {
             if is_transient(&err) {
                 return Err(err);
@@ -475,67 +600,102 @@ impl Inner {
             landed_id,
             landed,
             report: report.clone(),
-            index: rebased.index,
+            attestation,
         })))
+    }
+
+    /// The lander's `Rebase` attestation for `submitted` landing as
+    /// `result` (ADR 0018 amendment). A pure function of the two records,
+    /// so the same landing gives the same landed id anywhere: its time is
+    /// the submitted record's `created_at`. Unsigned until M5.
+    fn rebase_attestation(
+        &self,
+        submitted: ChangeId,
+        record: &ChangeRecord,
+        result: SnapshotId,
+    ) -> Evidence {
+        Evidence {
+            kind: EvidenceKind::Rebase { submitted },
+            snapshot: result,
+            toolchain: self.toolchain,
+            command: "hord lander: structural rebase (spec §6.4 rung 1)".into(),
+            scope: None,
+            result: EvidenceResult::Pass,
+            log: None,
+            cost_ms: 0,
+            produced_by: Actor::Agent {
+                id: "hord-lander".into(),
+                model: String::new(),
+                model_hash: Bytes::default(),
+                harness: "hord-txn".into(),
+            },
+            produced_at: record.provenance.created_at,
+        }
     }
 
     /// The id `change` landed under, if it is in the log (as submitted, or
     /// as its rebased record per a landed queue entry).
     fn landed_as(&self, change: ChangeId) -> Result<Option<ChangeId>> {
-        let log: std::collections::HashSet<ChangeId> = self.store.log()?.into_iter().collect();
-        if log.contains(&change) {
+        if self.store.log_contains(change)? {
             return Ok(Some(change));
         }
-        Ok(self
-            .queue_entries()?
-            .into_iter()
-            .find_map(|e| match e.status {
-                QueueStatus::Landed { landed } if e.change == change && log.contains(&landed) => {
-                    Some(landed)
-                }
-                _ => None,
-            }))
+        for e in self.named_entries(change)? {
+            if let QueueStatus::Landed { landed } = e.status
+                && e.change == change
+                && self.store.log_contains(landed)?
+            {
+                return Ok(Some(landed));
+            }
+        }
+        Ok(None)
     }
 
-    /// Land `candidate` unless the verifier failed it. The second value is
-    /// `false` when the landed change could not be added to the history
-    /// index; the landing stands and the caller retries the index later.
-    fn finish(&self, candidate: Candidate, verdict: Verdict) -> Result<(QueueEntry, bool)> {
+    /// Land `candidate` unless the verifier failed it, in one durable
+    /// commit ([`hord_store::Store::land`]).
+    fn finish(&self, candidate: Candidate, verdict: Verdict) -> Result<QueueEntry> {
         let Candidate {
             mut entry,
             landed_id,
             landed,
             mut report,
-            index,
+            attestation,
         } = candidate;
         if let Verdict::Fail { reason } = verdict {
             report.verification = Some(reason);
-            return Ok((
-                self.park(entry, QueueStatus::Conflicted, Some(report))?,
-                true,
-            ));
+            return self.park(entry, QueueStatus::Conflicted, Some(report));
         }
-        self.put_identity_index(landed.result, index)?;
+        if let Some(attestation) = &attestation {
+            self.store.put_object(attestation)?;
+        }
+        if landed_id != entry.change {
+            self.store.put_object(&landed)?;
+        }
         entry.status = QueueStatus::Landed { landed: landed_id };
         entry.report = Some(report);
         entry.updated_at = now();
-        self.put_entry(&entry)?;
-        self.store.append_log(landed_id)?;
-        self.store.set_head(landed_id)?;
+        let bytes = hord_encoding::encode(&entry.to_stored())?;
+        let names: &[ChangeId] = if landed_id == entry.change {
+            &[]
+        } else {
+            &[landed_id]
+        };
+        self.store.land(&hord_store::Landing {
+            change: landed_id,
+            record: &landed,
+            entry: (entry.seq, &bytes),
+            names,
+        })?;
         // Head is durable: the cache must follow before anything else can
         // fail, or the next landing would rebase onto the old head.
         self.set_head_cache(Head {
             change: Some(landed_id),
             snapshot: landed.result,
         });
-        // The footprint is a cache (`footprint` recomputes it on a miss),
-        // and the history index is derived and rebuildable: neither undoes
-        // the landing.
+        // The footprint is a cache (`footprint` recomputes it on a miss).
         if let Ok(footprint) = self.footprint_of(landed_id, &landed) {
-            lock(&self.footprints).insert(landed_id, Arc::new(footprint));
+            lock(&self.footprints).insert(landed_id, Arc::new(footprint), 1);
         }
-        let indexed = self.store.index_change(landed_id).is_ok();
-        Ok((entry, indexed))
+        Ok(entry)
     }
 
     /// The §6.3 set check of `record` against everything landed after its
@@ -594,11 +754,11 @@ impl Inner {
 
     fn footprint(&self, change: ChangeId) -> Result<Arc<Footprint>> {
         if let Some(found) = lock(&self.footprints).get(&change) {
-            return Ok(Arc::clone(found));
+            return Ok(found);
         }
         let record = self.change_record(change)?;
         let footprint = Arc::new(self.footprint_of(change, &record)?);
-        lock(&self.footprints).insert(change, Arc::clone(&footprint));
+        lock(&self.footprints).insert(change, Arc::clone(&footprint), 1);
         Ok(footprint)
     }
 
@@ -617,18 +777,23 @@ impl Inner {
     /// landed change whose result is the base snapshot. A base found nowhere
     /// in the log is checked against the whole log.
     fn landed_since(&self, record: &ChangeRecord) -> Result<Vec<Arc<Footprint>>> {
-        let log = self.store.log()?;
-        let start = match record
-            .parents
-            .first()
-            .and_then(|parent| log.iter().rposition(|c| c == parent))
-        {
-            Some(i) => i + 1,
-            None => self
-                .position_of_snapshot(&log, record.base)?
-                .map_or(0, |i| i + 1),
+        let parent = match record.parents.first() {
+            Some(parent) => self.store.log_position(*parent)?,
+            None => None,
         };
-        log[start..].iter().map(|c| self.footprint(*c)).collect()
+        let start = match parent {
+            Some(i) => i + 1,
+            None => {
+                let log = self.store.log()?;
+                self.position_of_snapshot(&log, record.base)?
+                    .map_or(0, |i| i + 1)
+            }
+        };
+        self.store
+            .log_since(start)?
+            .iter()
+            .map(|c| self.footprint(*c))
+            .collect()
     }
 
     fn position_of_snapshot(

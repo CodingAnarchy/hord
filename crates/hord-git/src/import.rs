@@ -7,8 +7,8 @@ use std::rc::Rc;
 use gix::bstr::ByteSlice;
 use gix::objs::tree::{EntryKind, EntryMode};
 use hord_core::{
-    Actor, Blob, ChangeId, ChangeRecord, Intent, IntentRef, ObjectId, Op, Provenance, RepoPath,
-    Snapshot, SnapshotId, SnapshotMetadata, Timestamp, Tree, TreeEntry, TreeOpKind,
+    Actor, Blob, ChangeId, ChangeRecord, IdentityEntry, IdentityTree, Intent, IntentRef, ObjectId,
+    Op, Provenance, RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeEntry, TreeOpKind,
 };
 
 use crate::leaf::{GitLeaf, MODE_BLOB};
@@ -34,9 +34,13 @@ pub fn import_git<S: Store>(store: &mut S, git_dir: impl AsRef<Path>) -> Result<
 /// Import the named git ref of `git_dir` into `store`.
 ///
 /// Walks ancestors oldest-first. Each commit becomes a [`Snapshot`] of blobs
-/// and trees (no [`hord_core::NodeFile`]) and a [`ChangeRecord`]. Merge commits
-/// get multiple `parents`. The git SHA is recorded as
-/// [`IntentRef::GitCommit`].
+/// and trees (no [`hord_core::NodeFile`]) and a [`ChangeRecord`] whose
+/// `base` and `result` are [`Snapshot`] ids (ADR 0017). Merge commits get
+/// multiple `parents`. The git SHA is recorded as [`IntentRef::GitCommit`].
+///
+/// An imported change is Tier 0 (ADR 0015 amendment): it carries no
+/// identity, so its result's identity tree is its first parent's without
+/// the paths the commit changed (those files take the fresh assignment).
 pub fn import_git_ref<S: Store>(
     store: &mut S,
     git_dir: impl AsRef<Path>,
@@ -90,7 +94,9 @@ fn import_revwalk<S: Store>(
     // Date order is not topological (clock skew, merges). Parents must come first.
     commit_ids = topo_oldest_first(&repo, commit_ids)?;
 
-    let empty_tree = store.put_object(&Tree::default())?;
+    store.put_object(&Tree::default())?;
+    store.put_object(&IdentityTree::default())?;
+    let empty = store.put_object(&Snapshot::empty())?;
     let mut cache = ImportCache::default();
     let mut last = None;
     let allow_missing_parents = max_commits.is_some();
@@ -100,7 +106,7 @@ fn import_revwalk<S: Store>(
             store,
             &repo,
             git_id,
-            empty_tree,
+            empty,
             &mut cache,
             allow_missing_parents,
         )?;
@@ -177,6 +183,8 @@ struct ImportCache {
     trees: HashMap<gix::ObjectId, ObjectId>,
     blobs: HashMap<gix::ObjectId, ObjectId>,
     commits: HashMap<gix::ObjectId, ChangeId>,
+    /// Result [`Snapshot`] of each imported commit.
+    snapshots: HashMap<gix::ObjectId, SnapshotId>,
     /// [`GitLeaf`] ids by (blob, raw git mode); every tree holding an
     /// executable or symlink would otherwise rewrite the same leaf object.
     leaves: HashMap<(ObjectId, u16), ObjectId>,
@@ -211,7 +219,7 @@ fn import_commit<S: Store>(
     store: &mut S,
     repo: &gix::Repository,
     git_id: gix::ObjectId,
-    empty_tree: ObjectId,
+    empty: SnapshotId,
     cache: &mut ImportCache,
     allow_missing_parents: bool,
 ) -> Result<ChangeId, Error> {
@@ -249,24 +257,29 @@ fn import_commit<S: Store>(
     }
 
     let git_tree = commit.tree_id().map_err(Error::git)?.detach();
-    let result = import_tree(store, repo, git_tree, cache)?;
+    let result_tree = import_tree(store, repo, git_tree, cache)?;
 
-    let base = if let Some(first_parent) = parent_git_ids.first() {
-        let parent_commit = repo.find_commit(*first_parent).map_err(Error::git)?;
-        let parent_tree = parent_commit.tree_id().map_err(Error::git)?.detach();
-        import_tree(store, repo, parent_tree, cache)?
-    } else {
-        empty_tree
+    let base = match parent_git_ids.first() {
+        Some(first_parent) => parent_snapshot(store, repo, *first_parent, cache)?,
+        None => empty,
     };
+    let base_snapshot: Snapshot = store.get_object(base)?;
 
-    let snapshot = Snapshot {
-        tree: result,
-        metadata: SnapshotMetadata {
-            toolchain: Some(git_import_toolchain()),
-        },
-        index: hord_core::IndexPointers::default(),
+    let mut ops = Vec::new();
+    diff_trees(
+        store,
+        cache,
+        &RepoPath::default(),
+        Some(base_snapshot.tree),
+        Some(result_tree),
+        &mut ops,
+    )?;
+    let identity = match base_snapshot.identity() {
+        Some(identity) => identity_without(store, identity, &changed_paths(&ops))?,
+        None => store.put_object(&IdentityTree::default())?,
     };
-    let _ = store.put_object(&snapshot)?;
+    let result = store.put_object(&Snapshot::new(result_tree, identity))?;
+    cache.snapshots.insert(git_id, result);
 
     let message = commit.message().map_err(Error::git)?;
     let summary = message.summary().to_str_lossy().trim().to_owned();
@@ -280,16 +293,6 @@ fn import_commit<S: Store>(
     let email = author.email.to_str_lossy();
     let actor_id = format!("{name} <{email}>");
     let created_at = timestamp_from_git(author.seconds());
-
-    let mut ops = Vec::new();
-    diff_trees(
-        store,
-        cache,
-        &RepoPath::default(),
-        Some(base),
-        Some(result),
-        &mut ops,
-    )?;
 
     let change = ChangeRecord {
         base,
@@ -314,12 +317,103 @@ fn import_commit<S: Store>(
         identity_deltas: Vec::new(),
         evidence: Vec::new(),
         signature: None,
+        rebased_from: None,
     };
     let change_id = store.put_object(&change)?;
     store.append_log(change_id)?;
     store.set_ref(&git_commit_ref(&sha), change_id)?;
     cache.commits.insert(git_id, change_id);
     Ok(change_id)
+}
+
+/// The result snapshot of the imported commit `git_id`. A commit outside an
+/// import window gets a snapshot of its tree with no carried identity.
+fn parent_snapshot<S: Store>(
+    store: &mut S,
+    repo: &gix::Repository,
+    git_id: gix::ObjectId,
+    cache: &mut ImportCache,
+) -> Result<SnapshotId, Error> {
+    if let Some(snapshot) = cache.snapshots.get(&git_id) {
+        return Ok(*snapshot);
+    }
+    if let Some(change) = cache.commits.get(&git_id) {
+        let record: ChangeRecord = store.get_object(*change)?;
+        cache.snapshots.insert(git_id, record.result);
+        return Ok(record.result);
+    }
+    let commit = repo.find_commit(git_id).map_err(Error::git)?;
+    let tree = commit.tree_id().map_err(Error::git)?.detach();
+    let root = import_tree(store, repo, tree, cache)?;
+    let identity = store.put_object(&IdentityTree::default())?;
+    let snapshot = store.put_object(&Snapshot::new(root, identity))?;
+    cache.snapshots.insert(git_id, snapshot);
+    Ok(snapshot)
+}
+
+/// Paths the ops create, change, or delete.
+fn changed_paths(ops: &[Op]) -> Vec<RepoPath> {
+    let mut paths: Vec<RepoPath> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Blob { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The identity tree `root` without entries for `paths` (a Tier 0 write
+/// makes those files fresh). Emptied directories are dropped.
+fn identity_without<S: Store>(
+    store: &mut S,
+    root: ObjectId,
+    paths: &[RepoPath],
+) -> Result<ObjectId, Error> {
+    let tree: IdentityTree = store.get_object(root)?;
+    if tree.entries.is_empty() || paths.is_empty() {
+        return Ok(root);
+    }
+    let components: Vec<&[String]> = paths.iter().map(RepoPath::components).collect();
+    match prune_identity(store, tree, &components)? {
+        Some(tree) => store.put_object(&tree),
+        None => store.put_object(&IdentityTree::default()),
+    }
+}
+
+fn prune_identity<S: Store>(
+    store: &mut S,
+    mut tree: IdentityTree,
+    paths: &[&[String]],
+) -> Result<Option<IdentityTree>, Error> {
+    let mut nested: BTreeMap<&str, Vec<&[String]>> = BTreeMap::new();
+    for path in paths {
+        match path {
+            [name] => {
+                tree.entries.remove(name);
+            }
+            [dir, rest @ ..] => nested.entry(dir.as_str()).or_default().push(rest),
+            [] => {}
+        }
+    }
+    for (dir, rest) in nested {
+        let Some(IdentityEntry::Dir(id)) = tree.entries.get(dir).cloned() else {
+            continue;
+        };
+        let sub: IdentityTree = store.get_object(id)?;
+        match prune_identity(store, sub, &rest)? {
+            Some(sub) => {
+                let id = store.put_object(&sub)?;
+                tree.entries.insert(dir.to_owned(), IdentityEntry::Dir(id));
+            }
+            None => {
+                tree.entries.remove(dir);
+            }
+        }
+    }
+    Ok((!tree.entries.is_empty()).then_some(tree))
 }
 
 fn import_tree<S: Store>(

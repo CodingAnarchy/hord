@@ -1,4 +1,4 @@
-//! Lander queue and identity-index tables used by `hord-txn`.
+//! Lander queue tables used by `hord-txn`, and the store format version.
 
 use std::fs;
 use std::path::PathBuf;
@@ -14,20 +14,15 @@ fn temp_repo() -> PathBuf {
 }
 
 #[test]
-fn queue_and_identity_index_round_trip_and_persist() {
+fn queue_round_trips_and_persists() {
     let path = temp_repo();
     {
         let store = Store::create(&path).unwrap();
         assert!(store.queue_entries().unwrap().is_empty());
-        assert_eq!(store.queue_push(b"first").unwrap(), 0);
-        assert_eq!(store.queue_push(b"second").unwrap(), 1);
+        assert_eq!(store.queue_push(b"first", &[], &[]).unwrap(), 0);
+        assert_eq!(store.queue_push(b"second", &[], &[]).unwrap(), 1);
         store.queue_set(0, b"first, updated").unwrap();
         assert!(store.queue_set(7, b"missing").is_err());
-        let snapshot = ObjectId::from_bytes([1; 32]);
-        let index = ObjectId::from_bytes([2; 32]);
-        assert_eq!(store.identity_index(snapshot).unwrap(), None);
-        store.set_identity_index(snapshot, index).unwrap();
-        assert_eq!(store.identity_index(snapshot).unwrap(), Some(index));
         // Make the non-fsynced writes durable, as the lander's set_head does.
         store.set_head(ObjectId::from_bytes([3; 32])).unwrap();
     }
@@ -38,66 +33,51 @@ fn queue_and_identity_index_round_trip_and_persist() {
     );
     assert_eq!(store.queue_entry(1).unwrap(), Some(b"second".to_vec()));
     assert_eq!(store.queue_entry(2).unwrap(), None);
-    assert_eq!(
-        store.identity_index(ObjectId::from_bytes([1; 32])).unwrap(),
-        Some(ObjectId::from_bytes([2; 32]))
-    );
-    assert_eq!(store.queue_push(b"third").unwrap(), 2);
+    assert_eq!(store.queue_push(b"third", &[], &[]).unwrap(), 2);
     drop(store);
     let _ = fs::remove_dir_all(&path);
 }
 
+/// ADR 0017 changed what a snapshot id is, so a store written before
+/// format versions existed (or by another format) is refused with a clear
+/// error instead of being read as if its snapshot ids were `Snapshot`s.
 #[test]
-fn identity_index_pointers_are_rebuilt_from_binding_objects() {
-    let path = temp_repo().with_extension("rebuild");
+fn a_store_of_another_format_is_refused() {
+    let path = temp_repo().with_extension("format");
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
-    let store = Store::create(&path).unwrap();
-    let a = ObjectId::from_bytes([1; 32]);
-    let b = ObjectId::from_bytes([4; 32]);
-    let first = ObjectId::from_bytes([2; 32]);
-    let second = ObjectId::from_bytes([3; 32]);
-    let other = ObjectId::from_bytes([5; 32]);
-    // `a` is repointed; the later binding supersedes the earlier one.
-    store.set_identity_index(a, first).unwrap();
-    store.set_identity_index(a, second).unwrap();
-    store.set_identity_index(b, other).unwrap();
-    drop(store);
+    drop(Store::create(&path).unwrap());
+    drop(Store::open(&path).unwrap());
 
-    // A new index over the same objects (the redb rows are lost).
-    let copy = path.with_extension("copy");
-    let _ = fs::remove_dir_all(&copy);
-    fs::create_dir_all(&copy).unwrap();
-    drop(Store::create(&copy).unwrap());
-    copy_dir(
-        &path.join(".hord").join("objects"),
-        &copy.join(".hord").join("objects"),
+    // Rewrite the recorded format as an older build would have left it:
+    // no `format` key at all.
+    let index = path.join(".hord").join("index.redb");
+    {
+        let db = redb::Database::open(&index).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut meta = txn
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new("meta"))
+                .unwrap();
+            meta.remove("format").unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let err = Store::open(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            hord_store::Error::StoreFormat {
+                found: None,
+                expected: 2
+            }
+        ),
+        "{err}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("format 1") && text.contains("re-create"),
+        "{text}"
     );
     let _ = fs::remove_dir_all(&path);
-    let path = copy;
-    let store = Store::open(&path).unwrap();
-    assert_eq!(store.identity_index(a).unwrap(), None);
-    store.rebuild_index().unwrap();
-    assert_eq!(store.identity_index(a).unwrap(), Some(second));
-    assert_eq!(store.identity_index(b).unwrap(), Some(other));
-
-    // A rebuilt row keeps its binding, so the next repoint chains from it.
-    store.set_identity_index(a, first).unwrap();
-    store.rebuild_index().unwrap();
-    assert_eq!(store.identity_index(a).unwrap(), Some(first));
-    drop(store);
-    let _ = fs::remove_dir_all(&path);
-}
-
-fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-    fs::create_dir_all(to).unwrap();
-    for entry in fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).unwrap();
-        }
-    }
 }

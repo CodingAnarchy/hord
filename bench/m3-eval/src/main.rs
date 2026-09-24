@@ -18,12 +18,17 @@
 //! - **`Cargo.lock`.** Two concurrent dependency additions to cargo's own
 //!   lockfile both land and give Cargo's canonical file ([`lock`]).
 //!
+//! `--remote-submit` runs only the simulation, with the changes submitted
+//! to and landed by a freshly opened repository that did not propose them
+//! (the M4 remote case, [`remote`]). Gate: throughput ≥ 20 changes/s.
+//!
 //! The process exits nonzero if any gate fails.
 //!
 //! ```text
 //! cargo run -p hord-eval-m3 --release --offline
 //! cargo run -p hord-eval-m3 --release --offline -- --json target/m3-eval.json
 //! cargo run -p hord-eval-m3 --release --offline -- --seed 7 --strict-reads
+//! cargo run -p hord-eval-m3 --release --offline -- --remote-submit
 //! ```
 //!
 //! The corpus is `cargo.git` under `--cache`, `$HORD_CORPORA`, or
@@ -33,6 +38,7 @@
 
 mod corpus;
 mod lock;
+mod remote;
 mod rust;
 mod sim;
 mod workspaces;
@@ -74,6 +80,10 @@ struct Args {
     /// a seeded order.
     #[arg(long)]
     racy_submit: bool,
+    /// Propose on one repository, then submit and land from a freshly
+    /// opened one (the M4 remote case). Runs only this simulation.
+    #[arg(long)]
+    remote_submit: bool,
     /// Also write the full report as JSON to this path.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -144,6 +154,9 @@ fn run(args: &Args) -> Result<bool> {
         .enable_all()
         .build()
         .context("tokio runtime")?;
+    if args.remote_submit {
+        return runtime.block_on(remote_submit(args, &corpus, &scratch.0));
+    }
     let report = runtime.block_on(evaluate(args, &corpus, &scratch.0))?;
     print(&report, args);
     if let Some(path) = &args.json {
@@ -152,6 +165,46 @@ fn run(args: &Args) -> Result<bool> {
         eprintln!("[report] wrote {}", path.display());
     }
     Ok(report.gates.all)
+}
+
+async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<bool> {
+    let files: Vec<(RepoPath, Vec<u8>)> = corpus
+        .files
+        .iter()
+        .filter_map(|(p, b)| p.parse::<RepoPath>().ok().map(|p| (p, b.clone())))
+        .collect();
+    let report = remote::run(
+        &scratch.join("remote"),
+        files,
+        &corpus.files,
+        &sim::SimConfig {
+            agents: args.agents,
+            overlap_percent: args.overlap_percent,
+            seed: args.seed,
+            strict_reads: args.strict_reads,
+            racy_submit: false,
+        },
+    )
+    .await?;
+    println!(
+        "[remote] seed {} agents {}: propose {:.2}s, submit {:.2}s, land {:.2}s = {:.1} changes/s \
+         (landed {}, conflicted {}, rejected {}) {}",
+        report.seed,
+        report.agents,
+        report.propose_secs,
+        report.submit_secs,
+        report.land_secs,
+        report.throughput,
+        report.landed,
+        report.conflicted,
+        report.rejected,
+        pass_fail(report.pass)
+    );
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(report.pass)
 }
 
 async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<Report> {

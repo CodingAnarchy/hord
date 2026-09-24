@@ -2,14 +2,17 @@
 //!
 //! Which files a change touched comes from the tree diff of `base` →
 //! `result`. Each structural op belongs to the file whose definitions (or
-//! path-derived root, [`hord_diff::file_parent`]) it names; ops are not
+//! path-derived root, [`NodeId::file_root`]) it names; ops are not
 //! scoped by their position. [`Op::Blob`] and [`Op::Tree`] ops name their
-//! path.
+//! path. A file move (ADR 0020) is `Op::Tree { path: from, kind: Rename {
+//! to } }`: the target's structural ops apply to the source's base content,
+//! less the `Move`s that re-parent its top-level definitions from the source
+//! root to the target root.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, Op, RepoPath};
+use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, Op, RepoPath, TreeOpKind};
 use hord_lang::IdentifiedTree;
 
 use crate::propose::check_reproduces;
@@ -25,6 +28,10 @@ pub(crate) struct FileChange {
     /// The record's ops for this file, in record order: structural ops and
     /// any `Blob`/`Tree` ops on the path.
     pub ops: Vec<Op>,
+    /// For the target of a file move, the source path (ADR 0020).
+    pub moved_from: Option<RepoPath>,
+    /// For the source of a file move, the target path.
+    pub moved_to: Option<RepoPath>,
 }
 
 impl FileChange {
@@ -32,6 +39,19 @@ impl FileChange {
         self.ops
             .iter()
             .filter(|op| !matches!(op, Op::Blob { .. } | Op::Tree { .. }))
+    }
+
+    /// Structural ops to apply to the base content: for a move target, the
+    /// re-parenting `Move`s from the source root are left out (the rename
+    /// itself does that).
+    pub fn applicable(&self) -> Vec<Op> {
+        let from_root = self.moved_from.as_ref().map(NodeId::file_root);
+        self.structural()
+            .filter(
+                |op| !matches!(op, Op::Move { from_parent, .. } if Some(*from_parent) == from_root),
+            )
+            .cloned()
+            .collect()
     }
 
     pub fn has_structural(&self) -> bool {
@@ -63,6 +83,8 @@ pub(crate) fn file_changes(inner: &Inner, record: &ChangeRecord) -> Result<Vec<F
             from: d.from,
             to: d.to,
             ops: Vec::new(),
+            moved_from: None,
+            moved_to: None,
         })
         .collect();
     let by_path: BTreeMap<RepoPath, usize> = changes
@@ -70,6 +92,17 @@ pub(crate) fn file_changes(inner: &Inner, record: &ChangeRecord) -> Result<Vec<F
         .enumerate()
         .map(|(i, c)| (c.path.clone(), i))
         .collect();
+    for op in &record.ops {
+        if let Op::Tree {
+            path,
+            kind: TreeOpKind::Rename { to },
+        } = op
+            && let (Some(&from), Some(&target)) = (by_path.get(path), by_path.get(to))
+        {
+            changes[from].moved_to = Some(to.clone());
+            changes[target].moved_from = Some(path.clone());
+        }
+    }
     let mut sides = Vec::with_capacity(changes.len());
     let mut owners: BTreeMap<NodeId, Vec<usize>> = BTreeMap::new();
     for (i, change) in changes.iter().enumerate() {
@@ -80,11 +113,17 @@ pub(crate) fn file_changes(inner: &Inner, record: &ChangeRecord) -> Result<Vec<F
                 .map(|p| p.tree))
         };
         let side = Sides {
-            base: parsed(record.base)?,
+            base: match &change.moved_from {
+                Some(from) => inner
+                    .file_view(record.base, from)?
+                    .and_then(|v| v.parsed)
+                    .map(|p| p.tree),
+                None => parsed(record.base)?,
+            },
             result: parsed(record.result)?,
         };
         owners
-            .entry(hord_diff::file_parent(&change.path))
+            .entry(NodeId::file_root(&change.path))
             .or_default()
             .push(i);
         for tree in [&side.base, &side.result].into_iter().flatten() {
@@ -168,6 +207,18 @@ pub(crate) fn validate_except(
         result: record.result,
         reason,
     };
+    // ADR 0018: a rebased record names the submitted record it came from.
+    if let Some(submitted) = record.rebased_from {
+        match inner.change_record(submitted) {
+            Ok(_) => {}
+            Err(Error::MissingChange(_)) => {
+                return Err(invalid(format!(
+                    "rebased_from names {submitted}, which is not a stored change record"
+                )));
+            }
+            Err(err) => return Err(err),
+        }
+    }
     let changes = file_changes(inner, record).map_err(|err| match err {
         Error::InvalidChange { reason, .. } => invalid(reason),
         other => other,
@@ -181,7 +232,14 @@ pub(crate) fn validate_except(
                 "the Blob op on {path} does not match the trees"
             )));
         }
-        if !file.has_structural() {
+        if let Some(to) = &file.moved_to {
+            // The move's source: gone, its content continues at `to`.
+            if file.to.is_some() || file.has_structural() {
+                return Err(invalid(format!("{path} moved to {to} but still changed")));
+            }
+            continue;
+        }
+        if !file.has_structural() && file.moved_from.is_none() {
             if file.blob_op().is_none() {
                 return Err(invalid(format!("{path} changed with no op")));
             }
@@ -200,49 +258,42 @@ pub(crate) fn validate_except(
         let tree = inner
             .parse(adapter, to, bytes.as_slice())
             .ok_or_else(|| invalid(format!("{path} does not parse")))?;
-        let base = match file.from {
-            Some(_) => inner
-                .file_view(record.base, path)?
+        let base_path = file.moved_from.as_ref().unwrap_or(path);
+        let base = match (file.from, &file.moved_from) {
+            (Some(_), _) | (None, Some(_)) => inner
+                .file_view(record.base, base_path)?
                 .and_then(|v| v.parsed)
                 .map(|p| p.tree)
-                .ok_or_else(|| invalid(format!("base {path} does not parse")))?,
-            None => Arc::new(IdentifiedTree::default()),
+                .ok_or_else(|| invalid(format!("base {base_path} does not parse")))?,
+            (None, None) => Arc::new(IdentifiedTree::default()),
         };
-        let ops: Vec<Op> = file.structural().cloned().collect();
+        let ops = file.applicable();
         check_reproduces(adapter, path, &base, &ops, &tree, &bytes)
             .map_err(|err| invalid(err.to_string()))?;
     }
     Ok(())
 }
 
-/// Path id of every coarse (whole-file) write: a `Blob` op on a path whose
-/// root no structural op names. Pure over the record, for footprints.
+/// Path of every coarse (whole-file) write: a `Blob` op on a path whose
+/// root no structural op names, and the source of a file move (ADR 0020: a
+/// concurrent edit of the old path conflicts with the move). Pure over the
+/// record, for footprints.
 pub(crate) fn coarse_paths(record: &ChangeRecord) -> Vec<RepoPath> {
-    let named: std::collections::BTreeSet<NodeId> = record
-        .ops
-        .iter()
-        .flat_map(|op| match op {
-            Op::Insert { parent, .. } => vec![*parent],
-            Op::Move {
-                from_parent,
-                to_parent,
-                ..
-            } => vec![*from_parent, *to_parent],
-            Op::Replace { node, .. } | Op::Delete { node } | Op::Rename { node, .. } => {
-                vec![*node]
-            }
-            Op::Blob { .. } | Op::Tree { .. } => Vec::new(),
-        })
-        .collect();
+    let named: std::collections::BTreeSet<NodeId> =
+        record.ops.iter().flat_map(Op::node_ids).collect();
     record
         .ops
         .iter()
         .filter_map(|op| match op {
             Op::Blob { path, to, .. }
-                if to.is_none() || !named.contains(&hord_diff::file_parent(path)) =>
+                if to.is_none() || !named.contains(&NodeId::file_root(path)) =>
             {
                 Some(path.clone())
             }
+            Op::Tree {
+                path,
+                kind: TreeOpKind::Rename { .. },
+            } => Some(path.clone()),
             _ => None,
         })
         .collect()

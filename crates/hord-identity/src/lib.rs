@@ -5,12 +5,14 @@
 //! births, deaths, derivations, and moves. [`identity_map`] is the
 //! per-snapshot [`hord_core::IdentityMap`]: each id located by file and a
 //! child-index path from that file's root. Each file root has the
-//! path-derived id [`file_root_id`] (ADR 0015), located at an empty path.
+//! path-derived id [`hord_core::NodeId::file_root`] (ADR 0015), located at an empty path.
 //!
 //! Rename similarity is [`hord_lang::default_identify`] (ADR 0007). This crate
-//! does not choose a different metric or threshold. Fresh birth ids are derived
-//! from the definition content id so they do not follow ULID randomness or the
-//! source order of unrelated nodes.
+//! does not choose a different metric or threshold. Birth ids are derived
+//! (ADR 0019, [`birth_id`]) from the definition's content id, its file's root
+//! id, its site, and the base snapshot of the change that creates it, so they
+//! are deterministic, and a definition that dies and is re-added later gets a
+//! new id.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -20,13 +22,11 @@ mod assign;
 mod carry;
 mod error;
 mod map;
-mod root;
 
-pub use assign::{assign, assign_in};
-pub use carry::{Declaration, carry, carry_in};
+pub use assign::{assign, birth_id};
+pub use carry::{Declaration, carry};
 pub use error::Error;
 pub use map::{SnapshotFile, identity_map};
-pub use root::file_root_id;
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;

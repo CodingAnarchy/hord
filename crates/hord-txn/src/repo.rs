@@ -1,27 +1,40 @@
 //! [`Repo`]: the shared handle every workspace and the lander hang off.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_core::{
-    Actor, ChangeId, ChangeRecord, Intent, LangId, ObjectId, Op, Provenance, RepoPath, SnapshotId,
-    Timestamp, Tree, TreeOpKind,
+    Actor, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
+    RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
 };
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
 
 use crate::lander::{QueueEntry, Verdict, Verifier, VerifyFuture, VerifyRequest};
 use crate::materialize::MaterializeMode;
-use crate::semantic::{IdentityIndex, RustCtx};
+use crate::semantic::RustCtx;
 use crate::workspace::{Materialization, Workspace};
 use crate::{Error, Result};
 
-/// Cap on cached parsed files. A cargo-sized snapshot has ~1,400 Rust files.
-const MAX_CACHED_FILES: usize = 4096;
+/// Byte budget for each of the parsed and identified tree caches, in
+/// [`NodeTree::resident_bytes`] (about 3/4 of the allocator's real use).
+/// Parsing every Rust file of cargo (~1,400 files, 10.5 MB) is ~320 MB by
+/// that measure. Identified trees share their nodes with the parsed ones,
+/// so the two budgets overlap in memory. Measured on 1,000 changes queued
+/// on one cargo base (perf review `queue 1000`): 1 GiB re-parses evicted
+/// base files while landing (38/s), 1.5 GiB does not (60/s, peak RSS
+/// 2.6 GB against 4.5 GB with the old count cap).
+const MAX_CACHED_TREE_BYTES: usize = 1536 << 20;
 /// Cap on cached per-snapshot Rust resolution contexts.
 const MAX_CACHED_CTX: usize = 8;
+/// Cap on cached footprints of landed changes and on the ids of records
+/// this process proposed. The lander needs the footprints of the changes
+/// landed after a queued change's base; a miss recomputes one from its
+/// record. Beyond this many, the least recently used are dropped (they grew
+/// by one per landing forever before).
+pub(crate) const MAX_TRACKED_CHANGES: usize = 16_384;
 
 /// Repository-wide settings for the lander (spec §6.3, §7.2).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -119,7 +132,7 @@ pub fn default_adapters() -> AdapterRegistry {
 /// Where a new workspace starts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Base {
-    /// The result snapshot of the current `head` (or the empty tree).
+    /// The result snapshot of the current `head` (or the empty snapshot).
     #[default]
     Head,
     /// The result snapshot of a landed change. That change becomes the
@@ -158,7 +171,7 @@ impl BeginOptions {
 pub struct Head {
     /// Latest landed change; `None` before anything lands.
     pub change: Option<ChangeId>,
-    /// Its result snapshot, or the empty tree.
+    /// Its result snapshot, or the empty snapshot ([`Snapshot::empty`]).
     pub snapshot: SnapshotId,
 }
 
@@ -187,16 +200,23 @@ pub(crate) struct Inner {
     pub config: RepoConfig,
     pub verifier: Arc<dyn Verifier>,
     pub toolchain: ObjectId,
+    /// Root [`Tree`] with no entries.
     pub empty_tree: ObjectId,
+    /// [`Snapshot::empty`]: the base before anything lands.
+    pub empty_snapshot: SnapshotId,
     pub head: Mutex<Option<Head>>,
     pub trees: Mutex<HashMap<ObjectId, Arc<Tree>>>,
-    pub parsed: Mutex<HashMap<(ObjectId, LangId), Arc<NodeTree>>>,
+    pub snapshots: Mutex<HashMap<SnapshotId, Arc<Snapshot>>>,
+    pub identity_trees: Mutex<HashMap<ObjectId, Arc<IdentityTree>>>,
+    pub parsed: Mutex<WeightedLru<(ObjectId, LangId), Arc<NodeTree>>>,
     pub identified: Mutex<IdentifiedCache>,
-    pub indexes: Mutex<HashMap<SnapshotId, Arc<IdentityIndex>>>,
     pub rust_ctx: Mutex<CtxCache>,
-    pub footprints: Mutex<HashMap<ChangeId, Arc<crate::conflict::Footprint>>>,
-    /// Records built by this process's `propose`, whose ops were checked then.
-    pub proposed: Mutex<HashSet<ChangeId>>,
+    /// Footprints of landed changes, least recently used evicted.
+    pub footprints: Mutex<WeightedLru<ChangeId, Arc<crate::conflict::Footprint>>>,
+    /// Records built by this process's `propose`, whose ops were checked
+    /// then (least recently proposed evicted; `submit` also records the
+    /// check in the store).
+    pub proposed: Mutex<WeightedLru<ChangeId, ()>>,
     /// Serializes the lander (spec §6.7: one lander per repository).
     pub lander: tokio::sync::Mutex<crate::lander::LanderState>,
 }
@@ -205,7 +225,89 @@ pub(crate) struct Inner {
 /// matters: a fresh assignment depends on it, so two files with identical
 /// content get different ids.
 pub(crate) type IdentifiedCache =
-    HashMap<(RepoPath, ObjectId, Option<ObjectId>), Arc<IdentifiedTree>>;
+    WeightedLru<(RepoPath, ObjectId, Option<ObjectId>), Arc<IdentifiedTree>>;
+
+/// A cache bounded by total weight (bytes), evicting the least recently
+/// used entry one at a time until it fits (perf review #3), rather than
+/// clearing everything when a count cap is hit. The newest entry always
+/// stays, even when it alone is over the budget.
+pub(crate) struct WeightedLru<K, V> {
+    entries: HashMap<K, LruEntry<V>>,
+    /// Last use → key; the first entry is the eviction candidate.
+    order: BTreeMap<u64, K>,
+    tick: u64,
+    weight: usize,
+    budget: usize,
+}
+
+struct LruEntry<V> {
+    value: V,
+    weight: usize,
+    used: u64,
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V: Clone> WeightedLru<K, V> {
+    pub fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            tick: 0,
+            weight: 0,
+            budget,
+        }
+    }
+
+    /// The cached value, marked as most recently used.
+    pub fn get(&mut self, key: &K) -> Option<V> {
+        let entry = self.entries.get_mut(key)?;
+        self.order.remove(&entry.used);
+        self.tick += 1;
+        entry.used = self.tick;
+        self.order.insert(self.tick, key.clone());
+        Some(entry.value.clone())
+    }
+
+    pub fn insert(&mut self, key: K, value: V, weight: usize) {
+        self.remove(&key);
+        self.tick += 1;
+        self.order.insert(self.tick, key.clone());
+        self.weight += weight;
+        self.entries.insert(
+            key,
+            LruEntry {
+                value,
+                weight,
+                used: self.tick,
+            },
+        );
+        while self.weight > self.budget && self.entries.len() > 1 {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.weight -= entry.weight;
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &K) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.order.remove(&entry.used);
+            self.weight -= entry.weight;
+        }
+    }
+
+    /// Total weight of the cached entries.
+    #[cfg(test)]
+    pub fn weight(&self) -> usize {
+        self.weight
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 pub(crate) type CtxSlot = Arc<OnceLock<std::result::Result<Arc<RustCtx>, String>>>;
 
@@ -213,6 +315,8 @@ pub(crate) type CtxSlot = Arc<OnceLock<std::result::Result<Arc<RustCtx>, String>
 pub(crate) struct CtxCache {
     pub slots: HashMap<SnapshotId, CtxSlot>,
     pub order: Vec<SnapshotId>,
+    /// The context built last: the next snapshot's build starts from it.
+    pub latest: Option<Arc<RustCtx>>,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -243,6 +347,8 @@ impl Inner {
             grammars: ["tree-sitter-rust 0.24", "tree-sitter-toml-ng 0.7"],
         })?;
         let empty_tree = store.put_object(&Tree::default())?;
+        store.put_object(&IdentityTree::default())?;
+        let empty_snapshot = store.put_object(&Snapshot::empty())?;
         Ok(Self {
             store,
             adapters: options.adapters.unwrap_or_else(default_adapters),
@@ -252,14 +358,16 @@ impl Inner {
                 .unwrap_or_else(|| Arc::new(FailClosedVerifier)),
             toolchain,
             empty_tree,
+            empty_snapshot,
             head: Mutex::new(None),
             trees: Mutex::new(HashMap::new()),
-            parsed: Mutex::new(HashMap::new()),
-            identified: Mutex::new(HashMap::new()),
-            indexes: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
+            identity_trees: Mutex::new(HashMap::new()),
+            parsed: Mutex::new(WeightedLru::new(MAX_CACHED_TREE_BYTES)),
+            identified: Mutex::new(WeightedLru::new(MAX_CACHED_TREE_BYTES)),
             rust_ctx: Mutex::new(CtxCache::default()),
-            footprints: Mutex::new(HashMap::new()),
-            proposed: Mutex::new(HashSet::new()),
+            footprints: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
+            proposed: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
         })
     }
@@ -275,7 +383,7 @@ impl Inner {
             },
             None => Head {
                 change: None,
-                snapshot: self.empty_tree,
+                snapshot: self.empty_snapshot,
             },
         };
         *lock(&self.head) = Some(head);
@@ -297,11 +405,8 @@ impl Inner {
     }
 
     pub(crate) fn cache_parsed(&self, key: (ObjectId, LangId), tree: Arc<NodeTree>) {
-        let mut cache = lock(&self.parsed);
-        if cache.len() >= MAX_CACHED_FILES {
-            cache.clear();
-        }
-        cache.insert(key, tree);
+        let weight = tree.resident_bytes();
+        lock(&self.parsed).insert(key, tree, weight);
     }
 
     pub(crate) fn cache_identified(
@@ -309,11 +414,8 @@ impl Inner {
         key: (RepoPath, ObjectId, Option<ObjectId>),
         tree: Arc<IdentifiedTree>,
     ) {
-        let mut cache = lock(&self.identified);
-        if cache.len() >= MAX_CACHED_FILES {
-            cache.clear();
-        }
-        cache.insert(key, tree);
+        let weight = tree.resident_bytes();
+        lock(&self.identified).insert(key, tree, weight);
     }
 
     pub(crate) fn ctx_slot(&self, snapshot: SnapshotId) -> CtxSlot {
@@ -329,6 +431,24 @@ impl Inner {
         cache.slots.insert(snapshot, Arc::clone(&slot));
         cache.order.push(snapshot);
         slot
+    }
+
+    pub(crate) fn latest_rust_ctx(&self) -> Option<Arc<RustCtx>> {
+        lock(&self.rust_ctx).latest.clone()
+    }
+
+    pub(crate) fn set_latest_rust_ctx(&self, ctx: Arc<RustCtx>) {
+        lock(&self.rust_ctx).latest = Some(ctx);
+    }
+
+    /// Record that this process proposed `change` and checked its ops.
+    pub(crate) fn note_proposed(&self, change: ChangeId) {
+        lock(&self.proposed).insert(change, (), 1);
+    }
+
+    /// Whether this process proposed `change` (and checked its ops).
+    pub(crate) fn was_proposed(&self, change: ChangeId) -> bool {
+        lock(&self.proposed).get(&change).is_some()
     }
 
     /// Land `files` as the first change (Tier 0 ops, fresh identity).
@@ -356,9 +476,11 @@ impl Inner {
             });
             changes.insert(path, Some(blob));
         }
-        let result = self.update_tree(self.empty_tree, &changes)?;
+        // Tier 0: every file is a fresh assignment, so the identity tree is
+        // empty (ADR 0017).
+        let result = self.commit_snapshot(self.empty_snapshot, &changes, &BTreeMap::new())?;
         let record = ChangeRecord {
-            base: self.empty_tree,
+            base: self.empty_snapshot,
             result,
             parents: Vec::new(),
             ops,
@@ -375,11 +497,9 @@ impl Inner {
             identity_deltas: Vec::new(),
             evidence: Vec::new(),
             signature: None,
+            rebased_from: None,
         };
         let change = self.store.put_object(&record)?;
-        // Tier 0: every file is a fresh assignment. Recorded so the pointer
-        // is durable with `set_head` below.
-        self.put_identity_index(result, crate::semantic::IdentityIndex::empty(result))?;
         self.store.append_log(change)?;
         self.store.set_head(change)?;
         self.store.index_change(change)?;
@@ -702,4 +822,103 @@ pub(crate) fn fs_path(dir: &Path, path: &RepoPath) -> PathBuf {
         out.push(component);
     }
     out
+}
+
+#[cfg(test)]
+mod lru_tests {
+    use super::WeightedLru;
+
+    /// Over budget, the least recently used entries go one at a time; the
+    /// rest stay (the count cap it replaces cleared every entry at once).
+    #[test]
+    fn evicts_least_recently_used_until_within_budget() {
+        let mut cache = WeightedLru::new(100);
+        for i in 0..10 {
+            cache.insert(i, i, 10);
+        }
+        assert_eq!((cache.len(), cache.weight()), (10, 100));
+        // Touch 0 so 1 is now the oldest.
+        assert_eq!(cache.get(&0), Some(0));
+        cache.insert(10, 10, 25);
+        assert!(cache.weight() <= 100);
+        assert_eq!(cache.get(&0), Some(0), "recently used entry survives");
+        for evicted in 1..=3 {
+            assert_eq!(cache.get(&evicted), None, "{evicted} was oldest");
+        }
+        for kept in 4..=10 {
+            assert_eq!(cache.get(&kept), Some(kept));
+        }
+    }
+
+    #[test]
+    fn replacing_a_key_reweighs_it_and_an_oversized_entry_stays_alone() {
+        let mut cache = WeightedLru::new(50);
+        cache.insert("a", 1, 30);
+        cache.insert("a", 2, 10);
+        assert_eq!((cache.len(), cache.weight()), (1, 10));
+        cache.insert("b", 3, 500);
+        assert_eq!(cache.len(), 1, "the newest entry is kept even over budget");
+        assert_eq!(cache.get(&"b"), Some(3));
+        assert_eq!(cache.weight(), 500);
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use std::sync::Arc;
+
+    use hord_core::{ChangeRecord, ObjectId};
+
+    use super::{MAX_TRACKED_CHANGES, Repo, lock};
+    use crate::conflict::Footprint;
+
+    fn id(n: usize) -> ObjectId {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        ObjectId::from_bytes(bytes)
+    }
+
+    /// The per-landing footprint cache and the proposed-change set are
+    /// bounded (perf review #7 leftover): past the cap the least recently
+    /// used go, and a recent one is still there. Both grew by one entry per
+    /// change forever before.
+    #[tokio::test]
+    async fn footprints_and_proposed_stay_bounded() {
+        let dir = std::env::temp_dir().join(format!("hord-txn-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repo::create(&dir).await.unwrap();
+        let inner = &repo.inner;
+        let record: ChangeRecord = {
+            let mut ws = repo
+                .begin(crate::BeginOptions::at_head(hord_core::Actor::Human {
+                    id: "t".into(),
+                }))
+                .await
+                .unwrap();
+            ws.write_file(&"a.txt".parse().unwrap(), "a\n")
+                .await
+                .unwrap();
+            ws.preview(hord_core::Intent {
+                summary: "s".into(),
+                body: String::new(),
+                refs: Vec::new(),
+                acceptance: Vec::new(),
+            })
+            .await
+            .unwrap()
+            .record
+        };
+        let footprint = Arc::new(Footprint::of(id(0), &record, &[]));
+        let total = MAX_TRACKED_CHANGES + 100;
+        for n in 0..total {
+            lock(&inner.footprints).insert(id(n), Arc::clone(&footprint), 1);
+            inner.note_proposed(id(n));
+        }
+        assert_eq!(lock(&inner.footprints).len(), MAX_TRACKED_CHANGES);
+        assert_eq!(lock(&inner.proposed).len(), MAX_TRACKED_CHANGES);
+        assert!(inner.was_proposed(id(total - 1)), "the newest stays");
+        assert!(!inner.was_proposed(id(0)), "the oldest went");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

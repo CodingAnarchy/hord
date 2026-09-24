@@ -28,7 +28,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use hord_lang::LangAdapter;
+use hord_lang::{LangAdapter, prefer_unchanged};
 pub use toml::{Table, Value};
 
 use crate::TomlAdapter;
@@ -393,7 +393,13 @@ pub fn merge_docs(
         config,
         conflicts: Vec::new(),
     };
-    let header = match pick3(Some(&base.header), Some(&ours.header), Some(&theirs.header)) {
+    let header = match prefer_unchanged(
+        &Some(&base.header),
+        &Some(&ours.header),
+        &Some(&theirs.header),
+    )
+    .copied()
+    {
         Some(h) => h.cloned().unwrap_or_default(),
         None => {
             m.conflict("#header", ConflictKind::BothChanged);
@@ -421,22 +427,6 @@ pub fn merge_docs(
         })
     } else {
         Err(m.conflicts)
-    }
-}
-
-/// Standard 3-way pick: `None` when both sides changed differently.
-#[allow(clippy::option_option)]
-fn pick3<'a, T: PartialEq + ?Sized>(
-    base: Option<&'a T>,
-    ours: Option<&'a T>,
-    theirs: Option<&'a T>,
-) -> Option<Option<&'a T>> {
-    if ours == theirs || theirs == base {
-        Some(ours)
-    } else if ours == base {
-        Some(theirs)
-    } else {
-        None
     }
 }
 
@@ -582,7 +572,7 @@ impl Merger<'_> {
         theirs: Option<&Value>,
         is_set: bool,
     ) -> Option<Value> {
-        if let Some(v) = pick3(base, ours, theirs) {
+        if let Some(v) = prefer_unchanged(&base, &ours, &theirs).copied() {
             return v.cloned();
         }
         let config = self.config;

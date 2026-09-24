@@ -33,6 +33,19 @@ impl IdentifiedTree {
         Self { tree, ids }
     }
 
+    /// Estimated heap bytes: [`NodeTree::resident_bytes`] plus the id map.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        // BTreeMap slot, the site vector's header, and its indices.
+        const PER_ID: usize = 64 + std::mem::size_of::<(Site, NodeId)>();
+        self.tree.resident_bytes()
+            + self
+                .ids
+                .keys()
+                .map(|site| PER_ID + site.len() * std::mem::size_of::<u32>())
+                .sum::<usize>()
+    }
+
     /// Content id of the node at `site`.
     #[must_use]
     pub fn oid_at(&self, site: &[u32]) -> Option<ObjectId> {
@@ -69,6 +82,46 @@ pub fn oid_at(tree: &NodeTree, site: &[u32]) -> Option<ObjectId> {
         oid = *tree.get(oid)?.children.get(*index as usize)?;
     }
     Some(oid)
+}
+
+/// One identified definition of a tree (see [`def_sites`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefSite<'a> {
+    /// Where the definition is.
+    pub site: &'a Site,
+    /// Its identity.
+    pub node: NodeId,
+    /// Content id of its subtree.
+    pub oid: ObjectId,
+    /// Identity of its nearest enclosing identified definition; `None` at
+    /// file level.
+    pub parent: Option<NodeId>,
+}
+
+/// The identified definitions of `tree` in preorder (the order of `ids`),
+/// each with its nearest enclosing identified definition. Ids at sites the
+/// tree does not have are skipped.
+pub fn def_sites<'a>(
+    tree: &'a NodeTree,
+    ids: &'a BTreeMap<Site, NodeId>,
+) -> impl Iterator<Item = DefSite<'a>> + 'a {
+    ids.iter().filter_map(move |(site, &node)| {
+        Some(DefSite {
+            site,
+            node,
+            oid: oid_at(tree, site)?,
+            parent: enclosing_site(ids, site).map(|parent| ids[parent]),
+        })
+    })
+}
+
+/// The nearest enclosing definition site of `site`: its longest proper
+/// prefix that is a key of `ids`.
+#[must_use]
+pub fn enclosing_site<'a>(ids: &'a BTreeMap<Site, NodeId>, site: &[u32]) -> Option<&'a Site> {
+    (0..site.len())
+        .rev()
+        .find_map(|len| ids.get_key_value(&site[..len]).map(|(key, _)| key))
 }
 
 /// Result of [`default_identify`]: carried ids, births/deaths, and moves.
@@ -548,6 +601,45 @@ mod tests {
 
     fn nid(n: u128) -> NodeId {
         NodeId::from_u128(n)
+    }
+
+    /// Preorder, nearest enclosing identified definition as the parent, and
+    /// ids at sites the tree does not have skipped.
+    #[test]
+    fn def_sites_are_preorder_with_nearest_identified_parent() {
+        let mut tree = NodeTree::new();
+        let a = leaf(&mut tree, "fn", "a", Some("a"));
+        let b = leaf(&mut tree, "fn", "b", Some("b"));
+        let open = leaf(&mut tree, "{", "{", None);
+        let block = tree
+            .intern_branch(NodeKind::new("block"), lang(), vec![open, b], None)
+            .unwrap();
+        let module = tree
+            .intern_branch(NodeKind::new("mod"), lang(), vec![block], None)
+            .unwrap();
+        let root = tree
+            .intern_branch(NodeKind::new("file"), lang(), vec![a, module], None)
+            .unwrap();
+        tree.set_root(root).unwrap();
+        let ids = BTreeMap::from([
+            (vec![0], nid(1)),
+            (vec![1], nid(2)),
+            (vec![1, 0, 1], nid(3)),
+            (vec![7], nid(4)),
+        ]);
+        let found: Vec<(Site, NodeId, ObjectId, Option<NodeId>)> = def_sites(&tree, &ids)
+            .map(|def| (def.site.clone(), def.node, def.oid, def.parent))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (vec![0], nid(1), a, None),
+                (vec![1], nid(2), module, None),
+                (vec![1, 0, 1], nid(3), b, Some(nid(2))),
+            ]
+        );
+        assert_eq!(enclosing_site(&ids, &[1, 0, 1]), Some(&vec![1]));
+        assert_eq!(enclosing_site(&ids, &[1]), None);
     }
 
     #[test]

@@ -7,7 +7,8 @@ use std::fs;
 use std::time::{Duration, SystemTime};
 
 use common::*;
-use hord_txn::{BeginOptions, Materialization, MaterializeMode, path_node_id};
+use hord_core::NodeId;
+use hord_txn::{BeginOptions, Materialization, MaterializeMode};
 
 fn checkout_of(ws: &hord_txn::Workspace) -> std::path::PathBuf {
     match ws.materialization() {
@@ -111,7 +112,7 @@ async fn propose_skips_stat_clean_files_and_paranoid_rehashes() {
         proposal
             .record
             .write_set
-            .contains(&path_node_id(&path("README.md")))
+            .contains(&NodeId::file_root(&path("README.md")))
     );
 }
 
@@ -277,6 +278,42 @@ async fn directory_workspaces_on_cargo() {
         "[dir] {used:?} x1000 live: total {total:?}, mean {mean:?} p50 {p50:?} p99 {p99:?} max {max:?}; first-100 mean {first100:?}, last-100 mean {last100:?}"
     );
 
+    // Preview of an unedited clone (the walk and stat compare alone),
+    // interleaved with the serial `lstat` walk it replaced (M3 review perf
+    // #8), so both see the same machine load.
+    fn serial_walk(dir: &std::path::Path, prefix: &mut Vec<String>, n: &mut usize) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = fs::symlink_metadata(entry.path()).unwrap();
+            prefix.push(entry.file_name().into_string().unwrap());
+            if meta.is_dir() {
+                serial_walk(&entry.path(), prefix, n);
+            } else if meta.is_file() {
+                std::hint::black_box(hord_core::RepoPath::new(prefix.clone()));
+                *n += 1;
+            }
+            prefix.pop();
+        }
+    }
+    let idle_dir = checkout_of(&live[499]);
+    let (mut idle, mut serial) = (Vec::new(), Vec::new());
+    for _ in 0..20 {
+        let started = Instant::now();
+        let mut n = 0;
+        serial_walk(&idle_dir, &mut Vec::new(), &mut n);
+        serial.push(started.elapsed());
+        assert_eq!(n, files.len());
+        let started = Instant::now();
+        let result = live[499].preview(intent("idle")).await;
+        idle.push(started.elapsed());
+        assert!(matches!(result, Err(hord_txn::Error::NothingToPropose)));
+    }
+    let (_, idle_p50, idle_p99, _) = stats(&mut idle);
+    let (_, serial_p50, serial_p99, _) = stats(&mut serial);
+    eprintln!(
+        "[dir] unedited preview (walk + stat compare) x20: p50 {idle_p50:?} p99 {idle_p99:?}; serial lstat walk alone: p50 {serial_p50:?} p99 {serial_p99:?}"
+    );
+
     // Propose from a clone: one edited file, stat index vs paranoid.
     let ws = &mut live[500];
     let edited = files
@@ -291,15 +328,23 @@ async fn directory_workspaces_on_cargo() {
     // context (a one-time parse of every Rust file), which is not what is
     // being compared.
     ws.preview(intent("warm-up")).await.unwrap();
-    let started = Instant::now();
-    let fast = ws.preview(intent("edit")).await.unwrap();
-    let with_index = started.elapsed();
+    let mut previews = Vec::new();
+    let mut fast = None;
+    for _ in 0..20 {
+        let started = Instant::now();
+        fast = Some(ws.preview(intent("edit")).await.unwrap());
+        previews.push(started.elapsed());
+    }
+    let fast = fast.unwrap();
+    let (_, with_index, preview_p99, _) = stats(&mut previews);
     ws.set_paranoid(true);
     let started = Instant::now();
     let slow = ws.preview(intent("edit")).await.unwrap();
     let paranoid = started.elapsed();
     assert_eq!(fast.record.result, slow.record.result);
-    eprintln!("[dir] preview with stat index {with_index:?}, paranoid {paranoid:?}");
+    eprintln!(
+        "[dir] preview with stat index x20: p50 {with_index:?} p99 {preview_p99:?}; paranoid {paranoid:?}"
+    );
     drop(live);
     let _ = fs::remove_dir_all(&dir);
 }
