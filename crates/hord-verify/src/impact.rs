@@ -79,6 +79,34 @@ impl ImpactSet {
     }
 }
 
+/// The impact set ADR 0022 selects tests with (amendments after the
+/// 50-commit measurement): the write set, plus bounded `References`
+/// dependents of only the writes coverage cannot attribute. A function the
+/// change wrote is looked up in coverage directly (a test that never ran it
+/// cannot observe it), so its callers are not added; types, fields, consts,
+/// statics, trait items, declarations, and anything else that is not a
+/// `function_item` in `facts` still expand to their dependents.
+pub fn impact_set_attributable(
+    graph: &dyn ReferenceGraph,
+    write_set: &BTreeSet<NodeId>,
+    bound: ImpactBound,
+    facts: ChangeFacts,
+) -> Result<ImpactSet> {
+    let functions: BTreeSet<NodeId> = facts
+        .touched
+        .iter()
+        .filter(|t| t.kind.as_str() == "function_item")
+        .map(|t| t.node)
+        .collect();
+    let seeds: BTreeSet<NodeId> = write_set.difference(&functions).copied().collect();
+    let mut set = impact_set(graph, &seeds, bound, facts)?;
+    for w in write_set {
+        set.nodes.insert(*w, 0);
+    }
+    set.write_set = write_set.clone();
+    Ok(set)
+}
+
 /// Compute the impact set of `write_set` in `graph` under `bound`, and
 /// attach `facts`.
 ///
@@ -179,7 +207,7 @@ mod tests {
             ImpactBound::default(),
             ChangeFacts::default(),
         )
-        .unwrap();
+        .expect("impact set");
         assert_eq!(set.node_set(), ids(&[1, 2, 3, 6]));
         assert_eq!(set.nodes[&NodeId::from_u128(3)], 2);
         assert_eq!(set.write_set, ids(&[1]));
@@ -191,14 +219,47 @@ mod tests {
             max_hops: None,
             package_boundary: false,
         };
-        let set = impact_set(&chain(), &ids(&[1]), unbounded, ChangeFacts::default()).unwrap();
+        let set = impact_set(&chain(), &ids(&[1]), unbounded, ChangeFacts::default())
+            .expect("impact set");
         assert_eq!(set.node_set(), ids(&[1, 2, 3, 4, 5, 6]));
         let zero = ImpactBound {
             max_hops: Some(0),
             package_boundary: true,
         };
-        let set = impact_set(&chain(), &ids(&[1, 4]), zero, ChangeFacts::default()).unwrap();
+        let set =
+            impact_set(&chain(), &ids(&[1, 4]), zero, ChangeFacts::default()).expect("impact set");
         assert_eq!(set.node_set(), ids(&[1, 4]));
+    }
+
+    #[test]
+    fn attributable_impact_expands_only_non_functions() {
+        use hord_core::{NodeKind, RepoPath};
+
+        use crate::{DefDelta, TouchedDef};
+        let touched = |node: u128, kind: &str| TouchedDef {
+            node: NodeId::from_u128(node),
+            path: RepoPath::default(),
+            kind: NodeKind::new(kind),
+            name: None,
+            delta: DefDelta::Edited,
+            attributes_changed: false,
+            test: false,
+            dispatch: false,
+        };
+        // 1 is a function (its callers 2, 5 are not added); 3 is a struct
+        // referenced by 4.
+        let graph = Graph {
+            dependents: HashMap::from([(1, vec![2, 5]), (3, vec![4])]),
+            packages: HashMap::new(),
+        };
+        let facts = ChangeFacts {
+            paths: Default::default(),
+            touched: vec![touched(1, "function_item"), touched(3, "struct_item")],
+        };
+        let set = impact_set_attributable(&graph, &ids(&[1, 3]), ImpactBound::default(), facts)
+            .expect("impact set attributable");
+        assert_eq!(set.node_set(), ids(&[1, 3, 4]));
+        assert_eq!(set.write_set, ids(&[1, 3]));
     }
 
     proptest! {
@@ -217,8 +278,8 @@ mod tests {
             let graph = Graph { dependents, packages: HashMap::new() };
             let write: BTreeSet<NodeId> = write.into_iter().map(NodeId::from_u128).collect();
             let bound = |h| ImpactBound { max_hops: Some(h), package_boundary: true };
-            let small = impact_set(&graph, &write, bound(hops), ChangeFacts::default()).unwrap();
-            let big = impact_set(&graph, &write, bound(hops + 1), ChangeFacts::default()).unwrap();
+            let small = impact_set(&graph, &write, bound(hops), ChangeFacts::default()).expect("impact set");
+            let big = impact_set(&graph, &write, bound(hops + 1), ChangeFacts::default()).expect("impact set");
             prop_assert!(write.is_subset(&small.node_set()));
             prop_assert!(small.node_set().is_subset(&big.node_set()));
             prop_assert!(small.nodes.values().all(|h| *h <= hops));

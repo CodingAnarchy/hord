@@ -7,7 +7,7 @@
 //! `Evidence { kind: Custom("coverage") }` whose `log` is a
 //! [`hord_core::Blob`] holding the canonical CBOR of the record.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{EvidenceKind, EvidenceResult, NodeId, ObjectId, SnapshotId};
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,32 @@ pub struct TestCoverage {
     /// It failed (or did not run) during the coverage run; its edges may
     /// be partial.
     pub failed: bool,
+    /// Snapshot this test's coverage was taken on, when it differs from
+    /// [`CoverageRecord::snapshot`] (ADR 0022: coverage is fresh per test;
+    /// see [`CoverageRecord::merge`]). `None`: the record's snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotId>,
+    /// The instrumented runs this entry is the union of, oldest first (at
+    /// most [`RUNS_PER_RECORD`]; ADR 0022: a record is the union of a test's
+    /// last three runs). `covers` is their union and `snapshot` the oldest
+    /// run's. Empty: one run, described by `covers` and `snapshot` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<TestRun>,
 }
+
+/// One instrumented run of a test, inside a [`TestCoverage`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestRun {
+    /// Snapshot the run was on.
+    pub snapshot: SnapshotId,
+    /// Indices into [`CoverageRecord::defs`] of the definitions it ran.
+    pub covers: Vec<u32>,
+}
+
+/// How many of a test's latest instrumented runs its record unites (ADR
+/// 0022, 2026-09-24): one run of a nondeterministic test can miss functions
+/// another run executes.
+pub const RUNS_PER_RECORD: usize = 3;
 
 /// Observed `Tests(t, def)` edges for one snapshot and toolchain.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,6 +124,8 @@ impl CoverageRecord {
                 node,
                 covers: covers.iter().map(index).collect(),
                 failed,
+                snapshot: None,
+                runs: Vec::new(),
             })
             .collect();
         tests.sort_by(|a, b| a.test.cmp(&b.test));
@@ -106,6 +133,112 @@ impl CoverageRecord {
             format: FORMAT,
             snapshot,
             toolchain,
+            defs,
+            tests,
+        }
+    }
+
+    /// The snapshot `test`'s coverage was taken on.
+    #[must_use]
+    pub fn test_snapshot(&self, test: &TestCoverage) -> SnapshotId {
+        test.snapshot.unwrap_or(self.snapshot)
+    }
+
+    /// This record refreshed by `newer`, a run of some tests (ADR 0022:
+    /// every verification run refreshes the coverage of each test it ran),
+    /// keeping each test's last [`RUNS_PER_RECORD`] runs.
+    #[must_use]
+    pub fn merge(&self, newer: &CoverageRecord) -> CoverageRecord {
+        self.merge_keeping(newer, RUNS_PER_RECORD)
+    }
+
+    /// [`Self::merge`], uniting each test's last `keep` runs (at least 1).
+    ///
+    /// A test in `newer` gets `newer`'s run appended to its runs here, the
+    /// oldest dropped past `keep`; its coverage is the union of the kept
+    /// runs, its snapshot the oldest kept run's (so drift is measured from
+    /// there), and `failed` is the newest run's. Every other test keeps its
+    /// entry. The result's snapshot and toolchain are `newer`'s, and its
+    /// instrumented definitions are the union.
+    #[must_use]
+    pub fn merge_keeping(&self, newer: &CoverageRecord, keep: usize) -> CoverageRecord {
+        let keep = keep.max(1);
+        let mut defs: BTreeSet<NodeId> = self.defs.iter().copied().collect();
+        defs.extend(newer.defs.iter().copied());
+        // Every test's runs as node sets, oldest first.
+        type Runs = Vec<(SnapshotId, BTreeSet<NodeId>)>;
+        let runs_of = |record: &CoverageRecord, t: &TestCoverage| -> Runs {
+            if t.runs.is_empty() {
+                vec![(record.test_snapshot(t), record.covered_by(t).collect())]
+            } else {
+                t.runs
+                    .iter()
+                    .map(|r| {
+                        let nodes = r
+                            .covers
+                            .iter()
+                            .filter_map(|i| record.defs.get(*i as usize).copied())
+                            .collect();
+                        (r.snapshot, nodes)
+                    })
+                    .collect()
+            }
+        };
+        let mut entries: BTreeMap<TestRef, (TestCoverage, Runs)> = BTreeMap::new();
+        for t in &self.tests {
+            entries.insert(t.test.clone(), (t.clone(), runs_of(self, t)));
+        }
+        for t in &newer.tests {
+            let fresh = runs_of(newer, t);
+            match entries.get_mut(&t.test) {
+                Some((entry, runs)) => {
+                    runs.extend(fresh);
+                    let drop = runs.len().saturating_sub(keep);
+                    runs.drain(..drop);
+                    entry.failed = t.failed;
+                    entry.node = t.node.or(entry.node);
+                }
+                None => {
+                    let mut runs = fresh;
+                    let drop = runs.len().saturating_sub(keep);
+                    runs.drain(..drop);
+                    entries.insert(t.test.clone(), (t.clone(), runs));
+                }
+            }
+        }
+        let defs: Vec<NodeId> = defs.into_iter().collect();
+        let index = |nodes: &BTreeSet<NodeId>| -> Vec<u32> {
+            nodes
+                .iter()
+                .filter_map(|n| defs.binary_search(n).ok())
+                .filter_map(|i| u32::try_from(i).ok())
+                .collect()
+        };
+        let tests: Vec<TestCoverage> = entries
+            .into_values()
+            .map(|(mut t, runs)| {
+                let union: BTreeSet<NodeId> =
+                    runs.iter().flat_map(|(_, n)| n.iter().copied()).collect();
+                let oldest = runs.first().map_or(newer.snapshot, |(s, _)| *s);
+                t.covers = index(&union);
+                t.snapshot = (oldest != newer.snapshot).then_some(oldest);
+                t.runs = if runs.len() > 1 {
+                    runs.iter()
+                        .map(|(s, n)| TestRun {
+                            snapshot: *s,
+                            covers: index(n),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                t
+            })
+            .collect();
+        CoverageRecord {
+            format: FORMAT,
+            snapshot: newer.snapshot,
+            toolchain: newer.toolchain,
             defs,
             tests,
         }
@@ -237,6 +370,106 @@ mod tests {
     }
 
     #[test]
+    fn a_record_unites_the_last_three_runs_and_dates_from_the_oldest() {
+        let tc = ObjectId::from_bytes([2; 32]);
+        let snap = |n: u8| ObjectId::from_bytes([n; 32]);
+        let run = |s: u8, covers: &[u128]| {
+            CoverageRecord::new(
+                snap(s),
+                tc,
+                BTreeSet::new(),
+                vec![(t("x"), None, covers.iter().copied().map(n).collect(), false)],
+            )
+        };
+        // A nondeterministic path: run 1 enters f(1), run 2 does not.
+        let r1 = run(10, &[1, 2]);
+        let ledger = r1.merge(&run(11, &[2]));
+        let x = &ledger.tests[0];
+        assert_eq!(ledger.covered_by(x).collect::<Vec<_>>(), vec![n(1), n(2)]);
+        assert_eq!(
+            ledger.test_snapshot(x),
+            snap(10),
+            "drift from the oldest run"
+        );
+        assert_eq!(
+            ledger.tests_covering(&[n(1)].into_iter().collect()).len(),
+            1
+        );
+        // Third and fourth runs: run 1 falls out of the union.
+        let ledger = ledger.merge(&run(12, &[3])).merge(&run(13, &[4]));
+        let x = &ledger.tests[0];
+        assert_eq!(
+            ledger.covered_by(x).collect::<Vec<_>>(),
+            vec![n(2), n(3), n(4)]
+        );
+        assert_eq!(ledger.test_snapshot(x), snap(11));
+        assert_eq!(x.runs.len(), 3);
+        // Keeping one run is the plain refresh.
+        let single = r1.merge_keeping(&run(11, &[2]), 1);
+        assert_eq!(
+            single.covered_by(&single.tests[0]).collect::<Vec<_>>(),
+            vec![n(2)]
+        );
+        assert_eq!(single.test_snapshot(&single.tests[0]), snap(11));
+        // Round-trips through canonical CBOR.
+        let bytes = hord_encoding::encode(&ledger).expect("encode");
+        assert_eq!(
+            hord_encoding::decode::<CoverageRecord>(&bytes).expect("decode"),
+            ledger
+        );
+    }
+
+    #[test]
+    fn merge_refreshes_the_tests_a_run_touched() {
+        let old = record();
+        let s2 = ObjectId::from_bytes([9; 32]);
+        let run = CoverageRecord::new(
+            s2,
+            ObjectId::from_bytes([2; 32]),
+            [n(5)].into_iter().collect(),
+            vec![(t("b"), Some(n(20)), [n(5)].into_iter().collect(), false)],
+        );
+        let merged = old.merge_keeping(&run, 1);
+        assert_eq!(merged.snapshot, s2);
+        let b = merged
+            .tests
+            .iter()
+            .find(|x| x.test == t("b"))
+            .expect("the merged record keeps every test");
+        assert_eq!(merged.test_snapshot(b), s2);
+        assert_eq!(merged.covered_by(b).collect::<Vec<_>>(), vec![n(5)]);
+        let a = merged
+            .tests
+            .iter()
+            .find(|x| x.test == t("a"))
+            .expect("the merged record keeps every test");
+        assert_eq!(merged.test_snapshot(a), ObjectId::from_bytes([1; 32]));
+        assert_eq!(merged.covered_by(a).collect::<Vec<_>>(), vec![n(3)]);
+        assert!(merged.is_instrumented(n(9)) && merged.is_instrumented(n(5)));
+        // Merging twice keeps the older test's own snapshot.
+        let s3 = ObjectId::from_bytes([8; 32]);
+        let empty = CoverageRecord::new(
+            s3,
+            ObjectId::from_bytes([2; 32]),
+            BTreeSet::new(),
+            Vec::new(),
+        );
+        let again = merged.merge_keeping(&empty, 1);
+        let a = again
+            .tests
+            .iter()
+            .find(|x| x.test == t("a"))
+            .expect("the merged record keeps every test");
+        assert_eq!(again.test_snapshot(a), ObjectId::from_bytes([1; 32]));
+        let b = again
+            .tests
+            .iter()
+            .find(|x| x.test == t("b"))
+            .expect("the merged record keeps every test");
+        assert_eq!(again.test_snapshot(b), s2);
+    }
+
+    #[test]
     fn queries() {
         let r = record();
         assert_eq!(r.defs, vec![n(1), n(2), n(3), n(9)]);
@@ -256,7 +489,7 @@ mod tests {
     fn stored_as_evidence_and_found_by_toolchain() {
         let index = MemoryIndex::new();
         let r = record();
-        let log = r.put(&index).unwrap();
+        let log = r.put(&index).expect("store the coverage record as a log");
         let evidence = |toolchain: ObjectId, snapshot: u8| {
             crate::EvidenceFields {
                 kind: EvidenceKind::Custom(COVERAGE_KIND.into()),
@@ -275,15 +508,15 @@ mod tests {
         };
         index
             .put_evidence(&evidence(ObjectId::from_bytes([2; 32]), 1))
-            .unwrap();
+            .expect("put evidence");
         let snaps = [ObjectId::from_bytes([5; 32]), ObjectId::from_bytes([1; 32])];
         let (_, found) = find_coverage(&index, snaps, ObjectId::from_bytes([2; 32]))
-            .unwrap()
-            .expect("record");
+            .expect("find coverage")
+            .expect("a coverage record exists for this toolchain");
         assert_eq!(found, r);
         assert!(
             find_coverage(&index, snaps, ObjectId::from_bytes([3; 32]))
-                .unwrap()
+                .expect("find coverage")
                 .is_none()
         );
     }

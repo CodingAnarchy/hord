@@ -57,9 +57,18 @@ mod tests {
         let a = Toolchain::new("rust").with("rustc", "1.0");
         let b = Toolchain::new("rust").with("rustc", "1.1");
         let c = a.clone().with("cargo-llvm-cov", "0.9");
-        assert_eq!(a.id().unwrap(), a.clone().id().unwrap());
-        assert_ne!(a.id().unwrap(), b.id().unwrap());
-        assert_ne!(a.id().unwrap(), c.id().unwrap());
+        assert_eq!(
+            a.id().expect("compute toolchain id"),
+            a.clone().id().expect("compute toolchain id")
+        );
+        assert_ne!(
+            a.id().expect("compute toolchain id"),
+            b.id().expect("compute toolchain id")
+        );
+        assert_ne!(
+            a.id().expect("compute toolchain id"),
+            c.id().expect("compute toolchain id")
+        );
         assert!(c.has("cargo-llvm-cov") && !a.has("cargo-llvm-cov"));
     }
 }

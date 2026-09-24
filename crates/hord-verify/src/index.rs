@@ -205,38 +205,57 @@ mod tests {
     }
 
     fn exercise(index: &dyn EvidenceIndex) {
-        let log = put_log(index, b"hello").unwrap();
-        assert_eq!(get_log(index, log).unwrap(), b"hello");
-        let a = index.put_evidence(&ev(1, "cargo check")).unwrap();
-        index.put_evidence(&ev(2, "cargo check")).unwrap();
-        assert_eq!(get_evidence(index, a).unwrap(), ev(1, "cargo check"));
+        let log = put_log(index, b"hello").expect("put log");
+        assert_eq!(get_log(index, log).expect("get log"), b"hello");
+        let a = index
+            .put_evidence(&ev(1, "cargo check"))
+            .expect("put evidence");
+        index
+            .put_evidence(&ev(2, "cargo check"))
+            .expect("put evidence");
+        assert_eq!(
+            get_evidence(index, a).expect("get evidence"),
+            ev(1, "cargo check")
+        );
         let snap = ObjectId::from_bytes([1; 32]);
         let tc = ObjectId::from_bytes([7; 32]);
         assert_eq!(
             index
                 .evidence_for_key(snap, tc, "cargo check", None)
-                .unwrap(),
+                .expect("evidence for key"),
             vec![a]
         );
         assert!(
             index
                 .evidence_for_key(snap, tc, "cargo test", None)
-                .unwrap()
+                .expect("evidence for key")
                 .is_empty()
         );
-        assert_eq!(index.evidence_at(snap).unwrap(), vec![a]);
+        assert_eq!(index.evidence_at(snap).expect("evidence at"), vec![a]);
         // A batch: the same ids and rows as putting each alone.
         let batch = [ev(3, "cargo check"), ev(3, "cargo clippy")];
-        let ids = index.put_evidence_batch(&batch).unwrap();
-        let expected: Vec<ObjectId> = batch.iter().map(|e| ObjectId::of(e).unwrap()).collect();
+        let ids = index
+            .put_evidence_batch(&batch)
+            .expect("put evidence batch");
+        let expected: Vec<ObjectId> = batch
+            .iter()
+            .map(|e| ObjectId::of(e).expect("hash an evidence object"))
+            .collect();
         assert_eq!(ids, expected);
-        let mut at = index.evidence_at(ObjectId::from_bytes([3; 32])).unwrap();
+        let mut at = index
+            .evidence_at(ObjectId::from_bytes([3; 32]))
+            .expect("evidence at");
         at.sort();
         let mut want = expected.clone();
         want.sort();
         assert_eq!(at, want);
-        assert_eq!(get_evidence(index, ids[1]).unwrap(), batch[1]);
-        assert!(index.put_evidence_batch(&[]).unwrap().is_empty());
+        assert_eq!(get_evidence(index, ids[1]).expect("get evidence"), batch[1]);
+        assert!(
+            index
+                .put_evidence_batch(&[])
+                .expect("put evidence batch")
+                .is_empty()
+        );
         assert!(matches!(
             index.get_raw(ObjectId::from_bytes([0; 32])),
             Err(Error::MissingObject(_))
@@ -256,9 +275,9 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).expect("create dir all");
         {
-            let store = Store::create(&dir).unwrap();
+            let store = Store::create(&dir).expect("create a store in a temp dir");
             exercise(&store);
         }
         let _ = fs::remove_dir_all(&dir);
