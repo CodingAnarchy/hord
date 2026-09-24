@@ -18,6 +18,8 @@ use hord_server::{Hosts, ServeOptions, Server, ServerConfig, WebhookConfig};
 use hord_txn::{Base, BeginOptions, Repo, RepoOptions};
 use tokio_stream::StreamExt;
 
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
 struct Dir(PathBuf);
 
 impl Drop for Dir {
@@ -26,7 +28,7 @@ impl Drop for Dir {
     }
 }
 
-fn temp(tag: &str) -> Dir {
+fn temp(tag: &str) -> std::io::Result<Dir> {
     static N: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "hord-remote-{tag}-{}-{}",
@@ -34,8 +36,8 @@ fn temp(tag: &str) -> Dir {
         N.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
-    Dir(path)
+    std::fs::create_dir_all(&path)?;
+    Ok(Dir(path))
 }
 
 fn actor(id: &str) -> Actor {
@@ -46,8 +48,8 @@ fn intent(summary: &str) -> Intent {
     Intent::from_summary(summary)
 }
 
-fn path(p: &str) -> RepoPath {
-    p.parse().unwrap()
+fn path(p: &str) -> TestResult<RepoPath> {
+    Ok(p.parse()?)
 }
 
 /// A running server: its address and the handle that stops it.
@@ -72,11 +74,9 @@ impl Running {
     }
 }
 
-async fn serve(hosts: Hosts, config: ServerConfig) -> Running {
-    let listener = Server::bind("127.0.0.1:0".parse().unwrap(), &ServeOptions::default())
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn serve(hosts: Hosts, config: ServerConfig) -> TestResult<Running> {
+    let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
+    let addr = listener.local_addr()?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = Server::new(hosts, config);
     let task = tokio::spawn(async move {
@@ -85,94 +85,91 @@ async fn serve(hosts: Hosts, config: ServerConfig) -> Running {
                 let _ = stopped.await;
             })
             .await
-            .unwrap();
+            .expect("serve the test server");
     });
-    Running {
+    Ok(Running {
         addr,
         stop: Some(stop),
         task: Some(task),
-    }
+    })
 }
 
-async fn empty_repo(dir: &Path) {
-    drop(Repo::create(dir).await.unwrap());
+async fn empty_repo(dir: &Path) -> TestResult {
+    drop(Repo::create(dir).await?);
+    Ok(())
 }
 
 const LIB: &str = "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    2\n}\n";
 
 /// A repository with `src/lib.rs` and a README landed, closed.
-async fn seeded(dir: &Path) {
-    let repo = Repo::create(dir).await.unwrap();
+async fn seeded(dir: &Path) -> TestResult {
+    let repo = Repo::create(dir).await?;
     repo.bootstrap(
         vec![
-            (path("src/lib.rs"), LIB.as_bytes().to_vec()),
-            (path("README.md"), b"# hi\n".to_vec()),
-            (path("docs/notes.txt"), b"notes\n".to_vec()),
+            (path("src/lib.rs")?, LIB.as_bytes().to_vec()),
+            (path("README.md")?, b"# hi\n".to_vec()),
+            (path("docs/notes.txt")?, b"notes\n".to_vec()),
         ],
         intent("seed"),
         actor("seed"),
     )
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_repo_passes_the_conformance_suite_over_tcp() {
-    let dir = temp("conf-tcp");
-    empty_repo(&dir.0).await;
-    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default())
-        .await
-        .unwrap();
-    let running = serve(hosts, ServerConfig::default()).await;
-    let remote = RemoteRepo::connect(&running.url()).await.unwrap();
+async fn remote_repo_passes_the_conformance_suite_over_tcp() -> TestResult {
+    let dir = temp("conf-tcp")?;
+    empty_repo(&dir.0).await?;
+    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default()).await?;
+    let running = serve(hosts, ServerConfig::default()).await?;
+    let remote = RemoteRepo::connect(&running.url()).await?;
     hord_api::conformance::run(&remote).await;
     running.stop().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_root_server_routes_by_repo_prefix() {
-    let root = temp("conf-root");
-    empty_repo(&root.0.join("team/app")).await;
-    empty_repo(&root.0.join("other")).await;
-    let hosts = Hosts::open_root(&root.0, RepoOptions::default)
-        .await
-        .unwrap();
+async fn a_root_server_routes_by_repo_prefix() -> TestResult {
+    let root = temp("conf-root")?;
+    empty_repo(&root.0.join("team/app")).await?;
+    empty_repo(&root.0.join("other")).await?;
+    let hosts = Hosts::open_root(&root.0, RepoOptions::default).await?;
     assert_eq!(hosts.names().collect::<Vec<_>>(), ["other", "team/app"]);
-    let running = serve(hosts, ServerConfig::default()).await;
-    let app = RemoteRepo::connect(&format!("{}/r/team/app", running.url()))
-        .await
-        .unwrap();
+    let running = serve(hosts, ServerConfig::default()).await?;
+    let app = RemoteRepo::connect(&format!("{}/r/team/app", running.url())).await?;
     hord_api::conformance::run(&app).await;
     // The other repository saw none of it.
-    let other = RemoteRepo::connect(&format!("{}/r/other", running.url()))
-        .await
-        .unwrap();
-    let head = other.head(proto::HeadRequest {}).await.unwrap();
+    let other = RemoteRepo::connect(&format!("{}/r/other", running.url())).await?;
+    let head = other.head(proto::HeadRequest {}).await?;
     assert_eq!(head.change, None);
     // Without a prefix, a root server cannot tell which repository is meant.
-    let bare = RemoteRepo::connect(&running.url()).await.unwrap();
-    let err = bare.head(proto::HeadRequest {}).await.unwrap_err();
+    let bare = RemoteRepo::connect(&running.url()).await?;
+    let err = bare
+        .head(proto::HeadRequest {})
+        .await
+        .expect_err("a root server refuses a request without a repo prefix");
     assert!(
         matches!(err, hord_api::ApiError::InvalidArgument(_)),
         "{err}"
     );
-    let missing = RemoteRepo::connect(&format!("{}/r/nope", running.url()))
+    let missing = RemoteRepo::connect(&format!("{}/r/nope", running.url())).await?;
+    let err = missing
+        .head(proto::HeadRequest {})
         .await
-        .unwrap();
-    let err = missing.head(proto::HeadRequest {}).await.unwrap_err();
+        .expect_err("a root server refuses an unknown repo");
     assert!(matches!(err, hord_api::ApiError::NotFound(_)), "{err}");
     running.stop().await;
+    Ok(())
 }
 
 /// ADR 0021's daemon transport: a Unix socket, or a named pipe on Windows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_repo_passes_the_conformance_suite_over_the_local_endpoint() {
-    let dir = temp("conf-local");
-    empty_repo(&dir.0).await;
-    let endpoint = hord_api::local::endpoint(&dir.0).unwrap();
-    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default())
-        .await
-        .unwrap();
+async fn remote_repo_passes_the_conformance_suite_over_the_local_endpoint() -> TestResult {
+    let dir = temp("conf-local")?;
+    empty_repo(&dir.0).await?;
+    let endpoint = hord_api::local::endpoint(&dir.0)?;
+    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default()).await?;
     let server = Arc::new(Server::new(hosts, ServerConfig::default()));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let serving = {
@@ -184,41 +181,45 @@ async fn remote_repo_passes_the_conformance_suite_over_the_local_endpoint() {
                     let _ = stopped.await;
                 })
                 .await
-                .unwrap();
+                .expect("serve on the local endpoint");
         })
     };
-    let remote = connect_local_retrying(&dir.0).await;
+    let remote = connect_local_retrying(&dir.0).await?;
     // A second server on the same endpoint is refused.
     let second = Server::new(
         Hosts::from_backends(BTreeMap::new()),
         ServerConfig::default(),
     );
-    let err = second.serve_local(&endpoint, async {}).await.unwrap_err();
+    let err = second
+        .serve_local(&endpoint, async {})
+        .await
+        .expect_err("a second server on the same endpoint is refused");
     assert!(err.to_string().contains("already"), "{err}");
     hord_api::conformance::run(&remote).await;
     let _ = stop.send(());
-    serving.await.unwrap();
+    serving.await?;
+    Ok(())
 }
 
-async fn connect_local_retrying(root: &Path) -> RemoteRepo {
+async fn connect_local_retrying(root: &Path) -> TestResult<RemoteRepo> {
     for _ in 0..100 {
         if let Ok(remote) = RemoteRepo::connect_local(root).await
             && remote.head(proto::HeadRequest {}).await.is_ok()
         {
-            return remote;
+            return Ok(remote);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("the local server never answered");
+    Err("the local server never answered".into())
 }
 
 /// A client-side cache repository reads the server's snapshot lazily,
 /// proposes locally, pushes only the new objects, and submits; the
 /// server's lander lands it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_remote_workspace_fetches_lazily_pushes_and_lands() {
-    let origin = temp("origin");
-    seeded(&origin.0).await;
+async fn a_remote_workspace_fetches_lazily_pushes_and_lands() -> TestResult {
+    let origin = temp("origin")?;
+    seeded(&origin.0).await?;
     let hosts = Hosts::open_repo(
         &origin.0,
         RepoOptions {
@@ -226,70 +227,74 @@ async fn a_remote_workspace_fetches_lazily_pushes_and_lands() {
             ..RepoOptions::default()
         },
     )
-    .await
-    .unwrap();
-    let running = serve(hosts, ServerConfig::default()).await;
-    let remote = RemoteRepo::connect(&running.url()).await.unwrap();
-    let head = remote.head(proto::HeadRequest {}).await.unwrap();
-    let head = wire::object_id("head", head.change.as_deref().unwrap()).unwrap();
+    .await?;
+    let running = serve(hosts, ServerConfig::default()).await?;
+    let remote = RemoteRepo::connect(&running.url()).await?;
+    let head = remote.head(proto::HeadRequest {}).await?;
+    let head = wire::object_id(
+        "head",
+        head.change
+            .as_deref()
+            .ok_or("the seeded repository has a head")?,
+    )?;
 
-    let client = temp("client");
-    let cache = open_cache(&client.0, remote.clone(), RepoOptions::default())
-        .await
-        .unwrap();
+    let client = temp("client")?;
+    let cache = open_cache(&client.0, remote.clone(), RepoOptions::default()).await?;
     let mut ws = cache
         .begin(BeginOptions {
             base: Base::Change(head),
             ..BeginOptions::at_head(actor("remote-agent"))
         })
-        .await
-        .unwrap();
-    let lib = ws.read_file(&path("src/lib.rs")).await.unwrap().unwrap();
+        .await?;
+    let lib = ws
+        .read_file(&path("src/lib.rs")?)
+        .await?
+        .ok_or("src/lib.rs exists")?;
     assert_eq!(lib.as_slice(), LIB.as_bytes());
     let base_snapshot = ws.base();
     // Only what was touched came over: not the README's blob.
-    let readme_blob = hord_core::ObjectId::of(&hord_core::Blob::new(b"# hi\n".to_vec())).unwrap();
-    assert!(!cache.store().contains(readme_blob).unwrap(), "lazy fetch");
-    ws.write_file(&path("src/lib.rs"), LIB.replace("    2\n", "    20\n"))
-        .await
-        .unwrap();
-    let proposal = ws.propose(intent("twenty")).await.unwrap();
+    let readme_blob = hord_core::ObjectId::of(&hord_core::Blob::new(b"# hi\n".to_vec()))?;
+    assert!(!cache.store().contains(readme_blob)?, "lazy fetch");
+    ws.write_file(&path("src/lib.rs")?, LIB.replace("    2\n", "    20\n"))
+        .await?;
+    let proposal = ws.propose(intent("twenty")).await?;
     assert_eq!(proposal.record.base, base_snapshot);
     assert_eq!(proposal.record.parents, vec![head]);
 
-    let sent = push_change(&remote, &cache, proposal.change).await.unwrap();
+    let sent = push_change(&remote, &cache, proposal.change).await?;
     assert!(sent >= 3, "record, snapshot, trees, blob: {sent}");
     // Pushing again sends nothing new except what the server still lacks.
-    assert_eq!(
-        push_change(&remote, &cache, proposal.change).await.unwrap(),
-        0
-    );
+    assert_eq!(push_change(&remote, &cache, proposal.change).await?, 0);
 
-    let mut events = remote
-        .events(proto::EventsRequest { from: None })
-        .await
-        .unwrap();
+    let mut events = remote.events(proto::EventsRequest { from: None }).await?;
     remote
         .submit(proto::SubmitRequest {
             change: wire::id(proposal.change),
         })
-        .await
-        .unwrap();
+        .await?;
     let change = wire::id(proposal.change);
     loop {
         let event = tokio::time::timeout(Duration::from_secs(30), events.next())
             .await
-            .expect("an event")
-            .unwrap()
-            .unwrap();
-        match event.event.unwrap().kind.unwrap() {
+            .map_err(|e| format!("wait for {change} to land: {e}"))?
+            .ok_or("the event stream ended")??;
+        match event
+            .event
+            .ok_or("an event envelope")?
+            .kind
+            .ok_or("an event kind")?
+        {
             Kind::Landed(l) if l.change == change => break,
-            Kind::Rejected(r) if r.change == change => panic!("rejected: {}", r.reason),
-            Kind::Parked(p) if p.change == change => panic!("parked: {}", p.detail),
+            Kind::Rejected(r) if r.change == change => {
+                return Err(format!("rejected: {}", r.reason).into());
+            }
+            Kind::Parked(p) if p.change == change => {
+                return Err(format!("parked: {}", p.detail).into());
+            }
             _ => {}
         }
     }
-    let now = remote.head(proto::HeadRequest {}).await.unwrap();
+    let now = remote.head(proto::HeadRequest {}).await?;
     assert_eq!(now.change.as_deref(), Some(change.as_str()));
 
     // A directory workspace on the new head writes its checkout from the
@@ -299,65 +304,58 @@ async fn a_remote_workspace_fetches_lazily_pushes_and_lands() {
             base: Base::Change(proposal.change),
             ..BeginOptions::at_head(actor("remote-agent"))
         })
-        .await
-        .unwrap();
+        .await?;
     let hord_txn::Materialization::Directory { path: checkout } = dir_ws.materialization().clone()
     else {
-        panic!("directory workspace");
+        return Err("expected a directory workspace".into());
     };
     assert_eq!(
-        std::fs::read_to_string(checkout.join("README.md")).unwrap(),
+        std::fs::read_to_string(checkout.join("README.md"))?,
         "# hi\n"
     );
-    assert!(cache.store().contains(readme_blob).unwrap());
+    assert!(cache.store().contains(readme_blob)?);
     let text = dir_ws
-        .read_file(&path("src/lib.rs"))
-        .await
-        .unwrap()
-        .unwrap();
+        .read_file(&path("src/lib.rs")?)
+        .await?
+        .ok_or("src/lib.rs exists")?;
     assert!(String::from_utf8_lossy(text.as_slice()).contains("20"));
     drop(dir_ws);
     drop(ws);
     drop(cache);
     running.stop().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_schema_is_served_by_rpc_and_at_schema_json() {
-    let dir = temp("schema");
-    empty_repo(&dir.0).await;
-    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default())
-        .await
-        .unwrap();
-    let running = serve(hosts, ServerConfig::default()).await;
-    let mut client = hord_api::proto::schema_client::SchemaClient::connect(running.url())
-        .await
-        .unwrap();
+async fn the_schema_is_served_by_rpc_and_at_schema_json() -> TestResult {
+    let dir = temp("schema")?;
+    empty_repo(&dir.0).await?;
+    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default()).await?;
+    let running = serve(hosts, ServerConfig::default()).await?;
+    let mut client = hord_api::proto::schema_client::SchemaClient::connect(running.url()).await?;
     let reply = client
         .get_schema(proto::GetSchemaRequest {})
-        .await
-        .unwrap()
+        .await?
         .into_inner();
     assert_eq!(reply.descriptor_set, hord_api::schema::descriptor_set());
-    let rpc_schema: serde_json::Value = serde_json::from_str(&reply.json_schema).unwrap();
-    let (status, body) = http1(running.addr, "GET", "/schema.json", &[], Vec::new()).await;
+    let rpc_schema: serde_json::Value = serde_json::from_str(&reply.json_schema)?;
+    let (status, body) = http1(running.addr, "GET", "/schema.json", &[], Vec::new()).await?;
     assert_eq!(status, 200);
-    let http_schema: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let http_schema: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(http_schema, rpc_schema);
     assert!(http_schema["$defs"]["hord.v1.EventEnvelope"].is_object());
     running.stop().await;
+    Ok(())
 }
 
 /// gRPC-Web on the same port (ADR 0024): an HTTP/1.1 POST of a framed
 /// `HeadRequest` answers with a framed `HeadResponse` and OK trailers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn grpc_web_is_served_on_the_same_port() {
-    let dir = temp("grpc-web");
-    seeded(&dir.0).await;
-    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default())
-        .await
-        .unwrap();
-    let running = serve(hosts, ServerConfig::default()).await;
+async fn grpc_web_is_served_on_the_same_port() -> TestResult {
+    let dir = temp("grpc-web")?;
+    seeded(&dir.0).await?;
+    let hosts = Hosts::open_repo(&dir.0, RepoOptions::default()).await?;
+    let running = serve(hosts, ServerConfig::default()).await?;
     // Frame: flag 0, length 0 (an empty HeadRequest).
     let body = vec![0, 0, 0, 0, 0];
     let (status, reply) = http1(
@@ -367,20 +365,21 @@ async fn grpc_web_is_served_on_the_same_port() {
         &[("content-type", "application/grpc-web+proto")],
         body,
     )
-    .await;
+    .await?;
     assert_eq!(status, 200);
     assert_eq!(reply[0], 0, "first frame is data");
-    let len = u32::from_be_bytes(reply[1..5].try_into().unwrap()) as usize;
-    let head = <proto::HeadResponse as prost::Message>::decode(&reply[5..5 + len]).unwrap();
+    let len = u32::from_be_bytes(reply[1..5].try_into()?) as usize;
+    let head = <proto::HeadResponse as prost::Message>::decode(&reply[5..5 + len])?;
     assert!(head.change.is_some(), "the seeded repository has a head");
     let trailers = String::from_utf8_lossy(&reply[5 + len..]);
     assert!(trailers.contains("grpc-status:0"), "{trailers}");
     running.stop().await;
+    Ok(())
 }
 
 /// Landed events are POSTed as JSON to a webhook that asks for them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn webhooks_receive_the_events_they_ask_for() {
+async fn webhooks_receive_the_events_they_ask_for() -> TestResult {
     let received: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
     let sink = {
         let received = Arc::clone(&received);
@@ -390,24 +389,32 @@ async fn webhooks_receive_the_events_they_ask_for() {
                 move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
                     let received = Arc::clone(&received);
                     async move {
-                        let kind = headers["x-hord-event"].to_str().unwrap().to_owned();
-                        let json = serde_json::from_slice(&body).unwrap();
-                        received.lock().unwrap().push((kind, json));
+                        let kind = headers["x-hord-event"]
+                            .to_str()
+                            .expect("x-hord-event header is ASCII")
+                            .to_owned();
+                        let json = serde_json::from_slice(&body).expect("webhook body is JSON");
+                        received
+                            .lock()
+                            .expect("lock received webhooks")
+                            .push((kind, json));
                         "ok"
                     }
                 },
             ),
         )
     };
-    let hook_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let hook_addr = hook_listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(hook_listener, sink).await.unwrap() });
+    let hook_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let hook_addr = hook_listener.local_addr()?;
+    tokio::spawn(async move {
+        axum::serve(hook_listener, sink)
+            .await
+            .expect("serve the webhook sink")
+    });
 
-    let origin = temp("webhook");
-    seeded(&origin.0).await;
-    let hosts = Hosts::open_repo(&origin.0, RepoOptions::default())
-        .await
-        .unwrap();
+    let origin = temp("webhook")?;
+    seeded(&origin.0).await?;
+    let hosts = Hosts::open_repo(&origin.0, RepoOptions::default()).await?;
     let config = ServerConfig {
         bind: None,
         webhooks: vec![WebhookConfig {
@@ -416,45 +423,39 @@ async fn webhooks_receive_the_events_they_ask_for() {
             repos: vec![],
         }],
     };
-    let running = serve(hosts, config).await;
-    let remote = RemoteRepo::connect(&running.url()).await.unwrap();
+    let running = serve(hosts, config).await?;
+    let remote = RemoteRepo::connect(&running.url()).await?;
     let head = remote
         .head(proto::HeadRequest {})
-        .await
-        .unwrap()
+        .await?
         .change
-        .unwrap();
-    let head = wire::object_id("head", &head).unwrap();
-    let client = temp("webhook-client");
-    let cache = open_cache(&client.0, remote.clone(), RepoOptions::default())
-        .await
-        .unwrap();
+        .ok_or("the seeded repository has a head")?;
+    let head = wire::object_id("head", &head)?;
+    let client = temp("webhook-client")?;
+    let cache = open_cache(&client.0, remote.clone(), RepoOptions::default()).await?;
     let mut ws = cache
         .begin(BeginOptions {
             base: Base::Change(head),
             ..BeginOptions::at_head(actor("a"))
         })
-        .await
-        .unwrap();
-    ws.write_file(&path("docs/notes.txt"), "more notes\n")
-        .await
-        .unwrap();
-    let proposal = ws.propose(intent("notes")).await.unwrap();
-    push_change(&remote, &cache, proposal.change).await.unwrap();
+        .await?;
+    ws.write_file(&path("docs/notes.txt")?, "more notes\n")
+        .await?;
+    let proposal = ws.propose(intent("notes")).await?;
+    push_change(&remote, &cache, proposal.change).await?;
     // Give the webhook task time to subscribe before anything happens.
     tokio::time::sleep(Duration::from_millis(200)).await;
     remote
         .submit(proto::SubmitRequest {
             change: wire::id(proposal.change),
         })
-        .await
-        .unwrap();
+        .await?;
     let mut waited = 0;
-    while received.lock().unwrap().is_empty() && waited < 300 {
+    while received.lock().expect("lock received webhooks").is_empty() && waited < 300 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         waited += 1;
     }
-    let got = received.lock().unwrap().clone();
+    let got = received.lock().expect("lock received webhooks").clone();
     assert_eq!(got.len(), 1, "only the landed event: {got:?}");
     assert_eq!(got[0].0, "landed");
     assert_eq!(
@@ -465,6 +466,7 @@ async fn webhooks_receive_the_events_they_ask_for() {
     drop(ws);
     drop(cache);
     running.stop().await;
+    Ok(())
 }
 
 /// A plain HTTP/1.1 request; returns the status and the whole body.
@@ -474,13 +476,11 @@ async fn http1(
     path: &str,
     headers: &[(&str, &str)],
     body: Vec<u8>,
-) -> (u16, Vec<u8>) {
+) -> TestResult<(u16, Vec<u8>)> {
     use http_body_util::{BodyExt, Full};
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(addr).await?;
     let (mut sender, conn) =
-        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
-            .await
-            .unwrap();
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
     tokio::spawn(conn);
     let mut request = http::Request::builder()
         .method(method)
@@ -490,10 +490,9 @@ async fn http1(
         request = request.header(*k, *v);
     }
     let response = sender
-        .send_request(request.body(Full::new(bytes::Bytes::from(body))).unwrap())
-        .await
-        .unwrap();
+        .send_request(request.body(Full::new(bytes::Bytes::from(body)))?)
+        .await?;
     let status = response.status().as_u16();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, bytes.to_vec())
+    let bytes = response.into_body().collect().await?.to_bytes();
+    Ok((status, bytes.to_vec()))
 }
