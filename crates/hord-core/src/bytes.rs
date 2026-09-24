@@ -134,18 +134,20 @@ mod tests {
     use hord_encoding::{decode, encode};
 
     #[test]
-    fn encodes_as_cbor_major_type_2() {
+    fn encodes_as_cbor_major_type_2() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
-        let encoded = encode(&bytes).unwrap();
+        let encoded = encode(&bytes)?;
         assert_eq!(encoded[0], 0x44, "major type 2, 4-byte payload");
         assert_eq!(&encoded[1..], &[0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(decode::<Bytes>(&encoded).unwrap(), bytes);
+        assert_eq!(decode::<Bytes>(&encoded)?, bytes);
+        Ok(())
     }
 
     #[test]
-    fn empty_is_one_byte() {
-        let encoded = encode(&Bytes::new(Vec::new())).unwrap();
+    fn empty_is_one_byte() -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = encode(&Bytes::new(Vec::new()))?;
         assert_eq!(encoded, [0x40]);
+        Ok(())
     }
 
     #[test]

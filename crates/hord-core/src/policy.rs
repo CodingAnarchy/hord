@@ -86,21 +86,22 @@ mod tests {
     }
 
     #[test]
-    fn no_max_impact_is_omitted_from_the_encoding() {
+    fn no_max_impact_is_omitted_from_the_encoding() -> Result<(), Box<dyn std::error::Error>> {
         let v0 = LandPolicyV0 {
             require: vec!["check".into()],
             strict_reads: false,
             max_write_set: Some(200),
             max_replay_attempts: 2,
         };
-        let bytes = hord_encoding::encode(&land(None)).unwrap();
-        assert_eq!(bytes, hord_encoding::encode(&v0).unwrap());
-        let back: LandPolicy = hord_encoding::decode(&bytes).unwrap();
+        let bytes = hord_encoding::encode(&land(None))?;
+        assert_eq!(bytes, hord_encoding::encode(&v0)?);
+        let back: LandPolicy = hord_encoding::decode(&bytes)?;
         assert_eq!(back, land(None));
 
-        let with = hord_encoding::encode(&land(Some(40))).unwrap();
+        let with = hord_encoding::encode(&land(Some(40)))?;
         assert_ne!(with, bytes);
-        let back: LandPolicy = hord_encoding::decode(&with).unwrap();
+        let back: LandPolicy = hord_encoding::decode(&with)?;
         assert_eq!(back.max_impact, Some(40));
+        Ok(())
     }
 }

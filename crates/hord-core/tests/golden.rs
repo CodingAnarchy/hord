@@ -41,18 +41,22 @@ fn sample_snapshot() -> Snapshot {
     }
 }
 
-fn assert_fixture<T>(name: &str, value: &T, fixture: &Fixture)
+fn assert_fixture<T>(
+    name: &str,
+    value: &T,
+    fixture: &Fixture,
+) -> Result<(), Box<dyn std::error::Error>>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
 {
-    let bytes = encode(value).unwrap_or_else(|e| panic!("{name}: encode: {e}"));
+    let bytes = encode(value).map_err(|e| format!("{name}: encode: {e}"))?;
     let got_hex = hex::encode(&bytes);
     assert_eq!(
         got_hex, fixture.hex,
         "vector {name} ({}) encoding mismatch\n  got  {got_hex}\n  want {}",
         fixture.name, fixture.hex
     );
-    let id = ObjectId::of(value).unwrap();
+    let id = ObjectId::of(value)?;
     assert_eq!(id, ObjectId::from_canonical(&bytes));
     assert_eq!(
         id.to_hex(),
@@ -60,27 +64,29 @@ where
         "ObjectId of fixture {} changed",
         fixture.name
     );
-    let parsed: ObjectId = fixture.object_id.parse().unwrap();
+    let parsed: ObjectId = fixture.object_id.parse()?;
     assert_eq!(id, parsed);
-    let back: T = decode(&bytes).unwrap();
+    let back: T = decode(&bytes)?;
     assert_eq!(&back, value);
+    Ok(())
 }
 
 #[test]
-fn blob_golden() {
+fn blob_golden() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = vectors().blob;
     let blob = sample_blob();
-    assert_fixture("blob", &blob, &fixture);
-    let encoded = encode(&blob).unwrap();
+    assert_fixture("blob", &blob, &fixture)?;
+    let encoded = encode(&blob)?;
     assert_eq!(encoded[0], 0xa1, "one-element map");
     let hex = hex::encode(&encoded);
     assert!(
         hex.ends_with("44deadbeef"),
         "payload must be CBOR bstr of deadbeef, got {hex}"
     );
+    Ok(())
 }
 
 #[test]
-fn snapshot_golden() {
-    assert_fixture("snapshot", &sample_snapshot(), &vectors().snapshot);
+fn snapshot_golden() -> Result<(), Box<dyn std::error::Error>> {
+    assert_fixture("snapshot", &sample_snapshot(), &vectors().snapshot)
 }

@@ -41,27 +41,27 @@ fn arb_node() -> impl Strategy<Value = Node> {
         })
 }
 
-fn streamed<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
+fn streamed<T: serde::Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, hord_encoding::Error> {
     let mut out = Vec::new();
-    encode_ordered_into(value, &mut out).unwrap();
-    out
+    encode_ordered_into(value, &mut out)?;
+    Ok(out)
 }
 
 proptest! {
     #[test]
     fn node_streamed_bytes_equal_canonical(node in arb_node()) {
-        prop_assert_eq!(streamed(&node), encode(&node).unwrap());
-        prop_assert_eq!(node.content_id().unwrap(), ObjectId::of(&node).unwrap());
+        prop_assert_eq!(streamed(&node)?, encode(&node)?);
+        prop_assert_eq!(node.content_id()?, ObjectId::of(&node)?);
     }
 
     #[test]
     fn normalized_children_streamed_bytes_equal_canonical(
         ids in prop::collection::vec(arb_oid(), 0..40),
     ) {
-        prop_assert_eq!(streamed(ids.as_slice()), encode(ids.as_slice()).unwrap());
+        prop_assert_eq!(streamed(ids.as_slice())?, encode(ids.as_slice())?);
         prop_assert_eq!(
-            ObjectId::of_ordered(ids.as_slice()).unwrap(),
-            ObjectId::of(ids.as_slice()).unwrap()
+            ObjectId::of_ordered(ids.as_slice())?,
+            ObjectId::of(ids.as_slice())?
         );
     }
 
@@ -73,9 +73,9 @@ proptest! {
         ],
     ) {
         let bytes = Bytes::from(bytes);
-        prop_assert_eq!(streamed(&bytes), encode(&bytes).unwrap());
-        prop_assert_eq!(ObjectId::of_ordered(&bytes).unwrap(), ObjectId::of(&bytes).unwrap());
-        prop_assert_eq!(ObjectId::of_byte_string(bytes.as_slice()), ObjectId::of(&bytes).unwrap());
+        prop_assert_eq!(streamed(&bytes)?, encode(&bytes)?);
+        prop_assert_eq!(ObjectId::of_ordered(&bytes)?, ObjectId::of(&bytes)?);
+        prop_assert_eq!(ObjectId::of_byte_string(bytes.as_slice()), ObjectId::of(&bytes)?);
     }
 }
 
@@ -83,7 +83,7 @@ proptest! {
 /// stream different bytes; this pins the fast path to the canonical bytes
 /// of a fixed leaf and branch.
 #[test]
-fn fixed_nodes_match_canonical() {
+fn fixed_nodes_match_canonical() -> Result<(), Box<dyn std::error::Error>> {
     let leaf = Node {
         kind: NodeKind::new("identifier"),
         lang: LangId::new("rust"),
@@ -93,12 +93,13 @@ fn fixed_nodes_match_canonical() {
         name: None,
     };
     let branch = Node {
-        children: vec![ObjectId::of(&leaf).unwrap(); 3],
+        children: vec![ObjectId::of(&leaf)?; 3],
         name: Some(QualifiedName::new("m::f")),
         ..leaf.clone()
     };
     for node in [&leaf, &branch] {
-        assert_eq!(streamed(node), encode(node).unwrap());
-        assert_eq!(node.content_id().unwrap(), ObjectId::of(node).unwrap());
+        assert_eq!(streamed(node)?, encode(node)?);
+        assert_eq!(node.content_id()?, ObjectId::of(node)?);
     }
+    Ok(())
 }

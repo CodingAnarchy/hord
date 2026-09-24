@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn no_qualifier_is_omitted_from_the_encoding() {
+    fn no_qualifier_is_omitted_from_the_encoding() -> Result<(), Box<dyn std::error::Error>> {
         let ev = sample(None);
         let v0 = EvidenceV0 {
             kind: ev.kind.clone(),
@@ -133,20 +133,22 @@ mod tests {
             produced_by: ev.produced_by.clone(),
             produced_at: ev.produced_at,
         };
-        let bytes = hord_encoding::encode(&ev).unwrap();
-        assert_eq!(bytes, hord_encoding::encode(&v0).unwrap());
-        let back: Evidence = hord_encoding::decode(&bytes).unwrap();
+        let bytes = hord_encoding::encode(&ev)?;
+        assert_eq!(bytes, hord_encoding::encode(&v0)?);
+        let back: Evidence = hord_encoding::decode(&bytes)?;
         assert_eq!(back, ev);
+        Ok(())
     }
 
     #[test]
-    fn a_qualifier_is_encoded_and_changes_the_id() {
+    fn a_qualifier_is_encoded_and_changes_the_id() -> Result<(), Box<dyn std::error::Error>> {
         let plain = sample(None);
         let selected = sample(Some("selected"));
-        let bytes = hord_encoding::encode(&selected).unwrap();
+        let bytes = hord_encoding::encode(&selected)?;
         assert!(bytes.windows(9).any(|w| w == b"qualifier"));
-        assert_ne!(bytes, hord_encoding::encode(&plain).unwrap());
-        let back: Evidence = hord_encoding::decode(&bytes).unwrap();
+        assert_ne!(bytes, hord_encoding::encode(&plain)?);
+        let back: Evidence = hord_encoding::decode(&bytes)?;
         assert_eq!(back, selected);
+        Ok(())
     }
 }

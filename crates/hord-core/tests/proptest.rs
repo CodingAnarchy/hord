@@ -19,19 +19,19 @@ proptest! {
     #[test]
     fn blob_round_trip(payload in arb_bytes()) {
         let blob = Blob::new(payload);
-        let encoded = encode(&blob).unwrap();
-        let back: Blob = decode(&encoded).unwrap();
+        let encoded = encode(&blob)?;
+        let back: Blob = decode(&encoded)?;
         prop_assert_eq!(&blob, &back);
-        prop_assert_eq!(ObjectId::of(&blob).unwrap(), ObjectId::from_canonical(&encoded));
-        let payload = encode(&blob.bytes).unwrap();
+        prop_assert_eq!(ObjectId::of(&blob)?, ObjectId::from_canonical(&encoded));
+        let payload = encode(&blob.bytes)?;
         prop_assert_eq!(payload[0] >> 5, 2, "Bytes must encode as CBOR major type 2");
     }
 
     #[test]
     fn blob_object_id_is_stable(payload in arb_bytes()) {
         let blob = Blob::new(payload);
-        let a = ObjectId::of(&blob).unwrap();
-        let b = ObjectId::of(&blob).unwrap();
+        let a = ObjectId::of(&blob)?;
+        let b = ObjectId::of(&blob)?;
         prop_assert_eq!(a, b);
     }
 
@@ -52,8 +52,8 @@ proptest! {
             children: child_seeds.into_iter().map(oid_from_seed).collect(),
             name: name.map(QualifiedName::new),
         };
-        let encoded = encode(&node).unwrap();
-        let back: Node = decode(&encoded).unwrap();
+        let encoded = encode(&node)?;
+        let back: Node = decode(&encoded)?;
         if node.children.is_empty() {
             prop_assert_eq!(&node, &back);
         } else {
@@ -62,7 +62,7 @@ proptest! {
             prop_assert_eq!(&back.children, &node.children);
             prop_assert_eq!(back.normalized, node.normalized);
         }
-        prop_assert_eq!(ObjectId::of(&node).unwrap(), ObjectId::from_canonical(&encoded));
+        prop_assert_eq!(ObjectId::of(&node)?, ObjectId::from_canonical(&encoded));
     }
 
     #[test]
@@ -91,10 +91,10 @@ proptest! {
                 require: vec!["review:human".into()],
             }],
         };
-        let encoded = encode(&policy).unwrap();
-        let back: Policy = decode(&encoded).unwrap();
+        let encoded = encode(&policy)?;
+        let back: Policy = decode(&encoded)?;
         prop_assert_eq!(&policy, &back);
-        prop_assert_eq!(ObjectId::of(&policy).unwrap(), ObjectId::from_canonical(&encoded));
+        prop_assert_eq!(ObjectId::of(&policy)?, ObjectId::from_canonical(&encoded));
     }
 
     #[test]
@@ -107,12 +107,12 @@ proptest! {
             EvidenceKind::Review,
             EvidenceKind::Custom(custom.clone()),
         ] {
-            let encoded = encode(&kind).unwrap();
-            let back: EvidenceKind = decode(&encoded).unwrap();
+            let encoded = encode(&kind)?;
+            let back: EvidenceKind = decode(&encoded)?;
             prop_assert_eq!(&kind, &back);
         }
         let fail = EvidenceResult::Fail { summary: summary.clone() };
-        let encoded = encode(&fail).unwrap();
-        prop_assert_eq!(decode::<EvidenceResult>(&encoded).unwrap(), fail);
+        let encoded = encode(&fail)?;
+        prop_assert_eq!(decode::<EvidenceResult>(&encoded)?, fail);
     }
 }

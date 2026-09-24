@@ -140,20 +140,22 @@ mod tests {
     const EXAMPLE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
     #[test]
-    fn parse_display_round_trip() {
-        let id: NodeId = EXAMPLE.parse().unwrap();
+    fn parse_display_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let id: NodeId = EXAMPLE.parse()?;
         assert_eq!(id.to_string(), EXAMPLE);
         assert_eq!(format!("{id}"), EXAMPLE);
+        Ok(())
     }
 
     #[test]
-    fn file_roots_are_stable_distinct_and_not_nil() {
-        let a: RepoPath = "src/lib.rs".parse().unwrap();
-        let b: RepoPath = "src/main.rs".parse().unwrap();
+    fn file_roots_are_stable_distinct_and_not_nil() -> Result<(), Box<dyn std::error::Error>> {
+        let a: RepoPath = "src/lib.rs".parse()?;
+        let b: RepoPath = "src/main.rs".parse()?;
         assert_eq!(NodeId::file_root(&a), NodeId::file_root(&a.clone()));
         assert_ne!(NodeId::file_root(&a), NodeId::file_root(&b));
         assert_ne!(NodeId::file_root(&a), NodeId::nil());
         assert_ne!(NodeId::file_root(&RepoPath::default()), NodeId::nil());
+        Ok(())
     }
 
     #[test]
@@ -165,26 +167,30 @@ mod tests {
 
     #[test]
     fn rejects_invalid_ulid() {
-        let err = "not-a-ulid".parse::<NodeId>().unwrap_err();
+        let err = "not-a-ulid"
+            .parse::<NodeId>()
+            .expect_err("parse rejects a non-ULID NodeId");
         assert!(matches!(err, Error::NodeId(_)));
         assert!("01ARZ3NDEKTSV4RRFFQ69G5FA".parse::<NodeId>().is_err());
     }
 
     #[test]
-    fn serde_is_ulid_text() {
-        let id: NodeId = EXAMPLE.parse().unwrap();
-        let bytes = encode(&id).unwrap();
+    fn serde_is_ulid_text() -> Result<(), Box<dyn std::error::Error>> {
+        let id: NodeId = EXAMPLE.parse()?;
+        let bytes = encode(&id)?;
         assert_eq!(bytes[0], 0x78, "major type 3, one-byte length");
         assert_eq!(bytes[1], ulid::ULID_LEN as u8);
         assert_eq!(&bytes[2..], EXAMPLE.as_bytes());
-        assert_eq!(decode::<NodeId>(&bytes).unwrap(), id);
+        assert_eq!(decode::<NodeId>(&bytes)?, id);
+        Ok(())
     }
 
     #[test]
-    fn generate_is_parseable() {
+    fn generate_is_parseable() -> Result<(), Box<dyn std::error::Error>> {
         let id = NodeId::generate();
-        let parsed: NodeId = id.to_string().parse().unwrap();
+        let parsed: NodeId = id.to_string().parse()?;
         assert_eq!(id, parsed);
         assert_ne!(id, NodeId::nil());
+        Ok(())
     }
 }

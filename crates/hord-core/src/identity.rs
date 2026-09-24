@@ -214,7 +214,8 @@ mod tests {
     /// Edits record and remove file entries along their paths, drop
     /// emptied directories, and create none only to remove from it.
     #[test]
-    fn edits_rewrite_the_paths_and_drop_emptied_directories() {
+    fn edits_rewrite_the_paths_and_drop_emptied_directories()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut trees = Memory::default();
         let (a, b) = (
             ObjectId::from_canonical(b"a"),
@@ -225,9 +226,8 @@ mod tests {
             &mut trees,
             None,
             &[(&x, Some(a)), (&y, Some(b)), (&z, Some(a))],
-        )
-        .unwrap()
-        .unwrap();
+        )?
+        .ok_or("recording files leaves a root")?;
         let top = trees.0[&root].clone();
         assert_eq!(top.entries.len(), 2);
         assert_eq!(top.entries["z.rs"], IdentityEntry::File(a));
@@ -241,15 +241,15 @@ mod tests {
             &mut trees,
             Some(root),
             &[(&y, None), (&x, None), (&gone, None), (&missing, None)],
-        )
-        .unwrap()
-        .unwrap();
+        )?
+        .ok_or("z.rs still keeps the root")?;
         let top = &trees.0[&pruned];
         assert_eq!(top.entries.len(), 1, "src emptied and dropped: {top:?}");
         assert_eq!(top.entries["z.rs"], IdentityEntry::File(a));
         assert_eq!(
-            edit_identity_tree(&mut trees, Some(pruned), &[(&z, None)]).unwrap(),
+            edit_identity_tree(&mut trees, Some(pruned), &[(&z, None)])?,
             None
         );
+        Ok(())
     }
 }
