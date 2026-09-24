@@ -19,12 +19,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// The change `propose` would record from `ws` now, under a placeholder
 /// intent; `None` when there is nothing to propose.
 pub fn preview(ws: &mut Workspace, summary: &str) -> Result<Option<ChangeRecord>> {
-    let intent = Intent {
-        summary: summary.into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    };
+    let intent = Intent::from_summary(summary);
     match block_on(ws.preview(intent)) {
         Ok(proposal) => Ok(Some(proposal.record)),
         Err(hord_txn::Error::NothingToPropose) => Ok(None),

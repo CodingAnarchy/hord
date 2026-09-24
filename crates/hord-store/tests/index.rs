@@ -57,12 +57,7 @@ fn record(
         result: snap(2),
         parents: Vec::new(),
         ops,
-        intent: Intent {
-            summary: "s".into(),
-            body: String::new(),
-            refs: Vec::new(),
-            acceptance: Vec::new(),
-        },
+        intent: Intent::from_summary("s"),
         provenance: Provenance {
             actor: Actor::Human {
                 id: "tester".into(),

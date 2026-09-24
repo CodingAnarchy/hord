@@ -285,12 +285,7 @@ pub(crate) fn blame(files: &[&FileSnap]) -> Result<BlameReport> {
         result: snapshot,
         parents: Vec::new(),
         ops: Vec::new(),
-        intent: Intent {
-            summary: "m2 blame sample".into(),
-            body: String::new(),
-            refs: Vec::new(),
-            acceptance: Vec::new(),
-        },
+        intent: Intent::from_summary("m2 blame sample"),
         provenance: Provenance {
             actor: Actor::Human {
                 id: "m2-eval".into(),

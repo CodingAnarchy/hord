@@ -123,12 +123,7 @@ impl Fixture {
                     to: Some(to),
                 },
             ],
-            intent: Intent {
-                summary: format!("add {path}"),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            },
+            intent: Intent::from_summary(format!("add {path}")),
             provenance: Provenance {
                 actor: actor(),
                 toolchain: ObjectId::from_canonical(b"hord-api conformance"),

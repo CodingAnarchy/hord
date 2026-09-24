@@ -70,12 +70,7 @@ pub fn actor(id: &str) -> Actor {
 }
 
 pub fn intent(summary: &str) -> Intent {
-    Intent {
-        summary: summary.into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    }
+    Intent::from_summary(summary)
 }
 
 pub fn path(p: &str) -> RepoPath {

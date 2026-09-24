@@ -363,12 +363,7 @@ pub(crate) fn actor(id: &str) -> Actor {
 }
 
 pub(crate) fn intent(summary: &str) -> Intent {
-    Intent {
-        summary: summary.into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    }
+    Intent::from_summary(summary)
 }
 
 /// What one agent did, recorded by the harness.

@@ -282,12 +282,7 @@ mod tests {
             result: ObjectId::from_bytes([2; 32]),
             parents: Vec::new(),
             ops,
-            intent: Intent {
-                summary: String::new(),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            },
+            intent: Intent::from_summary(""),
             provenance: Provenance {
                 actor: Actor::Human { id: "t".into() },
                 toolchain: ObjectId::from_bytes([3; 32]),

@@ -708,12 +708,7 @@ mod tests {
                     kind: TreeOpKind::CreateFile,
                 },
             ],
-            intent: Intent {
-                summary: "s".into(),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            },
+            intent: Intent::from_summary("s"),
             provenance: Provenance {
                 actor: Actor::Human { id: "t".into() },
                 toolchain: oid(3),

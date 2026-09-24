@@ -164,6 +164,20 @@ pub struct Intent {
     pub acceptance: Vec<Acceptance>,
 }
 
+impl Intent {
+    /// An intent that is only a one-line summary: no body, refs, or
+    /// acceptance criteria.
+    #[must_use]
+    pub fn from_summary(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            body: String::new(),
+            refs: Vec::new(),
+            acceptance: Vec::new(),
+        }
+    }
+}
+
 /// A reference attached to an [`Intent`].
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum IntentRef {

@@ -30,12 +30,7 @@ fn record(base: SnapshotId, result: SnapshotId, write: NodeId) -> ChangeRecord {
         result,
         parents: Vec::new(),
         ops: Vec::new(),
-        intent: Intent {
-            summary: "s".into(),
-            body: String::new(),
-            refs: Vec::new(),
-            acceptance: Vec::new(),
-        },
+        intent: Intent::from_summary("s"),
         provenance: Provenance {
             actor: Actor::Human {
                 id: "tester".into(),

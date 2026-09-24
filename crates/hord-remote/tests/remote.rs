@@ -43,12 +43,7 @@ fn actor(id: &str) -> Actor {
 }
 
 fn intent(summary: &str) -> Intent {
-    Intent {
-        summary: summary.into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    }
+    Intent::from_summary(summary)
 }
 
 fn path(p: &str) -> RepoPath {

@@ -336,12 +336,7 @@ fn export_change_handles_a_long_linear_history() {
             result: tree,
             parents: parent.into_iter().collect(),
             ops: Vec::new(),
-            intent: Intent {
-                summary: format!("step {i}"),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            },
+            intent: Intent::from_summary(format!("step {i}")),
             provenance: Provenance {
                 actor: Actor::Human {
                     id: "Ada Lovelace <ada@example.com>".into(),

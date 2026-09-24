@@ -947,12 +947,7 @@ impl crate::Repo {
         ws: &mut crate::Workspace,
         plan_only: bool,
     ) -> Result<WorkspaceVerification> {
-        let preview = hord_core::Intent {
-            summary: "(verify preview)".into(),
-            body: String::new(),
-            refs: Vec::new(),
-            acceptance: Vec::new(),
-        };
+        let preview = hord_core::Intent::from_summary("(verify preview)");
         let proposal = ws.preview(preview).await?;
         let record = Arc::new(proposal.record);
         let inner = Arc::clone(&self.inner);
