@@ -258,9 +258,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_schema_covers_every_message_and_rpc() {
+    fn the_schema_covers_every_message_and_rpc() -> Result<(), Box<dyn std::error::Error>> {
         let schema = json_schema();
-        let defs = schema["$defs"].as_object().unwrap();
+        let defs = schema["$defs"].as_object().ok_or("$defs is an object")?;
         for name in [
             "hord.v1.QueueEntry",
             "hord.v1.ConflictReport",
@@ -280,12 +280,12 @@ mod tests {
         assert!(
             defs["hord.v1.QueueEntry"]["description"]
                 .as_str()
-                .unwrap()
+                .ok_or("QueueEntry has a string description")?
                 .contains("lander queue")
         );
         let rpcs = schema["x-hord-services"]["hord.v1.RepoBackend"]
             .as_object()
-            .unwrap();
+            .ok_or("RepoBackend's services are an object")?;
         for rpc in [
             "GetObjects",
             "PutObjects",
@@ -305,11 +305,13 @@ mod tests {
             assert!(rpcs.contains_key(rpc), "{rpc}");
         }
         assert_eq!(rpcs["Events"]["serverStreaming"], true);
+        Ok(())
     }
 
     #[test]
-    fn a_oneof_allows_at_most_one_member() {
-        let defs = json_schema()["$defs"].as_object().unwrap();
+    fn a_oneof_allows_at_most_one_member() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = json_schema();
+        let defs = schema["$defs"].as_object().ok_or("$defs is an object")?;
         let actor = &defs["hord.v1.Actor"];
         assert_eq!(
             actor["allOf"][0]["allOf"][0]["not"]["required"],
@@ -317,26 +319,33 @@ mod tests {
         );
         // A proto3 `optional` is not a oneof for this purpose.
         assert!(defs["hord.v1.HeadResponse"].get("allOf").is_none());
+        Ok(())
     }
 
     #[test]
-    fn json_mapping_matches_the_schema_names() {
+    fn json_mapping_matches_the_schema_names() -> Result<(), Box<dyn std::error::Error>> {
         let entry = proto::QueueEntry {
             seq: 7,
             submitted_at_ms: 1,
             status: proto::QueueStatus::Landed.into(),
             ..Default::default()
         };
-        let json = serde_json::to_value(&entry).unwrap();
+        let json = serde_json::to_value(&entry)?;
         assert_eq!(json["seq"], "7");
         assert_eq!(json["status"], "QUEUE_STATUS_LANDED");
-        let props = json_schema()["$defs"]["hord.v1.QueueEntry"]["properties"]
+        let schema = json_schema();
+        let props = schema["$defs"]["hord.v1.QueueEntry"]["properties"]
             .as_object()
-            .unwrap();
-        for key in json.as_object().unwrap().keys() {
+            .ok_or("QueueEntry's properties are an object")?;
+        for key in json
+            .as_object()
+            .ok_or("a QueueEntry maps to a JSON object")?
+            .keys()
+        {
             assert!(props.contains_key(key), "{key} is in the schema");
         }
-        let back: proto::QueueEntry = serde_json::from_value(json).unwrap();
+        let back: proto::QueueEntry = serde_json::from_value(json)?;
         assert_eq!(back, entry);
+        Ok(())
     }
 }

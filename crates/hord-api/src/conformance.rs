@@ -484,7 +484,14 @@ async fn second_change_and_log(
 
     let by_node = backend
         .log(proto::LogQuery {
-            node: Some(NodeId::file_root(&"docs/b.txt".parse().unwrap()).to_string()),
+            node: Some(
+                NodeId::file_root(
+                    &"docs/b.txt"
+                        .parse()
+                        .expect("docs/b.txt is a valid repo path"),
+                )
+                .to_string(),
+            ),
             ..Default::default()
         })
         .await
@@ -521,7 +528,7 @@ async fn second_change_and_log(
 
 /// Node history, edges, and name resolution over the landed snapshots.
 async fn queries(backend: &dyn RepoBackend, fx: &Fixture, a: ObjectId, b: ObjectId) {
-    let root = NodeId::file_root(&"a.txt".parse().unwrap());
+    let root = NodeId::file_root(&"a.txt".parse().expect("a.txt is a valid repo path"));
     let history = backend
         .node_history(proto::NodeHistoryRequest {
             node: root.to_string(),

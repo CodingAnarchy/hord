@@ -105,21 +105,22 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_replays_what_was_recorded() {
+    fn a_recording_replays_what_was_recorded() -> Result<(), Box<dyn std::error::Error>> {
         let header = proto::RecordingHeader {
             repo: "r".into(),
             from_cursor: 2,
             ..Default::default()
         };
-        let mut rec = Recorder::new(Vec::new(), header).unwrap();
-        rec.record(&event(3)).unwrap();
-        rec.record(&event(7)).unwrap();
+        let mut rec = Recorder::new(Vec::new(), header)?;
+        rec.record(&event(3))?;
+        rec.record(&event(7))?;
         assert!(rec.record(&event(7)).is_err(), "cursors must increase");
-        let bytes = rec.finish().unwrap();
-        let (header, events) = parse(&bytes).unwrap();
+        let bytes = rec.finish()?;
+        let (header, events) = parse(&bytes)?;
         assert_eq!(header.format, FORMAT);
         assert_eq!(header.repo, "r");
         assert_eq!(events, vec![event(3), event(7)]);
         assert!(parse(b"{\"format\":\"other\"}\n").is_err());
+        Ok(())
     }
 }

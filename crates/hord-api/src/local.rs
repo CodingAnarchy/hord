@@ -35,12 +35,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_repository_one_endpoint() {
-        let here = endpoint(Path::new(".")).unwrap();
-        let again = endpoint(&std::env::current_dir().unwrap()).unwrap();
+    fn one_repository_one_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+        let here = endpoint(Path::new("."))?;
+        let again = endpoint(&std::env::current_dir()?)?;
         assert_eq!(here, again);
-        let other = endpoint(&std::env::temp_dir()).unwrap();
+        let other = endpoint(&std::env::temp_dir())?;
         assert_ne!(here, other);
         assert!(here.len() < 104, "{here} fits a Unix socket path");
+        Ok(())
     }
 }

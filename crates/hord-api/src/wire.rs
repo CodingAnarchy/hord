@@ -165,19 +165,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ids_round_trip_and_bad_ones_name_the_field() {
+    fn ids_round_trip_and_bad_ones_name_the_field() -> Result<(), Box<dyn std::error::Error>> {
         let oid = ObjectId::from_canonical(b"x");
-        assert_eq!(object_id("change", &id(oid)).unwrap(), oid);
-        let err = object_id("change", "zz").unwrap_err();
+        assert_eq!(object_id("change", &id(oid))?, oid);
+        let err = object_id("change", "zz").expect_err("zz is not a hex object id");
         assert!(matches!(&err, ApiError::InvalidArgument(m) if m.starts_with("change:")));
-        let node = NodeId::file_root(&"a/b.rs".parse().unwrap());
-        assert_eq!(node_id("node", &node.to_string()).unwrap(), node);
+        let node = NodeId::file_root(&"a/b.rs".parse()?);
+        assert_eq!(node_id("node", &node.to_string())?, node);
         assert!(node_id("node", "not a ulid").is_err());
-        assert_eq!(optional_object_id("after", Some("")).unwrap(), None);
+        assert_eq!(optional_object_id("after", Some(""))?, None);
+        Ok(())
     }
 
     #[test]
-    fn actors_round_trip() {
+    fn actors_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let agent = Actor::Agent {
             id: "a".into(),
             model: "m".into(),
@@ -187,9 +188,10 @@ mod tests {
         let human = Actor::Human { id: "h".into() };
         for a in [agent, human] {
             let wire = actor(&a);
-            assert_eq!(actor_from("actor", &wire).unwrap(), a);
+            assert_eq!(actor_from("actor", &wire)?, a);
         }
         assert!(actor_from("actor", &proto::Actor::default()).is_err());
+        Ok(())
     }
 
     #[test]
