@@ -106,17 +106,21 @@ mod tests {
     #[test]
     fn matches_toml_suffix_including_cargo_toml() {
         let a = adapter();
-        let cargo = RepoPath::from_str("Cargo.toml").unwrap();
-        let nested = RepoPath::from_str("crates/foo/Cargo.toml").unwrap();
-        let other = RepoPath::from_str("settings.toml").unwrap();
-        let rs = RepoPath::from_str("src/lib.rs").unwrap();
-        let lock = RepoPath::from_str("Cargo.lock").unwrap();
+        let cargo = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
+        let nested = RepoPath::from_str("crates/foo/Cargo.toml")
+            .expect("parse repo path crates/foo/Cargo.toml");
+        let other = RepoPath::from_str("settings.toml").expect("parse repo path settings.toml");
+        let rs = RepoPath::from_str("src/lib.rs").expect("parse repo path src/lib.rs");
+        let lock = RepoPath::from_str("Cargo.lock").expect("parse repo path Cargo.lock");
         assert!(a.matches(&cargo, b"[package]"));
         assert!(a.matches(&nested, &[]));
         assert!(a.matches(&other, &[]));
         assert!(!a.matches(&rs, b"fn main() {}"));
         assert!(!a.matches(&lock, b"# This file is automatically"));
-        assert!(!a.matches(&RepoPath::from_str("foo.toml.bak").unwrap(), &[]));
+        assert!(!a.matches(
+            &RepoPath::from_str("foo.toml.bak").expect("parse repo path foo.toml.bak"),
+            &[]
+        ));
         // ADR 0003: matches ignores head; parse has no size cutoff.
         assert!(a.matches(&cargo, &[]));
     }
@@ -167,7 +171,8 @@ mod tests {
 
     #[test]
     fn is_definition_tables_and_pairs() {
-        let bytes = fs::read(testdata_dir().join("nested_tables.toml")).unwrap();
+        let bytes = fs::read(testdata_dir().join("nested_tables.toml"))
+            .expect("read testdata/nested_tables.toml");
         let tree = parse_ok(&bytes);
         let kinds = kinds_in(&tree);
         let a = adapter();
@@ -177,7 +182,10 @@ mod tests {
         assert!(a.is_definition(&NodeKind::new("table_array_element")));
         assert!(a.is_definition(&NodeKind::new("pair")));
 
-        let arrays = parse_ok(&fs::read(testdata_dir().join("arrays_of_tables.toml")).unwrap());
+        let arrays = parse_ok(
+            &fs::read(testdata_dir().join("arrays_of_tables.toml"))
+                .expect("read testdata/arrays_of_tables.toml"),
+        );
         assert!(kinds_in(&arrays).contains("table_array_element"));
 
         assert!(!a.is_definition(&NodeKind::new("document")));
@@ -189,9 +197,14 @@ mod tests {
 
     #[test]
     fn dotted_keys_and_strings_kinds() {
-        let dotted = parse_ok(&fs::read(testdata_dir().join("dotted_keys.toml")).unwrap());
+        let dotted = parse_ok(
+            &fs::read(testdata_dir().join("dotted_keys.toml"))
+                .expect("read testdata/dotted_keys.toml"),
+        );
         assert!(kinds_in(&dotted).contains("dotted_key"));
-        let strings = parse_ok(&fs::read(testdata_dir().join("strings.toml")).unwrap());
+        let strings = parse_ok(
+            &fs::read(testdata_dir().join("strings.toml")).expect("read testdata/strings.toml"),
+        );
         assert!(kinds_in(&strings).contains("string"));
     }
 
@@ -240,7 +253,7 @@ mod tests {
             .find(|(_, n)| n.kind.as_str() == "table")
             .map(|(_, n)| n)
             .expect("table");
-        let raw = std::str::from_utf8(table.raw.as_slice()).unwrap();
+        let raw = std::str::from_utf8(table.raw.as_slice()).expect("table raw is UTF-8");
         assert!(
             raw.contains("# doc"),
             "leading comment should move with the table, got {raw:?}"
@@ -256,7 +269,7 @@ mod tests {
             .find(|(_, n)| n.kind.as_str() == "pair")
             .map(|(_, n)| n)
             .expect("pair");
-        let raw = std::str::from_utf8(pair.raw.as_slice()).unwrap();
+        let raw = std::str::from_utf8(pair.raw.as_slice()).expect("pair raw is UTF-8");
         assert!(
             raw.contains("# note"),
             "same-line trailing comment should stay with the pair, got {raw:?}"
@@ -316,7 +329,10 @@ mod tests {
     #[test]
     fn as_lang_adapter_trait_object() {
         let a: &dyn LangAdapter = &TomlAdapter;
-        assert!(a.matches(&RepoPath::from_str("Cargo.toml").unwrap(), &[]));
+        assert!(a.matches(
+            &RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml"),
+            &[]
+        ));
         assert_lossless(b"[a]\nb = 1\n");
     }
 }

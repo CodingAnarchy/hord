@@ -816,7 +816,7 @@ mod tests {
             }
             _ => panic!("asymmetric: {one:?} vs {two:?}"),
         }
-        one.map(|b| String::from_utf8(b).unwrap())
+        one.map(|b| String::from_utf8(b).expect("merge output is built from UTF-8 inputs"))
     }
 
     const BASE: &str =
@@ -824,7 +824,10 @@ mod tests {
 
     #[test]
     fn unchanged_round_trips_canonical_input() {
-        assert_eq!(merge(BASE, BASE, BASE).unwrap(), BASE);
+        assert_eq!(
+            merge(BASE, BASE, BASE).expect("merge unchanged input"),
+            BASE
+        );
     }
 
     #[test]
@@ -836,11 +839,14 @@ mod tests {
             format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n\n[[item]]\nid = \"c\"\nrev = 1\n");
         // Every input CRLF: the output is CRLF.
         assert_eq!(
-            merge(&crlf(BASE), &crlf(&ours), &crlf(&theirs)).unwrap(),
+            merge(&crlf(BASE), &crlf(&ours), &crlf(&theirs)).expect("merge all-CRLF inputs"),
             crlf(&want)
         );
         // One side switched to CRLF: that side's ending wins.
-        assert_eq!(merge(BASE, &crlf(&ours), &theirs).unwrap(), crlf(&want));
+        assert_eq!(
+            merge(BASE, &crlf(&ours), &theirs).expect("merge with ours switched to CRLF"),
+            crlf(&want)
+        );
         assert_eq!(LineEnding::detect("a = 1"), LineEnding::Lf);
     }
 
@@ -850,7 +856,10 @@ mod tests {
         let theirs = format!("{BASE}\n[[item]]\nid = \"c\"\nrev = 1\n");
         let want =
             format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n\n[[item]]\nid = \"c\"\nrev = 1\n");
-        assert_eq!(merge(BASE, &ours, &theirs).unwrap(), want);
+        assert_eq!(
+            merge(BASE, &ours, &theirs).expect("merge ours and theirs"),
+            want
+        );
     }
 
     #[test]
@@ -858,7 +867,10 @@ mod tests {
         let ours = BASE.replace("  \"x\",\n", "  \"w\",\n");
         let theirs = BASE.replace("  \"x\",\n", "  \"x\",\n  \"y\",\n");
         let want = BASE.replace("  \"x\",\n", "  \"w\",\n  \"y\",\n");
-        assert_eq!(merge(BASE, &ours, &theirs).unwrap(), want);
+        assert_eq!(
+            merge(BASE, &ours, &theirs).expect("merge ours and theirs"),
+            want
+        );
     }
 
     #[test]
@@ -866,7 +878,10 @@ mod tests {
         let ours = BASE.replace("rev = 1", "rev = 2");
         let theirs = BASE.replace("  \"x\",\n", "  \"x\",\n  \"y\",\n");
         let want = ours.replace("  \"x\",\n", "  \"x\",\n  \"y\",\n");
-        assert_eq!(merge(BASE, &ours, &theirs).unwrap(), want);
+        assert_eq!(
+            merge(BASE, &ours, &theirs).expect("merge ours and theirs"),
+            want
+        );
     }
 
     #[test]
@@ -901,7 +916,7 @@ mod tests {
         let ours = "a = 2\nb = 1\n\n[meta]\nx = 1\ny = 2\n";
         let theirs = "a = 1\nb = 3\n\n[meta]\nx = 1\nz = 3\n";
         assert_eq!(
-            merge(base, ours, theirs).unwrap(),
+            merge(base, ours, theirs).expect("merge ours and theirs"),
             "a = 2\nb = 3\n\n[meta]\nx = 1\ny = 2\nz = 3\n"
         );
     }
