@@ -33,6 +33,10 @@ M3 decisions that constrain later work: read sets (ADR 0012), lander merge mode 
   - Code that can fail returns the error with `?`, adding context where the crate's error type allows.
   - `.expect("…")` is only for a true invariant, and its message says why the call cannot fail.
   - Tests return `Result` and use `?`, or use `.expect("…")` naming what was being attempted, so a failure says what broke.
+- Imports go in `use` statements at the top of the file, or of the inline module (`mod tests { use … }`), not as full paths inline (`crate::a::b::f()`, `std::collections::BTreeMap::new()`). Exceptions:
+  - a qualified path that disambiguates two items with the same name;
+  - a path inside a macro body, where hygiene needs it.
+  Existing code is not yet converted. Apply the rule to code you write or touch.
 - Async: `tokio`. No blocking I/O in async contexts.
 - No hand-rolled parsers, hashes, or serialization formats. Use `tree-sitter`, `blake3`, canonical CBOR.
 - Deterministic everything: same inputs → same `ObjectId`s. Non-determinism is a P0 bug.
