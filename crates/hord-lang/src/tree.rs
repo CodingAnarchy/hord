@@ -531,39 +531,39 @@ mod tests {
     }
 
     #[test]
-    fn intern_branch_concat_equals_raw() {
+    fn intern_branch_concat_equals_raw() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = NodeTree::new();
-        let a = tree
-            .intern_token(lang(), &token("ident", "hello"), None)
-            .unwrap();
-        let b = tree.intern_token(lang(), &token("ws", " "), None).unwrap();
-        let c = tree
-            .intern_token(lang(), &token("ident", "world"), None)
-            .unwrap();
-        let root = tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![a, b, c], None)
-            .unwrap();
-        tree.set_root(root).unwrap();
+        let a = tree.intern_token(lang(), &token("ident", "hello"), None)?;
+        let b = tree.intern_token(lang(), &token("ws", " "), None)?;
+        let c = tree.intern_token(lang(), &token("ident", "world"), None)?;
+        let root = tree.intern_branch(NodeKind::new("file"), lang(), vec![a, b, c], None)?;
+        tree.set_root(root)?;
 
-        tree.check_concat().unwrap();
+        tree.check_concat()?;
         assert_eq!(tree.to_bytes().as_slice(), b"hello world");
 
-        let parent = tree.get(root).unwrap();
+        let parent = tree.get(root).expect("look up interned node");
         assert_eq!(parent.children, vec![a, b, c]);
         let concat: Vec<u8> = parent
             .children
             .iter()
-            .flat_map(|id| tree.get(*id).unwrap().raw.as_slice().iter().copied())
+            .flat_map(|id| {
+                tree.get(*id)
+                    .expect("look up interned node")
+                    .raw
+                    .as_slice()
+                    .iter()
+                    .copied()
+            })
             .collect();
         assert_eq!(concat, parent.raw.as_slice());
+        Ok(())
     }
 
     #[test]
-    fn intern_rejects_concat_mismatch() {
+    fn intern_rejects_concat_mismatch() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = NodeTree::new();
-        let a = tree
-            .intern_token(lang(), &token("ident", "ab"), None)
-            .unwrap();
+        let a = tree.intern_token(lang(), &token("ident", "ab"), None)?;
         let err = tree
             .intern(
                 NodeKind::new("file"),
@@ -573,41 +573,36 @@ mod tests {
                 vec![a],
                 None,
             )
-            .unwrap_err();
+            .expect_err("intern a node whose raw is not its children's concat");
         assert!(matches!(err, ParseError::ConcatInvariant { .. }));
+        Ok(())
     }
 
     #[test]
-    fn identical_leaves_share_object_id() {
+    fn identical_leaves_share_object_id() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = NodeTree::new();
-        let a = tree
-            .intern_token(lang(), &token("ident", "x"), None)
-            .unwrap();
-        let b = tree
-            .intern_token(lang(), &token("ident", "x"), None)
-            .unwrap();
+        let a = tree.intern_token(lang(), &token("ident", "x"), None)?;
+        let b = tree.intern_token(lang(), &token("ident", "x"), None)?;
         assert_eq!(a, b);
         assert_eq!(tree.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn object_id_is_hash_of_canonical_node() {
+    fn object_id_is_hash_of_canonical_node() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = NodeTree::new();
-        let id = tree
-            .intern_token(lang(), &token("ident", "x"), None)
-            .unwrap();
-        let node = tree.get(id).unwrap();
-        assert_eq!(id, ObjectId::of(node).unwrap());
-        let parent = tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![id], None)
-            .unwrap();
-        let branch = tree.get(parent).unwrap();
+        let id = tree.intern_token(lang(), &token("ident", "x"), None)?;
+        let node = tree.get(id).expect("look up interned node");
+        assert_eq!(id, ObjectId::of(node)?);
+        let parent = tree.intern_branch(NodeKind::new("file"), lang(), vec![id], None)?;
+        let branch = tree.get(parent).expect("look up interned node");
         assert!(!branch.raw.is_empty(), "projection cache is kept in memory");
-        assert_eq!(parent, ObjectId::of(branch).unwrap());
+        assert_eq!(parent, ObjectId::of(branch)?);
+        Ok(())
     }
 
     #[test]
-    fn trivia_does_not_change_normalized() {
+    fn trivia_does_not_change_normalized() -> Result<(), Box<dyn std::error::Error>> {
         let lex_ws = [
             Lexeme::trivia(b"  ".as_slice()),
             Lexeme::token("ident", b"foo".as_slice()),
@@ -619,84 +614,97 @@ mod tests {
 
         let mut a = NodeTree::new();
         let mut b = NodeTree::new();
-        let id_ws = a.intern_token(lang(), &with_ws[0], None).unwrap();
-        let id_bare = b.intern_token(lang(), &bare[0], None).unwrap();
+        let id_ws = a.intern_token(lang(), &with_ws[0], None)?;
+        let id_bare = b.intern_token(lang(), &bare[0], None)?;
         assert_ne!(id_ws, id_bare, "raw differs so content ObjectId differs");
         assert_eq!(
-            a.get(id_ws).unwrap().normalized,
-            b.get(id_bare).unwrap().normalized
+            a.get(id_ws).expect("look up interned node").normalized,
+            b.get(id_bare).expect("look up interned node").normalized
         );
-        assert_eq!(a.get(id_ws).unwrap().normalized, normalized_hash(b"foo"));
-        assert_eq!(a.get(id_ws).unwrap().raw.as_slice(), b"  foo\n");
-        assert_eq!(b.get(id_bare).unwrap().raw.as_slice(), b"foo");
-
-        let parent_a = a
-            .intern_branch(NodeKind::new("file"), lang(), vec![id_ws], None)
-            .unwrap();
-        let parent_b = b
-            .intern_branch(NodeKind::new("file"), lang(), vec![id_bare], None)
-            .unwrap();
         assert_eq!(
-            a.get(parent_a).unwrap().normalized,
-            b.get(parent_b).unwrap().normalized,
+            a.get(id_ws).expect("look up interned node").normalized,
+            normalized_hash(b"foo")
+        );
+        assert_eq!(
+            a.get(id_ws).expect("look up interned node").raw.as_slice(),
+            b"  foo\n"
+        );
+        assert_eq!(
+            b.get(id_bare)
+                .expect("look up interned node")
+                .raw
+                .as_slice(),
+            b"foo"
+        );
+
+        let parent_a = a.intern_branch(NodeKind::new("file"), lang(), vec![id_ws], None)?;
+        let parent_b = b.intern_branch(NodeKind::new("file"), lang(), vec![id_bare], None)?;
+        assert_eq!(
+            a.get(parent_a).expect("look up interned node").normalized,
+            b.get(parent_b).expect("look up interned node").normalized,
             "whitespace does not change an internal normalized id"
         );
         assert_ne!(parent_a, parent_b, "ancestor content ids still change");
         assert_eq!(
-            a.get(parent_a).unwrap().normalized,
-            normalized_of_children(&[a.get(id_ws).unwrap().normalized]).unwrap()
+            a.get(parent_a).expect("look up interned node").normalized,
+            normalized_of_children(&[a.get(id_ws).expect("look up interned node").normalized])?
         );
+        Ok(())
     }
 
     #[test]
-    fn from_tokens_projects_concatenated_raw() {
+    fn from_tokens_projects_concatenated_raw() -> Result<(), Box<dyn std::error::Error>> {
         let tokens = attach_trivia(&[
             Lexeme::trivia(b"// c\n".as_slice()),
             Lexeme::token("kw", b"fn".as_slice()),
             Lexeme::trivia(b" ".as_slice()),
             Lexeme::token("ident", b"f".as_slice()),
         ]);
-        let tree = NodeTree::from_tokens(lang(), NodeKind::new("file"), &tokens).unwrap();
-        tree.check_concat().unwrap();
+        let tree = NodeTree::from_tokens(lang(), NodeKind::new("file"), &tokens)?;
+        tree.check_concat()?;
         assert_eq!(tree.to_bytes().as_slice(), b"// c\nfn f");
-        let root = tree.root().unwrap();
-        assert_eq!(tree.stripped(root).unwrap(), b"fnf");
+        let root = tree.root().expect("tree has a root");
+        assert_eq!(
+            tree.stripped(root).expect("stripped text of interned node"),
+            b"fnf"
+        );
+        Ok(())
     }
 
     #[test]
-    fn clones_share_nodes_and_resident_bytes_tracks_source() {
+    fn clones_share_nodes_and_resident_bytes_tracks_source()
+    -> Result<(), Box<dyn std::error::Error>> {
         let source = "fn f() { 1 }\n".repeat(200);
         let lexemes: Vec<Lexeme> = source
             .split_inclusive(' ')
             .map(|w| Lexeme::token("word", w.as_bytes()))
             .collect();
         let tokens = attach_trivia(&lexemes);
-        let tree = NodeTree::from_tokens(lang(), NodeKind::new("file"), &tokens).unwrap();
+        let tree = NodeTree::from_tokens(lang(), NodeKind::new("file"), &tokens)?;
         let copy = tree.clone();
-        let root = tree.root().unwrap();
+        let root = tree.root().expect("tree has a root");
         assert!(
-            std::ptr::eq(tree.get(root).unwrap(), copy.get(root).unwrap()),
+            std::ptr::eq(
+                tree.get(root).expect("look up interned node"),
+                copy.get(root).expect("look up interned node")
+            ),
             "a clone must not deep-copy the interned nodes"
         );
         let bytes = tree.resident_bytes();
         assert!(bytes >= source.len(), "counts at least the root's raw");
         assert!(bytes < source.len() * 64, "estimate stays bounded: {bytes}");
+        Ok(())
     }
 
     #[test]
-    fn graft_copies_a_subtree_under_the_same_ids() {
+    fn graft_copies_a_subtree_under_the_same_ids() -> Result<(), Box<dyn std::error::Error>> {
         let mut src = NodeTree::new();
-        let a = src
-            .intern_token(lang(), &token("ident", "a"), None)
-            .unwrap();
-        let b = src.intern_token(lang(), &token("ws", " "), None).unwrap();
-        let pair = src
-            .intern_branch(NodeKind::new("pair"), lang(), vec![a, b], None)
-            .unwrap();
+        let a = src.intern_token(lang(), &token("ident", "a"), None)?;
+        let b = src.intern_token(lang(), &token("ws", " "), None)?;
+        let pair = src.intern_branch(NodeKind::new("pair"), lang(), vec![a, b], None)?;
         let mut dest = NodeTree::new();
-        dest.intern_token(lang(), &token("ident", "a"), None)
-            .unwrap();
-        assert_eq!(dest.graft(&src, pair).unwrap(), pair);
+        dest.intern_token(lang(), &token("ident", "a"), None)?;
+        assert_eq!(dest.graft(&src, pair)?, pair);
         assert_eq!(dest.len(), 3);
         for id in [a, b, pair] {
             assert_eq!(dest.get(id), src.get(id));
@@ -707,6 +715,7 @@ mod tests {
             dest.graft(&src, ghost),
             Err(ParseError::MissingNode(id)) if id == ghost
         ));
+        Ok(())
     }
 
     #[test]
@@ -715,37 +724,46 @@ mod tests {
         let ghost = ObjectId::from_bytes([0; 32]);
         let err = tree
             .intern_branch(NodeKind::new("file"), lang(), vec![ghost], None)
-            .unwrap_err();
+            .expect_err("intern a branch with a missing child");
         assert!(matches!(err, ParseError::MissingNode(_)));
     }
 
     #[test]
-    fn from_raw_root_projects_source() {
-        let tree = NodeTree::from_raw_root(NodeKind::new("file"), lang(), b"// only\n").unwrap();
+    fn from_raw_root_projects_source() -> Result<(), Box<dyn std::error::Error>> {
+        let tree = NodeTree::from_raw_root(NodeKind::new("file"), lang(), b"// only\n")?;
         assert_eq!(tree.root_bytes(), Some(b"// only\n".as_slice()));
-        assert_eq!(tree.stripped(tree.root().unwrap()).unwrap(), b"");
+        assert_eq!(
+            tree.stripped(tree.root().expect("tree has a root"))
+                .expect("stripped text of interned node"),
+            b""
+        );
+        Ok(())
     }
 
     #[test]
-    fn builder_token_copies_once_from_source() {
+    fn builder_token_copies_once_from_source() -> Result<(), Box<dyn std::error::Error>> {
         use crate::trivia::{TokenSpan, attach_trivia_spans};
         let source = b"  foo\n";
         let spans = attach_trivia_spans(source, vec![TokenSpan::new("ident", 2, 5)]);
         let mut builder = TreeBuilder::new(lang(), source);
-        let id = builder.token(&spans[0]).unwrap();
-        let tree = builder.finish(id).unwrap();
-        let node = tree.get(id).unwrap();
+        let id = builder.token(&spans[0])?;
+        let tree = builder.finish(id)?;
+        let node = tree.get(id).expect("look up interned node");
         assert_eq!(node.raw.as_slice(), source);
-        assert_eq!(tree.stripped(id).unwrap(), b"foo");
-        let stripped = tree.stripped(id).unwrap();
+        assert_eq!(
+            tree.stripped(id).expect("stripped text of interned node"),
+            b"foo"
+        );
+        let stripped = tree.stripped(id).expect("stripped text of interned node");
         assert!(
             std::ptr::eq(stripped.as_ptr(), node.raw[2..].as_ptr()),
             "stripped text must be a subslice of raw, not a second copy"
         );
+        Ok(())
     }
 
     #[test]
-    fn builder_reuses_repeated_tokens_and_branches() {
+    fn builder_reuses_repeated_tokens_and_branches() -> Result<(), Box<dyn std::error::Error>> {
         use crate::trivia::{TokenSpan, attach_trivia_spans};
         let source = b"a a b a a b ";
         let spans = attach_trivia_spans(
@@ -759,7 +777,10 @@ mod tests {
         let mut plain = NodeTree::new();
         let mut pairs = Vec::new();
         for pair in spans.chunks(3) {
-            let ids: Vec<ObjectId> = pair.iter().map(|t| built.token(t).unwrap()).collect();
+            let ids: Vec<ObjectId> = pair
+                .iter()
+                .map(|t| built.token(t))
+                .collect::<Result<_, _>>()?;
             let kids: Vec<ObjectId> = pair
                 .iter()
                 .map(|t| {
@@ -770,25 +791,20 @@ mod tests {
                         text: Bytes::from(&source[t.text.clone()]),
                         trailing: Bytes::from(&raw[t.text.end - t.raw.start..]),
                     };
-                    plain.intern_token(lang(), &token, None).unwrap()
+                    plain.intern_token(lang(), &token, None)
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             assert_eq!(ids, kids);
-            let group = built.branch(NodeKind::new("group"), ids, None).unwrap();
-            let plain_group = plain
-                .intern_branch(NodeKind::new("group"), lang(), kids, None)
-                .unwrap();
+            let group = built.branch(NodeKind::new("group"), ids, None)?;
+            let plain_group = plain.intern_branch(NodeKind::new("group"), lang(), kids, None)?;
             assert_eq!(group, plain_group);
             pairs.push(group);
         }
         assert_eq!(pairs[0], pairs[1], "identical input reuses one id");
-        let root = built
-            .branch(NodeKind::new("file"), pairs.clone(), None)
-            .unwrap();
-        let plain_root = plain
-            .intern_branch(NodeKind::new("file"), lang(), pairs, None)
-            .unwrap();
-        plain.set_root(plain_root).unwrap();
-        assert_eq!(built.finish(root).unwrap(), plain);
+        let root = built.branch(NodeKind::new("file"), pairs.clone(), None)?;
+        let plain_root = plain.intern_branch(NodeKind::new("file"), lang(), pairs, None)?;
+        plain.set_root(plain_root)?;
+        assert_eq!(built.finish(root)?, plain);
+        Ok(())
     }
 }

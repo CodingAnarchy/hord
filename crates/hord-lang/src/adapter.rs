@@ -542,13 +542,14 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn registry_first_match_wins() {
+    fn registry_first_match_wins() -> Result<(), Box<dyn std::error::Error>> {
         let mut reg = AdapterRegistry::new();
         reg.register(Arc::new(TestAdapter));
-        let path = RepoPath::from_str("src/lib.t").unwrap();
+        let path = RepoPath::from_str("src/lib.t")?;
         assert!(reg.get(&path, b"").is_some());
-        let other = RepoPath::from_str("src/lib.rs").unwrap();
+        let other = RepoPath::from_str("src/lib.rs")?;
         assert!(reg.get(&other, b"").is_none());
+        Ok(())
     }
 
     #[test]

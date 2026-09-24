@@ -254,7 +254,7 @@ mod tests {
     fn ratio_rejects_a_one_node_relabel() {
         let a = leaf("fn", "old");
         let b = leaf("fn", "new");
-        let ted = tree_distance(&a, &b).unwrap();
+        let ted = tree_distance(&a, &b).expect("distance of two one-node trees");
         let max = 1usize;
         assert!(ted * 5 > max);
     }
