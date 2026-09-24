@@ -209,8 +209,7 @@ impl Inner {
         blob: ObjectId,
         tree: &Arc<IdentifiedTree>,
     ) -> Result<Option<ObjectId>> {
-        let fresh = hord_identity::assign(adapter, path, None, &tree.tree);
-        if fresh.nodes == tree.ids {
+        if hord_identity::is_fresh(adapter, path, tree) {
             self.cache_identified((path.clone(), blob, None), Arc::clone(tree));
             return Ok(None);
         }
@@ -505,12 +504,7 @@ mod tests {
     }
 
     fn intent(summary: &str) -> Intent {
-        Intent {
-            summary: summary.into(),
-            body: String::new(),
-            refs: Vec::new(),
-            acceptance: Vec::new(),
-        }
+        Intent::from_summary(summary)
     }
 
     fn path(p: &str) -> RepoPath {

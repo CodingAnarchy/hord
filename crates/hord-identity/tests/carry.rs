@@ -9,7 +9,7 @@ use std::str::FromStr;
 use hord_core::{
     Bytes, IdentityDelta, LangId, NodeId, NodeKind, NodePath, ObjectId, Op, QualifiedName, RepoPath,
 };
-use hord_identity::{Declaration, Error, SnapshotFile, assign, carry, identity_map};
+use hord_identity::{Declaration, Error, SnapshotFile, assign, carry, identity_map, is_fresh};
 use hord_lang::{
     AttachedToken, IdentifiedTree, LangAdapter, NodeTree, ParseError, Site, Tier, default_identify,
 };
@@ -574,6 +574,65 @@ fn identity_map_rejects_ids_at_sites_not_in_the_tree() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::Unmapped(id) if id == nid(4)));
+}
+
+/// `assign` equals the stabilized `default_identify` against an empty base
+/// (`carry` with no declarations), which it computes directly.
+#[test]
+fn assign_equals_carry_from_an_empty_base() {
+    let adapter = TestAdapter;
+    let mut tree = NodeTree::new();
+    let dup = leaf(&mut tree, "fn", "same_body", Some("same"));
+    let other = leaf(&mut tree, "fn", "other_body", Some("other"));
+    let inner = branch(&mut tree, "mod", vec![dup, other], Some("inner"));
+    let mod_a = branch(&mut tree, "mod", vec![inner, dup, other], Some("a"));
+    let text = leaf(&mut tree, "text", "glue", None);
+    finish(&mut tree, vec![mod_a, text, dup, mod_a]);
+    let empty = IdentifiedTree::default();
+    for snapshot in [None, Some(ObjectId::from_canonical(b"base"))] {
+        let assigned = assign(&adapter, &path(), snapshot, &tree);
+        let carried = carry(&adapter, &path(), snapshot, &empty, &tree, &[]).unwrap();
+        assert_eq!(assigned, carried);
+        assert_eq!(assigned.nodes.len(), 13);
+    }
+    let bare = NodeTree::new();
+    assert_eq!(assign(&adapter, &path(), None, &bare), Default::default());
+}
+
+/// `is_fresh` answers exactly what comparing with `assign` does.
+#[test]
+fn is_fresh_agrees_with_comparing_against_assign() {
+    let adapter = TestAdapter;
+    let mut tree = NodeTree::new();
+    let dup = leaf(&mut tree, "fn", "same_body", Some("same"));
+    let other = leaf(&mut tree, "fn", "other_body", Some("other"));
+    let mod_a = branch(&mut tree, "mod", vec![dup, other], Some("a"));
+    let mod_b = branch(&mut tree, "mod", vec![dup], Some("b"));
+    finish(&mut tree, vec![mod_a, mod_b]);
+    let fresh = assign(&adapter, &path(), None, &tree).nodes;
+    let agrees = |ids: BTreeMap<Site, NodeId>| {
+        let identified = IdentifiedTree::new(tree.clone(), ids);
+        let expected = fresh == identified.ids;
+        assert_eq!(is_fresh(&adapter, &path(), &identified), expected);
+        expected
+    };
+    assert!(agrees(fresh.clone()));
+    let snapshot = ObjectId::from_canonical(b"base");
+    assert!(!agrees(
+        assign(&adapter, &path(), Some(snapshot), &tree).nodes
+    ));
+    let mut changed = fresh.clone();
+    changed.insert(vec![1, 0], nid(7));
+    assert!(!agrees(changed));
+    let mut missing = fresh.clone();
+    missing.remove(&vec![0, 1]);
+    assert!(!agrees(missing));
+    let mut extra = fresh.clone();
+    extra.insert(vec![5], nid(8));
+    assert!(!agrees(extra));
+    assert!(!agrees(BTreeMap::new()));
+    let empty = IdentifiedTree::default();
+    assert!(is_fresh(&adapter, &path(), &empty));
 }
 
 /// Two definitions with the same text under different parents are one
