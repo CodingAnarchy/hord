@@ -17,9 +17,7 @@ use redb::{
 };
 
 use super::index::{REBASED, plan_history_rows, touched_nodes, write_history_rows};
-use super::{
-    META, META_HEAD, Store, lock, lock_map, lock_vec, write_pending_log, write_pending_refs,
-};
+use super::{META, META_HEAD, Store, lock, write_pending_log, write_pending_refs};
 use crate::{Error, Result};
 
 const QUEUE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("lander_queue");
@@ -225,14 +223,14 @@ impl Store {
     /// Either all of it is durable or none of it is. Objects the rows name
     /// (the record and its result snapshot) must already be stored.
     pub fn land(&self, landing: &Landing<'_>) -> Result<()> {
-        let _guard = self.lock_index();
+        let _guard = lock(&self.index_lock);
         let nodes: BTreeSet<NodeId> = touched_nodes(landing.record);
         // Load the log before taking `pending_log`; loading takes it too.
         drop(self.ensure_landing_log()?);
         // `append_log` takes `pending_log` first, so holding it keeps the
         // log still until the commit and the in-memory append below.
-        let mut refs = lock_map(&self.pending_refs);
-        let mut pending = lock_vec(&self.pending_log);
+        let mut refs = lock(&self.pending_refs);
+        let mut pending = lock(&self.pending_log);
         let mut txn = self.db.begin_write().map_err(Error::index)?;
         txn.set_durability(Durability::Immediate);
         if let Some(submitted) = landing.record.rebased_from {

@@ -20,8 +20,9 @@ use redb::TableDefinition;
 use super::Store;
 use crate::{Error, Result};
 
-/// Same table `init_tables` creates for new stores.
-const EVIDENCE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("evidence_by_snapshot");
+/// Created empty by `init_tables` for new stores.
+pub(super) const EVIDENCE: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("evidence_by_snapshot");
 
 const LEN: usize = ObjectId::LEN;
 const ROW_LEN: usize = 3 * LEN;
@@ -53,9 +54,7 @@ impl Store {
     ///
     /// Idempotent: the same evidence value has the same id and one row.
     pub fn put_evidence(&self, evidence: &Evidence) -> Result<ObjectId> {
-        let id = self.put_object(evidence)?;
-        self.index_evidence_row(id, evidence)?;
-        Ok(id)
+        Ok(self.put_evidence_batch(std::slice::from_ref(evidence))?[0])
     }
 
     /// Store every one of `evidence` and index them all in one write
@@ -84,34 +83,6 @@ impl Store {
         }
         txn.commit().map_err(Error::index)?;
         Ok(ids)
-    }
-
-    /// Index an evidence object that is already stored (for example one an
-    /// author attached at `propose`, or one fetched from a remote).
-    ///
-    /// Fails with [`Error::MissingObject`] if `id` is not stored, and with
-    /// an encoding error if it is not an [`Evidence`] object.
-    pub fn index_evidence(&self, id: ObjectId) -> Result<()> {
-        let evidence: Evidence = self.get_object(id)?;
-        self.index_evidence_row(id, &evidence)
-    }
-
-    fn index_evidence_row(&self, id: ObjectId, evidence: &Evidence) -> Result<()> {
-        let key = key_hash(
-            evidence.toolchain,
-            &evidence.command,
-            evidence.scope.as_ref(),
-        )?;
-        let row = row(evidence.snapshot, key, id);
-        let txn = self.db.begin_write().map_err(Error::index)?;
-        {
-            let mut table = txn.open_table(EVIDENCE).map_err(Error::index)?;
-            table
-                .insert(row.as_slice(), [].as_slice())
-                .map_err(Error::index)?;
-        }
-        txn.commit().map_err(Error::index)?;
-        Ok(())
     }
 
     /// Evidence indexed for exactly `(snapshot, toolchain, command, scope)`,
@@ -299,31 +270,5 @@ mod tests {
         want.sort();
         assert_eq!(at, want);
         assert_eq!(store.evidence_at(id(3)).unwrap(), Vec::<ObjectId>::new());
-    }
-
-    #[test]
-    fn indexes_stored_objects_and_survives_reopen() {
-        let mut repo = repo();
-        let ev = evidence(4, "cargo clippy", None);
-        let stored = {
-            let store = repo.1.as_ref().unwrap();
-            let stored = store.put_object(&ev).unwrap();
-            assert!(store.evidence_at(id(4)).unwrap().is_empty());
-            store.index_evidence(stored).unwrap();
-            assert!(matches!(
-                store.index_evidence(id(77)),
-                Err(Error::MissingObject(_))
-            ));
-            stored
-        };
-        repo.1.take();
-        let store = Store::open(&repo.0).unwrap();
-        assert_eq!(
-            store
-                .evidence_for_key(id(4), id(9), "cargo clippy", None)
-                .unwrap(),
-            vec![stored]
-        );
-        repo.1 = Some(store);
     }
 }
