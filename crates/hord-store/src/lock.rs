@@ -160,11 +160,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_timeouts() {
-        assert_eq!(parse_timeout("0").unwrap(), Duration::ZERO);
-        assert_eq!(parse_timeout(" 2.5 ").unwrap(), Duration::from_millis(2500));
-        assert_eq!(parse_timeout("").unwrap(), DEFAULT_LOCK_TIMEOUT);
+    fn parses_timeouts() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(parse_timeout("0")?, Duration::ZERO);
+        assert_eq!(parse_timeout(" 2.5 ")?, Duration::from_millis(2500));
+        assert_eq!(parse_timeout("")?, DEFAULT_LOCK_TIMEOUT);
         assert!(matches!(parse_timeout("-1"), Err(Error::LockTimeout(_))));
         assert!(matches!(parse_timeout("soon"), Err(Error::LockTimeout(_))));
+        Ok(())
     }
 }

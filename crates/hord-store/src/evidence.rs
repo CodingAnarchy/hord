@@ -152,16 +152,16 @@ mod tests {
         }
     }
 
-    fn repo() -> Repo {
+    fn repo() -> std::result::Result<Repo, Box<dyn std::error::Error>> {
         static N: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "hord-store-evidence-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
-        let store = Store::create(&path).unwrap();
-        Repo(path, Some(store))
+        fs::create_dir_all(&path)?;
+        let store = Store::create(&path)?;
+        Ok(Repo(path, Some(store)))
     }
 
     fn id(n: u8) -> ObjectId {
@@ -187,88 +187,88 @@ mod tests {
     /// A batch indexes like one `put_evidence` per piece, in one commit,
     /// and survives a reopen (the commit is durable).
     #[test]
-    fn a_batch_indexes_every_piece() {
-        let mut repo = repo();
+    fn a_batch_indexes_every_piece() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut repo = repo()?;
         let batch = [
             evidence(1, "cargo check", None),
             evidence(1, "cargo test", Some(&[3])),
             evidence(2, "cargo check", None),
         ];
-        let ids = repo.1.as_ref().unwrap().put_evidence_batch(&batch).unwrap();
+        let ids = repo
+            .1
+            .as_ref()
+            .ok_or("the repo holds an open store")?
+            .put_evidence_batch(&batch)?;
         repo.1.take();
-        let store = Store::open(&repo.0).unwrap();
+        let store = Store::open(&repo.0)?;
         for (piece, id) in batch.iter().zip(&ids) {
-            assert_eq!(*id, ObjectId::of(piece).unwrap());
+            assert_eq!(*id, ObjectId::of(piece)?);
             assert_eq!(
-                store
-                    .evidence_for_key(
-                        piece.snapshot,
-                        piece.toolchain,
-                        &piece.command,
-                        piece.scope.as_ref()
-                    )
-                    .unwrap(),
+                store.evidence_for_key(
+                    piece.snapshot,
+                    piece.toolchain,
+                    &piece.command,
+                    piece.scope.as_ref()
+                )?,
                 vec![*id]
             );
         }
-        assert_eq!(store.evidence_at(id(1)).unwrap().len(), 2);
-        assert!(store.put_evidence_batch(&[]).unwrap().is_empty());
+        assert_eq!(store.evidence_at(id(1))?.len(), 2);
+        assert!(store.put_evidence_batch(&[])?.is_empty());
         repo.1 = Some(store);
+        Ok(())
     }
 
     #[test]
-    fn finds_evidence_by_exact_key_only() {
-        let repo = repo();
-        let store = repo.1.as_ref().unwrap();
+    fn finds_evidence_by_exact_key_only() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let repo = repo()?;
+        let store = repo.1.as_ref().ok_or("the repo holds an open store")?;
         let a = evidence(1, "cargo test", Some(&[1, 2]));
-        let a_id = store.put_evidence(&a).unwrap();
+        let a_id = store.put_evidence(&a)?;
         let scope: BTreeSet<NodeId> = [1, 2].into_iter().map(NodeId::from_u128).collect();
         assert_eq!(
-            store
-                .evidence_for_key(id(1), id(9), "cargo test", Some(&scope))
-                .unwrap(),
+            store.evidence_for_key(id(1), id(9), "cargo test", Some(&scope))?,
             vec![a_id]
         );
         // Every other component of the key misses.
         assert!(
             store
-                .evidence_for_key(id(2), id(9), "cargo test", Some(&scope))
-                .unwrap()
+                .evidence_for_key(id(2), id(9), "cargo test", Some(&scope))?
                 .is_empty()
         );
         assert!(
             store
-                .evidence_for_key(id(1), id(8), "cargo test", Some(&scope))
-                .unwrap()
+                .evidence_for_key(id(1), id(8), "cargo test", Some(&scope))?
                 .is_empty()
         );
         assert!(
             store
-                .evidence_for_key(id(1), id(9), "cargo check", Some(&scope))
-                .unwrap()
+                .evidence_for_key(id(1), id(9), "cargo check", Some(&scope))?
                 .is_empty()
         );
         assert!(
             store
-                .evidence_for_key(id(1), id(9), "cargo test", None)
-                .unwrap()
+                .evidence_for_key(id(1), id(9), "cargo test", None)?
                 .is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn lists_a_snapshots_evidence_and_is_idempotent() {
-        let repo = repo();
-        let store = repo.1.as_ref().unwrap();
-        let a = store.put_evidence(&evidence(1, "a", None)).unwrap();
-        let b = store.put_evidence(&evidence(1, "b", Some(&[3]))).unwrap();
-        store.put_evidence(&evidence(2, "a", None)).unwrap();
-        assert_eq!(store.put_evidence(&evidence(1, "a", None)).unwrap(), a);
-        let mut at = store.evidence_at(id(1)).unwrap();
+    fn lists_a_snapshots_evidence_and_is_idempotent()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let repo = repo()?;
+        let store = repo.1.as_ref().ok_or("the repo holds an open store")?;
+        let a = store.put_evidence(&evidence(1, "a", None))?;
+        let b = store.put_evidence(&evidence(1, "b", Some(&[3])))?;
+        store.put_evidence(&evidence(2, "a", None))?;
+        assert_eq!(store.put_evidence(&evidence(1, "a", None))?, a);
+        let mut at = store.evidence_at(id(1))?;
         at.sort();
         let mut want = vec![a, b];
         want.sort();
         assert_eq!(at, want);
-        assert_eq!(store.evidence_at(id(3)).unwrap(), Vec::<ObjectId>::new());
+        assert_eq!(store.evidence_at(id(3))?, Vec::<ObjectId>::new());
+        Ok(())
     }
 }

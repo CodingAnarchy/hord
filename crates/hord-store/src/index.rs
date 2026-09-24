@@ -630,7 +630,8 @@ mod tests {
     }
 
     #[test]
-    fn index_facts_round_trip_and_do_not_match_other_objects() {
+    fn index_facts_round_trip_and_do_not_match_other_objects()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let edge = IndexFact::Edge {
             format: super::INDEX_FACT_FORMAT,
             snapshot: oid(1),
@@ -638,21 +639,23 @@ mod tests {
             source: nid(2),
             target: nid(3),
         };
-        let bytes = encode(&edge).unwrap();
-        assert_eq!(encode(&edge).unwrap(), bytes);
+        let bytes = encode(&edge)?;
+        assert_eq!(encode(&edge)?, bytes);
         assert!(bytes.starts_with(super::EDGE_FACT_PREFIX));
         assert!(looks_like_index_fact(&bytes));
-        assert_eq!(decode::<IndexFact>(&bytes).unwrap(), edge);
+        assert_eq!(decode::<IndexFact>(&bytes)?, edge);
 
-        let blob = encode(&Blob::new(b"hi".to_vec())).unwrap();
+        let blob = encode(&Blob::new(b"hi".to_vec()))?;
         assert!(decode::<IndexFact>(&blob).is_err());
-        let map = encode(&IdentityMap::default()).unwrap();
+        let map = encode(&IdentityMap::default())?;
         assert!(decode::<IndexFact>(&map).is_err());
         assert!(!looks_like_index_fact(&map));
+        Ok(())
     }
 
     #[test]
-    fn touched_nodes_include_writes_ops_and_deltas_not_reads() {
+    fn touched_nodes_include_writes_ops_and_deltas_not_reads()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let write = nid(1);
         let read = nid(2);
         let parent = nid(3);
@@ -761,9 +764,10 @@ mod tests {
             ])
         );
         assert!(!got.contains(&read));
-        let bytes = encode(&record).unwrap();
+        let bytes = encode(&record)?;
         assert!(decode::<IndexFact>(&bytes).is_err());
         assert!(!looks_like_index_fact(&bytes));
+        Ok(())
     }
 
     #[test]

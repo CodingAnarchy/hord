@@ -8,15 +8,15 @@ use hord_core::ObjectId;
 use hord_store::Store;
 use proptest::prelude::*;
 
-fn temp_repo() -> PathBuf {
+fn temp_repo() -> std::io::Result<PathBuf> {
     static N: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "hord-store-prop-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir_all(&path).unwrap();
-    path
+    fs::create_dir_all(&path)?;
+    Ok(path)
 }
 
 proptest! {
@@ -24,21 +24,21 @@ proptest! {
 
     #[test]
     fn put_get_bytes(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
-        let path = temp_repo();
-        let store = Store::create(&path).unwrap();
-        let id = store.put(&bytes).unwrap();
+        let path = temp_repo()?;
+        let store = Store::create(&path)?;
+        let id = store.put(&bytes)?;
         prop_assert_eq!(id, ObjectId::from_canonical(&bytes));
-        prop_assert_eq!(store.get(id).unwrap(), bytes);
+        prop_assert_eq!(store.get(id)?, bytes);
         let _ = fs::remove_dir_all(&path);
     }
 
     #[test]
     fn put_pack_get(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
-        let path = temp_repo();
-        let store = Store::create(&path).unwrap();
-        let id = store.put(&bytes).unwrap();
-        store.pack().unwrap();
-        prop_assert_eq!(store.get(id).unwrap(), bytes);
+        let path = temp_repo()?;
+        let store = Store::create(&path)?;
+        let id = store.put(&bytes)?;
+        store.pack()?;
+        prop_assert_eq!(store.get(id)?, bytes);
         let _ = fs::remove_dir_all(&path);
     }
 }

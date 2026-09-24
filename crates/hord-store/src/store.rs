@@ -1057,29 +1057,31 @@ mod refs_tests {
     use super::Store;
 
     #[test]
-    fn refs_lists_flushed_and_pending_refs_by_prefix() {
+    fn refs_lists_flushed_and_pending_refs_by_prefix()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join(format!("hord-store-refs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Store::create(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
+        let store = Store::create(&dir)?;
         let a = ObjectId::from_canonical(b"a");
         let b = ObjectId::from_canonical(b"b");
-        store.set_ref("main", a).unwrap();
-        store.set_ref("release/1.0", b).unwrap();
-        store.flush().unwrap();
-        store.set_ref("release/1.1", a).unwrap();
-        store.set_ref("main", b).unwrap();
-        let all = store.refs("").unwrap();
+        store.set_ref("main", a)?;
+        store.set_ref("release/1.0", b)?;
+        store.flush()?;
+        store.set_ref("release/1.1", a)?;
+        store.set_ref("main", b)?;
+        let all = store.refs("")?;
         assert_eq!(all.len(), 3);
         assert_eq!(all["main"], b, "a pending ref wins over the flushed one");
-        let release = store.refs("release/").unwrap();
+        let release = store.refs("release/")?;
         assert_eq!(
             release.keys().map(String::as_str).collect::<Vec<_>>(),
             ["release/1.0", "release/1.1"]
         );
-        assert!(store.refs("zzz").unwrap().is_empty());
+        assert!(store.refs("zzz")?.is_empty());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
 
@@ -1092,22 +1094,24 @@ mod put_all_tests {
     /// A batch spread over several writers stores every object and
     /// returns the ids in input order, duplicates included.
     #[test]
-    fn put_all_stores_every_object_in_input_order() {
+    fn put_all_stores_every_object_in_input_order()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join(format!("hord-store-put-all-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Store::create(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
+        let store = Store::create(&dir)?;
         let mut objects: Vec<Vec<u8>> = (0..50u8).map(|n| vec![n; 64 + usize::from(n)]).collect();
         objects.push(objects[3].clone());
-        let ids = store.put_all(&objects).unwrap();
+        let ids = store.put_all(&objects)?;
         assert_eq!(ids.len(), objects.len());
         for (bytes, id) in objects.iter().zip(&ids) {
             assert_eq!(*id, ObjectId::from_canonical(bytes));
-            assert_eq!(store.get(*id).unwrap(), *bytes);
+            assert_eq!(store.get(*id)?, *bytes);
         }
-        assert!(store.put_all(&[]).unwrap().is_empty());
+        assert!(store.put_all(&[])?.is_empty());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
 
@@ -1128,11 +1132,12 @@ mod race_tests {
     /// temporary file and renamed it, a writer truncating the file under a
     /// reader failed this within a few rounds.
     #[test]
-    fn concurrent_puts_and_gets_never_read_a_torn_object() {
+    fn concurrent_puts_and_gets_never_read_a_torn_object()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join(format!("hord-store-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Arc::new(Store::create(&dir).unwrap());
+        std::fs::create_dir_all(&dir)?;
+        let store = Arc::new(Store::create(&dir)?);
         const WRITERS: usize = 4;
         const READERS: usize = 4;
         const PUTS: usize = 6;
@@ -1182,13 +1187,14 @@ mod race_tests {
                 }));
             }
             for thread in threads {
-                if let Err(err) = thread.join().unwrap() {
-                    panic!("round {round}: {err}");
+                if let Err(err) = thread.join().expect("join reader thread") {
+                    return Err(format!("round {round}: {err}").into());
                 }
             }
-            assert_eq!(store.get(id).unwrap(), *bytes);
+            assert_eq!(store.get(id)?, *bytes);
         }
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
