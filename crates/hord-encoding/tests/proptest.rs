@@ -48,16 +48,16 @@ fn arb_atom() -> impl Strategy<Value = Atom> {
 proptest! {
     #[test]
     fn encode_decode_round_trip(atom in arb_atom()) {
-        let bytes = encode(&atom).unwrap();
-        let back: Atom = decode(&bytes).unwrap();
+        let bytes = encode(&atom)?;
+        let back: Atom = decode(&bytes)?;
         prop_assert_eq!(atom, back);
     }
 
     #[test]
     fn encode_is_idempotent_after_decode(atom in arb_atom()) {
-        let first = encode(&atom).unwrap();
-        let decoded: Value = decode(&first).unwrap();
-        let second = encode(&decoded).unwrap();
+        let first = encode(&atom)?;
+        let decoded: Value = decode(&first)?;
+        let second = encode(&decoded)?;
         prop_assert_eq!(first, second);
     }
 
@@ -84,18 +84,18 @@ proptest! {
                 .collect(),
         );
 
-        let a = encode(&forward).unwrap();
-        let b = encode(&reverse).unwrap();
-        let c = encode(&as_value).unwrap();
+        let a = encode(&forward)?;
+        let b = encode(&reverse)?;
+        let c = encode(&as_value)?;
         prop_assert_eq!(&a, &b);
         prop_assert_eq!(&a, &c);
     }
 
     #[test]
     fn object_id_is_stable(atom in arb_atom()) {
-        let encoded = encode(&atom).unwrap();
-        let id1 = ObjectId::of(&atom).unwrap();
-        let id2 = ObjectId::of(&atom).unwrap();
+        let encoded = encode(&atom)?;
+        let id1 = ObjectId::of(&atom)?;
+        let id2 = ObjectId::of(&atom)?;
         let id3 = ObjectId::from_canonical(&encoded);
         prop_assert_eq!(id1, id2);
         prop_assert_eq!(id1, id3);
@@ -118,6 +118,6 @@ proptest! {
         for (k, v) in pairs.iter().rev() {
             b.insert(k.clone(), *v);
         }
-        prop_assert_eq!(ObjectId::of(&a).unwrap(), ObjectId::of(&b).unwrap());
+        prop_assert_eq!(ObjectId::of(&a)?, ObjectId::of(&b)?);
     }
 }

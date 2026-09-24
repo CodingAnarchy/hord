@@ -116,30 +116,32 @@ fn integers_preferred_serialization_boundaries() {
 }
 
 #[test]
-fn byte_strings() {
+fn byte_strings() -> Result<(), Box<dyn std::error::Error>> {
     for v in vectors().bytes {
         let payload = hex::decode(&v.bytes).unwrap_or_else(|e| panic!("{}: {e}", v.name));
         let value = Value::Bytes(payload);
         let bytes = encode(&value).unwrap_or_else(|e| panic!("{}: encode: {e}", v.name));
         assert_hex(&v.name, &bytes, &v.hex);
-        let back: Value = decode(&bytes).unwrap();
+        let back: Value = decode(&bytes)?;
         assert_eq!(back, value, "vector {}", v.name);
     }
+    Ok(())
 }
 
 #[test]
-fn text_strings() {
+fn text_strings() -> Result<(), Box<dyn std::error::Error>> {
     for v in vectors().text {
         let value = Value::Text(v.text.clone());
         let bytes = encode(&value).unwrap_or_else(|e| panic!("{}: encode: {e}", v.name));
         assert_hex(&v.name, &bytes, &v.hex);
-        let back: Value = decode(&bytes).unwrap();
+        let back: Value = decode(&bytes)?;
         assert_eq!(back, value, "vector {}", v.name);
     }
+    Ok(())
 }
 
 #[test]
-fn arrays() {
+fn arrays() -> Result<(), Box<dyn std::error::Error>> {
     let vectors = vectors();
     let empty = Value::Array(vec![]);
     let one_two_three = Value::Array(vec![
@@ -158,14 +160,15 @@ fn arrays() {
             .iter()
             .find(|(n, _)| *n == expected.name)
             .unwrap_or_else(|| panic!("missing array constructor {}", expected.name));
-        let bytes = encode(value).unwrap();
+        let bytes = encode(value)?;
         assert_hex(&expected.name, &bytes, &expected.hex);
-        assert_eq!(decode::<Value>(&bytes).unwrap(), *value);
+        assert_eq!(decode::<Value>(&bytes)?, *value);
     }
+    Ok(())
 }
 
 #[test]
-fn unsorted_maps_encode_with_bytewise_sorted_keys() {
+fn unsorted_maps_encode_with_bytewise_sorted_keys() -> Result<(), Box<dyn std::error::Error>> {
     let vectors = vectors();
 
     let empty = Value::Map(vec![]);
@@ -212,35 +215,34 @@ fn unsorted_maps_encode_with_bytewise_sorted_keys() {
             .iter()
             .find(|(n, _)| *n == expected.name)
             .unwrap_or_else(|| panic!("missing map constructor {}", expected.name));
-        let bytes = encode(value).unwrap();
+        let bytes = encode(value)?;
         assert_hex(&expected.name, &bytes, &expected.hex);
-        let back: Value = decode(&bytes).unwrap();
-        assert_eq!(encode(&back).unwrap(), bytes, "re-encode {}", expected.name);
+        let back: Value = decode(&bytes)?;
+        assert_eq!(encode(&back)?, bytes, "re-encode {}", expected.name);
     }
+    Ok(())
 }
 
 #[test]
-fn hashmap_and_value_agree_on_unsorted_text_keys() {
+fn hashmap_and_value_agree_on_unsorted_text_keys() -> Result<(), Box<dyn std::error::Error>> {
     let mut map = HashMap::new();
     map.insert("z", 1i64);
     map.insert("aa", 2);
     map.insert("b", 3);
-    assert_eq!(hex::encode(encode(&map).unwrap()), "a3616203617a0162616102");
+    assert_eq!(hex::encode(encode(&map)?), "a3616203617a0162616102");
+    Ok(())
 }
 
 #[test]
-fn object_id_of_known_fixture() {
+fn object_id_of_known_fixture() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = vectors().object_id_fixture;
     let value = Value::Map(vec![
         (Value::from("kind"), Value::from("blob")),
-        (
-            Value::from("bytes"),
-            Value::Bytes(hex::decode("deadbeef").unwrap()),
-        ),
+        (Value::from("bytes"), Value::Bytes(hex::decode("deadbeef")?)),
     ]);
-    let bytes = encode(&value).unwrap();
+    let bytes = encode(&value)?;
     assert_hex(&fixture.name, &bytes, &fixture.hex);
-    let id = ObjectId::of(&value).unwrap();
+    let id = ObjectId::of(&value)?;
     assert_eq!(id, ObjectId::from_canonical(&bytes));
     assert_eq!(
         id.to_hex(),
@@ -248,6 +250,7 @@ fn object_id_of_known_fixture() {
         "ObjectId of fixture {} changed",
         fixture.name
     );
-    let parsed: ObjectId = fixture.object_id.parse().unwrap();
+    let parsed: ObjectId = fixture.object_id.parse()?;
     assert_eq!(id, parsed);
+    Ok(())
 }
