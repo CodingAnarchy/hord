@@ -11,14 +11,16 @@
 //! 3. **Coverage.** Per checkpoint (every `--coverage-every` commits, at the
 //!    base of its first commit), per-test coverage with `cargo-llvm-cov`,
 //!    stored as coverage evidence in the hord store (ADR 0022).
-//! 4. **Commits.** Per commit, on `--jobs` workers: hord's selection on the
-//!    unmutated commit (efficiency), then one seeded fault in a function the
-//!    commit wrote that type-checks; (b) the selection and, unless (b)
-//!    detected it, (a) every test of the affected packages. A miss is a
-//!    fault (a) detects and (b) does not.
+//! 4. **Commits.** Per commit, on `--jobs` workers: the selection under
+//!    four variants from the same checkpoint (A current rules, B
+//!    region-level coverage for edited functions, C narrowed non-Rust
+//!    fallback, D both; see [`run`]), then one seeded fault in a function
+//!    the commit wrote that type-checks, graded under every variant against
+//!    (a) every test of the affected packages. A miss is a fault (a)
+//!    detects and a variant's (b) does not.
 //!
-//! Gates: zero misses; median selected ≤ 20% of the suite over unmutated
-//! commits with write set ≤ 5. Every phase writes its results under
+//! Gates (variant A, the rules in force): zero misses; median selected
+//! ≤ 20% of the suite over commits with write set ≤ 5. Every phase writes its results under
 //! `--work`, so a rerun resumes; `--budget` stops starting new work once
 //! spent.
 //!
@@ -34,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod fault;
+mod fresh;
 mod git;
 mod prepare;
 mod run;
@@ -46,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use hord_core::Actor;
+use hord_core::{Actor, RepoPath};
 use hord_store::Store;
 use hord_verify::{Checkout as VerifyCheckout, CoverageRecord, TestRef, find_coverage};
 use hord_verify_rust::coverage::{collect, record_evidence};
@@ -54,7 +57,32 @@ use hord_verify_rust::{CoverageOptions, detect_toolchain};
 use serde::{Deserialize, Serialize};
 
 use crate::prepare::Prepared;
-use crate::run::{CommitResult, Ctx};
+use crate::run::{CommitResult, Ctx, VARIANTS};
+
+/// `--sizes-ignoring` output: index, commit, write set, and per variant
+/// the size and fallback kinds.
+type SizeRow = (usize, String, usize, BTreeMap<String, (usize, Vec<String>)>);
+
+/// One test's executed lines of interest, as stored on disk.
+type LinesRow = (TestRef, Vec<(RepoPath, Vec<u32>)>);
+
+/// `*.profraw` files in the working directory modified since `since`: an
+/// instrumented binary run without `LLVM_PROFILE_FILE`. Should be empty.
+fn profraw_leaks(since: std::time::SystemTime) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(".") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".profraw"))
+        .filter(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m >= since)
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -108,6 +136,19 @@ struct Args {
     /// Write the report as JSON here.
     #[arg(long)]
     json: Option<PathBuf>,
+    /// Run the four-variant measurement (shared coverage checkpoints every
+    /// `--coverage-every` commits) instead of the lander-view grading of
+    /// ADR 0022's fresh per-test coverage (the default).
+    #[arg(long)]
+    variants: bool,
+    /// Diagnostic mode: instead of running tests, print and write (to
+    /// `--json`) each commit's variant sizes with these fallback kinds
+    /// turned off (comma-separated `Fallback::kind` names). Ungraded.
+    #[arg(long)]
+    sizes_ignoring: Option<String>,
+    /// Write a Markdown summary table here.
+    #[arg(long)]
+    summary: Option<PathBuf>,
 }
 
 fn parse_budget(text: &str) -> Result<Duration> {
@@ -178,47 +219,45 @@ struct CoverageResult {
 }
 
 #[derive(Debug, Default, Serialize)]
-struct FallbackCost {
-    /// Commits it fired on.
-    commits: usize,
-    /// Of those, with write set <= 5.
-    small_commits: usize,
-    /// Median extra tests it selected, over the commits it fired on.
-    median_extra_tests: Option<f64>,
-    /// Median selected share on those commits, with and without it.
-    median_share: Option<f64>,
-    median_share_without: Option<f64>,
+struct VariantSummary {
+    /// Median share of the suite selected over commits with write set <= 5.
+    median_share_small: Option<f64>,
+    /// Median over every commit.
+    median_share_all: Option<f64>,
+    /// Median selected test count over commits with write set <= 5.
+    median_selected_small: Option<f64>,
+    /// Faults this variant's (b) detected.
+    detected: usize,
+    /// Faults where this variant runs all of (a) (no miss possible).
+    covers_a: usize,
+    /// Misses: (a) detected, this variant did not.
+    misses: Vec<String>,
+    confirmed_misses: usize,
+    /// Commits each fallback kind fired on.
+    fallbacks: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Serialize)]
 struct Report {
     corpus_commits: usize,
     evaluated: usize,
+    errors: usize,
     complete: bool,
     prepare_secs: f64,
     quarantine: Vec<String>,
     sample: Vec<SampleResult>,
     coverage: Vec<CoverageResult>,
     faults_injected: usize,
-    faults_detected: usize,
-    /// Of those, detected by the probe alone.
-    probe_detected: usize,
-    /// Faults where (b) runs all of (a): no miss possible, not run.
-    b_covers_a: usize,
+    /// Faults (a) detected (where determined).
+    faults_detected_a: usize,
+    /// Faults whose (a) verdict was not needed (every variant detected).
+    faults_a_undetermined: usize,
     no_fault: usize,
-    misses: Vec<CommitResult>,
-    confirmed_misses: usize,
-    efficiency_commits: usize,
-    efficiency_median: Option<f64>,
-    efficiency_median_all: Option<f64>,
-    fallbacks: BTreeMap<String, usize>,
-    /// Per fallback kind: how often it fires and what it costs.
-    fallback_costs: BTreeMap<String, FallbackCost>,
-    /// Median selected share with every fallback off (coverage only), over
-    /// write set <= 5: what the fallbacks cost in total.
-    efficiency_median_without_fallbacks: Option<f64>,
+    small_commits: usize,
+    variants: BTreeMap<String, VariantSummary>,
     mean_commit_secs: f64,
-    projected_full_run_hours: f64,
+    /// `*.profraw` written into the working directory during the run.
+    profraw_in_cwd: Vec<String>,
     safety_gate: bool,
     efficiency_gate: bool,
     commits: Vec<CommitResult>,
@@ -241,6 +280,7 @@ fn median(mut v: Vec<f64>) -> Option<f64> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let started = Instant::now();
+    let started_at = std::time::SystemTime::now();
     let budget = args.budget.as_deref().map(parse_budget).transpose()?;
     let over_budget = || budget.is_some_and(|b| started.elapsed() > b);
     let corpus = corpus_dir(args.cache.clone())?;
@@ -263,26 +303,41 @@ async fn main() -> Result<()> {
     // 1. Prepare.
     let commits = git::first_parent_commits(&corpus, args.commits)?;
     // CBOR: the facts have maps keyed by NodeId and RepoPath.
-    let prepared_path = work.join("prepared.cbor");
+    let prepared_path = work.join(if args.variants {
+        "prepared.cbor"
+    } else {
+        "prepared-fresh.cbor"
+    });
+    // Fresh mode has one checkpoint: the initial full run.
+    let every = if args.variants {
+        args.coverage_every
+    } else {
+        usize::MAX
+    };
     let cached: Option<Prepared> = fs::read(&prepared_path)
         .ok()
         .and_then(|b| hord_encoding::decode(&b).ok());
-    let prepared: Prepared = match cached
-        .filter(|p| p.commits.iter().map(|c| &c.commit).eq(commits.iter()))
-    {
-        Some(p) => {
-            eprintln!("[prepare] reusing {}", prepared_path.display());
-            p
-        }
-        None => {
-            let p = prepare::prepare(&corpus, &work.join("hord"), &commits, args.coverage_every)
-                .await?;
-            fs::write(&prepared_path, hord_encoding::encode(&p)?)?;
-            p
-        }
-    };
+    let prepared: Prepared =
+        match cached.filter(|p| p.commits.iter().map(|c| &c.commit).eq(commits.iter())) {
+            Some(p) => {
+                eprintln!("[prepare] reusing {}", prepared_path.display());
+                p
+            }
+            None => {
+                let p = prepare::prepare(&corpus, &work.join("hord"), &commits, every).await?;
+                fs::write(&prepared_path, hord_encoding::encode(&p)?)?;
+                p
+            }
+        };
 
-    let workers: Vec<run::Worker> = (0..args.jobs.max(1))
+    // Fresh mode: workers 0 and 1 are the lander chain (alternating builds),
+    // the others grade.
+    let worker_count = if args.variants {
+        args.jobs.max(1)
+    } else {
+        args.jobs.max(1) + 2
+    };
+    let workers: Vec<run::Worker> = (0..worker_count)
         .map(|i| run::worker(&work, &corpus, i))
         .collect::<Result<_>>()?;
     let toolchain = detect_toolchain(&workers[0].checkout.root)?;
@@ -330,10 +385,26 @@ async fn main() -> Result<()> {
         .flat_map(|s| s.failed.iter().cloned())
         .collect();
 
+    if !args.variants {
+        return run_fresh(
+            &args,
+            &work,
+            &prepared,
+            &workers,
+            &toolchain,
+            &quarantine_names,
+            timeout,
+            started_at,
+            &in_shard,
+            &over_budget,
+        );
+    }
+
     // 3 and 4, checkpoint by checkpoint.
     let results_dir = work.join("results");
     let coverage_dir = work.join("coverage");
     let mut coverage_results = Vec::new();
+    let mut diagnostic: Vec<SizeRow> = Vec::new();
     for (j, checkpoint) in prepared.checkpoints.iter().enumerate() {
         let group: Vec<&prepare::CommitFacts> = prepared
             .commits
@@ -344,7 +415,9 @@ async fn main() -> Result<()> {
             .iter()
             .copied()
             .filter(|c| {
-                in_shard(c.index) && !results_dir.join(format!("{}.json", c.index)).exists()
+                in_shard(c.index)
+                    && (args.sizes_ignoring.is_some()
+                        || !results_dir.join(format!("{}.json", c.index)).exists())
             })
             .collect();
         let cov_path = coverage_dir.join(format!("{j}.json"));
@@ -358,9 +431,14 @@ async fn main() -> Result<()> {
             let store = Store::open(work.join("hord"))?;
             // The record is also kept as a file: prepare re-creates the store.
             let saved = coverage_dir.join(format!("{j}.cbor"));
+            let saved_lines = coverage_dir.join(format!("{j}.lines.cbor"));
             let tc = toolchain.id()?;
             let mut found = find_coverage(&store, [checkpoint.snapshot], tc)?.map(|f| f.1);
-            if found.is_none() {
+            // Variant B needs this checkpoint's line data too.
+            if !saved_lines.exists() {
+                found = None;
+            }
+            if found.is_none() && saved_lines.exists() {
                 found = fs::read(&saved)
                     .ok()
                     .and_then(|b| hord_encoding::decode::<CoverageRecord>(&b).ok())
@@ -385,6 +463,8 @@ async fn main() -> Result<()> {
                             jobs: args.coverage_jobs,
                             test_timeout: Duration::from_secs(600),
                             skip: BTreeSet::new(),
+                            only: None,
+                            lines_of_interest: checkpoint.interest.clone(),
                         },
                     )?;
                     record_evidence(
@@ -396,6 +476,19 @@ async fn main() -> Result<()> {
                     )?;
                     fs::create_dir_all(&coverage_dir)?;
                     fs::write(&saved, hord_encoding::encode(&run.record)?)?;
+                    let flat: Vec<LinesRow> = run
+                        .lines
+                        .iter()
+                        .map(|(t, l)| {
+                            (
+                                t.clone(),
+                                l.iter()
+                                    .map(|(p, n)| (p.clone(), n.iter().copied().collect()))
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                    fs::write(&saved_lines, hord_encoding::encode(&flat)?)?;
                     let r = &run.record;
                     write_json(
                         &cov_path,
@@ -423,6 +516,63 @@ async fn main() -> Result<()> {
             coverage_results.push(r);
         }
         let record = Arc::new(record);
+        let lines: BTreeMap<TestRef, BTreeMap<RepoPath, BTreeSet<u32>>> =
+            fs::read(coverage_dir.join(format!("{j}.lines.cbor")))
+                .ok()
+                .and_then(|b| hord_encoding::decode::<Vec<LinesRow>>(&b).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(t, l)| {
+                    (
+                        t,
+                        l.into_iter()
+                            .map(|(p, n)| (p, n.into_iter().collect()))
+                            .collect(),
+                    )
+                })
+                .collect();
+        if let Some(kinds) = &args.sizes_ignoring {
+            let ignore: BTreeSet<&str> = kinds.split(',').map(str::trim).collect();
+            let quarantine: BTreeSet<TestRef> = record
+                .tests
+                .iter()
+                .filter(|t| quarantine_names.contains(&t.test.name))
+                .map(|t| t.test.clone())
+                .collect();
+            let ctx = Ctx {
+                toolchain: toolchain.clone(),
+                seed: args.seed,
+                quarantine,
+                timeout,
+                idle: Duration::from_secs(args.idle_timeout_mins * 60),
+            };
+            for facts in &group {
+                let input = run::CommitInput {
+                    facts,
+                    record: &record,
+                    lines: &lines,
+                };
+                let sizes = run::sizes_ignoring(&ctx, &workers[0], &input, &ignore)?;
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    facts.index,
+                    &facts.commit[..10],
+                    facts.write_set.len(),
+                    VARIANTS
+                        .iter()
+                        .map(|v| format!("{v}={} {:?}", sizes[*v].0, sizes[*v].1))
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                );
+                diagnostic.push((
+                    facts.index,
+                    facts.commit.clone(),
+                    facts.write_set.len(),
+                    sizes,
+                ));
+            }
+            continue;
+        }
         if let Some(n) = args.explain {
             if let Some(facts) = group.iter().find(|c| c.index == n) {
                 explain(facts, &record);
@@ -444,7 +594,12 @@ async fn main() -> Result<()> {
         };
         run_parallel(&workers, todo, &over_budget, |worker, facts| {
             let t = Instant::now();
-            let result = match run::evaluate(&ctx, worker, facts, Arc::clone(&record)) {
+            let input = run::CommitInput {
+                facts,
+                record: &record,
+                lines: &lines,
+            };
+            let result = match run::evaluate(&ctx, worker, &input) {
                 Ok(r) => r,
                 Err(err) => CommitResult {
                     index: facts.index,
@@ -453,20 +608,31 @@ async fn main() -> Result<()> {
                     ..CommitResult::default()
                 },
             };
+            let cell = |v: &str| {
+                result.variants.get(v).map_or("-".to_owned(), |r| {
+                    let d = match r.detected {
+                        Some(true) => "+",
+                        Some(false) if r.miss => "MISS",
+                        Some(false) => "-",
+                        None => "",
+                    };
+                    format!("{v}={}{d}", r.selected)
+                })
+            };
             eprintln!(
-                "[commit {}] {} ws={} selected {}/{} fault={} b={} a={:?} miss={} ({:.0}s)",
+                "[commit {}] {} ws={} {} {} {} {} fault={} a={:?} ({:.0}s)",
                 facts.index,
                 &facts.commit[..10],
                 result.write_set,
-                result.selection.selected,
-                result.selection.suite,
+                cell("A"),
+                cell("B"),
+                cell("C"),
+                cell("D"),
                 result
                     .fault
                     .as_ref()
                     .map_or("none".to_owned(), |f| format!("{:?}", f.kind)),
-                result.detected_b,
                 result.detected_a,
-                result.miss,
                 t.elapsed().as_secs_f64()
             );
             if let Some(e) = &result.error {
@@ -476,6 +642,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    if args.sizes_ignoring.is_some() {
+        if let Some(path) = &args.json {
+            write_json(path, &diagnostic)?;
+        }
+        return Ok(());
+    }
     // Report.
     let results: Vec<CommitResult> = prepared
         .commits
@@ -490,12 +662,124 @@ async fn main() -> Result<()> {
         coverage_results,
         &quarantine_names,
     );
+    let mut report = report;
+    report.profraw_in_cwd = profraw_leaks(started_at);
     print_report(&report);
     if let Some(path) = &args.json {
         write_json(path, &report)?;
     }
+    if let Some(path) = &args.summary {
+        fs::write(path, summary(&report))?;
+    }
     if report.complete && !(report.safety_gate && report.efficiency_gate) {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The lander-view grading of ADR 0022 as amended ([`fresh`]).
+#[allow(clippy::too_many_arguments)]
+fn run_fresh(
+    args: &Args,
+    work: &Path,
+    prepared: &Prepared,
+    workers: &[run::Worker],
+    toolchain: &hord_verify::Toolchain,
+    quarantine_names: &BTreeSet<String>,
+    timeout: Duration,
+    started_at: std::time::SystemTime,
+    in_shard: &(dyn Fn(usize) -> bool + Sync),
+    over_budget: &(dyn Fn() -> bool + Sync),
+) -> Result<()> {
+    let checkpoint = prepared.checkpoints.first().context("no checkpoint")?;
+    let initial_path = fresh::initial_path(work);
+    let initial_meta = work.join("chain/initial.json");
+    let initial: CoverageRecord = match fs::read(&initial_path)
+        .ok()
+        .and_then(|b| hord_encoding::decode::<CoverageRecord>(&b).ok())
+        .filter(|r| r.snapshot == checkpoint.snapshot)
+    {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "[coverage] initial full run at {}",
+                &checkpoint.commit[..10]
+            );
+            let w = &workers[0];
+            w.checkout.checkout(&checkpoint.commit)?;
+            let run = collect(
+                &VerifyCheckout {
+                    root: w.checkout.root.clone(),
+                    snapshot: checkpoint.snapshot,
+                },
+                toolchain,
+                &checkpoint.defs,
+                &CoverageOptions {
+                    packages: None,
+                    target_dir: work.join("coverage-target"),
+                    jobs: args.coverage_jobs,
+                    test_timeout: Duration::from_secs(600),
+                    skip: BTreeSet::new(),
+                    only: None,
+                    lines_of_interest: BTreeMap::new(),
+                },
+            )?;
+            fs::create_dir_all(work.join("chain"))?;
+            fs::write(&initial_path, hord_encoding::encode(&run.record)?)?;
+            write_json(
+                &initial_meta,
+                &(run.elapsed_ms, run.record.tests.len(), run.log.clone()),
+            )?;
+            eprintln!(
+                "[coverage] {} tests, {} definitions, {:.1} min",
+                run.record.tests.len(),
+                run.record.defs.len(),
+                run.elapsed_ms as f64 / 60_000.0
+            );
+            run.record
+        }
+    };
+    let initial_secs =
+        read_json::<(u64, usize, String)>(&initial_meta).map_or(0.0, |m| m.0 as f64 / 1000.0);
+    let quarantine: BTreeSet<TestRef> = initial
+        .tests
+        .iter()
+        .filter(|t| quarantine_names.contains(&t.test.name))
+        .map(|t| t.test.clone())
+        .collect();
+    let ctx = Ctx {
+        toolchain: toolchain.clone(),
+        seed: args.seed,
+        quarantine,
+        timeout,
+        idle: Duration::from_secs(args.idle_timeout_mins * 60),
+    };
+    anyhow::ensure!(
+        workers.len() >= 3,
+        "fresh mode needs two chain workers and a grader"
+    );
+    let (chain_workers, graders) = workers.split_at(2);
+    fresh::run(
+        &fresh::FreshRun {
+            ctx: &ctx,
+            prepared,
+            work,
+            coverage_jobs: args.coverage_jobs,
+            initial,
+            in_shard,
+            over_budget,
+        },
+        chain_workers,
+        graders,
+    )?;
+    let mut report = fresh::report(work, prepared, initial_secs);
+    report.profraw_in_cwd = profraw_leaks(started_at);
+    let md = fresh::print(&report);
+    if let Some(path) = &args.json {
+        write_json(path, &report)?;
+    }
+    if let Some(path) = &args.summary {
+        fs::write(path, md)?;
     }
     Ok(())
 }
@@ -560,7 +844,7 @@ fn explain(facts: &prepare::CommitFacts, record: &CoverageRecord) {
 }
 
 fn report(
-    args: &Args,
+    _args: &Args,
     prepared: &Prepared,
     results: Vec<CommitResult>,
     sample: Vec<SampleResult>,
@@ -569,143 +853,98 @@ fn report(
 ) -> Report {
     let ok: Vec<&CommitResult> = results.iter().filter(|r| r.error.is_none()).collect();
     let faulted: Vec<&&CommitResult> = ok.iter().filter(|r| r.fault.is_some()).collect();
-    let detected = faulted
-        .iter()
-        .filter(|r| r.detected_b || r.detected_a == Some(true))
-        .count();
-    let b_covers_a = faulted.iter().filter(|r| r.b_covers_a).count();
-    let probe_detected = faulted.iter().filter(|r| r.probe_detected).count();
-    let misses: Vec<CommitResult> = ok.iter().filter(|r| r.miss).map(|r| (*r).clone()).collect();
-    let ratio = |r: &CommitResult| r.selection.selected as f64 / r.selection.suite.max(1) as f64;
-    let small: Vec<f64> = ok
-        .iter()
-        .filter(|r| r.write_set <= 5)
-        .map(|r| ratio(r))
-        .collect();
-    let all: Vec<f64> = ok.iter().map(|r| ratio(r)).collect();
-    // kind -> (commits, small commits, extra tests, share, share without)
-    type Tally = (usize, usize, Vec<f64>, Vec<f64>, Vec<f64>);
-    let mut costs: BTreeMap<String, Tally> = BTreeMap::new();
-    for r in &ok {
-        let suite = r.selection.suite.max(1) as f64;
-        for (kind, without) in &r.selection.without {
-            let e = costs.entry(kind.clone()).or_default();
-            e.0 += 1;
-            if r.write_set <= 5 {
-                e.1 += 1;
+    let mut variants = BTreeMap::new();
+    for v in VARIANTS {
+        let share = |r: &CommitResult| {
+            r.variants
+                .get(v)
+                .map(|x| x.selected as f64 / x.suite.max(1) as f64)
+        };
+        let small: Vec<&&CommitResult> = ok.iter().filter(|r| r.write_set <= 5).collect();
+        let mut fallbacks: BTreeMap<String, usize> = BTreeMap::new();
+        for r in &ok {
+            if let Some(x) = r.variants.get(v) {
+                if x.fallbacks.is_empty() {
+                    *fallbacks.entry("(none)".into()).or_default() += 1;
+                }
+                for k in &x.fallbacks {
+                    *fallbacks.entry(k.clone()).or_default() += 1;
+                }
             }
-            e.2.push(r.selection.selected.saturating_sub(*without) as f64);
-            e.3.push(r.selection.selected as f64 / suite);
-            e.4.push(*without as f64 / suite);
         }
-    }
-    let fallback_costs = costs
-        .into_iter()
-        .map(
-            |(k, (commits, small_commits, extra, share, share_without))| {
-                (
-                    k,
-                    FallbackCost {
-                        commits,
-                        small_commits,
-                        median_extra_tests: median(extra),
-                        median_share: median(share),
-                        median_share_without: median(share_without),
-                    },
-                )
+        let get = |r: &CommitResult| r.variants.get(v).cloned().unwrap_or_default();
+        variants.insert(
+            v.to_owned(),
+            VariantSummary {
+                median_share_small: median(small.iter().filter_map(|r| share(r)).collect()),
+                median_share_all: median(ok.iter().filter_map(|r| share(r)).collect()),
+                median_selected_small: median(
+                    small
+                        .iter()
+                        .filter_map(|r| r.variants.get(v))
+                        .map(|x| x.selected as f64)
+                        .collect(),
+                ),
+                detected: faulted
+                    .iter()
+                    .filter(|r| get(r).detected == Some(true))
+                    .count(),
+                covers_a: faulted.iter().filter(|r| get(r).covers_a).count(),
+                misses: faulted
+                    .iter()
+                    .filter(|r| get(r).miss)
+                    .map(|r| format!("{} {}", r.index, &r.commit[..10]))
+                    .collect(),
+                confirmed_misses: faulted.iter().filter(|r| get(r).confirmed_miss).count(),
+                fallbacks,
             },
-        )
-        .collect();
-    let without_any: Vec<f64> = ok
-        .iter()
-        .filter(|r| r.write_set <= 5)
-        .map(|r| r.selection.without_any as f64 / r.selection.suite.max(1) as f64)
-        .collect();
-    let mut fallbacks: BTreeMap<String, usize> = BTreeMap::new();
-    for r in &ok {
-        for k in r.selection.without.keys().cloned() {
-            *fallbacks.entry(k).or_default() += 1;
-        }
-        if r.selection.fallbacks.is_empty() {
-            *fallbacks.entry("(none)".into()).or_default() += 1;
-        }
+        );
     }
     let mean_commit_secs = if ok.is_empty() {
         0.0
     } else {
         ok.iter().map(|r| r.total_ms as f64 / 1000.0).sum::<f64>() / ok.len() as f64
     };
-    let sample_secs = if sample.is_empty() {
-        0.0
-    } else {
-        sample
-            .iter()
-            .map(|s| s.elapsed_ms as f64 / 1000.0)
-            .sum::<f64>()
-            / sample.len() as f64
-    };
-    let coverage_secs = if coverage.is_empty() {
-        0.0
-    } else {
-        coverage
-            .iter()
-            .map(|c| c.elapsed_ms as f64 / 1000.0)
-            .sum::<f64>()
-            / coverage.len() as f64
-    };
-    let jobs = args.jobs.max(1) as f64;
-    let checkpoints = 500usize.div_ceil(args.coverage_every.max(1)) as f64;
-    let projected =
-        (500.0 * mean_commit_secs / jobs + 20.0 * sample_secs / jobs + checkpoints * coverage_secs)
-            / 3600.0;
-    let efficiency_median = median(small.clone());
     let complete = results.len() == prepared.commits.len() && prepared.commits.len() >= 500;
+    let a = &variants["A"];
     Report {
         corpus_commits: prepared.commits.len(),
         evaluated: results.len(),
+        errors: results.len() - ok.len(),
         complete,
         prepare_secs: prepared.prepare_ms as f64 / 1000.0,
         quarantine: quarantine.iter().cloned().collect(),
         sample,
         coverage,
         faults_injected: faulted.len(),
-        faults_detected: detected,
-        probe_detected,
-        b_covers_a,
+        faults_detected_a: faulted
+            .iter()
+            .filter(|r| r.detected_a == Some(true))
+            .count(),
+        faults_a_undetermined: faulted.iter().filter(|r| r.detected_a.is_none()).count(),
         no_fault: ok.iter().filter(|r| r.fault.is_none()).count(),
-        confirmed_misses: misses.iter().filter(|m| m.confirmed_miss).count(),
-        safety_gate: misses.is_empty(),
-        misses,
-        efficiency_commits: small.len(),
-        efficiency_gate: efficiency_median.is_some_and(|m| m <= 0.20),
-        efficiency_median,
-        efficiency_median_all: median(all),
-        fallbacks,
-        fallback_costs,
-        efficiency_median_without_fallbacks: median(without_any),
+        small_commits: ok.iter().filter(|r| r.write_set <= 5).count(),
+        safety_gate: a.misses.is_empty(),
+        efficiency_gate: a.median_share_small.is_some_and(|m| m <= 0.20),
+        variants,
         mean_commit_secs,
-        projected_full_run_hours: projected,
+        profraw_in_cwd: Vec::new(),
         commits: results,
     }
 }
 
+fn pct(m: Option<f64>) -> String {
+    m.map_or("n/a".to_owned(), |m| format!("{:.1}%", m * 100.0))
+}
+
 fn print_report(r: &Report) {
     println!(
-        "M4 selection eval ({} of {} commits evaluated{})",
+        "M4 selection eval: {} of {} commits evaluated ({} errors){}",
         r.evaluated,
         r.corpus_commits,
+        r.errors,
         if r.complete { "" } else { ", incomplete" }
     );
-    println!("  prepare: {:.1}s", r.prepare_secs);
-    for s in &r.sample {
-        println!(
-            "  full-suite sample {}: {} failed, {:.1} min",
-            &s.commit[..10],
-            s.failed.len(),
-            s.elapsed_ms as f64 / 60_000.0
-        );
-    }
-    println!("  quarantined: {:?}", r.quarantine);
     for c in &r.coverage {
         println!(
             "  coverage checkpoint {} ({}): {} tests ({} failed), {} defs, {:.1} min",
@@ -717,51 +956,32 @@ fn print_report(r: &Report) {
             c.elapsed_ms as f64 / 60_000.0
         );
     }
+    println!("  quarantined: {:?}", r.quarantine);
     println!(
-        "  safety: {} faults injected, {} detected ({} by the probe), {} where (b) runs all of (a), {} misses ({} confirmed), {} commits without a fault",
-        r.faults_injected,
-        r.faults_detected,
-        r.probe_detected,
-        r.b_covers_a,
-        r.misses.len(),
-        r.confirmed_misses,
-        r.no_fault
+        "  faults: {} injected, (a) detected {} ({} not needed), {} commits without a fault",
+        r.faults_injected, r.faults_detected_a, r.faults_a_undetermined, r.no_fault
     );
-    for m in &r.misses {
+    for (v, s) in &r.variants {
         println!(
-            "    MISS {} {:?} failed_a={:?}",
-            m.commit, m.fault, m.failed_a
+            "  {v}: median {} (write set <= 5, n={}), all {}; detected {}, covers (a) {}, misses {} ({} confirmed) {:?}",
+            pct(s.median_share_small),
+            r.small_commits,
+            pct(s.median_share_all),
+            s.detected,
+            s.covers_a,
+            s.misses.len(),
+            s.confirmed_misses,
+            s.misses
         );
+        println!("     fallbacks: {:?}", s.fallbacks);
     }
-    let pct = |m: Option<f64>| m.map_or("n/a".to_owned(), |m| format!("{:.1}%", m * 100.0));
+    println!("  mean {:.0}s per commit", r.mean_commit_secs);
     println!(
-        "  efficiency: median selected {} of the suite over {} commits with write set <= 5 (all commits: {})",
-        pct(r.efficiency_median),
-        r.efficiency_commits,
-        pct(r.efficiency_median_all)
-    );
-    println!("  fallbacks (commits): {:?}", r.fallbacks);
-    println!(
-        "  with every fallback off (coverage only): median {} for write set <= 5",
-        pct(r.efficiency_median_without_fallbacks)
-    );
-    for (kind, c) in &r.fallback_costs {
-        println!(
-            "    {kind}: fired on {} commits ({} with write set <= 5), median +{} tests, median share {} -> {} without it",
-            c.commits,
-            c.small_commits,
-            c.median_extra_tests
-                .map_or("n/a".into(), |v| format!("{v:.0}")),
-            pct(c.median_share),
-            pct(c.median_share_without)
-        );
-    }
-    println!(
-        "  mean {:.0}s per commit; projected full run (500 commits): {:.1} h",
-        r.mean_commit_secs, r.projected_full_run_hours
+        "  profraw written to the working directory: {:?}",
+        r.profraw_in_cwd
     );
     println!(
-        "  gates: safety {} efficiency {}{}",
+        "  gates (A): safety {} efficiency {}{}",
         if r.safety_gate { "PASS" } else { "FAIL" },
         if r.efficiency_gate { "PASS" } else { "FAIL" },
         if r.complete {
@@ -770,4 +990,89 @@ fn print_report(r: &Report) {
             " (not gated: incomplete run)"
         }
     );
+}
+
+/// The Markdown summary: one row per variant, then one per commit.
+fn summary(r: &Report) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# M4 selection variants ({} commits, {} with write set <= 5, {} faults)
+
+",
+        r.evaluated, r.small_commits, r.faults_injected
+    ));
+    out.push_str("| Variant | Median share (ws <= 5) | Median tests (ws <= 5) | Median share (all) | Detected | Covers (a) | Misses (confirmed) |\n|---|---|---|---|---|---|---|\n");
+    let names = [
+        ("A", "current rules"),
+        ("B", "region-level coverage"),
+        ("C", "narrowed non-Rust fallback"),
+        ("D", "B + C"),
+    ];
+    for (v, label) in names {
+        let s = &r.variants[v];
+        out.push_str(&format!(
+            "| {v} {label} | {} | {} | {} | {} | {} | {} ({}) |\n",
+            pct(s.median_share_small),
+            s.median_selected_small
+                .map_or("n/a".into(), |m| format!("{m:.0}")),
+            pct(s.median_share_all),
+            s.detected,
+            s.covers_a,
+            s.misses.len(),
+            s.confirmed_misses
+        ));
+    }
+    out.push_str("\n## Fallback kinds (commits fired)\n\n| Kind |");
+    for (v, _) in names {
+        out.push_str(&format!(" {v} |"));
+    }
+    out.push_str("\n|---|---|---|---|---|\n");
+    let kinds: BTreeSet<&String> = r
+        .variants
+        .values()
+        .flat_map(|s| s.fallbacks.keys())
+        .collect();
+    for k in kinds {
+        out.push_str(&format!("| {k} |"));
+        for (v, _) in names {
+            out.push_str(&format!(
+                " {} |",
+                r.variants[v].fallbacks.get(k).copied().unwrap_or(0)
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str("\n## Commits\n\n| # | Commit | ws | A | B | C | D | Fault | (a) |\n|---|---|---|---|---|---|---|---|---|\n");
+    for c in &r.commits {
+        let cell = |v: &str| {
+            c.variants.get(v).map_or("-".into(), |x| {
+                let d = match (x.detected, x.miss) {
+                    (_, true) => " MISS",
+                    (Some(true), _) => " ✓",
+                    _ => "",
+                };
+                format!("{}{d}", x.selected)
+            })
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            c.index,
+            &c.commit[..10],
+            c.write_set,
+            cell("A"),
+            cell("B"),
+            cell("C"),
+            cell("D"),
+            c.fault.as_ref().map_or_else(
+                || c.error.clone().map_or("none".into(), |_| "error".into()),
+                |f| format!("{:?} `{}`", f.kind, f.name)
+            ),
+            c.detected_a.map_or("-".into(), |d| d.to_string())
+        ));
+    }
+    out.push_str(&format!(
+        "\nprofraw written to the working directory: {:?}\n",
+        r.profraw_in_cwd
+    ));
+    out
 }
