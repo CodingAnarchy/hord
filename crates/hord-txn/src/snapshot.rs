@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use hord_core::{
-    Blob, Bytes, IdentityEntry, IdentityTree, ObjectId, RepoPath, Snapshot, SnapshotId, Tree,
-    TreeEntry,
+    Blob, Bytes, IdentityEntry, IdentityTree, IdentityTrees, ObjectId, RepoPath, Snapshot,
+    SnapshotId, Tree, TreeEntry, edit_identity_tree,
 };
 
 use crate::repo::{Inner, lock};
@@ -194,70 +194,14 @@ impl Inner {
             .filter(|(path, _)| !path.is_root())
             .map(|(path, id)| (path.components(), *id))
             .collect();
-        match self.update_identity_subtree(snapshot, Some(root), &list)? {
+        let mut trees = SnapshotIdentityTrees {
+            inner: self,
+            snapshot,
+        };
+        match edit_identity_tree(&mut trees, Some(root), &list)? {
             Some(id) => Ok(id),
             None => Ok(self.store.put_object(&IdentityTree::default())?),
         }
-    }
-
-    fn update_identity_subtree(
-        &self,
-        snapshot: SnapshotId,
-        tree: Option<ObjectId>,
-        changes: PathChangesRef<'_, '_>,
-    ) -> Result<Option<ObjectId>> {
-        let mut out = match tree {
-            Some(id) => (*self.identity_tree(snapshot, id)?).clone(),
-            None => IdentityTree::default(),
-        };
-        let mut nested: BTreeMap<&str, PathChanges<'_>> = BTreeMap::new();
-        for (components, identity) in changes {
-            match components {
-                [name] => match identity {
-                    Some(id) => {
-                        out.entries.insert(name.clone(), IdentityEntry::File(*id));
-                    }
-                    None => {
-                        if matches!(out.entries.get(name), Some(IdentityEntry::File(_))) {
-                            out.entries.remove(name);
-                        }
-                    }
-                },
-                [dir, rest @ ..] => nested
-                    .entry(dir.as_str())
-                    .or_default()
-                    .push((rest, *identity)),
-                [] => {}
-            }
-        }
-        for (dir, sub) in nested {
-            let existing = match out.entries.get(dir) {
-                Some(IdentityEntry::Dir(id)) => Some(*id),
-                _ => None,
-            };
-            if existing.is_none() && sub.iter().all(|(_, id)| id.is_none()) {
-                continue;
-            }
-            match self.update_identity_subtree(snapshot, existing, &sub)? {
-                Some(id) => {
-                    out.entries.insert(dir.to_owned(), IdentityEntry::Dir(id));
-                }
-                None => {
-                    out.entries.remove(dir);
-                }
-            }
-        }
-        if out.entries.is_empty() {
-            return Ok(None);
-        }
-        let id = self.store.put_object(&out)?;
-        cache_insert(
-            &self.identity_trees,
-            MAX_CACHED_SNAPSHOTS,
-            id,
-            Arc::new(out),
-        );
-        Ok(Some(id))
     }
 
     pub(crate) fn tree(&self, id: ObjectId) -> Result<Arc<Tree>> {
@@ -518,5 +462,31 @@ impl Inner {
         let id = self.store.put_object(&out)?;
         cache_insert(&self.trees, MAX_CACHED_TREES, id, Arc::new(out));
         Ok(Some(id))
+    }
+}
+
+/// The identity trees of `snapshot`: read through the cache, a missing one
+/// is [`Error::MissingIdentity`]; written to the store and the cache.
+struct SnapshotIdentityTrees<'a> {
+    inner: &'a Inner,
+    snapshot: SnapshotId,
+}
+
+impl IdentityTrees for SnapshotIdentityTrees<'_> {
+    type Error = Error;
+
+    fn load(&mut self, id: ObjectId) -> Result<IdentityTree> {
+        Ok((*self.inner.identity_tree(self.snapshot, id)?).clone())
+    }
+
+    fn store(&mut self, tree: IdentityTree) -> Result<ObjectId> {
+        let id = self.inner.store.put_object(&tree)?;
+        cache_insert(
+            &self.inner.identity_trees,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::new(tree),
+        );
+        Ok(id)
     }
 }
