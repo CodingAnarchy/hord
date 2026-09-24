@@ -1,13 +1,13 @@
 //! Apply a definition-granularity edit script to an identified tree.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hord_core::{NodeId, ObjectId, Op, RepoPath};
 use hord_lang::{IdentifiedTree, NodeTree, Site};
 
 use crate::Error;
-use crate::defs::{chain, file_parent, oid_of, root_sentinel, site_of, swap_root};
+use crate::defs::{chain, oid_of, site_of};
 use crate::graft::graft;
 
 /// Apply `ops` to `base` (the file at `path`), producing a new identified
@@ -18,9 +18,10 @@ use crate::graft::graft;
 /// nodes must already be interned in `store` (the `result` tree passed to
 /// [`crate::diff`], or a union of trees for a merge).
 ///
-/// The file root is [`file_parent`]`(path)` (ADR 0015). A Replace of that id
-/// swaps the file's glue or, on an empty base, creates the file. An op that
-/// names [`NodeId::nil`] is rejected: nil is not a file parent.
+/// The file root is [`NodeId::file_root`]`(path)` (ADR 0015). A Replace of
+/// that id swaps the file's glue or, on an empty base, creates the file. An
+/// op that names any other id not in `base` (such as [`NodeId::nil`]) fails
+/// with [`Error::MissingId`].
 ///
 /// Ops are classified and applied in a fixed order (replaces, deletes,
 /// moves, inserts). Insert indices are result-side CST positions and are
@@ -31,17 +32,96 @@ pub fn apply(
     ops: &[Op],
     store: &NodeTree,
 ) -> Result<IdentifiedTree, Error> {
-    if ops
-        .iter()
-        .any(|op| crate::defs::mentions(op, root_sentinel()))
-    {
-        return Err(Error::apply(
-            "an op names the nil NodeId; the file parent is file_parent(path) (ADR 0015)",
-        ));
+    let root = NodeId::file_root(path);
+    check_replace_sources(base, ops, root)?;
+    apply_internal(base, ops, store, root)
+}
+
+/// [`apply`] with a `store` whose definitions have ids: typically the result
+/// of the change the ops were diffed from. Content the ops bring in takes
+/// its ids from `store` instead of fresh ones:
+///
+/// - a replaced definition's subtree takes the ids under that definition in
+///   `store`;
+/// - the sites of each inserted content id are paired, in preorder, with the
+///   sites of that content in `store` whose ids `base` does not have.
+///
+/// Every id in the result is from `base` or `store`. A definition whose id
+/// cannot be placed that way (a replaced definition missing from `store`,
+/// or inserted content that occurs a different number of times on the two
+/// sides) is left without one, so a caller can tell and carry identity
+/// instead.
+pub fn apply_identified(
+    path: &RepoPath,
+    base: &IdentifiedTree,
+    ops: &[Op],
+    store: &IdentifiedTree,
+) -> Result<IdentifiedTree, Error> {
+    let root = NodeId::file_root(path);
+    let mut applied = apply(path, base, ops, &store.tree)?;
+    let mut ids = applied.ids.clone();
+    let mut inserted = BTreeSet::new();
+    for op in ops {
+        match op {
+            Op::Replace { node, .. } => {
+                let Some(at) = site_of(&applied, *node, root) else {
+                    continue;
+                };
+                match site_of(store, *node, root) {
+                    Some(from) => copy_subtree(&mut ids, store, &from, &at),
+                    None => ids.retain(|site, _| !site.starts_with(&at)),
+                }
+            }
+            Op::Insert { node, .. } => {
+                inserted.insert(*node);
+            }
+            _ => {}
+        }
     }
-    let ops = swap_root(ops, file_parent(path), root_sentinel());
-    check_replace_sources(base, &ops, file_parent(path))?;
-    apply_internal(base, &ops, store)
+    let base_ids: HashSet<NodeId> = base.ids.values().copied().collect();
+    let known: HashSet<NodeId> = base_ids.iter().chain(store.ids.values()).copied().collect();
+    for oid in inserted {
+        // Sites `apply` gave a fresh id, and new sites of the same content in
+        // `store`.
+        let targets: Vec<&Site> = applied
+            .ids
+            .iter()
+            .filter(|(site, id)| !known.contains(id) && applied.oid_at(site) == Some(oid))
+            .map(|(site, _)| site)
+            .collect();
+        let sources: Vec<&Site> = store
+            .ids
+            .iter()
+            .filter(|(site, id)| !base_ids.contains(id) && store.oid_at(site) == Some(oid))
+            .map(|(site, _)| site)
+            .collect();
+        if targets.len() == sources.len() {
+            for (at, from) in targets.into_iter().zip(sources) {
+                copy_subtree(&mut ids, store, from, at);
+            }
+        }
+    }
+    ids.retain(|site, id| known.contains(id) && applied.oid_at(site).is_some());
+    applied.ids = ids;
+    Ok(applied)
+}
+
+/// Replace the ids at and below `at` with `store`'s ids at and below
+/// `from`, at the same relative sites.
+fn copy_subtree(
+    ids: &mut BTreeMap<Site, NodeId>,
+    store: &IdentifiedTree,
+    from: &[u32],
+    at: &[u32],
+) {
+    ids.retain(|site, _| !site.starts_with(at));
+    for (site, id) in &store.ids {
+        if site.starts_with(from) {
+            let mut key = at.to_vec();
+            key.extend_from_slice(&site[from.len()..]);
+            ids.insert(key, *id);
+        }
+    }
 }
 
 /// Every [`Op::Replace`] must find its `from` at its node in `base`, so a
@@ -53,16 +133,11 @@ fn check_replace_sources(base: &IdentifiedTree, ops: &[Op], root: NodeId) -> Res
     }
     for op in ops {
         if let Op::Replace { node, from, .. } = op
-            && let Some(found) = oid_of(base, *node)
+            && let Some(found) = oid_of(base, *node, root)
             && found != *from
         {
-            let node = if *node == root_sentinel() {
-                root
-            } else {
-                *node
-            };
             return Err(Error::StaleReplace {
-                node,
+                node: *node,
                 expected: *from,
                 found,
             });
@@ -71,17 +146,19 @@ fn check_replace_sources(base: &IdentifiedTree, ops: &[Op], root: NodeId) -> Res
     Ok(())
 }
 
-/// [`apply`] with the file root as [`root_sentinel`].
+/// [`apply`] without the stale-Replace check, for a file whose root id is
+/// `root`.
 pub(crate) fn apply_internal(
     base: &IdentifiedTree,
     ops: &[Op],
     store: &NodeTree,
+    root: NodeId,
 ) -> Result<IdentifiedTree, Error> {
     let mut working = base.clone();
     if working.tree.root().is_none() {
         if let Some(Op::Replace { to, .. }) = ops
             .iter()
-            .find(|o| matches!(o, Op::Replace { node, .. } if *node == root_sentinel()))
+            .find(|o| matches!(o, Op::Replace { node, .. } if *node == root))
         {
             graft(&mut working.tree, store, *to)?;
             working.tree.set_root(*to)?;
@@ -135,36 +212,36 @@ pub(crate) fn apply_internal(
 
     // Ancestors first, then content id. `NodeId` is a random ULID and must
     // not decide which edit lands.
-    replaces.sort_by_key(|op| content_order(base, op.node));
+    replaces.sort_by_key(|op| content_order(base, op.node, root));
 
     for op in replaces {
         graft(&mut working.tree, store, op.to)?;
-        apply_replace(&mut working, op.node, op.to)?;
+        apply_replace(&mut working, op.node, op.to, root)?;
     }
 
     deletes.sort_by_key(|node| {
-        let (depth, oid) = content_order(&working, *node);
+        let (depth, oid) = content_order(&working, *node, root);
         (Reverse(depth), oid)
     });
 
     for node in deletes {
-        apply_delete(&mut working, node)?;
+        apply_delete(&mut working, node, root)?;
     }
 
     moves.sort_by_key(|op| {
-        let (_, oid) = content_order(&working, op.node);
-        let (_, parent) = content_order(&working, op.to_parent);
+        let (_, oid) = content_order(&working, op.node, root);
+        let (_, parent) = content_order(&working, op.to_parent, root);
         (op.index, parent, oid)
     });
 
     for op in moves {
-        apply_move(&mut working, op.node, op.to_parent, op.index)?;
+        apply_move(&mut working, op.node, op.to_parent, op.index, root)?;
     }
 
     // Inserts last so `index` is the result-side CST index after deletes.
     for op in inserts {
         graft(&mut working.tree, store, op.node)?;
-        apply_insert(&mut working, op.parent, op.index, op.node)?;
+        apply_insert(&mut working, op.parent, op.index, op.node, root)?;
     }
 
     let seps = trailing_commas(store);
@@ -272,15 +349,20 @@ struct InsertEdit {
 
 /// Tree depth, then the node's content id. Both come from the CST, not from
 /// a generated [`NodeId`].
-fn content_order(tree: &IdentifiedTree, node: NodeId) -> (usize, ObjectId) {
-    match (site_of(tree, node), oid_of(tree, node)) {
+fn content_order(tree: &IdentifiedTree, node: NodeId, root: NodeId) -> (usize, ObjectId) {
+    match (site_of(tree, node, root), oid_of(tree, node, root)) {
         (Some(site), Some(oid)) => (site.len(), oid),
         _ => (usize::MAX, ObjectId::from_bytes([0; 32])),
     }
 }
 
-fn apply_replace(working: &mut IdentifiedTree, node_id: NodeId, to: ObjectId) -> Result<(), Error> {
-    let site = site_of(working, node_id).ok_or(Error::MissingId(node_id))?;
+fn apply_replace(
+    working: &mut IdentifiedTree,
+    node_id: NodeId,
+    to: ObjectId,
+    root: NodeId,
+) -> Result<(), Error> {
+    let site = site_of(working, node_id, root).ok_or(Error::MissingId(node_id))?;
     let old = working.oid_at(&site).ok_or(Error::MissingId(node_id))?;
     if old == to {
         return Ok(());
@@ -290,14 +372,14 @@ fn apply_replace(working: &mut IdentifiedTree, node_id: NodeId, to: ObjectId) ->
     working
         .ids
         .retain(|key, _| !(key.len() > site.len() && key.starts_with(&site)));
-    if node_id != root_sentinel() {
+    if node_id != root {
         working.ids.insert(site, node_id);
     }
     Ok(())
 }
 
-fn apply_delete(working: &mut IdentifiedTree, node_id: NodeId) -> Result<(), Error> {
-    let Some(site) = site_of(working, node_id) else {
+fn apply_delete(working: &mut IdentifiedTree, node_id: NodeId, root: NodeId) -> Result<(), Error> {
+    let Some(site) = site_of(working, node_id, root) else {
         return Ok(());
     };
     remove_at(working, &site)?;
@@ -309,8 +391,9 @@ fn apply_insert(
     parent: NodeId,
     index: u32,
     node: ObjectId,
+    root: NodeId,
 ) -> Result<(), Error> {
-    let (container, fallback) = insert_container(working, parent)?;
+    let (container, fallback) = insert_container(working, parent, root)?;
     let idx = child_index(working, &container, fallback, index)?;
     let at = insert_at(working, &container, idx, node)?;
     working.ids.entry(at).or_insert_with(NodeId::generate);
@@ -322,8 +405,9 @@ fn apply_move(
     node_id: NodeId,
     to_parent: NodeId,
     index: u32,
+    root: NodeId,
 ) -> Result<(), Error> {
-    let site = site_of(working, node_id).ok_or(Error::MissingId(node_id))?;
+    let site = site_of(working, node_id, root).ok_or(Error::MissingId(node_id))?;
     let oid = working.oid_at(&site).ok_or(Error::MissingId(node_id))?;
     // Ids at and below the moved node, relative to it.
     let carried: Vec<(Site, NodeId)> = working
@@ -334,7 +418,7 @@ fn apply_move(
         .collect();
     remove_at(working, &site)?;
 
-    let dest_site = site_of(working, to_parent).ok_or(Error::MissingId(to_parent))?;
+    let dest_site = site_of(working, to_parent, root).ok_or(Error::MissingId(to_parent))?;
     let dest_oid = working
         .oid_at(&dest_site)
         .ok_or(Error::MissingId(to_parent))?;
@@ -342,7 +426,7 @@ fn apply_move(
         return Ok(());
     }
 
-    let (container, fallback) = insert_container(working, to_parent)?;
+    let (container, fallback) = insert_container(working, to_parent, root)?;
     let idx = child_index(working, &container, fallback, index)?;
     let at = insert_at(working, &container, idx, oid)?;
     for (suffix, id) in carried {
@@ -368,8 +452,12 @@ fn already_has_child(tree: &NodeTree, ancestor: ObjectId, child: ObjectId) -> bo
 /// Where a child of `parent` goes: the first node at or below `parent`
 /// whose children include an identified definition, else `parent` itself
 /// (`true`: append before its closing token).
-fn insert_container(working: &IdentifiedTree, parent: NodeId) -> Result<(Site, bool), Error> {
-    let parent_site = site_of(working, parent).ok_or(Error::MissingId(parent))?;
+fn insert_container(
+    working: &IdentifiedTree,
+    parent: NodeId,
+    root: NodeId,
+) -> Result<(Site, bool), Error> {
+    let parent_site = site_of(working, parent, root).ok_or(Error::MissingId(parent))?;
     let parent_oid = working
         .oid_at(&parent_site)
         .ok_or(Error::MissingId(parent))?;

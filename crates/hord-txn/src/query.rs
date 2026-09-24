@@ -7,11 +7,10 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, Op, RepoPath, SnapshotId};
+use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, RepoPath, SnapshotId};
 use hord_lang::Anchor;
 use hord_store::EdgeKind;
 
-use crate::ids::path_node_id;
 use crate::repo::{Inner, Repo, blocking};
 use crate::semantic::{DefinitionInfo, definitions, enclosing};
 use crate::{Error, Result};
@@ -94,32 +93,12 @@ impl Query {
     }
 }
 
-/// Whether `change` touches `node` the way `node_history` counts it: its
-/// `write_set`, any [`NodeId`] an [`Op`] names, or any identity delta. The
-/// read set does not count.
+/// Whether `change` touches `node` the way `node_history` counts it
+/// ([`hord_store::touched_nodes`]): its `write_set`, any [`NodeId`] an
+/// [`Op`](hord_core::Op) names, or any identity delta. The read set does not count.
 #[must_use]
 pub fn touches_node(change: &ChangeRecord, node: NodeId) -> bool {
-    if change.write_set.contains(&node) {
-        return true;
-    }
-    let in_op = change.ops.iter().any(|op| match op {
-        Op::Insert { parent, .. } => *parent == node,
-        Op::Delete { node: id } | Op::Replace { node: id, .. } | Op::Rename { node: id, .. } => {
-            *id == node
-        }
-        Op::Move {
-            node: id,
-            from_parent,
-            to_parent,
-            ..
-        } => *id == node || *from_parent == node || *to_parent == node,
-        Op::Blob { .. } | Op::Tree { .. } => false,
-    });
-    in_op
-        || change
-            .identity_deltas
-            .iter()
-            .any(|delta| crate::sets::delta_nodes(delta).contains(&node))
+    hord_store::touched_nodes(change).contains(&node)
 }
 
 /// Byte offset where `line` (1-based) starts in `source`, if that line has
@@ -278,7 +257,7 @@ impl Inner {
     fn ids_under(&self, snapshot: SnapshotId, prefix: &RepoPath) -> Result<HashSet<NodeId>> {
         let mut out = HashSet::new();
         for (path, _) in self.files_under(snapshot, prefix)? {
-            out.insert(path_node_id(&path));
+            out.insert(NodeId::file_root(&path));
             if let Some(parsed) = self.file_view(snapshot, &path)?.and_then(|v| v.parsed) {
                 out.extend(parsed.tree.ids.values().copied());
             }

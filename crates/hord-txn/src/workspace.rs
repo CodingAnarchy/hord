@@ -574,12 +574,11 @@ fn view_of(
                 .and_then(|v| v.parsed.as_ref())
                 .map(|p| Arc::clone(&p.tree));
             let base_ref = base_tree.as_deref().unwrap_or(&empty);
-            let mapping =
-                hord_identity::carry_in(adapter, path, Some(base), base_ref, &parsed, &[])
-                    .map_err(|source| Error::Identity {
-                        path: path.clone(),
-                        source,
-                    })?;
+            let mapping = hord_identity::carry(adapter, path, Some(base), base_ref, &parsed, &[])
+                .map_err(|source| Error::Identity {
+                path: path.clone(),
+                source,
+            })?;
             (
                 adapter.lang(),
                 Arc::new(IdentifiedTree::new((*parsed).clone(), mapping.nodes)),

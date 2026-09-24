@@ -37,7 +37,7 @@ mod store;
 mod workspace;
 
 pub use error::Error;
-pub use store::{EdgeKind, HORD_DIR, Landing, Store};
+pub use store::{EdgeKind, HORD_DIR, Landing, Store, touched_nodes};
 pub use workspace::{WorkspaceId, WorkspaceMeta};
 
 /// Result of a store operation.

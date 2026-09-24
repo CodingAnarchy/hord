@@ -15,9 +15,10 @@
 //!
 //! Definition [`hord_core::NodeId`]s stop at adapter definitions. The CST
 //! file root is not a definition. Ops that need a parent for a file-level
-//! definition use [`file_parent`]`(path)`, a path-derived id (ADR 0015), so
-//! an op names its file. A [`hord_core::Op::Replace`] of that id swaps the
-//! file's glue. [`diff`], [`apply`], and [`merge_ops`] take the file's path.
+//! definition use [`hord_core::NodeId::file_root`]`(path)`, a path-derived
+//! id (ADR 0015), so an op names its file. A [`hord_core::Op::Replace`] of
+//! that id swaps the file's glue. [`diff`], [`apply`], and [`merge`] take
+//! the file's path, and a file-level conflict names that id.
 //!
 //! # Granularity
 //!
@@ -41,9 +42,8 @@ mod graft;
 mod merge;
 mod text_merge;
 
-pub use apply::apply;
+pub use apply::{apply, apply_identified};
 pub use blob::merge_blob;
-pub use defs::file_parent;
 pub use diff::diff;
 pub use error::Error;
-pub use merge::{Conflict, ConflictKind, MergeMode, MergeResult, merge, merge_ops};
+pub use merge::{Conflict, ConflictKind, MergeMode, MergeResult, merge};

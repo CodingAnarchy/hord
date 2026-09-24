@@ -61,6 +61,19 @@ pub enum IdentityDelta {
     },
 }
 
+impl IdentityDelta {
+    /// Every [`NodeId`] the delta names: `node`, then `from` or `into`.
+    pub fn node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let (node, rest): (&NodeId, &[NodeId]) = match self {
+            Self::Birth { node } | Self::Death { node } => (node, &[]),
+            Self::DerivedFrom { node, from } => (node, std::slice::from_ref(from)),
+            Self::SplitInto { node, into } => (node, into),
+            Self::MergedFrom { node, from } => (node, from),
+        };
+        std::iter::once(*node).chain(rest.iter().copied())
+    }
+}
+
 /// One directory of a snapshot's identity (ADR 0017): name → subdirectory or
 /// [`FileIdentity`].
 ///

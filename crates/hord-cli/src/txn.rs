@@ -194,7 +194,7 @@ impl Names {
         // The file root id (ADR 0015) is the whole-file and glue identity.
         for path in &paths {
             known.insert(
-                hord_txn::path_node_id(path),
+                NodeId::file_root(path),
                 (Some("(file)".into()), path.clone()),
             );
         }

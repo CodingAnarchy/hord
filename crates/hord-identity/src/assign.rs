@@ -7,28 +7,19 @@ use hord_lang::{
     IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, default_identify, oid_at,
 };
 
-/// Assign a fresh [`hord_core::NodeId`] to every definition in `tree`.
-///
-/// This is [`default_identify`] against an empty base: each definition is an
-/// [`hord_core::IdentityDelta::Birth`]. Non-definitions are omitted. Rename
-/// detection is not involved. It is [`assign_in`] at the repository root path
-/// with no base snapshot.
-#[must_use]
-pub fn assign<A: LangAdapter + ?Sized>(adapter: &A, tree: &NodeTree) -> IdentityMapping {
-    assign_in(adapter, &RepoPath::default(), None, tree)
-}
-
 /// Assign a fresh [`hord_core::NodeId`] to every definition of the file at
 /// `path` (ADR 0019).
 ///
-/// Each id is derived from the definition's content id, the file's root id
-/// ([`crate::file_root_id`]), its site, and `snapshot`: the base snapshot of
+/// This is [`default_identify`] against an empty base: each definition is an
+/// [`hord_core::IdentityDelta::Birth`]. Non-definitions are omitted. Rename
+/// detection is not involved. Each id is derived from the definition's content id, the file's root id
+/// ([`NodeId::file_root`]), its site, and `snapshot`: the base snapshot of
 /// the change that creates it. With `snapshot` `None` this is the *fresh
 /// assignment* that readers fall back to for a file whose identity a
 /// snapshot omits (ADR 0017). The same inputs give the same ids on every
 /// call.
 #[must_use]
-pub fn assign_in<A: LangAdapter + ?Sized>(
+pub fn assign<A: LangAdapter + ?Sized>(
     adapter: &A,
     path: &RepoPath,
     snapshot: Option<SnapshotId>,
@@ -75,7 +66,7 @@ pub(crate) fn stabilize_births(
         .filter(|(_, id)| births.contains(id))
         .filter_map(|(site, id)| Some((oid_at(tree, site)?, site.clone(), *id)))
         .collect();
-    let root = crate::file_root_id(scope.path);
+    let root = NodeId::file_root(scope.path);
 
     let mut reserved: BTreeSet<NodeId> = mapping
         .nodes

@@ -663,8 +663,8 @@ fn hard_reason_bucket(reason: &str) -> String {
 fn eval_one_merge(dir: &Path) -> Result<MergeOut> {
     let (ext, base_src, ours_src, theirs_src, want) = load_case(dir)?;
     match ext {
-        "rs" => eval_merge_pair(&RustAdapter, &base_src, &ours_src, &theirs_src, &want),
-        "toml" => eval_merge_pair(&TomlAdapter, &base_src, &ours_src, &theirs_src, &want),
+        "rs" => eval_merge_pair(&RustAdapter, ext, &base_src, &ours_src, &theirs_src, &want),
+        "toml" => eval_merge_pair(&TomlAdapter, ext, &base_src, &ours_src, &theirs_src, &want),
         "md" => eval_blob_merge(&base_src, &ours_src, &theirs_src, &want),
         other => bail!("unknown case suffix .{other}"),
     }
@@ -672,6 +672,7 @@ fn eval_one_merge(dir: &Path) -> Result<MergeOut> {
 
 fn eval_merge_pair<A: LangAdapter>(
     adapter: &A,
+    ext: &str,
     base_src: &[u8],
     ours_src: &[u8],
     theirs_src: &[u8],
@@ -687,7 +688,9 @@ fn eval_merge_pair<A: LangAdapter>(
     let theirs_tree = adapter.parse(theirs_src).context("parse theirs")?;
     let theirs_map = default_identify(adapter, &base, &theirs_tree);
     let theirs = IdentifiedTree::new(theirs_tree, theirs_map.nodes);
-    match merge(adapter, &base, &ours, &theirs, MergeMode::Corpus) {
+    // A corpus case has no repository path; only conflict node ids use it.
+    let path: hord_core::RepoPath = format!("merge-case.{ext}").parse()?;
+    match merge(adapter, &path, &base, &ours, &theirs, MergeMode::Corpus) {
         Ok(merged) => {
             let got = adapter.project(&merged.tree.tree);
             Ok(MergeOut::Match {
@@ -1117,7 +1120,7 @@ fn check_apply_pair<A: LangAdapter>(
     // `diff` verifies apply identity (file Replace fallback if needed).
     let got = match ops.first() {
         Some(hord_core::Op::Replace { node, to, .. })
-            if *node == hord_diff::file_parent(&file) && ops.len() == 1 =>
+            if *node == hord_core::NodeId::file_root(&file) && ops.len() == 1 =>
         {
             Some(*to)
         }

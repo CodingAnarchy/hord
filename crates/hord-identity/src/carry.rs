@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hord_core::{IdentityDelta, NodeId, ObjectId, Op, RepoPath, SnapshotId};
 use hord_lang::{
-    IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, default_identify, oid_at,
+    IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, def_sites, default_identify,
+    oid_at,
 };
 
 use crate::Result;
@@ -40,13 +41,16 @@ pub enum Declaration {
     },
 }
 
-/// Carry [`NodeId`]s from `base` onto `result` (spec §3.4).
+/// Carry [`NodeId`]s from `base` onto `result`, the file at `path`, in a
+/// change whose base snapshot is `snapshot` (spec §3.4).
 ///
 /// Steps 1–3 and unmatched births and deaths come from [`default_identify`],
 /// including rename similarity (ADR 0007). Birth ids are then replaced with
-/// ids derived per ADR 0019 ([`carry_in`]). `declarations` (step 5) then
-/// override those heuristic results. Anything still unmatched stays a birth
-/// or a death (step 6).
+/// ids derived per ADR 0019 from the definition's content, `path`'s file
+/// root, its site, and `snapshot` (see [`crate::assign`]), so a definition
+/// deleted and later re-added is born on a later base and gets a new id.
+/// `declarations` (step 5) then override those heuristic results. Anything
+/// still unmatched stays a birth or a death (step 6).
 ///
 /// [`Declaration::DerivedFrom`] names a result definition by content id:
 ///
@@ -84,27 +88,6 @@ pub enum Declaration {
 /// corresponding list is empty. [`Error::DuplicateNode`] if the result would
 /// give one [`NodeId`] to two definitions.
 pub fn carry<A: LangAdapter + ?Sized>(
-    adapter: &A,
-    base: &IdentifiedTree,
-    result: &NodeTree,
-    declarations: &[Declaration],
-) -> Result<IdentityMapping> {
-    carry_in(
-        adapter,
-        &RepoPath::default(),
-        None,
-        base,
-        result,
-        declarations,
-    )
-}
-
-/// [`carry`] for the file at `path`, in a change whose base snapshot is
-/// `snapshot` (ADR 0019): birth ids are derived from the definition's
-/// content, `path`'s file root, its site, and `snapshot` (see
-/// [`crate::assign_in`]). A definition deleted and later re-added is born
-/// on a later base, so it gets a new id.
-pub fn carry_in<A: LangAdapter + ?Sized>(
     adapter: &A,
     path: &RepoPath,
     snapshot: Option<SnapshotId>,
@@ -266,16 +249,11 @@ fn stable_copy_id(oid: ObjectId, from: NodeId, salt: u32) -> NodeId {
 
 fn id_in_use(mapping: &IdentityMapping, id: NodeId) -> bool {
     mapping.nodes.values().any(|node| *node == id)
-        || mapping.deltas.iter().any(|delta| delta_mentions(delta, id))
-}
-
-fn delta_mentions(delta: &IdentityDelta, id: NodeId) -> bool {
-    match delta {
-        IdentityDelta::Birth { node } | IdentityDelta::Death { node } => *node == id,
-        IdentityDelta::DerivedFrom { node, from } => *node == id || *from == id,
-        IdentityDelta::SplitInto { node, into } => *node == id || into.contains(&id),
-        IdentityDelta::MergedFrom { node, from } => *node == id || from.contains(&id),
-    }
+        || mapping
+            .deltas
+            .iter()
+            .flat_map(IdentityDelta::node_ids)
+            .any(|node| node == id)
 }
 
 fn apply_copy(
@@ -483,35 +461,18 @@ fn site_index(tree: &NodeTree, ids: &BTreeMap<Site, NodeId>) -> BTreeMap<NodeId,
     map
 }
 
-fn sites(tree: &NodeTree, ids: &BTreeMap<Site, NodeId>) -> Vec<(NodeId, Placement)> {
-    let Some(root) = tree.root() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    walk_sites(tree, ids, root, None, &mut Vec::new(), &mut out);
-    out
-}
-
-fn walk_sites(
-    tree: &NodeTree,
-    ids: &BTreeMap<Site, NodeId>,
-    oid: ObjectId,
-    parent: Option<NodeId>,
-    site: &mut Site,
-    out: &mut Vec<(NodeId, Placement)>,
-) {
-    let Some(node) = tree.get(oid) else {
-        return;
-    };
-    let mut child_parent = parent;
-    if let Some(&node_id) = ids.get(site.as_slice()) {
-        let index = site.last().copied().unwrap_or(0);
-        out.push((node_id, Placement { parent, index }));
-        child_parent = Some(node_id);
-    }
-    for (i, child) in node.children.iter().enumerate() {
-        site.push(u32::try_from(i).unwrap_or(u32::MAX));
-        walk_sites(tree, ids, *child, child_parent, site, out);
-        site.pop();
-    }
+fn sites<'a>(
+    tree: &'a NodeTree,
+    ids: &'a BTreeMap<Site, NodeId>,
+) -> impl Iterator<Item = (NodeId, Placement)> + 'a {
+    def_sites(tree, ids).map(|def| {
+        let index = def.site.last().copied().unwrap_or(0);
+        (
+            def.node,
+            Placement {
+                parent: def.parent,
+                index,
+            },
+        )
+    })
 }

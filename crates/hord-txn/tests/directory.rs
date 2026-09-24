@@ -7,7 +7,8 @@ use std::fs;
 use std::time::{Duration, SystemTime};
 
 use common::*;
-use hord_txn::{BeginOptions, Materialization, MaterializeMode, path_node_id};
+use hord_core::NodeId;
+use hord_txn::{BeginOptions, Materialization, MaterializeMode};
 
 fn checkout_of(ws: &hord_txn::Workspace) -> std::path::PathBuf {
     match ws.materialization() {
@@ -111,7 +112,7 @@ async fn propose_skips_stat_clean_files_and_paranoid_rehashes() {
         proposal
             .record
             .write_set
-            .contains(&path_node_id(&path("README.md")))
+            .contains(&NodeId::file_root(&path("README.md")))
     );
 }
 

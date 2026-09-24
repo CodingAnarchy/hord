@@ -68,9 +68,9 @@ struct Import {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileRoot {
     object_id: ObjectId,
-    /// Repository path, when the adapter recorded it. Two files with the
-    /// same content share `object_id`; the path tells them apart.
-    path: Option<RepoPath>,
+    /// Two files with the same content share `object_id`; the path tells
+    /// them apart.
+    path: RepoPath,
     module: QualifiedName,
 }
 
@@ -274,21 +274,9 @@ impl ResolveCtx {
         });
     }
 
-    /// Record a file root's module, for nodes that are not themselves definitions.
-    ///
-    /// Prefer [`Self::add_file_at`]: without a path, two files with the same
-    /// content cannot be told apart.
-    pub fn add_file(&mut self, object_id: ObjectId, module: impl Into<QualifiedName>) {
-        self.bump();
-        self.files.push(FileRoot {
-            object_id,
-            path: None,
-            module: module.into(),
-        });
-    }
-
-    /// Record the root of the file at `path` and its module.
-    pub fn add_file_at(
+    /// Record the root of the file at `path` and its module, for nodes that
+    /// are not themselves definitions.
+    pub fn add_file(
         &mut self,
         path: RepoPath,
         object_id: ObjectId,
@@ -297,7 +285,7 @@ impl ResolveCtx {
         self.bump();
         self.files.push(FileRoot {
             object_id,
-            path: Some(path),
+            path,
             module: module.into(),
         });
     }
@@ -345,21 +333,11 @@ impl ResolveCtx {
         }
     }
 
-    /// Visit every file root in insertion order (`object_id`, `module`).
-    pub fn for_each_file(&self, mut visit: impl FnMut(ObjectId, &QualifiedName)) {
-        for f in &self.files {
-            visit(f.object_id, &f.module);
-        }
-    }
-
     /// Visit every file root in insertion order (`path`, `object_id`,
-    /// `module`). `path` is `None` for roots added with [`Self::add_file`].
-    pub fn for_each_file_at(
-        &self,
-        mut visit: impl FnMut(Option<&RepoPath>, ObjectId, &QualifiedName),
-    ) {
+    /// `module`).
+    pub fn for_each_file(&self, mut visit: impl FnMut(&RepoPath, ObjectId, &QualifiedName)) {
         for f in &self.files {
-            visit(f.path.as_ref(), f.object_id, &f.module);
+            visit(&f.path, f.object_id, &f.module);
         }
     }
 

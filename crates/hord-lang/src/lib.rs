@@ -27,7 +27,10 @@ mod trivia;
 
 pub use adapter::{AdapterRegistry, Anchor, LangAdapter, NameRef, ResolveCtx, Tier};
 pub use error::ParseError;
-pub use identify::{IdentifiedTree, IdentityMapping, Site, default_identify, oid_at};
+pub use identify::{
+    DefSite, IdentifiedTree, IdentityMapping, Site, def_sites, default_identify, enclosing_site,
+    oid_at,
+};
 pub use normalized::normalized_hash;
 pub use tree::NodeTree;
 pub use trivia::{
@@ -36,6 +39,23 @@ pub use trivia::{
 
 /// Result alias for this crate.
 pub type Result<T, E = ParseError> = std::result::Result<T, E>;
+
+/// The 3-way merge of a value that only one side changed: ours when both
+/// sides agree or only ours changed, theirs when only theirs changed, and
+/// `None` when both changed it differently.
+pub fn prefer_unchanged<'a, T: PartialEq + ?Sized>(
+    base: &'a T,
+    ours: &'a T,
+    theirs: &'a T,
+) -> Option<&'a T> {
+    if ours == theirs || theirs == base {
+        Some(ours)
+    } else if ours == base {
+        Some(theirs)
+    } else {
+        None
+    }
+}
 
 #[cfg(test)]
 mod test_util {
@@ -67,5 +87,23 @@ mod test_util {
         fn is_definition(&self, kind: &NodeKind) -> bool {
             matches!(kind.as_str(), "fn" | "mod")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefer_unchanged;
+
+    #[test]
+    fn prefer_unchanged_takes_the_side_that_changed() {
+        assert_eq!(prefer_unchanged(&1, &1, &1), Some(&1));
+        assert_eq!(prefer_unchanged(&1, &2, &1), Some(&2));
+        assert_eq!(prefer_unchanged(&1, &1, &3), Some(&3));
+        assert_eq!(prefer_unchanged(&1, &2, &2), Some(&2));
+        assert_eq!(prefer_unchanged(&1, &2, &3), None);
+        let (none, a, b) = (None, Some(&"a"), Some(&"b"));
+        assert_eq!(prefer_unchanged(&none, &a, &none).copied(), Some(a));
+        assert_eq!(prefer_unchanged(&a, &none, &a).copied(), Some(none));
+        assert_eq!(prefer_unchanged(&none, &a, &b), None);
     }
 }

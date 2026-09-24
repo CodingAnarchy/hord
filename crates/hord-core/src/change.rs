@@ -113,6 +113,28 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// Every [`NodeId`] field of the op: an `Insert`'s parent, the node of a
+    /// `Delete`, `Replace`, or `Rename`, and a `Move`'s node and both
+    /// parents. `Blob` and `Tree` name none.
+    pub fn node_ids(&self) -> impl Iterator<Item = NodeId> {
+        let ids = match self {
+            Self::Insert { parent, .. } => [Some(*parent), None, None],
+            Self::Delete { node } | Self::Replace { node, .. } | Self::Rename { node, .. } => {
+                [Some(*node), None, None]
+            }
+            Self::Move {
+                node,
+                from_parent,
+                to_parent,
+                ..
+            } => [Some(*node), Some(*from_parent), Some(*to_parent)],
+            Self::Blob { .. } | Self::Tree { .. } => [None; 3],
+        };
+        ids.into_iter().flatten()
+    }
+}
+
 /// File/directory mutation used by [`Op::Tree`].
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum TreeOpKind {

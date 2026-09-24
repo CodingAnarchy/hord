@@ -3,7 +3,7 @@
 //! # Op layout (ADR 0015)
 //!
 //! A parsed file's edit is its structural ops ([`hord_diff::diff`]). They
-//! name their file through [`hord_diff::file_parent`]`(path)`, the parent of
+//! name their file through [`NodeId::file_root`]`(path)`, the parent of
 //! file-level definitions and the node a glue edit replaces, so they do not
 //! depend on their position in `ops`. [`Op::Blob`] appears only for new or
 //! deleted content (with [`Op::Tree`] `CreateFile` before / `Delete` after,
@@ -27,7 +27,7 @@
 //! snapshots ([`crate::sets::sets_between`], shared with the lander's rebased
 //! records): every definition whose own content or parent changed, births,
 //! deaths, derivations, moved definitions, and the path id
-//! ([`crate::path_node_id`], equal to the file root id) for created,
+//! ([`crate::NodeId::file_root`], equal to the file root id) for created,
 //! deleted, moved, blob-tier, and coarsely written files and for glue
 //! edits.
 //!
@@ -42,10 +42,9 @@ use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, IdentityDelta, Intent, LangId, NodeId, ObjectId, Op,
     Provenance, RepoPath, SnapshotId, TreeOpKind,
 };
-use hord_lang::{Anchor, IdentifiedTree, NodeTree, Site};
+use hord_lang::{Anchor, IdentifiedTree, NodeTree, Site, enclosing_site};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::path_node_id;
 use crate::repo::{Inner, now};
 use crate::semantic::{FileView, Parsed, RustCtx, definitions, enclosing, result_anchor};
 use crate::sets::sets_between;
@@ -162,7 +161,7 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
 
     let mut read_set = BTreeSet::new();
     read_set.extend(input.access.reads.iter().copied());
-    read_set.extend(input.access.read_paths.iter().map(path_node_id));
+    read_set.extend(input.access.read_paths.iter().map(NodeId::file_root));
     references(inner, base, &build.written, &write_set, &mut read_set)?;
     declarations(inner, base, result, &input.declared, &mut read_set)?;
     read_set.remove(&NodeId::nil());
@@ -242,7 +241,7 @@ fn propose_file(inner: &Inner, base: SnapshotId, edit: &Edit, build: &mut Build)
             let base_tree = base_parsed.map(|p| Arc::clone(&p.tree));
             let base_ref = base_tree.as_deref().unwrap_or(&empty);
             let mapping =
-                hord_identity::carry_in(adapter, path, Some(base), base_ref, &result_tree, &[])
+                hord_identity::carry(adapter, path, Some(base), base_ref, &result_tree, &[])
                     .map_err(|source| Error::Identity {
                         path: path.clone(),
                         source,
@@ -310,14 +309,14 @@ fn propose_move(
     let result_tree = inner
         .parse(adapter, blob, bytes.as_slice())
         .ok_or_else(|| Error::NotParsed(path.clone()))?;
-    let mapping = hord_identity::carry_in(adapter, path, Some(base), &old.tree, &result_tree, &[])
+    let mapping = hord_identity::carry(adapter, path, Some(base), &old.tree, &result_tree, &[])
         .map_err(|source| Error::Identity {
             path: path.clone(),
             source,
         })?;
     let file_ops = hord_diff::diff(path, &old.tree, &result_tree, &mapping);
     check_reproduces(adapter, path, &old.tree, &file_ops, &result_tree, bytes)?;
-    let (old_root, new_root) = (path_node_id(&from.path), path_node_id(path));
+    let (old_root, new_root) = (NodeId::file_root(&from.path), NodeId::file_root(path));
     build.ops.push(Op::Tree {
         path: from.path.clone(),
         kind: TreeOpKind::Rename { to: path.clone() },
@@ -327,9 +326,8 @@ fn propose_move(
         mapping.nodes.clone(),
     ));
     let carried: BTreeSet<NodeId> = old.tree.ids.values().copied().collect();
-    let parents = enclosing(&result_tree);
     for (site, node) in &result_tree.ids {
-        if parents.contains_key(site) || !carried.contains(node) {
+        if enclosing_site(&result_tree.ids, site).is_some() || !carried.contains(node) {
             continue;
         }
         build.ops.push(Op::Move {
@@ -398,7 +396,7 @@ fn pair_moves(inner: &Inner, edits: &[Edit]) -> Result<BTreeMap<usize, Pairing>>
         let Some(tree) = inner.parse(adapter, blob, bytes.as_slice()) else {
             continue;
         };
-        let fresh = hord_identity::assign_in(adapter, &edits[i].path, None, &tree);
+        let fresh = hord_identity::assign(adapter, &edits[i].path, None, &tree);
         created_defs.insert(i, (adapter.lang(), normalized(&tree, fresh.nodes.keys())));
     }
     let mut taken: BTreeSet<usize> = BTreeSet::new();
@@ -566,7 +564,7 @@ fn declarations(
                 out.insert(*node);
             }
             ReadDeclaration::Path(path) => {
-                out.insert(path_node_id(path));
+                out.insert(NodeId::file_root(path));
                 for snapshot in [base, result] {
                     if let Some(view) = inner.file_view(snapshot, path)?
                         && let Some(parsed) = view.parsed

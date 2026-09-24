@@ -8,7 +8,7 @@
 //! definition-level hard conflict.
 
 use hord_core::{Bytes, ObjectId};
-use hord_lang::NodeTree;
+use hord_lang::{NodeTree, prefer_unchanged};
 
 use crate::align::{Span, spans};
 
@@ -52,21 +52,6 @@ pub(crate) fn merge_cst(
                 .map_err(|_| ())
         }
         Err(()) => merge_leaf(store, ours, theirs, &b, &o, &t),
-    }
-}
-
-/// When one side matches another, the edit (or the shared result) is that side.
-fn prefer_unchanged<'a, T: PartialEq + ?Sized>(
-    base: &'a T,
-    ours: &'a T,
-    theirs: &'a T,
-) -> Option<&'a T> {
-    if ours == theirs || theirs == base {
-        Some(ours)
-    } else if ours == base {
-        Some(theirs)
-    } else {
-        None
     }
 }
 

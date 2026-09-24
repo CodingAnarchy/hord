@@ -3,10 +3,8 @@
 mod common;
 
 use common::*;
-use hord_core::{ChangeId, Timestamp};
-use hord_txn::{
-    ConflictKind, ConflictReport, QueueStatus, ReadDeclaration, Repo, RepoOptions, path_node_id,
-};
+use hord_core::{ChangeId, NodeId, Timestamp};
+use hord_txn::{ConflictKind, ConflictReport, QueueStatus, ReadDeclaration, Repo, RepoOptions};
 use serde::{Deserialize, Serialize};
 
 fn landed(status: &QueueStatus) -> bool {
@@ -148,7 +146,10 @@ async fn reading_or_declaring_a_missing_file_conflicts_with_its_creation() {
             .unwrap();
         let cb = submit(&t.repo, &mut b, "b creates").await;
         let rb = t.repo.change(cb).await.unwrap();
-        assert!(rb.write_set.contains(&path_node_id(&path("src/new.rs"))));
+        assert!(
+            rb.write_set
+                .contains(&NodeId::file_root(&path("src/new.rs")))
+        );
         let ca = submit(&t.repo, &mut a, "a assumes absent").await;
         t.repo.land_local().await.unwrap();
         let report = t.repo.conflicts(ca).await.unwrap();

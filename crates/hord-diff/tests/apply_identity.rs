@@ -134,7 +134,6 @@ fn toml_insert_table() {
 #[test]
 fn file_level_ops_name_the_path_derived_root() {
     use hord_core::{NodeId, Op, RepoPath};
-    use hord_diff::file_parent;
 
     let adapter = rust();
     let base = parse_identified(&adapter, b"fn a() {}\n");
@@ -142,7 +141,7 @@ fn file_level_ops_name_the_path_derived_root() {
     let lib: RepoPath = "src/lib.rs".parse().unwrap();
     let other: RepoPath = "src/other.rs".parse().unwrap();
     let ops = diff(&lib, &base, &result, &mapping);
-    let root = file_parent(&lib);
+    let root = NodeId::file_root(&lib);
     assert!(
         ops.iter().any(|op| matches!(
             op,
@@ -162,7 +161,7 @@ fn file_level_ops_name_the_path_derived_root() {
     assert_ne!(ops, elsewhere);
     // Ops for one file do not apply to another: the parent is unknown there.
     assert!(apply(&other, &base, &ops, &result).is_err());
-    // Nil is rejected outright.
+    // Nil is not a file root: like any unknown id, it does not apply.
     let nil = vec![Op::Insert {
         parent: NodeId::nil(),
         index: 0,
@@ -175,7 +174,7 @@ fn file_level_ops_name_the_path_derived_root() {
     assert!(
         glue_ops
             .iter()
-            .any(|op| matches!(op, Op::Replace { node, .. } if *node == file_parent(&lib))),
+            .any(|op| matches!(op, Op::Replace { node, .. } if *node == NodeId::file_root(&lib))),
         "{glue_ops:?}"
     );
 }
@@ -215,4 +214,36 @@ fn identical_definitions_do_not_collapse() {
     );
     let applied = apply(&common::file(), &base, &ops, &result).unwrap();
     assert_eq!(project(&adapter, &applied.tree), edited.as_bytes());
+}
+
+/// `apply_identified` takes the ids of replaced and inserted content from
+/// the store (the change's own result), nested definitions included, and
+/// invents none. Content it cannot pair keeps no id.
+#[test]
+fn apply_identified_takes_ids_from_the_store() {
+    use hord_diff::apply_identified;
+    use hord_lang::IdentifiedTree;
+
+    let adapter = rust();
+    let lib = common::file();
+    let base = parse_identified(&adapter, b"fn a() { 1 }\n");
+    let result_src: &[u8] = b"fn a() { 2 }\nmod m {\n    fn inner() {}\n}\n";
+    let (result, mapping) = identify_result(&adapter, &base, result_src);
+    let store = IdentifiedTree::new(result.clone(), mapping.nodes.clone());
+    let ops = diff(&lib, &base, &result, &mapping);
+    assert_eq!(common::ops_kinds(&ops), ["replace", "insert"]);
+
+    let applied = apply_identified(&lib, &base, &ops, &store).expect("apply_identified");
+    assert_eq!(applied.tree.root(), result.root());
+    assert_eq!(applied.ids, store.ids);
+    // Plain `apply` has no ids for the inserted content to take.
+    let plain = apply(&lib, &base, &ops, &result).expect("apply");
+    assert_ne!(plain.ids, store.ids);
+
+    // A store without ids: nothing new can be placed, so only base ids stay.
+    let bare = IdentifiedTree::new(result.clone(), Default::default());
+    let unplaced = apply_identified(&lib, &base, &ops, &bare).expect("apply_identified");
+    let base_ids: Vec<_> = base.ids.values().collect();
+    assert!(unplaced.ids.values().all(|id| base_ids.contains(&id)));
+    assert!(unplaced.ids.len() < store.ids.len());
 }

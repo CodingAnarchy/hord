@@ -3,7 +3,7 @@
 //! # Identity per snapshot
 //!
 //! A file's [`NodeId`]s in a snapshot are either the fresh assignment
-//! ([`hord_identity::assign_in`] with no base snapshot, a pure function of
+//! ([`hord_identity::assign`] with no base snapshot, a pure function of
 //! the file's path and content) or were carried by a change that wrote the
 //! file. Only the second kind is stored: the snapshot's [`hord_core::Snapshot`]
 //! object names a Merkle identity tree with a [`FileIdentity`] for each such
@@ -30,7 +30,7 @@ use hord_core::{
     Bytes, FileIdentity, LangId, Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath,
     SnapshotId,
 };
-use hord_lang::{Anchor, IdentifiedTree, LangAdapter, NodeTree, ResolveCtx, Site};
+use hord_lang::{Anchor, IdentifiedTree, LangAdapter, NodeTree, ResolveCtx, Site, enclosing_site};
 use hord_lang_rust::{ManifestFile, RustAdapter};
 use hord_store::EdgeKind;
 use serde::{Deserialize, Serialize};
@@ -163,7 +163,7 @@ impl Inner {
         };
         let ids = match &stored {
             Some((_, file)) => ids_of(&tree, file),
-            None => hord_identity::assign_in(adapter, path, None, &tree).nodes,
+            None => hord_identity::assign(adapter, path, None, &tree).nodes,
         };
         let identified = Arc::new(IdentifiedTree::new((*tree).clone(), ids));
         self.cache_identified(key, Arc::clone(&identified));
@@ -183,7 +183,7 @@ impl Inner {
         blob: ObjectId,
         tree: &Arc<IdentifiedTree>,
     ) -> Result<Option<ObjectId>> {
-        let fresh = hord_identity::assign_in(adapter, path, None, &tree.tree);
+        let fresh = hord_identity::assign(adapter, path, None, &tree.tree);
         if fresh.nodes == tree.ids {
             self.cache_identified((path.clone(), blob, None), Arc::clone(tree));
             return Ok(None);
@@ -416,17 +416,10 @@ pub(crate) fn by_node(tree: &IdentifiedTree) -> HashMap<NodeId, Site> {
 /// Nearest enclosing identified definition of each identified definition:
 /// the longest proper prefix of its site that is a definition site.
 pub(crate) fn enclosing(tree: &IdentifiedTree) -> HashMap<Site, Site> {
-    let mut out = HashMap::new();
-    for site in tree.ids.keys() {
-        let parent = (0..site.len())
-            .rev()
-            .map(|len| &site[..len])
-            .find(|prefix| tree.ids.contains_key(*prefix));
-        if let Some(parent) = parent {
-            out.insert(site.clone(), parent.to_vec());
-        }
-    }
-    out
+    tree.ids
+        .keys()
+        .filter_map(|site| Some((site.clone(), enclosing_site(&tree.ids, site)?.clone())))
+        .collect()
 }
 
 /// Where to resolve the result definition at `site`: its own id when the

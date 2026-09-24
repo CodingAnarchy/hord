@@ -4,8 +4,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use hord_core::Op;
-use hord_diff::{ConflictKind, MergeMode, apply, diff, merge, merge_ops};
+use hord_diff::{ConflictKind, MergeMode, apply, diff, merge};
 use hord_lang::{IdentifiedTree, LangAdapter, default_identify};
 
 use common::{identify_result, parse_identified, rust, toml};
@@ -36,7 +35,7 @@ fn merge_in<A: LangAdapter>(
     let theirs_tree = adapter.parse(theirs_src).expect("parse theirs");
     let theirs_map = default_identify(adapter, &base, &theirs_tree);
     let theirs = IdentifiedTree::new(theirs_tree, theirs_map.nodes);
-    merge(adapter, &base, &ours, &theirs, mode)
+    merge(adapter, &common::file(), &base, &ours, &theirs, mode)
 }
 
 fn projected_text<A: LangAdapter>(adapter: &A, tree: &hord_lang::IdentifiedTree) -> String {
@@ -62,8 +61,15 @@ fn identical_normalized_replace_composes() {
         hord_lang::IdentifiedTree::new(tree, mapping.nodes)
     };
 
-    let merged = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus)
-        .unwrap_or_else(|c| panic!("expected compose, got {c:?}"));
+    let merged = merge(
+        &adapter,
+        &common::file(),
+        &base,
+        &ours,
+        &theirs,
+        MergeMode::Corpus,
+    )
+    .unwrap_or_else(|c| panic!("expected compose, got {c:?}"));
     let got = adapter.project(&merged.tree.tree);
     // Landing order picks ours.
     assert_eq!(got.as_slice(), ours_src);
@@ -161,7 +167,15 @@ fn delete_vs_replace_is_hard_conflict() {
         hord_lang::IdentifiedTree::new(tree, mapping.nodes)
     };
 
-    let err = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus).expect_err("hard conflict");
+    let err = merge(
+        &adapter,
+        &common::file(),
+        &base,
+        &ours,
+        &theirs,
+        MergeMode::Corpus,
+    )
+    .expect_err("hard conflict");
     assert_eq!(err.kind, ConflictKind::Hard);
     assert!(
         !err.nodes.is_empty(),
@@ -186,8 +200,15 @@ fn disjoint_ops_compose() {
         hord_lang::IdentifiedTree::new(tree, mapping.nodes)
     };
 
-    let merged = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus)
-        .unwrap_or_else(|c| panic!("disjoint should compose: {c:?}"));
+    let merged = merge(
+        &adapter,
+        &common::file(),
+        &base,
+        &ours,
+        &theirs,
+        MergeMode::Corpus,
+    )
+    .unwrap_or_else(|c| panic!("disjoint should compose: {c:?}"));
     let got = adapter.project(&merged.tree.tree);
     let want = b"fn a() { let x = 2; }\nfn b() { let y = 2; }\n";
     assert_eq!(
@@ -212,8 +233,15 @@ fn same_index_inserts_are_soft_conflicts() {
     let theirs_ops = diff(&common::file(), &base, &theirs_tree, &theirs_map);
     let ours = hord_lang::IdentifiedTree::new(ours_tree, ours_map.nodes);
     let theirs = hord_lang::IdentifiedTree::new(theirs_tree, theirs_map.nodes);
-    let merged = merge(&adapter, &base, &ours, &theirs, MergeMode::Corpus)
-        .unwrap_or_else(|c| panic!("soft conflict should still merge: {c:?}"));
+    let merged = merge(
+        &adapter,
+        &common::file(),
+        &base,
+        &ours,
+        &theirs,
+        MergeMode::Corpus,
+    )
+    .unwrap_or_else(|c| panic!("soft conflict should still merge: {c:?}"));
     assert!(
         merged.soft.iter().any(|c| c.kind == ConflictKind::Soft),
         "expected a soft conflict, ops ours={ours_ops:?} theirs={theirs_ops:?} soft={:?}",
@@ -225,29 +253,6 @@ fn same_index_inserts_are_soft_conflicts() {
     let x = text.find("fn x").expect("ours insert present");
     let y = text.find("fn y").expect("theirs insert present");
     assert!(x < y, "landing order ours then theirs: {text}");
-}
-
-#[test]
-fn merge_ops_delete_vs_replace() {
-    let adapter = rust();
-    let base_src = b"fn a() { let x = 1; }\nfn keep() {}\n";
-    let base = parse_identified(&adapter, base_src);
-    let (_, a_id) = common::def_named(&base, "fn a").expect("fn a");
-    let ours = vec![Op::Delete { node: a_id }];
-    let (theirs_tree, theirs_map) =
-        identify_result(&adapter, &base, b"fn a() { let x = 9; }\nfn keep() {}\n");
-    let theirs = diff(&common::file(), &base, &theirs_tree, &theirs_map);
-    let err = merge_ops(
-        &adapter,
-        &common::file(),
-        &base,
-        &ours,
-        &theirs,
-        &theirs_tree,
-        MergeMode::Corpus,
-    )
-    .expect_err("delete vs replace");
-    assert_eq!(err.kind, ConflictKind::Hard);
 }
 
 #[test]
@@ -454,4 +459,37 @@ fn lander_mode_flags_a_combined_same_definition_edit_soft() {
         merged.soft
     );
     assert!(adapter.parse(text.as_bytes()).is_ok());
+}
+
+/// ADR 0015 amendment: contention at file level names the file root, in a
+/// soft conflict (two top-level inserts at one index) and in a hard one
+/// (both sides rewrote the same top-level macro call, which is file glue). Nil is never named.
+#[test]
+fn file_level_conflicts_name_the_file_root() {
+    use hord_core::NodeId;
+
+    let adapter = rust();
+    let root = NodeId::file_root(&common::file());
+    let base = b"fn a() {}\nfn b() {}\n";
+    let ours = b"fn a() {}\nfn x() {}\nfn b() {}\n";
+    let theirs = b"fn a() {}\nfn y() {}\nfn b() {}\n";
+    let merged = merge_in(&adapter, base, ours, theirs, MergeMode::Lander).expect("soft");
+    let inserts = merged
+        .soft
+        .iter()
+        .find(|c| c.reason.starts_with("two inserts"))
+        .unwrap_or_else(|| panic!("{:?}", merged.soft));
+    assert_eq!(inserts.nodes, vec![root]);
+    assert!(
+        inserts.reason.contains(&root.to_string()),
+        "{}",
+        inserts.reason
+    );
+
+    let base = b"m!(one);\nfn f() {}\n";
+    let ours = b"m!(two);\nfn f() {}\n";
+    let theirs = b"m!(three);\nfn f() {}\n";
+    let err = merge_in(&adapter, base, ours, theirs, MergeMode::Lander).expect_err("hard");
+    assert_eq!(err.kind, ConflictKind::Hard);
+    assert_eq!(err.nodes, vec![root], "{err}");
 }

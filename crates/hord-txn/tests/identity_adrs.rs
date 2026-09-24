@@ -282,12 +282,12 @@ async fn moving_a_file_keeps_every_node_id() {
     assert!(
         record
             .write_set
-            .contains(&hord_txn::path_node_id(&path("src/a.rs")))
+            .contains(&NodeId::file_root(&path("src/a.rs")))
     );
     assert!(
         record
             .write_set
-            .contains(&hord_txn::path_node_id(&path("src/b.rs")))
+            .contains(&NodeId::file_root(&path("src/b.rs")))
     );
     repo.submit(proposal.change).await.unwrap();
     repo.land_local().await.unwrap();

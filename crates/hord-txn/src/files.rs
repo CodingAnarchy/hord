@@ -2,7 +2,7 @@
 //!
 //! Which files a change touched comes from the tree diff of `base` →
 //! `result`. Each structural op belongs to the file whose definitions (or
-//! path-derived root, [`hord_diff::file_parent`]) it names; ops are not
+//! path-derived root, [`NodeId::file_root`]) it names; ops are not
 //! scoped by their position. [`Op::Blob`] and [`Op::Tree`] ops name their
 //! path. A file move (ADR 0020) is `Op::Tree { path: from, kind: Rename {
 //! to } }`: the target's structural ops apply to the source's base content,
@@ -45,7 +45,7 @@ impl FileChange {
     /// re-parenting `Move`s from the source root are left out (the rename
     /// itself does that).
     pub fn applicable(&self) -> Vec<Op> {
-        let from_root = self.moved_from.as_ref().map(hord_diff::file_parent);
+        let from_root = self.moved_from.as_ref().map(NodeId::file_root);
         self.structural()
             .filter(
                 |op| !matches!(op, Op::Move { from_parent, .. } if Some(*from_parent) == from_root),
@@ -123,7 +123,7 @@ pub(crate) fn file_changes(inner: &Inner, record: &ChangeRecord) -> Result<Vec<F
             result: parsed(record.result)?,
         };
         owners
-            .entry(hord_diff::file_parent(&change.path))
+            .entry(NodeId::file_root(&change.path))
             .or_default()
             .push(i);
         for tree in [&side.base, &side.result].into_iter().flatten() {
@@ -279,28 +279,14 @@ pub(crate) fn validate_except(
 /// concurrent edit of the old path conflicts with the move). Pure over the
 /// record, for footprints.
 pub(crate) fn coarse_paths(record: &ChangeRecord) -> Vec<RepoPath> {
-    let named: std::collections::BTreeSet<NodeId> = record
-        .ops
-        .iter()
-        .flat_map(|op| match op {
-            Op::Insert { parent, .. } => vec![*parent],
-            Op::Move {
-                from_parent,
-                to_parent,
-                ..
-            } => vec![*from_parent, *to_parent],
-            Op::Replace { node, .. } | Op::Delete { node } | Op::Rename { node, .. } => {
-                vec![*node]
-            }
-            Op::Blob { .. } | Op::Tree { .. } => Vec::new(),
-        })
-        .collect();
+    let named: std::collections::BTreeSet<NodeId> =
+        record.ops.iter().flat_map(Op::node_ids).collect();
     record
         .ops
         .iter()
         .filter_map(|op| match op {
             Op::Blob { path, to, .. }
-                if to.is_none() || !named.contains(&hord_diff::file_parent(path)) =>
+                if to.is_none() || !named.contains(&NodeId::file_root(path)) =>
             {
                 Some(path.clone())
             }

@@ -13,12 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hord_core::{IdentityDelta, NodeId, ObjectId, Op, RepoPath, SnapshotId, TreeOpKind};
-use hord_lang::{IdentifiedTree, Site};
+use hord_lang::{IdentifiedTree, Site, enclosing_site};
 
 use crate::Result;
-use crate::ids::path_node_id;
 use crate::repo::Inner;
-use crate::semantic::enclosing;
 
 /// `write_set` and `identity_deltas` of the change `base → result` whose ops
 /// are `ops`.
@@ -69,15 +67,15 @@ pub(crate) fn sets_between(
         if let Some(from) = renamed.get(path) {
             // The source file is its own changed path, so its definitions
             // are already in `before`. A move writes both paths (ADR 0020).
-            writes.insert(path_node_id(from));
-            writes.insert(path_node_id(path));
+            writes.insert(NodeId::file_root(from));
+            writes.insert(NodeId::file_root(path));
         }
         let glue_changed = match (&base_tree, &result_tree) {
             (Some(b), Some(r)) => root_glue(b) != root_glue(r),
             _ => true,
         };
         if glue_changed {
-            writes.insert(path_node_id(path));
+            writes.insert(NodeId::file_root(path));
         }
     }
     let mut births = Vec::new();
@@ -107,9 +105,8 @@ pub(crate) fn sets_between(
         .collect();
     deltas.extend(declared.iter().cloned());
     for delta in &deltas {
-        writes.extend(delta_nodes(delta));
+        writes.extend(delta.node_ids());
     }
-    writes.remove(&NodeId::nil());
     Ok((writes, deltas))
 }
 
@@ -151,11 +148,10 @@ impl Def {
 
 /// Every identified definition of `tree`, by id.
 fn defs(tree: &Arc<IdentifiedTree>) -> BTreeMap<NodeId, Def> {
-    let parents = enclosing(tree);
     tree.ids
         .iter()
         .map(|(site, id)| {
-            let parent = parents.get(site).and_then(|p| tree.ids.get(p).copied());
+            let parent = enclosing_site(&tree.ids, site).map(|p| tree.ids[p]);
             let def = Def {
                 tree: Arc::clone(tree),
                 site: site.clone(),
@@ -236,22 +232,4 @@ fn own_leaves(tree: &IdentifiedTree, site: &[u32]) -> Vec<ObjectId> {
         walk(tree, oid, &mut site.to_vec(), true, false, &mut out);
     }
     out
-}
-
-/// Every [`NodeId`] a delta names.
-pub(crate) fn delta_nodes(delta: &IdentityDelta) -> Vec<NodeId> {
-    match delta {
-        IdentityDelta::Birth { node } | IdentityDelta::Death { node } => vec![*node],
-        IdentityDelta::DerivedFrom { node, from } => vec![*node, *from],
-        IdentityDelta::SplitInto { node, into } => {
-            let mut out = vec![*node];
-            out.extend(into.iter().copied());
-            out
-        }
-        IdentityDelta::MergedFrom { node, from } => {
-            let mut out = vec![*node];
-            out.extend(from.iter().copied());
-            out
-        }
-    }
 }

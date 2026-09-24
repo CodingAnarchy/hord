@@ -2,83 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hord_core::{IdentityDelta, Node, NodeId, ObjectId, Op, RepoPath};
-use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree, Site, oid_at};
-
-/// [`NodeId`] of the file root at `path`: the parent of file-level
-/// definitions (ADR 0015).
-///
-/// The CST root (`source_file`, `document`, …) is not a definition, but
-/// [`hord_core::Op::Insert`] and [`hord_core::Op::Move`] need a parent id.
-/// [`hord_core::Op::Replace`] on this id replaces that file's glue (or the
-/// whole file). It is [`hord_identity::file_root_id`]: derived from the path,
-/// so ops name their file without depending on op order.
-#[must_use]
-pub fn file_parent(path: &RepoPath) -> NodeId {
-    hord_identity::file_root_id(path)
-}
-
-/// Internal stand-in for the file root. Never appears in public ops: the
-/// public functions swap it with [`file_parent`] at the boundary.
-pub(crate) fn root_sentinel() -> NodeId {
-    NodeId::nil()
-}
-
-/// Whether `op` names `id` in any [`NodeId`] field.
-pub(crate) fn mentions(op: &Op, id: NodeId) -> bool {
-    match op {
-        Op::Insert { parent, .. } => *parent == id,
-        Op::Delete { node } | Op::Replace { node, .. } | Op::Rename { node, .. } => *node == id,
-        Op::Move {
-            node,
-            from_parent,
-            to_parent,
-            ..
-        } => *node == id || *from_parent == id || *to_parent == id,
-        Op::Blob { .. } | Op::Tree { .. } => false,
-    }
-}
-
-/// `ops` with every [`NodeId`] field equal to `from` replaced by `to`.
-pub(crate) fn swap_root(ops: &[Op], from: NodeId, to: NodeId) -> Vec<Op> {
-    let swap = |id: NodeId| if id == from { to } else { id };
-    ops.iter()
-        .map(|op| match op.clone() {
-            Op::Insert {
-                parent,
-                index,
-                node,
-            } => Op::Insert {
-                parent: swap(parent),
-                index,
-                node,
-            },
-            Op::Delete { node } => Op::Delete { node: swap(node) },
-            Op::Replace { node, from, to } => Op::Replace {
-                node: swap(node),
-                from,
-                to,
-            },
-            Op::Move {
-                node,
-                from_parent,
-                to_parent,
-                index,
-            } => Op::Move {
-                node: swap(node),
-                from_parent: swap(from_parent),
-                to_parent: swap(to_parent),
-                index,
-            },
-            Op::Rename { node, from, to } => Op::Rename {
-                node: swap(node),
-                from,
-                to,
-            },
-            other => other,
-        })
-        .collect()
-}
+use hord_core::{IdentityDelta, Node, NodeId, ObjectId, Op};
+use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree, Site, def_sites, oid_at};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DefSite {
@@ -90,42 +15,21 @@ pub(crate) struct DefSite {
 }
 
 /// Preorder definition sites in `tree` using `ids` as the def set.
-pub(crate) fn collect_sites(tree: &NodeTree, ids: &BTreeMap<Site, NodeId>) -> Vec<DefSite> {
-    let Some(root) = tree.root() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    walk(tree, ids, root, &mut Vec::new(), root_sentinel(), &mut out);
-    out
-}
-
-fn walk(
+/// File-level definitions have the parent `root`, the file root's id.
+pub(crate) fn collect_sites(
     tree: &NodeTree,
     ids: &BTreeMap<Site, NodeId>,
-    oid: ObjectId,
-    site: &mut Site,
-    parent_id: NodeId,
-    out: &mut Vec<DefSite>,
-) {
-    let Some(node) = tree.get(oid) else {
-        return;
-    };
-    let mut child_parent = parent_id;
-    if let Some(&node_id) = ids.get(site.as_slice()) {
-        out.push(DefSite {
-            node_id,
-            object_id: oid,
-            site: site.clone(),
-            parent_id,
-            cst_index: site.last().copied().unwrap_or(0),
-        });
-        child_parent = node_id;
-    }
-    for (i, child) in node.children.iter().enumerate() {
-        site.push(u32::try_from(i).unwrap_or(u32::MAX));
-        walk(tree, ids, *child, site, child_parent, out);
-        site.pop();
-    }
+    root: NodeId,
+) -> Vec<DefSite> {
+    def_sites(tree, ids)
+        .map(|def| DefSite {
+            node_id: def.node,
+            object_id: def.oid,
+            site: def.site.clone(),
+            parent_id: def.parent.unwrap_or(root),
+            cst_index: def.site.last().copied().unwrap_or(0),
+        })
+        .collect()
 }
 
 pub(crate) fn sites_by_id(sites: &[DefSite]) -> BTreeMap<NodeId, DefSite> {
@@ -227,17 +131,18 @@ fn walk_outside_defs(
     }
 }
 
-/// Site of `id` in `tree`; the file root for [`root_sentinel`].
-pub(crate) fn site_of(tree: &IdentifiedTree, id: NodeId) -> Option<Site> {
-    if id == root_sentinel() {
+/// Site of `id` in `tree`; the empty site when `id` is the file `root`.
+pub(crate) fn site_of(tree: &IdentifiedTree, id: NodeId, root: NodeId) -> Option<Site> {
+    if id == root {
         return tree.tree.root().map(|_| Vec::new());
     }
     tree.site_of(id).cloned()
 }
 
-/// Content id of the definition `id` (the file root for [`root_sentinel`]).
-pub(crate) fn oid_of(tree: &IdentifiedTree, id: NodeId) -> Option<ObjectId> {
-    tree.oid_at(&site_of(tree, id)?)
+/// Content id of the definition `id` (of the whole file when `id` is the
+/// file `root`).
+pub(crate) fn oid_of(tree: &IdentifiedTree, id: NodeId, root: NodeId) -> Option<ObjectId> {
+    tree.oid_at(&site_of(tree, id, root)?)
 }
 
 /// `(parent content id, child index)` for each step from the root to `site`.
@@ -253,12 +158,17 @@ pub(crate) fn chain(tree: &NodeTree, site: &[u32]) -> Option<Vec<(ObjectId, usiz
     Some(out)
 }
 
-/// Build an [`IdentityMapping`] from ids already on `side`, relative to `base`.
+/// Build an [`IdentityMapping`] from ids already on `side`, relative to `base`
+/// (a file whose root id is `root`).
 ///
 /// [`LangAdapter::identify`] is not used: the caller owns carrying (tests
 /// pair by source label; M2 will pass names). Deltas and moves are
 /// recovered from the two id maps and CST parents.
-pub(crate) fn mapping_between(base: &IdentifiedTree, side: &IdentifiedTree) -> IdentityMapping {
+pub(crate) fn mapping_between(
+    base: &IdentifiedTree,
+    side: &IdentifiedTree,
+    root: NodeId,
+) -> IdentityMapping {
     let mut mapping = IdentityMapping {
         nodes: side.ids.clone(),
         ..IdentityMapping::default()
@@ -275,8 +185,8 @@ pub(crate) fn mapping_between(base: &IdentifiedTree, side: &IdentifiedTree) -> I
             mapping.deltas.push(IdentityDelta::Death { node: *nid });
         }
     }
-    let base_by = sites_by_id(&collect_sites(&base.tree, &base.ids));
-    let side_by = sites_by_id(&collect_sites(&side.tree, &side.ids));
+    let base_by = sites_by_id(&collect_sites(&base.tree, &base.ids, root));
+    let side_by = sites_by_id(&collect_sites(&side.tree, &side.ids, root));
     for (nid, r) in &side_by {
         let Some(b) = base_by.get(nid) else {
             continue;
@@ -284,7 +194,7 @@ pub(crate) fn mapping_between(base: &IdentifiedTree, side: &IdentifiedTree) -> I
         if b.parent_id == r.parent_id {
             continue;
         }
-        if b.parent_id == root_sentinel() || r.parent_id == root_sentinel() {
+        if b.parent_id == root || r.parent_id == root {
             continue;
         }
         mapping.moves.push(Op::Move {

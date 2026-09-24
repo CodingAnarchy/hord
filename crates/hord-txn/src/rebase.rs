@@ -8,7 +8,6 @@ use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree, Site};
 
 use crate::conflict::{AdapterMerge, MergeConflict, MergeSeverity};
 use crate::files::{FileChange, file_changes};
-use crate::ids::path_node_id;
 use crate::propose::check_reproduces;
 use crate::repo::Inner;
 use crate::snapshot::IdentityEdits;
@@ -38,7 +37,7 @@ fn adapter_merge(
     head: SnapshotId,
     path: &RepoPath,
 ) -> Result<AdapterMerge> {
-    let mut nodes = BTreeSet::from([path_node_id(path)]);
+    let mut nodes = BTreeSet::from([NodeId::file_root(path)]);
     for snapshot in [record.base, head, record.result] {
         if let Some(parsed) = inner.file_view(snapshot, path)?.and_then(|v| v.parsed) {
             nodes.extend(parsed.tree.ids.values().copied());
@@ -223,7 +222,7 @@ fn reapply(
 ) -> Result<Option<Merged>> {
     let landed_writes = own.landed;
     let path = &file.path;
-    let root = hord_diff::file_parent(path);
+    let root = NodeId::file_root(path);
     let ops: Vec<Op> = file.structural().cloned().collect();
     if ops.is_empty() || file.from.is_none() || file.to.is_none() {
         return Ok(None);
@@ -254,7 +253,7 @@ fn reapply(
     let Some(adapter) = inner.adapter_for(path, ours.lang) else {
         return Ok(None);
     };
-    let Ok(applied) = hord_diff::apply(path, &ours.tree, &ops, &theirs.tree.tree) else {
+    let Ok(applied) = hord_diff::apply_identified(path, &ours.tree, &ops, &theirs.tree) else {
         return Ok(None);
     };
     let bytes = adapter.project(&applied.tree).into_vec();
@@ -266,17 +265,12 @@ fn reapply(
     // built (equal Merkle roots), the change's ops reproduce it by
     // construction and each definition keeps the id it has on its side.
     let same_root = parsed.root().is_some() && parsed.root() == applied.tree.root();
-    let unioned = if same_root {
-        union_ids(adapter, &applied, &ours.tree, &theirs.tree, &ops)
-    } else {
-        None
-    };
-    if let Some(ids) = unioned {
+    if same_root && fully_identified(adapter, &applied) {
         let identity = inner.put_file_identity(
             adapter,
             path,
             blob,
-            &Arc::new(IdentifiedTree::new((*parsed).clone(), ids)),
+            &Arc::new(IdentifiedTree::new((*parsed).clone(), applied.ids)),
         )?;
         return Ok(Some(Merged::Clean {
             blob,
@@ -293,89 +287,31 @@ fn reapply(
     }
 }
 
-/// Ids for `applied` (head with the change's ops applied; the caller has
-/// checked it equals the re-parse). `apply` keeps head's ids at their new
-/// sites. Content the change brought in (a replaced definition's body, an
-/// inserted definition) takes the ids it has in the change's result,
-/// relative to that definition. `None` when a definition site is left
-/// without a known id or two sites share one; then identity is carried the
-/// slow way.
-fn union_ids(
-    adapter: &dyn hord_lang::LangAdapter,
-    applied: &IdentifiedTree,
-    ours: &IdentifiedTree,
-    theirs: &IdentifiedTree,
-    ops: &[Op],
-) -> Option<BTreeMap<Site, NodeId>> {
-    let mut ids = applied.ids.clone();
-    let mut inserted: BTreeMap<ObjectId, Vec<Site>> = BTreeMap::new();
-    for op in ops {
-        match op {
-            Op::Replace { node, .. } => {
-                let at = applied.site_of(*node)?.clone();
-                let from = theirs.site_of(*node)?.clone();
-                copy_subtree(&mut ids, theirs, &from, &at);
-            }
-            Op::Insert { node, .. } => {
-                inserted.entry(*node).or_default();
-            }
-            _ => {}
-        }
-    }
-    // Pair each inserted content's sites in the result with its sites in
-    // the change, in preorder.
-    let known: std::collections::HashSet<NodeId> = ours
-        .ids
-        .values()
-        .chain(theirs.ids.values())
-        .copied()
-        .collect();
-    for (oid, _) in inserted {
-        let targets: Vec<Site> = applied
-            .ids
-            .iter()
-            .filter(|(site, id)| !known.contains(id) && applied.oid_at(site) == Some(oid))
-            .map(|(site, _)| site.clone())
-            .collect();
-        let sources: Vec<Site> = theirs
-            .ids
-            .iter()
-            .filter(|(site, id)| {
-                !ours.ids.values().any(|o| o == *id) && theirs.oid_at(site) == Some(oid)
-            })
-            .map(|(site, _)| site.clone())
-            .collect();
-        if targets.len() != sources.len() {
-            return None;
-        }
-        for (at, from) in targets.iter().zip(&sources) {
-            copy_subtree(&mut ids, theirs, from, at);
-        }
-    }
-    // Every definition site has a known id, and no id is at two sites.
-    fn check(
+/// Whether `tree` (head with the change's ops applied, ids placed by
+/// [`hord_diff::apply_identified`]) gives every definition site an id and no
+/// id to two sites. Otherwise identity is carried the slow way.
+fn fully_identified(adapter: &dyn hord_lang::LangAdapter, tree: &IdentifiedTree) -> bool {
+    fn walk(
         adapter: &dyn hord_lang::LangAdapter,
-        tree: &hord_lang::NodeTree,
+        tree: &IdentifiedTree,
         oid: ObjectId,
         site: &mut Site,
-        ids: &BTreeMap<Site, NodeId>,
-        known: &std::collections::HashSet<NodeId>,
         seen: &mut std::collections::HashSet<NodeId>,
     ) -> bool {
-        let Some(node) = tree.get(oid) else {
+        let Some(node) = tree.tree.get(oid) else {
             return false;
         };
         if adapter.is_definition(&node.kind) {
-            let Some(id) = ids.get(site.as_slice()) else {
+            let Some(id) = tree.ids.get(site.as_slice()) else {
                 return false;
             };
-            if !known.contains(id) || !seen.insert(*id) {
+            if !seen.insert(*id) {
                 return false;
             }
         }
         for (i, child) in node.children.iter().enumerate() {
             site.push(u32::try_from(i).unwrap_or(u32::MAX));
-            let ok = check(adapter, tree, *child, site, ids, known, seen);
+            let ok = walk(adapter, tree, *child, site, seen);
             site.pop();
             if !ok {
                 return false;
@@ -383,39 +319,16 @@ fn union_ids(
         }
         true
     }
-    let root = applied.tree.root()?;
-    let mut seen = std::collections::HashSet::new();
-    if !check(
+    let Some(root) = tree.tree.root() else {
+        return false;
+    };
+    walk(
         adapter,
-        &applied.tree,
+        tree,
         root,
         &mut Vec::new(),
-        &ids,
-        &known,
-        &mut seen,
-    ) {
-        return None;
-    }
-    ids.retain(|site, _| applied.oid_at(site).is_some());
-    Some(ids)
-}
-
-/// Replace the ids at and below `at` with `theirs`' ids at and below
-/// `from`, at the same relative sites.
-fn copy_subtree(
-    ids: &mut BTreeMap<Site, NodeId>,
-    theirs: &IdentifiedTree,
-    from: &[u32],
-    at: &[u32],
-) {
-    ids.retain(|site, _| !site.starts_with(at));
-    for (site, id) in &theirs.ids {
-        if site.starts_with(from) {
-            let mut key = at.to_vec();
-            key.extend_from_slice(&site[from.len()..]);
-            ids.insert(key, *id);
-        }
-    }
+        &mut std::collections::HashSet::new(),
+    )
 }
 
 fn parsed_or_empty(
@@ -532,6 +445,7 @@ fn merge_file(
     };
     let merged_result = hord_diff::merge(
         adapter,
+        path,
         &base,
         &ours_tree,
         &theirs_tree,
@@ -609,10 +523,12 @@ fn finish_parsed(
         ));
     };
     let ours = parsed_or_empty(inner, head, path)?;
-    let mut mapping = hord_identity::carry_in(adapter, path, Some(head), &ours, &tree, &[])
-        .map_err(|source| Error::Identity {
-            path: path.clone(),
-            source,
+    let mut mapping =
+        hord_identity::carry(adapter, path, Some(head), &ours, &tree, &[]).map_err(|source| {
+            Error::Identity {
+                path: path.clone(),
+                source,
+            }
         })?;
     if let Some(theirs) = theirs {
         keep_own_births(&mut mapping, &tree, theirs, own);

@@ -417,52 +417,21 @@ type RebuiltHistory = (
     BTreeMap<ChangeId, ChangeId>,
 );
 
-/// Node ids a change touched. `read_set` is a dependency, not an edit, so it
-/// is omitted. Every [`NodeId`] field on [`Op`] and [`IdentityDelta`] counts,
-/// plus `write_set`.
-pub(super) fn touched_nodes(change: &ChangeRecord) -> BTreeSet<NodeId> {
+/// Node ids a change touched, as [`crate::Store::node_history`] indexes
+/// them. `read_set` is a dependency, not an edit, so it is omitted. Every
+/// [`NodeId`] field on [`Op`] and [`IdentityDelta`] counts, plus
+/// `write_set`.
+#[must_use]
+pub fn touched_nodes(change: &ChangeRecord) -> BTreeSet<NodeId> {
     let mut nodes = BTreeSet::new();
     nodes.extend(change.write_set.iter().copied());
-    for op in &change.ops {
-        match op {
-            Op::Insert { parent, .. } => {
-                nodes.insert(*parent);
-            }
-            Op::Delete { node } | Op::Replace { node, .. } | Op::Rename { node, .. } => {
-                nodes.insert(*node);
-            }
-            Op::Move {
-                node,
-                from_parent,
-                to_parent,
-                ..
-            } => {
-                nodes.insert(*node);
-                nodes.insert(*from_parent);
-                nodes.insert(*to_parent);
-            }
-            Op::Blob { .. } | Op::Tree { .. } => {}
-        }
-    }
-    for delta in &change.identity_deltas {
-        match delta {
-            IdentityDelta::Birth { node } | IdentityDelta::Death { node } => {
-                nodes.insert(*node);
-            }
-            IdentityDelta::DerivedFrom { node, from } => {
-                nodes.insert(*node);
-                nodes.insert(*from);
-            }
-            IdentityDelta::SplitInto { node, into } => {
-                nodes.insert(*node);
-                nodes.extend(into.iter().copied());
-            }
-            IdentityDelta::MergedFrom { node, from } => {
-                nodes.insert(*node);
-                nodes.extend(from.iter().copied());
-            }
-        }
-    }
+    nodes.extend(change.ops.iter().flat_map(Op::node_ids));
+    nodes.extend(
+        change
+            .identity_deltas
+            .iter()
+            .flat_map(IdentityDelta::node_ids),
+    );
     nodes
 }
 

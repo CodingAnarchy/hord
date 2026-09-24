@@ -1646,7 +1646,6 @@ version = "0.0.0"
 dependencies = [
  "diffy",
  "hord-core",
- "hord-identity",
  "hord-lang",
  "hord-lang-rust",
  "hord-lang-toml",

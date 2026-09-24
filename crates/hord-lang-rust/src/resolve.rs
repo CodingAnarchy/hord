@@ -735,7 +735,7 @@ fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
 
 fn add_rows(path: &RepoPath, rows: &FileRows, ctx: &mut ResolveCtx) {
     if let Some((root, module)) = &rows.root {
-        ctx.add_file_at(path.clone(), *root, module.as_str());
+        ctx.add_file(path.clone(), *root, module.as_str());
     }
     for def in &rows.defs {
         ctx.add_definition(
@@ -1655,14 +1655,12 @@ impl Index {
                 target_module: None,
             });
         });
-        ctx.for_each_file_at(|path, oid, module| {
+        ctx.for_each_file(|path, oid, module| {
             let module = module.as_str().to_owned();
             if !module.is_empty() {
                 idx.crate_keys.insert(crate_key(&module).to_owned());
             }
-            if let Some(path) = path {
-                idx.files_by_path.insert(path.clone(), module.clone());
-            }
+            idx.files_by_path.insert(path.clone(), module.clone());
             let modules = idx.files.entry(oid).or_default();
             if !modules.contains(&module) {
                 modules.push(module);

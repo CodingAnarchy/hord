@@ -20,7 +20,7 @@
 //! Read sets follow ADR 0012 (access log ∪ one hop of outgoing references
 //! from written definitions, base and result ∪ declarations). Blob-tier
 //! files and whole-file writes use a path-derived [`NodeId`](hord_core::NodeId)
-//! ([`path_node_id`]); see [`propose`](Workspace::propose) for the op layout
+//! ([`NodeId::file_root`](hord_core::NodeId::file_root)); see [`propose`](Workspace::propose) for the op layout
 //! and sets.
 
 #![forbid(unsafe_code)]
@@ -30,7 +30,6 @@
 mod conflict;
 mod error;
 mod files;
-mod ids;
 mod lander;
 mod materialize;
 mod propose;
@@ -47,9 +46,6 @@ pub use conflict::{
 };
 pub use error::{Error, Result};
 pub use hord_store::{EdgeKind, WorkspaceId};
-#[allow(deprecated)]
-pub use ids::glue_node_id;
-pub use ids::path_node_id;
 pub use lander::{
     QueueEntry, QueueStatus, StubVerifier, Verdict, Verifier, VerifyFuture, VerifyRequest,
 };

@@ -26,7 +26,7 @@ mod lock;
 #[path = "queue.rs"]
 mod queue;
 
-pub use index::EdgeKind;
+pub use index::{EdgeKind, touched_nodes};
 pub use queue::Landing;
 
 /// Directory name of a Hord store, next to the repository root (spec §8.1).

@@ -252,7 +252,7 @@ fn snapshot(store: &Store, files: &[(&str, &str, &[NodeId])]) -> ObjectId {
             .put_object(&Blob::new(source.as_bytes().to_vec()))
             .unwrap();
         let tree = RustAdapter.parse(source.as_bytes()).unwrap();
-        let fresh = hord_identity::assign_in(&RustAdapter, &path, None, &tree);
+        let fresh = hord_identity::assign(&RustAdapter, &path, None, &tree);
         let mut nodes: Vec<(Vec<u32>, NodeId)> = fresh.nodes.into_iter().collect();
         assert!(
             nodes.len() >= ids.len(),
