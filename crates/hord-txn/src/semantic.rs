@@ -508,28 +508,33 @@ mod tests {
     }
 
     fn path(p: &str) -> RepoPath {
-        p.parse().unwrap()
+        p.parse().expect("parse test path literal")
     }
 
     use super::*;
 
-    async fn land(repo: &Repo, edit: impl AsyncFnOnce(&mut Workspace)) {
-        let mut ws = repo.begin(BeginOptions::at_head(actor())).await.unwrap();
-        edit(&mut ws).await;
-        let before = repo.head().await.unwrap().snapshot;
-        let proposal = ws.propose(intent("step")).await.unwrap();
-        repo.submit(proposal.change).await.unwrap();
-        repo.land_local().await.unwrap();
-        assert_ne!(repo.head().await.unwrap().snapshot, before, "landed");
+    async fn land(
+        repo: &Repo,
+        edit: impl AsyncFnOnce(&mut Workspace) -> crate::Result<()>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut ws = repo.begin(BeginOptions::at_head(actor())).await?;
+        edit(&mut ws).await?;
+        let before = repo.head().await?.snapshot;
+        let proposal = ws.propose(intent("step")).await?;
+        repo.submit(proposal.change).await?;
+        repo.land_local().await?;
+        assert_ne!(repo.head().await?.snapshot, before, "landed");
+        Ok(())
     }
 
     /// The head's context, built incrementally from the previous head's,
     /// equals a full rebuild after every landing (perf review #1).
     #[tokio::test]
-    async fn incremental_context_equals_full_rebuild_over_landings() {
+    async fn incremental_context_equals_full_rebuild_over_landings()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join(format!("hord-txn-ctx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let repo = Repo::create(&dir).await.unwrap();
+        let repo = Repo::create(&dir).await?;
         let files = [
             ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
             ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
@@ -555,75 +560,73 @@ mod tests {
             .iter()
             .map(|(p, s)| (path(p), s.as_bytes().to_vec()))
             .collect();
-        repo.bootstrap(files, intent("bootstrap"), actor())
-            .await
-            .unwrap();
+        repo.bootstrap(files, intent("bootstrap"), actor()).await?;
 
-        let check = |step: &str| {
+        let check = |step: &str| -> Result<(), Box<dyn std::error::Error>> {
             let inner = &repo.inner;
-            let head = inner.head().unwrap().snapshot;
-            let full = inner.build_rust_ctx_full(head).unwrap();
-            let inc = inner.rust_ctx(head).unwrap();
+            let head = inner.head()?.snapshot;
+            let full = inner.build_rust_ctx_full(head)?;
+            let inc = inner.rust_ctx(head)?;
             assert!(
                 inc.ctx.same_contents(&full),
                 "{step}: incremental context differs from a full rebuild"
             );
             assert!(full.definition_count() > 0);
+            Ok(())
         };
-        check("bootstrap");
+        check("bootstrap")?;
 
         land(&repo, async |ws| {
             ws.write_file(
                 &path("a/src/x.rs"),
                 "pub fn helper() -> u32 {\n    crate::f() + 1\n}\n",
             )
-            .await
-            .unwrap();
+            .await?;
+            Ok(())
         })
-        .await;
+        .await?;
         assert!(repo.inner.latest_rust_ctx().is_some(), "propose built one");
-        check("edit a body");
+        check("edit a body")?;
 
         land(&repo, async |ws| {
             ws.write_file(
                 &path("a/src/lib.rs"),
                 "mod x;\nmod y;\npub use x::helper;\n\npub fn f() -> u32 {\n    1\n}\n",
             )
-            .await
-            .unwrap();
+            .await?;
             ws.write_file(&path("a/src/y.rs"), "pub struct Y;\n")
-                .await
-                .unwrap();
+                .await?;
+            Ok(())
         })
-        .await;
-        check("add a module");
+        .await?;
+        check("add a module")?;
 
         land(&repo, async |ws| {
             ws.write_file(
                 &path("a/src/x.rs"),
                 "pub fn helper_renamed() -> u32 {\n    crate::f() + 1\n}\n",
             )
-            .await
-            .unwrap();
+            .await?;
             ws.write_file(
                 &path("a/src/lib.rs"),
                 "mod x;\nmod y;\npub use x::helper_renamed as helper;\n\npub fn f() -> u32 {\n    1\n}\n",
             )
-            .await
-            .unwrap();
+            .await?;
+            Ok(())
         })
-        .await;
-        check("rename (carried identity)");
+        .await?;
+        check("rename (carried identity)")?;
 
         land(&repo, async |ws| {
-            ws.delete_file(&path("a/src/y.rs")).await.unwrap();
+            ws.delete_file(&path("a/src/y.rs")).await?;
             ws.write_file(&path("b/Cargo.toml"), "[package]\nname = \"b\"\n")
-                .await
-                .unwrap();
+                .await?;
+            Ok(())
         })
-        .await;
-        check("delete a file and a dependency");
+        .await?;
+        check("delete a file and a dependency")?;
 
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

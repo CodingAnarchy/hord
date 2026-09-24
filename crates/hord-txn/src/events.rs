@@ -406,69 +406,78 @@ mod tests {
         })
     }
 
-    fn reason(envelope: &proto::EventEnvelope) -> String {
-        match &envelope.event.as_ref().unwrap().kind {
-            Some(proto::event::Kind::Rejected(r)) => r.reason.clone(),
-            other => panic!("{other:?}"),
+    fn reason(envelope: &proto::EventEnvelope) -> Result<String, Box<dyn std::error::Error>> {
+        match &envelope
+            .event
+            .as_ref()
+            .ok_or("an appended envelope carries its event")?
+            .kind
+        {
+            Some(proto::event::Kind::Rejected(r)) => Ok(r.reason.clone()),
+            other => Err(format!("expected a Rejected event, got {other:?}").into()),
         }
     }
 
-    fn temp(tag: &str) -> std::path::PathBuf {
+    fn temp(tag: &str) -> std::io::Result<std::path::PathBuf> {
         let dir = std::env::temp_dir().join(format!("hord-events-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 
     #[tokio::test]
-    async fn cursors_persist_and_a_subscriber_resumes_after_its_cursor() {
-        let dir = temp("persist");
+    async fn cursors_persist_and_a_subscriber_resumes_after_its_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = temp("persist")?;
         {
-            let log = EventLog::open(&dir).unwrap();
-            let first = log.append(vec![rejected(1), rejected(2)]).unwrap();
+            let log = EventLog::open(&dir)?;
+            let first = log.append(vec![rejected(1), rejected(2)])?;
             assert_eq!(
                 first.iter().map(|e| e.cursor).collect::<Vec<_>>(),
                 vec![1, 2]
             );
         }
-        let log = Arc::new(EventLog::open(&dir).unwrap());
+        let log = Arc::new(EventLog::open(&dir)?);
         assert_eq!(log.last(), 2, "the cursor survives a reopen");
-        log.append(vec![rejected(3)]).unwrap();
+        log.append(vec![rejected(3)])?;
         let mut stream = log.subscribe(Some(1));
-        let replayed: Vec<_> = [stream.next().await, stream.next().await]
-            .into_iter()
-            .map(|e| e.unwrap().unwrap())
-            .collect();
+        let mut replayed = Vec::new();
+        for _ in 0..2 {
+            replayed.push(stream.next().await.ok_or("replayed event")??);
+        }
         assert_eq!(
             replayed.iter().map(|e| e.cursor).collect::<Vec<_>>(),
             vec![2, 3]
         );
-        log.append(vec![rejected(4)]).unwrap();
-        let live = stream.next().await.unwrap().unwrap();
-        assert_eq!((live.cursor, reason(&live)), (4, "4".to_owned()));
+        log.append(vec![rejected(4)])?;
+        let live = stream.next().await.ok_or("live event")??;
+        assert_eq!((live.cursor, reason(&live)?), (4, "4".to_owned()));
         drop(stream);
         drop(log);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_live_subscriber_sees_only_new_events_and_one_that_lags_catches_up() {
-        let dir = temp("live");
-        let log = Arc::new(EventLog::open(&dir).unwrap());
-        log.append(vec![rejected(0)]).unwrap();
+    async fn a_live_subscriber_sees_only_new_events_and_one_that_lags_catches_up()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = temp("live")?;
+        let log = Arc::new(EventLog::open(&dir)?);
+        log.append(vec![rejected(0)])?;
         let mut stream = log.subscribe(None);
         // More than the broadcast buffer, so the follower lags and re-reads.
         let total = LIVE_BUFFER as u32 * 2 + 5;
         for n in 1..=total {
-            log.append(vec![rejected(n)]).unwrap();
+            log.append(vec![rejected(n)])?;
         }
         for n in 1..=total {
-            let e = stream.next().await.unwrap().unwrap();
+            let e = stream.next().await.ok_or("lagging event")??;
             assert_eq!(e.cursor, u64::from(n) + 1);
-            assert_eq!(reason(&e), n.to_string());
+            assert_eq!(reason(&e)?, n.to_string());
         }
         drop(stream);
         drop(log);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

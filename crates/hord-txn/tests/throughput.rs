@@ -46,7 +46,7 @@ impl Lcg {
     }
 }
 
-async fn measure(files: usize, changes: usize) -> f64 {
+async fn measure(files: usize, changes: usize) -> TestResult<f64> {
     let mut lib = String::new();
     for f in 0..files {
         lib.push_str(&format!("pub mod m{f};\n"));
@@ -60,7 +60,7 @@ async fn measure(files: usize, changes: usize) -> f64 {
         .map(|(p, c)| (p.as_str(), c.as_str()))
         .collect();
     let started = Instant::now();
-    let t = repo(&refs).await;
+    let t = repo(&refs).await?;
     eprintln!(
         "[throughput] bootstrap {files} files in {:?}",
         started.elapsed()
@@ -73,7 +73,7 @@ async fn measure(files: usize, changes: usize) -> f64 {
     let started = Instant::now();
     let mut submitted = Vec::new();
     for c in 0..changes {
-        let mut ws = begin(&t.repo, &format!("agent-{c}")).await;
+        let mut ws = begin(&t.repo, &format!("agent-{c}")).await?;
         let file = if rng.next(10) < 2 {
             hot[rng.next(hot.len())]
         } else {
@@ -84,9 +84,8 @@ async fn measure(files: usize, changes: usize) -> f64 {
             .map(|_| (rng.next(FNS_PER_FILE), 1000 + c))
             .collect();
         ws.write_file(&path(&format!("src/m{file}.rs")), file_text(file, &bumps))
-            .await
-            .unwrap();
-        submitted.push(submit(&t.repo, &mut ws, &format!("change {c}")).await);
+            .await?;
+        submitted.push(submit(&t.repo, &mut ws, &format!("change {c}")).await?);
     }
     eprintln!(
         "[throughput] proposed and submitted {changes} in {:?}",
@@ -94,7 +93,7 @@ async fn measure(files: usize, changes: usize) -> f64 {
     );
 
     let started = Instant::now();
-    let done = t.repo.land_local().await.unwrap();
+    let done = t.repo.land_local().await?;
     let elapsed = started.elapsed();
     assert_eq!(done.len(), changes);
     let landed = done
@@ -117,17 +116,19 @@ async fn measure(files: usize, changes: usize) -> f64 {
     eprintln!(
         "[throughput] landed {landed}, conflicted {conflicted}, flagged {flagged} of {changes} in {elapsed:?}: {rate:.1} changes/s"
     );
-    rate
+    Ok(rate)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lander_throughput_smoke() {
-    measure(40, 20).await;
+async fn lander_throughput_smoke() -> TestResult {
+    measure(40, 20).await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "cargo-sized; run in release (see module docs)"]
-async fn lander_throughput_cargo_sized() {
-    let rate = measure(1_400, 100).await;
+async fn lander_throughput_cargo_sized() -> TestResult {
+    let rate = measure(1_400, 100).await?;
     assert!(rate >= 20.0, "{rate:.1} changes/s < 20");
+    Ok(())
 }

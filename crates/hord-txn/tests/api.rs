@@ -15,13 +15,17 @@ use hord_txn::{Base, BeginOptions, Lander, ObjectSource, QueueStatus, Repo, Repo
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-async fn next_kind(stream: &mut EventStream) -> Kind {
+async fn next_kind(stream: &mut EventStream) -> TestResult<Kind> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await
         .expect("an event in time")
         .expect("stream open")
         .expect("no stream error");
-    envelope.event.unwrap().kind.unwrap()
+    Ok(envelope
+        .event
+        .ok_or("envelope carries an event")?
+        .kind
+        .ok_or("event carries a kind")?)
 }
 
 /// Kind names, for comparing sequences.
@@ -43,16 +47,16 @@ fn name(kind: &Kind) -> &'static str {
 /// A spawned lander lands what is submitted without `land_local`, reports
 /// it on its stream, and stops when cancelled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_lander_task_lands_submissions_and_stops_on_cancel() {
-    let t = repo(&fixture()).await;
+async fn the_lander_task_lands_submissions_and_stops_on_cancel() -> TestResult {
+    let t = repo(&fixture()).await?;
     let cancel = CancellationToken::new();
-    let (task, mut events) = Lander::spawn(t.repo.clone(), cancel.clone()).unwrap();
-    let mut ws = begin(&t.repo, "a").await;
-    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-    let change = submit(&t.repo, &mut ws, "twenty").await;
+    let (task, mut events) = Lander::spawn(t.repo.clone(), cancel.clone())?;
+    let mut ws = begin(&t.repo, "a").await?;
+    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    let change = submit(&t.repo, &mut ws, "twenty").await?;
     let mut seen = Vec::new();
     loop {
-        let kind = next_kind(&mut events).await;
+        let kind = next_kind(&mut events).await?;
         seen.push(name(&kind));
         if let Kind::HeadMoved(moved) = &kind {
             assert_eq!(moved.to, change.to_hex());
@@ -63,59 +67,61 @@ async fn the_lander_task_lands_submissions_and_stops_on_cancel() {
         seen,
         ["submitted", "conflict_check", "landed", "head_moved"]
     );
-    assert_eq!(t.repo.head().await.unwrap().change, Some(change));
+    assert_eq!(t.repo.head().await?.change, Some(change));
     assert!(matches!(
-        t.repo.status(change).await.unwrap().status,
+        t.repo.status(change).await?.status,
         QueueStatus::Landed { .. }
     ));
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(10), task)
         .await
-        .expect("the lander stops when cancelled")
-        .unwrap();
+        .expect("the lander stops when cancelled")?;
+    Ok(())
 }
 
 /// `land_local` emits the same events, and the log keeps them with their
 /// cursors across a reopen, so a reader resumes where it left off.
 #[tokio::test]
-async fn events_persist_across_a_reopen() {
-    let dir = temp_dir("events");
+async fn events_persist_across_a_reopen() -> TestResult {
+    let dir = temp_dir("events")?;
     let options = || RepoOptions {
         verifier: Some(Arc::new(hord_txn::StubVerifier)),
         ..RepoOptions::default()
     };
     let (first, second) = {
-        let repo = Repo::create_with(&dir, options()).await.unwrap();
+        let repo = Repo::create_with(&dir, options()).await?;
         let files = fixture()
             .into_iter()
             .map(|(p, s)| (path(p), s.as_bytes().to_vec()))
             .collect();
-        repo.bootstrap(files, intent("seed"), actor("seed"))
-            .await
-            .unwrap();
-        let mut a = begin(&repo, "a").await;
-        edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-        let first = submit(&repo, &mut a, "a").await;
-        let mut b = begin(&repo, "b").await;
-        edit(&mut b, "src/lib.rs", LIB, "    4\n", "    40\n").await;
-        let second = submit(&repo, &mut b, "b").await;
-        let done = repo.land_local().await.unwrap();
+        repo.bootstrap(files, intent("seed"), actor("seed")).await?;
+        let mut a = begin(&repo, "a").await?;
+        edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+        let first = submit(&repo, &mut a, "a").await?;
+        let mut b = begin(&repo, "b").await?;
+        edit(&mut b, "src/lib.rs", LIB, "    4\n", "    40\n").await?;
+        let second = submit(&repo, &mut b, "b").await?;
+        let done = repo.land_local().await?;
         assert_eq!(done.len(), 2);
         (first, second)
     };
-    let repo = Repo::open_with(&dir, options()).await.unwrap();
-    let mut all = repo.events(Some(0)).await.unwrap();
+    let repo = Repo::open_with(&dir, options()).await?;
+    let mut all = repo.events(Some(0)).await?;
     let mut kinds = Vec::new();
     let mut cursors = Vec::new();
     // bootstrap: landed, head_moved; then two submissions and two landings.
     while kinds.len() < 10 {
         let envelope = tokio::time::timeout(Duration::from_secs(10), all.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await?
+            .ok_or("event stream ended")??;
         cursors.push(envelope.cursor);
-        kinds.push(envelope.event.unwrap().kind.unwrap());
+        kinds.push(
+            envelope
+                .event
+                .ok_or("envelope carries an event")?
+                .kind
+                .ok_or("event carries a kind")?,
+        );
     }
     assert_eq!(cursors, (1..=10).collect::<Vec<u64>>());
     assert_eq!(
@@ -149,37 +155,39 @@ async fn events_persist_across_a_reopen() {
     assert_eq!(rebased.submitted.as_deref(), Some(second.to_hex().as_str()));
     assert_eq!(rebased.position, 2);
     // Resume after cursor 7: exactly the last three.
-    let mut resumed = repo.events(Some(7)).await.unwrap();
+    let mut resumed = repo.events(Some(7)).await?;
     for expected in 8..=10 {
-        let e = resumed.next().await.unwrap().unwrap();
+        let e = resumed.next().await.ok_or("resumed stream ended")??;
         assert_eq!(e.cursor, expected);
     }
     drop(resumed);
     drop(all);
     drop(repo);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = remove_tree(&dir);
+    Ok(())
 }
 
 /// Parked and rejected changes are reported as such.
 #[tokio::test]
-async fn parked_changes_emit_parked() {
-    let t = repo(&fixture()).await;
-    let mut a = begin(&t.repo, "a").await;
-    let mut b = begin(&t.repo, "b").await;
-    edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-    edit(&mut b, "src/lib.rs", LIB, "    2\n", "    21\n").await;
-    submit(&t.repo, &mut a, "a").await;
-    let parked = submit(&t.repo, &mut b, "b").await;
-    let mut events = t.repo.events(None).await.unwrap();
-    t.repo.land_local().await.unwrap();
+async fn parked_changes_emit_parked() -> TestResult {
+    let t = repo(&fixture()).await?;
+    let mut a = begin(&t.repo, "a").await?;
+    let mut b = begin(&t.repo, "b").await?;
+    edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    edit(&mut b, "src/lib.rs", LIB, "    2\n", "    21\n").await?;
+    submit(&t.repo, &mut a, "a").await?;
+    let parked = submit(&t.repo, &mut b, "b").await?;
+    let mut events = t.repo.events(None).await?;
+    t.repo.land_local().await?;
     loop {
-        if let Kind::Parked(p) = next_kind(&mut events).await {
+        if let Kind::Parked(p) = next_kind(&mut events).await? {
             assert_eq!(p.change, parked.to_hex());
             assert_ne!(p.reason, i32::from(proto::ParkReason::Unspecified));
             assert!(!p.detail.is_empty());
             break;
         }
     }
+    Ok(())
 }
 
 /// Counts reads and serves them from another repository's objects.
@@ -204,14 +212,14 @@ impl ObjectSource for Counting {
 /// snapshot reads files and proposes a change, and only the objects it
 /// touched were fetched.
 #[tokio::test]
-async fn a_workspace_reads_through_the_object_source() {
-    let origin = repo(&fixture()).await;
-    let snapshot: SnapshotId = origin.repo.head().await.unwrap().snapshot;
+async fn a_workspace_reads_through_the_object_source() -> TestResult {
+    let origin = repo(&fixture()).await?;
+    let snapshot: SnapshotId = origin.repo.head().await?.snapshot;
     let source = Arc::new(Counting {
         inner: origin.repo.clone(),
         reads: AtomicUsize::new(0),
     });
-    let dir = temp_dir("sourced");
+    let dir = temp_dir("sourced")?;
     let local = Repo::create_with(
         &dir,
         RepoOptions {
@@ -219,31 +227,33 @@ async fn a_workspace_reads_through_the_object_source() {
             ..RepoOptions::default()
         },
     )
-    .await
-    .unwrap();
-    assert!(!local.store().contains(snapshot).unwrap());
+    .await?;
+    assert!(!local.store().contains(snapshot)?);
     let mut ws = local
         .begin(BeginOptions {
             base: Base::Snapshot(snapshot),
             ..BeginOptions::at_head(actor("remote"))
         })
-        .await
-        .unwrap();
+        .await?;
     assert_eq!(source.reads.load(Ordering::Relaxed), 0, "begin is O(1)");
-    let readme = ws.read_file(&path("README.md")).await.unwrap().unwrap();
+    let readme = ws
+        .read_file(&path("README.md"))
+        .await?
+        .ok_or("README.md missing in workspace")?;
     assert_eq!(readme.as_slice(), README.as_bytes());
     assert!(source.reads.load(Ordering::Relaxed) > 0);
     assert_eq!(
-        ws.objects().snapshot_identity(snapshot).unwrap(),
-        origin.repo.snapshot_identity(snapshot).unwrap()
+        ws.objects().snapshot_identity(snapshot)?,
+        origin.repo.snapshot_identity(snapshot)?
     );
-    edit(&mut ws, "README.md", README, "line two", "line 2").await;
-    let proposal = ws.propose(intent("remote edit")).await.unwrap();
+    edit(&mut ws, "README.md", README, "line two", "line 2").await?;
+    let proposal = ws.propose(intent("remote edit")).await?;
     assert_eq!(proposal.record.base, snapshot);
     // The proposal's new objects are written locally.
-    assert!(local.store().contains(proposal.change).unwrap());
-    assert!(local.store().contains(proposal.record.result).unwrap());
+    assert!(local.store().contains(proposal.change)?);
+    assert!(local.store().contains(proposal.record.result)?);
     drop(ws);
     drop(local);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = remove_tree(&dir);
+    Ok(())
 }

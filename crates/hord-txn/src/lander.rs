@@ -1125,7 +1125,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_store_and_io_failures_are_transient() {
+    fn only_store_and_io_failures_are_transient() -> Result<(), Box<dyn std::error::Error>> {
         let io = || std::io::Error::other("disk");
         let transient = [
             Error::Io(io()),
@@ -1137,7 +1137,7 @@ mod tests {
             assert!(is_transient(err), "{err}");
         }
         let id = ObjectId::from_bytes([7; 32]);
-        let path: RepoPath = "src/lib.rs".parse().unwrap();
+        let path: RepoPath = "src/lib.rs".parse()?;
         let deterministic = [
             Error::MissingChange(id),
             Error::Store(hord_store::Error::MissingObject(id)),
@@ -1154,5 +1154,6 @@ mod tests {
         for err in &deterministic {
             assert!(!is_transient(err), "{err}");
         }
+        Ok(())
     }
 }

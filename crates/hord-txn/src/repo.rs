@@ -1000,24 +1000,20 @@ mod bounded_tests {
     /// used go, and a recent one is still there. Both grew by one entry per
     /// change forever before.
     #[tokio::test]
-    async fn footprints_and_proposed_stay_bounded() {
+    async fn footprints_and_proposed_stay_bounded() -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join(format!("hord-txn-bounded-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let repo = Repo::create(&dir).await.unwrap();
+        let repo = Repo::create(&dir).await?;
         let inner = &repo.inner;
         let record: ChangeRecord = {
             let mut ws = repo
                 .begin(crate::BeginOptions::at_head(hord_core::Actor::Human {
                     id: "t".into(),
                 }))
-                .await
-                .unwrap();
-            ws.write_file(&"a.txt".parse().unwrap(), "a\n")
-                .await
-                .unwrap();
+                .await?;
+            ws.write_file(&"a.txt".parse()?, "a\n").await?;
             ws.preview(hord_core::Intent::from_summary("s"))
-                .await
-                .unwrap()
+                .await?
                 .record
         };
         let footprint = Arc::new(Footprint::of(id(0), &record, &[]));
@@ -1032,5 +1028,6 @@ mod bounded_tests {
         assert!(!inner.was_proposed(id(0)), "the oldest went");
         drop(repo);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

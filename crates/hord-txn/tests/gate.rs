@@ -122,7 +122,10 @@ impl VerifierFactory for FakeFactory {
         _coverage: Option<Arc<CoverageRecord>>,
     ) -> hord_verify::Result<Box<dyn hord_verify::Verifier>> {
         Ok(Box::new(FakeRunner {
-            toolchain: self.toolchain().unwrap(),
+            toolchain: self.toolchain().ok_or_else(|| hord_verify::Error::Tool {
+                tool: "fake".into(),
+                message: "no toolchain".into(),
+            })?,
             runs: Arc::clone(&self.runs),
         }))
     }
@@ -138,7 +141,7 @@ when = { paths = [\"src/**\"] }
 require = [\"review:human\"]
 ";
 
-async fn policed(policy: &str, toolchain: bool) -> (TempRepo, Arc<AtomicUsize>) {
+async fn policed(policy: &str, toolchain: bool) -> TestResult<(TempRepo, Arc<AtomicUsize>)> {
     let runs = Arc::new(AtomicUsize::new(0));
     let factory = FakeFactory {
         runs: Arc::clone(&runs),
@@ -150,10 +153,10 @@ async fn policed(policy: &str, toolchain: bool) -> (TempRepo, Arc<AtomicUsize>) 
         verifier: Some(Arc::new(EngineVerifier::new(Arc::new(factory)))),
         ..RepoOptions::default()
     };
-    (repo_with(&files, options).await, runs)
+    Ok((repo_with(&files, options).await?, runs))
 }
 
-fn review(snapshot: SnapshotId, result: EvidenceResult) -> Vec<u8> {
+fn review(snapshot: SnapshotId, result: EvidenceResult) -> TestResult<Vec<u8>> {
     let evidence = EvidenceFields {
         kind: EvidenceKind::Review,
         qualifier: Some("human".into()),
@@ -168,26 +171,27 @@ fn review(snapshot: SnapshotId, result: EvidenceResult) -> Vec<u8> {
         produced_at: Timestamp::from_millis(2),
     }
     .build();
-    hord_encoding::encode(&evidence).unwrap()
+    Ok(hord_encoding::encode(&evidence)?)
 }
 
-async fn attach(repo: &Repo, change: hord_core::ChangeId, bytes: Vec<u8>) {
+async fn attach(repo: &Repo, change: hord_core::ChangeId, bytes: Vec<u8>) -> TestResult {
     use hord_api::RepoBackend;
     LocalRepo::without_lander(repo.clone())
         .attach_evidence(hord_api::proto::AttachEvidenceRequest {
             change: change.to_hex(),
             evidence: bytes,
         })
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
-async fn land_one(repo: &Repo, change: hord_core::ChangeId) -> hord_txn::QueueEntry {
-    repo.submit(change).await.unwrap();
-    let done = repo.land_local().await.unwrap();
-    done.into_iter()
+async fn land_one(repo: &Repo, change: hord_core::ChangeId) -> TestResult<hord_txn::QueueEntry> {
+    repo.submit(change).await?;
+    let done = repo.land_local().await?;
+    Ok(done
+        .into_iter()
         .find(|e| e.change == change)
-        .expect("processed")
+        .ok_or("change processed")?)
 }
 
 /// Spec §12 M4: resubmitting an unchanged change against an unchanged head
@@ -195,20 +199,20 @@ async fn land_one(repo: &Repo, change: hord_core::ChangeId) -> hord_txn::QueueEn
 /// it is parked again with zero commands run; reviewed and resubmitted, it
 /// lands, still with zero commands run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resubmitting_an_unchanged_change_runs_nothing() {
-    let (t, runs) = policed(POLICY, true).await;
-    let mut ws = begin(&t.repo, "a").await;
-    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-    let proposal = ws.propose(intent("beta twenty")).await.unwrap();
+async fn resubmitting_an_unchanged_change_runs_nothing() -> TestResult {
+    let (t, runs) = policed(POLICY, true).await?;
+    let mut ws = begin(&t.repo, "a").await?;
+    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    let proposal = ws.propose(intent("beta twenty")).await?;
     let change = proposal.change;
-    let head = t.repo.head().await.unwrap();
+    let head = t.repo.head().await?;
 
-    let first = land_one(&t.repo, change).await;
+    let first = land_one(&t.repo, change).await?;
     let QueueStatus::Parked { reason } = &first.status else {
-        panic!("{first:#?}");
+        return Err(format!("{first:#?}").into());
     };
     assert!(reason.contains("review:human"), "{reason}");
-    let report = first.report.as_ref().unwrap();
+    let report = first.report.as_ref().ok_or("parked entry has a report")?;
     assert_eq!(report.policy.len(), 1, "{report:#?}");
     let violation = &report.policy[0];
     assert_eq!(violation.rule.as_deref(), Some("src needs review"));
@@ -219,27 +223,32 @@ async fn resubmitting_an_unchanged_change_runs_nothing() {
         "check and test:selected ran"
     );
 
-    let again = land_one(&t.repo, change).await;
+    let again = land_one(&t.repo, change).await?;
     assert!(matches!(again.status, QueueStatus::Parked { .. }));
     assert_eq!(runs.load(Ordering::SeqCst), 2, "nothing re-ran");
-    assert_eq!(t.repo.head().await.unwrap(), head, "head did not move");
+    assert_eq!(t.repo.head().await?, head, "head did not move");
 
     attach(
         &t.repo,
         change,
-        review(proposal.record.result, EvidenceResult::Pass),
+        review(proposal.record.result, EvidenceResult::Pass)?,
     )
-    .await;
-    let mut events = t.repo.events(None).await.unwrap();
-    let landed = land_one(&t.repo, change).await;
+    .await?;
+    let mut events = t.repo.events(None).await?;
+    let landed = land_one(&t.repo, change).await?;
     assert_eq!(landed.status, QueueStatus::Landed { landed: change });
     assert_eq!(runs.load(Ordering::SeqCst), 2, "still nothing re-ran");
     // The verdict's evidence is announced and listed in Landed.
     use tokio_stream::StreamExt;
     let mut attached = 0;
     loop {
-        let event = events.next().await.unwrap().unwrap();
-        match event.event.unwrap().kind.unwrap() {
+        let event = events.next().await.ok_or("event stream ended")??;
+        match event
+            .event
+            .ok_or("event has a body")?
+            .kind
+            .ok_or("event has a kind")?
+        {
             hord_api::proto::event::Kind::EvidenceAttached(_) => attached += 1,
             hord_api::proto::event::Kind::Landed(l) => {
                 assert_eq!(l.evidence.len(), 2, "{l:?}");
@@ -249,16 +258,17 @@ async fn resubmitting_an_unchanged_change_runs_nothing() {
         }
     }
     assert_eq!(attached, 2);
+    Ok(())
 }
 
 /// A required check that failed on this very snapshot cannot pass: the
 /// change is rejected, with the violation machine-readable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_required_evidence_rejects() {
-    let (t, _) = policed(POLICY, true).await;
-    let mut ws = begin(&t.repo, "a").await;
-    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-    let proposal = ws.propose(intent("beta twenty")).await.unwrap();
+async fn failed_required_evidence_rejects() -> TestResult {
+    let (t, _) = policed(POLICY, true).await?;
+    let mut ws = begin(&t.repo, "a").await?;
+    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    let proposal = ws.propose(intent("beta twenty")).await?;
     attach(
         &t.repo,
         proposal.change,
@@ -267,32 +277,38 @@ async fn failed_required_evidence_rejects() {
             EvidenceResult::Fail {
                 summary: "no".into(),
             },
-        ),
+        )?,
     )
-    .await;
-    let entry = land_one(&t.repo, proposal.change).await;
+    .await?;
+    let entry = land_one(&t.repo, proposal.change).await?;
     let QueueStatus::Rejected { reason } = &entry.status else {
-        panic!("{entry:#?}");
+        return Err(format!("{entry:#?}").into());
     };
     assert!(reason.contains("review:human"), "{reason}");
-    let violation = &entry.report.as_ref().unwrap().policy[0];
+    let violation = &entry
+        .report
+        .as_ref()
+        .ok_or("rejected entry has a report")?
+        .policy[0];
     assert_eq!(violation.evidence, EvidenceState::Failed);
+    Ok(())
 }
 
 /// Without a toolchain the engine verifies nothing, and the policy still
 /// holds: a required check that nothing produced parks the change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_a_toolchain_policy_still_applies() {
-    let (t, runs) = policed("[land]\nrequire = [\"check\"]\n", false).await;
-    let mut ws = begin(&t.repo, "a").await;
-    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-    let change = ws.propose(intent("beta twenty")).await.unwrap().change;
-    let entry = land_one(&t.repo, change).await;
+async fn without_a_toolchain_policy_still_applies() -> TestResult {
+    let (t, runs) = policed("[land]\nrequire = [\"check\"]\n", false).await?;
+    let mut ws = begin(&t.repo, "a").await?;
+    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    let change = ws.propose(intent("beta twenty")).await?.change;
+    let entry = land_one(&t.repo, change).await?;
     assert!(
         matches!(&entry.status, QueueStatus::Parked { reason } if reason.contains("check")),
         "{entry:#?}"
     );
     assert_eq!(runs.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 /// Fails the change whose summary is `bad`, slowly, and counts calls.
@@ -325,7 +341,7 @@ impl Verifier for FailBad {
 /// earlier ones; when one fails, those behind it are prepared again on the
 /// real head and land there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_candidate_invalidates_the_window_behind_it() {
+async fn a_failed_candidate_invalidates_the_window_behind_it() -> TestResult {
     let verifier = Arc::new(FailBad::default());
     let t = repo_with(
         &fixture(),
@@ -334,25 +350,25 @@ async fn a_failed_candidate_invalidates_the_window_behind_it() {
             ..RepoOptions::default()
         },
     )
-    .await;
-    let head = t.repo.head().await.unwrap();
+    .await?;
+    let head = t.repo.head().await?;
     let mut changes = Vec::new();
     for (who, file, content, from, to, summary) in [
         ("a", "src/lib.rs", LIB, "    2\n", "    20\n", "bad"),
         ("b", "src/lib.rs", LIB, "    4\n", "    40\n", "delta"),
         ("c", "README.md", README, "line one", "line 1", "readme"),
     ] {
-        let mut ws = begin(&t.repo, who).await;
-        edit(&mut ws, file, content, from, to).await;
-        let change = ws.propose(intent(summary)).await.unwrap().change;
-        t.repo.submit(change).await.unwrap();
+        let mut ws = begin(&t.repo, who).await?;
+        edit(&mut ws, file, content, from, to).await?;
+        let change = ws.propose(intent(summary)).await?.change;
+        t.repo.submit(change).await?;
         changes.push(change);
     }
-    let done = t.repo.land_local().await.unwrap();
+    let done = t.repo.land_local().await?;
     let statuses: Vec<_> = done.iter().map(|e| e.status.clone()).collect();
     assert_eq!(statuses[0], QueueStatus::Conflicted, "{done:#?}");
     let QueueStatus::Landed { landed: b } = statuses[1] else {
-        panic!("{done:#?}");
+        return Err(format!("{done:#?}").into());
     };
     assert!(
         matches!(statuses[2], QueueStatus::Landed { .. }),
@@ -360,23 +376,24 @@ async fn a_failed_candidate_invalidates_the_window_behind_it() {
     );
     // b was verified once stacked on a (abandoned), then again on head.
     assert_eq!(verifier.calls.load(Ordering::SeqCst), 5);
-    let b = t.repo.change(b).await.unwrap();
+    let b = t.repo.change(b).await?;
     assert_eq!(b.parents, head.change.into_iter().collect::<Vec<_>>());
     assert_eq!(b.base, head.snapshot);
+    Ok(())
 }
 
 /// The impact set follows References dependents through the resolver:
 /// editing `alpha` impacts `gamma`, which calls it, and not `beta`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn impact_sets_follow_resolved_references() {
-    let t = repo(&fixture()).await;
-    let mut ws = begin(&t.repo, "a").await;
-    let alpha = def(&mut ws, "src/lib.rs", "alpha").await;
-    let gamma = def(&mut ws, "src/lib.rs", "gamma").await;
-    let beta = def(&mut ws, "src/lib.rs", "beta").await;
-    edit(&mut ws, "src/lib.rs", LIB, "    1\n", "    10\n").await;
-    let record = ws.propose(intent("alpha ten")).await.unwrap().record;
-    let impact = t.repo.impact(record).await.unwrap();
+async fn impact_sets_follow_resolved_references() -> TestResult {
+    let t = repo(&fixture()).await?;
+    let mut ws = begin(&t.repo, "a").await?;
+    let alpha = def(&mut ws, "src/lib.rs", "alpha").await?;
+    let gamma = def(&mut ws, "src/lib.rs", "gamma").await?;
+    let beta = def(&mut ws, "src/lib.rs", "beta").await?;
+    edit(&mut ws, "src/lib.rs", LIB, "    1\n", "    10\n").await?;
+    let record = ws.propose(intent("alpha ten")).await?.record;
+    let impact = t.repo.impact(record).await?;
     assert!(impact.write_set.contains(&alpha));
     assert_eq!(impact.nodes.get(&gamma), Some(&1), "{impact:#?}");
     assert!(!impact.nodes.contains_key(&beta), "{impact:#?}");
@@ -385,16 +402,17 @@ async fn impact_sets_follow_resolved_references() {
         "{:#?}",
         impact.facts
     );
+    Ok(())
 }
 
 /// `hord verify` plans with reuse, runs, and indexes evidence under the
 /// proposal's snapshot, which the lander then reuses: nothing runs again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn verify_workspace_attaches_evidence_the_lander_reuses() {
-    let (t, runs) = policed("[land]\nrequire = [\"check\", \"lint\"]\n", true).await;
-    let mut ws = begin(&t.repo, "a").await;
-    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-    let plan = t.repo.verify_workspace(&mut ws, true).await.unwrap();
+async fn verify_workspace_attaches_evidence_the_lander_reuses() -> TestResult {
+    let (t, runs) = policed("[land]\nrequire = [\"check\", \"lint\"]\n", true).await?;
+    let mut ws = begin(&t.repo, "a").await?;
+    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    let plan = t.repo.verify_workspace(&mut ws, true).await?;
     assert_eq!(
         plan.requirements
             .iter()
@@ -402,36 +420,41 @@ async fn verify_workspace_attaches_evidence_the_lander_reuses() {
             .collect::<Vec<_>>(),
         ["check", "lint"]
     );
-    assert_eq!(plan.plan.as_ref().unwrap().checks.len(), 2);
+    assert_eq!(plan.plan.as_ref().ok_or("a plan")?.checks.len(), 2);
     assert_eq!(runs.load(Ordering::SeqCst), 0, "plan only");
-    let ran = t.repo.verify_workspace(&mut ws, false).await.unwrap();
+    let ran = t.repo.verify_workspace(&mut ws, false).await?;
     assert!(ran.verdict.passed());
     assert_eq!(ran.verdict.evidence().len(), 2);
     assert_eq!(runs.load(Ordering::SeqCst), 2);
-    let again = t.repo.verify_workspace(&mut ws, true).await.unwrap();
-    assert_eq!(again.plan.unwrap().reused.len(), 2, "reused next time");
-    let change = ws.propose(intent("beta twenty")).await.unwrap().change;
-    let entry = land_one(&t.repo, change).await;
+    let again = t.repo.verify_workspace(&mut ws, true).await?;
+    assert_eq!(
+        again.plan.ok_or("a plan")?.reused.len(),
+        2,
+        "reused next time"
+    );
+    let change = ws.propose(intent("beta twenty")).await?.change;
+    let entry = land_one(&t.repo, change).await?;
     assert_eq!(entry.status, QueueStatus::Landed { landed: change });
     assert_eq!(runs.load(Ordering::SeqCst), 2, "the lander reused it");
+    Ok(())
 }
 
 /// The default verifier runs cargo for head's policy (ADR 0022): a clean
 /// edit lands with `check` evidence; a compile error parks as a semantic
 /// conflict (spec §6.5) with cargo's message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_default_verifier_runs_cargo() {
+async fn the_default_verifier_runs_cargo() -> TestResult {
     if hord_verify_rust::detect_toolchain(&std::env::temp_dir()).is_err() {
         eprintln!("no Rust toolchain; skipped");
-        return;
+        return Ok(());
     }
     let mut files = fixture();
     files.push((".hord-policy.toml", "[land]\nrequire = [\"check\"]\n"));
-    let t = repo_with(&files, RepoOptions::default()).await;
-    let mut ws = begin(&t.repo, "a").await;
-    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await;
-    let good = ws.propose(intent("beta twenty")).await.unwrap();
-    let entry = land_one(&t.repo, good.change).await;
+    let t = repo_with(&files, RepoOptions::default()).await?;
+    let mut ws = begin(&t.repo, "a").await?;
+    edit(&mut ws, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    let good = ws.propose(intent("beta twenty")).await?;
+    let entry = land_one(&t.repo, good.change).await?;
     assert_eq!(
         entry.status,
         QueueStatus::Landed {
@@ -439,50 +462,53 @@ async fn the_default_verifier_runs_cargo() {
         },
         "{entry:#?}"
     );
-    let evidence = t.repo.store().evidence_at(good.record.result).unwrap();
+    let evidence = t.repo.store().evidence_at(good.record.result)?;
     assert_eq!(evidence.len(), 1, "one cargo check");
 
-    let mut ws = begin(&t.repo, "b").await;
+    let mut ws = begin(&t.repo, "b").await?;
     let lib = String::from_utf8(
         ws.read_file(&path("src/lib.rs"))
-            .await
-            .unwrap()
-            .unwrap()
+            .await?
+            .ok_or("src/lib.rs at head")?
             .as_slice()
             .to_vec(),
-    )
-    .unwrap();
-    edit(&mut ws, "src/lib.rs", &lib, "    4\n", "    not_a_value\n").await;
-    let bad = ws.propose(intent("broken")).await.unwrap();
-    let entry = land_one(&t.repo, bad.change).await;
+    )?;
+    edit(&mut ws, "src/lib.rs", &lib, "    4\n", "    not_a_value\n").await?;
+    let bad = ws.propose(intent("broken")).await?;
+    let entry = land_one(&t.repo, bad.change).await?;
     assert_eq!(entry.status, QueueStatus::Conflicted, "{entry:#?}");
-    let reason = entry.report.unwrap().verification.unwrap();
+    let reason = entry
+        .report
+        .ok_or("conflicted entry has a report")?
+        .verification
+        .ok_or("a verification failure")?;
     assert!(reason.contains("cargo check"), "{reason}");
+    Ok(())
 }
 
 /// Policy facts name each written definition's visibility and the kinds
 /// inside it (ADR 0026): an `unsafe` block in a `pub fn`, a `pub(crate)`
 /// function, and a field (not an item, so read from the whole file).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn policy_facts_carry_kinds_and_visibility() {
+async fn policy_facts_carry_kinds_and_visibility() -> TestResult {
     let lib = "pub struct S {\n    pub x: u32,\n}\n\npub fn a() -> u32 {\n    1\n}\n\npub(crate) fn b() -> u32 {\n    2\n}\n";
-    let t = repo(&[("src/lib.rs", lib)]).await;
-    let mut ws = begin(&t.repo, "a").await;
+    let t = repo(&[("src/lib.rs", lib)]).await?;
+    let mut ws = begin(&t.repo, "a").await?;
     let edited = lib
         .replace("    1\n", "    unsafe { 1 }\n")
         .replace("    2\n", "    3\n")
         .replace("pub x: u32", "pub x: u64");
-    ws.write_file(&path("src/lib.rs"), edited).await.unwrap();
-    let record = ws.propose(intent("edits")).await.unwrap().record;
-    let facts = t.repo.policy_facts(record).await.unwrap();
+    ws.write_file(&path("src/lib.rs"), edited).await?;
+    let record = ws.propose(intent("edits")).await?.record;
+    let facts = t.repo.policy_facts(record).await?;
     let by_name = |kind: &str| {
         facts
             .definitions
             .iter()
             .find(|d| d.kinds.contains(kind))
-            .unwrap_or_else(|| panic!("no {kind} in {facts:#?}"))
+            .ok_or_else(|| format!("no {kind} in {facts:#?}"))
     };
-    let a = by_name("unsafe_block");
+    let a = by_name("unsafe_block")?;
     assert_eq!(a.visibility.as_deref(), Some("pub"));
     assert!(a.kinds.contains("function_item"));
     let fields: Vec<_> = facts
@@ -499,31 +525,33 @@ async fn policy_facts_carry_kinds_and_visibility() {
             .any(|d| d.visibility.as_deref() == Some("pub(crate)")),
         "{facts:#?}"
     );
+    Ok(())
 }
 
 /// ADR 0026 amendment: `propose` refuses a `.hord-policy.toml` that does
 /// not parse, and the lander rejects such a change from anywhere else (a
 /// record stored directly), naming the parse error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unparseable_policy_file_never_lands() {
-    let t = repo(&fixture()).await;
+async fn an_unparseable_policy_file_never_lands() -> TestResult {
+    let t = repo(&fixture()).await?;
     let bad = "[land]\nrequire = [\"check\"]\nstrict_reads = 3\n";
-    let mut ws = begin(&t.repo, "a").await;
-    ws.write_file(&path(".hord-policy.toml"), bad)
+    let mut ws = begin(&t.repo, "a").await?;
+    ws.write_file(&path(".hord-policy.toml"), bad).await?;
+    let err = ws
+        .propose(intent("bad policy"))
         .await
-        .unwrap();
-    let err = ws.propose(intent("bad policy")).await.unwrap_err();
+        .expect_err("propose refuses an unparseable policy file");
     assert!(
         matches!(&err, hord_txn::Error::Policy(m) if m.contains(".hord-policy.toml:3:16")),
         "{err}"
     );
     // The same change, stored without `propose`'s check.
-    let preview = ws.preview(intent("bad policy")).await.unwrap();
-    let stored = t.repo.store().put_object(&preview.record).unwrap();
+    let preview = ws.preview(intent("bad policy")).await?;
+    let stored = t.repo.store().put_object(&preview.record)?;
     assert_eq!(stored, preview.change);
-    let entry = land_one(&t.repo, preview.change).await;
+    let entry = land_one(&t.repo, preview.change).await?;
     let QueueStatus::Rejected { reason } = &entry.status else {
-        panic!("{entry:#?}");
+        return Err(format!("{entry:#?}").into());
     };
     assert!(
         reason.contains("does not parse") && reason.contains(":3:16"),
@@ -531,13 +559,13 @@ async fn an_unparseable_policy_file_never_lands() {
     );
     // A policy that parses lands, and a change that leaves it alone is not
     // checked again.
-    let mut ws = begin(&t.repo, "b").await;
+    let mut ws = begin(&t.repo, "b").await?;
     ws.write_file(&path(".hord-policy.toml"), "[land]\nrequire = []\n")
-        .await
-        .unwrap();
-    let good = ws.propose(intent("good policy")).await.unwrap().change;
+        .await?;
+    let good = ws.propose(intent("good policy")).await?.change;
     assert_eq!(
-        land_one(&t.repo, good).await.status,
+        land_one(&t.repo, good).await?.status,
         QueueStatus::Landed { landed: good }
     );
+    Ok(())
 }

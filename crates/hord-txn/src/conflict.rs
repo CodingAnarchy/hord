@@ -300,13 +300,16 @@ mod tests {
     }
 
     fn fp(n: u8, record: &ChangeRecord, touched: &[&str]) -> Footprint {
-        let touched: Vec<RepoPath> = touched.iter().map(|p| p.parse().unwrap()).collect();
+        let touched: Vec<RepoPath> = touched
+            .iter()
+            .map(|p| p.parse().expect("parse test path literal"))
+            .collect();
         Footprint::of(ObjectId::from_bytes([n; 32]), record, &touched)
     }
 
     fn blob(path: &str) -> Op {
         Op::Blob {
-            path: path.parse().unwrap(),
+            path: path.parse().expect("parse test path literal"),
             from: Some(ObjectId::from_bytes([4; 32])),
             to: Some(ObjectId::from_bytes([5; 32])),
         }
@@ -354,7 +357,8 @@ mod tests {
     }
 
     #[test]
-    fn coarse_write_conflicts_with_any_touch_of_the_file() {
+    fn coarse_write_conflicts_with_any_touch_of_the_file() -> Result<(), Box<dyn std::error::Error>>
+    {
         // A Tier 0 import that rewrote a.rs as a blob.
         let import = fp(2, &record(&[], &[], vec![blob("a.rs")]), &["a.rs"]);
         let change = fp(1, &record(&[], &[7], vec![replace(7)]), &["a.rs"]);
@@ -364,14 +368,15 @@ mod tests {
         ] {
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].kind, ConflictKind::WriteWrite);
-            assert_eq!(found[0].paths, vec!["a.rs".parse::<RepoPath>().unwrap()]);
+            assert_eq!(found[0].paths, vec!["a.rs".parse::<RepoPath>()?]);
             assert!(found[0].nodes.is_empty());
         }
+        Ok(())
     }
 
     #[test]
-    fn glue_edits_conflict_only_with_glue_edits() {
-        let path: RepoPath = "a.rs".parse().unwrap();
+    fn glue_edits_conflict_only_with_glue_edits() -> Result<(), Box<dyn std::error::Error>> {
+        let path: RepoPath = "a.rs".parse()?;
         let root = NodeId::file_root(&path);
         let glue = |n: u8| {
             let record = ChangeRecord {
@@ -385,5 +390,6 @@ mod tests {
         let found = check(&glue(2), &[Arc::new(glue(1))], false);
         assert_eq!(found[0].kind, ConflictKind::WriteWrite);
         assert_eq!(found[0].paths, vec![path]);
+        Ok(())
     }
 }
