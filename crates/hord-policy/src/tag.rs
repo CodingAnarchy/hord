@@ -134,7 +134,7 @@ mod tests {
     use super::*;
 
     fn tag(s: &str) -> EvidenceTag {
-        s.parse().unwrap()
+        s.parse().expect("parse evidence tag literal")
     }
 
     #[test]
@@ -221,10 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn serde_is_text() {
-        let json = serde_json::to_string(&tag("review:human")).unwrap();
+    fn serde_is_text() -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string(&tag("review:human"))?;
         assert_eq!(json, "\"review:human\"");
-        let back: EvidenceTag = serde_json::from_str(&json).unwrap();
+        let back: EvidenceTag = serde_json::from_str(&json)?;
         assert_eq!(back, tag("review:human"));
+        Ok(())
     }
 }

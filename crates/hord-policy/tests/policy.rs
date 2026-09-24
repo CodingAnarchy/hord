@@ -36,7 +36,7 @@ fn policy() -> CompiledPolicy {
 }
 
 fn path(s: &str) -> RepoPath {
-    s.parse().unwrap()
+    s.parse().expect("parse path literal")
 }
 
 fn node(n: u128) -> NodeId {
@@ -57,7 +57,7 @@ fn def(n: u128, file: &str, kinds: &[&str], visibility: Option<&str>) -> Touched
 
 fn pass(tag: &str) -> EvidenceFact {
     EvidenceFact {
-        tag: tag.parse().unwrap(),
+        tag: tag.parse().expect("parse evidence tag literal"),
         result: EvidenceResult::Pass,
     }
 }
@@ -113,12 +113,13 @@ fn parses_the_spec_example() {
 }
 
 #[test]
-fn object_round_trip_compiles_the_same() {
+fn object_round_trip_compiles_the_same() -> Result<(), Box<dyn std::error::Error>> {
     let policy = policy();
-    let again = CompiledPolicy::from_object(policy.policy().clone()).unwrap();
+    let again = CompiledPolicy::from_object(policy.policy().clone())?;
     assert_eq!(again.policy(), policy.policy());
     let facts = baseline(ActorClass::Agent);
     assert_eq!(again.evaluate(&facts), policy.evaluate(&facts));
+    Ok(())
 }
 
 #[test]
@@ -130,17 +131,17 @@ fn land_requirements_allow_when_all_pass() {
 }
 
 #[test]
-fn land_requirements_deny_missing_failed_and_skipped() {
+fn land_requirements_deny_missing_failed_and_skipped() -> Result<(), Box<dyn std::error::Error>> {
     let mut facts = baseline(ActorClass::Human);
     facts.evidence = vec![
         EvidenceFact {
-            tag: "test:selected".parse().unwrap(),
+            tag: "test:selected".parse()?,
             result: EvidenceResult::Fail {
                 summary: "1 failed".into(),
             },
         },
         EvidenceFact {
-            tag: "lint".parse().unwrap(),
+            tag: "lint".parse()?,
             result: EvidenceResult::Skipped {
                 reason: "no clippy".into(),
             },
@@ -168,18 +169,20 @@ fn land_requirements_deny_missing_failed_and_skipped() {
             .iter()
             .all(|v| v.rule.is_none() && v.triggers.is_empty())
     );
+    Ok(())
 }
 
 #[test]
-fn a_pass_beside_a_failure_meets_the_requirement() {
+fn a_pass_beside_a_failure_meets_the_requirement() -> Result<(), Box<dyn std::error::Error>> {
     let mut facts = baseline(ActorClass::Human);
     facts.evidence.push(EvidenceFact {
-        tag: "check".parse().unwrap(),
+        tag: "check".parse()?,
         result: EvidenceResult::Fail {
             summary: "earlier run".into(),
         },
     });
     assert_eq!(policy().evaluate(&facts), Decision::Allow);
+    Ok(())
 }
 
 #[test]
@@ -425,7 +428,7 @@ fn rules_combine_in_policy_order() {
 }
 
 #[test]
-fn paths_alone_match_touched_files() {
+fn paths_alone_match_touched_files() -> Result<(), Box<dyn std::error::Error>> {
     let policy = parse(
         r#"[land]
 require = []
@@ -443,8 +446,7 @@ name = "always"
 when = {}
 require = ["check"]
 "#,
-    )
-    .unwrap();
+    )?;
     assert!(policy.land().strict_reads);
     let mut facts = Facts::new(ActorClass::Human);
     facts.evidence.push(pass("check"));
@@ -467,10 +469,11 @@ require = ["check"]
     facts.paths = vec![path("Cargo.toml")];
     facts.evidence.push(pass("review:human"));
     assert_eq!(policy.evaluate(&facts), Decision::Allow);
+    Ok(())
 }
 
 #[test]
-fn deny_serializes_machine_readably() {
+fn deny_serializes_machine_readably() -> Result<(), Box<dyn std::error::Error>> {
     let mut facts = baseline(ActorClass::Human);
     facts.definitions = vec![def(
         2,
@@ -478,7 +481,7 @@ fn deny_serializes_machine_readably() {
         &["function_item", "unsafe_block"],
         None,
     )];
-    let json = serde_json::to_value(policy().evaluate(&facts)).unwrap();
+    let json = serde_json::to_value(policy().evaluate(&facts))?;
     assert_eq!(
         json,
         serde_json::json!({
@@ -496,12 +499,13 @@ fn deny_serializes_machine_readably() {
             }],
         })
     );
-    let back: Decision = serde_json::from_value(json).unwrap();
+    let back: Decision = serde_json::from_value(json)?;
     assert_eq!(back, policy().evaluate(&facts));
     assert_eq!(
-        serde_json::to_value(Decision::Allow).unwrap(),
+        serde_json::to_value(Decision::Allow)?,
         serde_json::json!({ "decision": "allow" })
     );
+    Ok(())
 }
 
 /// The error for `source`, which must fail to parse.
@@ -521,7 +525,8 @@ const LAND: &str =
 fn syntax_error_has_line_and_column() {
     let (location, _) = error("[land]\nrequire = [\"check\"\n");
     assert_eq!(location.map(|l| l.line), Some(2));
-    let err = parse("[land]\nrequire = [\"check\"\n").unwrap_err();
+    let err =
+        parse("[land]\nrequire = [\"check\"\n").expect_err("an unclosed array does not parse");
     assert!(err.to_string().starts_with("2:"), "{err}");
 }
 
@@ -550,43 +555,42 @@ fn wrong_type_is_located() {
 }
 
 #[test]
-fn land_keys_default() {
+fn land_keys_default() -> Result<(), Box<dyn std::error::Error>> {
     // ADR 0026: every `[land]` key is optional.
     for source in [
         "",
         "[land]\n",
         "[[rule]]\nname = \"x\"\nwhen = {}\nrequire = []\n",
     ] {
-        let policy = parse(source).unwrap();
+        let policy = parse(source)?;
         let land = policy.land();
         assert!(land.require.is_empty(), "{source:?}");
         assert!(!land.strict_reads);
         assert_eq!(land.max_write_set, None);
         assert_eq!(land.max_replay_attempts, 2);
     }
-    assert_eq!(parse("").unwrap().land().max_impact, None);
-    let policy = parse("[land]\nmax_impact = 40\n").unwrap();
+    assert_eq!(parse("")?.land().max_impact, None);
+    let policy = parse("[land]\nmax_impact = 40\n")?;
     assert_eq!(policy.land().max_impact, Some(40));
     assert_eq!(policy.land().max_write_set, None);
     let (location, _) = error("[land]\nmax_impact = -1\n");
     assert_eq!(location, at(2, 14));
-    let policy = parse("[land]\nstrict_reads = true\n").unwrap();
+    let policy = parse("[land]\nstrict_reads = true\n")?;
     assert!(policy.land().strict_reads);
     assert_eq!(policy.land().max_replay_attempts, 2);
-    assert_eq!(
-        parse("").unwrap().policy(),
-        CompiledPolicy::default().policy()
-    );
+    assert_eq!(parse("")?.policy(), CompiledPolicy::default().policy());
+    Ok(())
 }
 
 #[test]
-fn no_max_write_set_is_no_limit() {
-    let policy = parse("[land]\nrequire = [\"check\"]\n").unwrap();
+fn no_max_write_set_is_no_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let policy = parse("[land]\nrequire = [\"check\"]\n")?;
     let mut facts = Facts::new(ActorClass::Agent);
     facts.write_set_len = 1_000_000;
     facts.evidence.push(pass("check"));
     assert_eq!(policy.evaluate(&facts), Decision::Allow);
     assert_eq!(CompiledPolicy::default().evaluate(&facts), Decision::Allow);
+    Ok(())
 }
 
 #[test]
@@ -647,7 +651,8 @@ fn duplicate_rule_name_is_located() {
 fn object_errors_have_no_location() {
     let mut object = policy().policy().clone();
     object.rules[0].when.actor = Some("robot".into());
-    let err = CompiledPolicy::from_object(object).unwrap_err();
+    let err =
+        CompiledPolicy::from_object(object).expect_err("an invalid policy object does not compile");
     assert_eq!(err.location, None);
     assert!(err.message.contains("robot"));
 }
