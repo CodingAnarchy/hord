@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_core::{
@@ -204,6 +204,40 @@ pub(crate) struct Inner {
     pub fetching: [Mutex<()>; FETCH_SHARDS],
     /// Parsed policies by blob (ADR 0026).
     pub policies: Mutex<HashMap<ObjectId, Arc<hord_policy::CompiledPolicy>>>,
+}
+
+impl Drop for Inner {
+    /// Freeing the parse caches (up to [`MAX_CACHED_TREE_BYTES`] each, in
+    /// millions of small allocations) takes hundreds of milliseconds, and a
+    /// process that is exiting need not wait for it: they are freed on a
+    /// thread of their own. The store and the event log still close here,
+    /// in order, when the fields drop.
+    fn drop(&mut self) {
+        let caches = (
+            std::mem::replace(
+                self.parsed
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner),
+                WeightedLru::new(0),
+            ),
+            std::mem::replace(
+                self.identified
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner),
+                WeightedLru::new(0),
+            ),
+            std::mem::take(
+                self.rust_ctx
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner),
+            ),
+            std::mem::take(self.refs.get_mut().unwrap_or_else(PoisonError::into_inner)),
+        );
+        // If no thread can start, the closure (and the caches) drop here.
+        let _ = std::thread::Builder::new()
+            .name("hord-cache-drop".into())
+            .spawn(move || drop(caches));
+    }
 }
 
 /// Identified trees keyed by (path, blob, carried identity object). The path
@@ -981,15 +1015,10 @@ mod bounded_tests {
             ws.write_file(&"a.txt".parse().unwrap(), "a\n")
                 .await
                 .unwrap();
-            ws.preview(hord_core::Intent {
-                summary: "s".into(),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            })
-            .await
-            .unwrap()
-            .record
+            ws.preview(hord_core::Intent::from_summary("s"))
+                .await
+                .unwrap()
+                .record
         };
         let footprint = Arc::new(Footprint::of(id(0), &record, &[]));
         let total = MAX_TRACKED_CHANGES + 100;
