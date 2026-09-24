@@ -8,7 +8,7 @@ use crate::cli::Materialize;
 use crate::output;
 use crate::remotes::Remotes;
 use crate::session::{Session, Target};
-use crate::txn::block_on;
+use crate::txn::{block_on, short};
 use crate::workspaces::this_caller;
 
 /// Create the workspace and check its base out into `.hord/ws/<id>/`.
@@ -80,7 +80,12 @@ pub fn run_list(json: bool, target: &Target) -> Result<()> {
             } else {
                 " "
             };
-            println!("{mark} {} {} {}", ws.id, &ws.base[..12], ws.materialization);
+            println!(
+                "{mark} {} {} {}",
+                ws.id,
+                short(&ws.base),
+                ws.materialization
+            );
         }
     }
     Ok(())

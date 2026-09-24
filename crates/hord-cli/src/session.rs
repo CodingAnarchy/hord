@@ -18,7 +18,7 @@ use hord_remote::RemoteRepo;
 use hord_txn::{LocalRepo, Repo};
 
 use crate::remotes::Remotes;
-use crate::txn::{self, block_on};
+use crate::txn::block_on;
 use crate::workspaces::LocalWorkspaces;
 use crate::{daemon, repo};
 
@@ -88,9 +88,8 @@ impl Session {
     pub fn direct(root: &Path) -> Result<Self> {
         daemon::stop(root)?;
         let store = hord_store::Store::open(root)?;
-        Ok(Self::Direct {
-            repo: txn::open_store(store)?,
-        })
+        let repo = block_on(Repo::from_store(store, hord_txn::RepoOptions::default()))?;
+        Ok(Self::Direct { repo })
     }
 
     fn remote(root: &Path, remotes: &Remotes, name: &str) -> Result<Self> {

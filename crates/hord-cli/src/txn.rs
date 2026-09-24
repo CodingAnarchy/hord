@@ -6,10 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use anyhow::{Context, Result, anyhow};
-use hord_core::{Actor, Bytes, ChangeId, ChangeRecord, NodeId, ObjectId, Op, RepoPath};
-use hord_store::Store;
-use hord_txn::{Repo, RepoOptions};
-use serde::Serialize;
+use hord_api::proto;
+use hord_core::{Actor, Bytes, ChangeId, ChangeRecord, Intent, NodeId, ObjectId, Op, RepoPath};
+use hord_txn::{Repo, Workspace};
 
 /// Run `future` to completion from a command (which runs on tokio's
 /// blocking pool, so blocking on the runtime here is allowed).
@@ -17,10 +16,20 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Handle::current().block_on(future)
 }
 
-/// The default options use `FailClosedVerifier`: until M4 verifies,
-/// `land --local` lands only changes with a clean conflict report.
-pub fn open_store(store: Store) -> Result<Repo> {
-    Ok(block_on(Repo::from_store(store, RepoOptions::default()))?)
+/// The change `propose` would record from `ws` now, under a placeholder
+/// intent; `None` when there is nothing to propose.
+pub fn preview(ws: &mut Workspace, summary: &str) -> Result<Option<ChangeRecord>> {
+    let intent = Intent {
+        summary: summary.into(),
+        body: String::new(),
+        refs: Vec::new(),
+        acceptance: Vec::new(),
+    };
+    match block_on(ws.preview(intent)) {
+        Ok(proposal) => Ok(Some(proposal.record)),
+        Err(hord_txn::Error::NothingToPropose) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Who is running the command: `HORD_ACTOR` (else `USER`), recorded as an
@@ -54,27 +63,17 @@ pub fn hex(id: ObjectId) -> String {
     id.to_hex()
 }
 
-pub fn short(id: ObjectId) -> String {
-    id.to_hex()[..12].to_owned()
+/// The first 12 digits of a wire id, for text output.
+pub fn short(id: &str) -> &str {
+    &id[..12.min(id.len())]
 }
 
-/// A definition id with its name and file, when they could be found.
-#[derive(Clone, Debug, Serialize)]
-pub struct NodeView {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-}
-
-impl NodeView {
-    pub fn text(&self) -> String {
-        match (&self.name, &self.path) {
-            (Some(name), Some(path)) => format!("{name} ({path})"),
-            (None, Some(path)) => format!("{} ({path})", self.id),
-            _ => self.id.clone(),
-        }
+/// Text form of a definition: its name and file, when they are known.
+pub fn node_text(node: &proto::NodeRef) -> String {
+    match (&node.name, &node.path) {
+        (Some(name), Some(path)) => format!("{name} ({path})"),
+        (None, Some(path)) => format!("{} ({path})", node.id),
+        _ => node.id.clone(),
     }
 }
 
@@ -114,18 +113,13 @@ impl Names {
         Ok(Self { known })
     }
 
-    pub fn view(&self, node: NodeId) -> NodeView {
-        match self.known.get(&node) {
-            Some((name, path)) => NodeView {
-                id: node.to_string(),
-                name: name.clone(),
-                path: Some(path.to_string()),
-            },
-            None => NodeView {
-                id: node.to_string(),
-                name: None,
-                path: None,
-            },
+    /// `node` with its name and file, when they were found.
+    pub fn view(&self, node: NodeId) -> proto::NodeRef {
+        let known = self.known.get(&node);
+        proto::NodeRef {
+            id: node.to_string(),
+            name: known.and_then(|(name, _)| name.clone()),
+            path: known.map(|(_, path)| path.to_string()),
         }
     }
 }
@@ -133,10 +127,10 @@ impl Names {
 /// One-line text form of an [`Op`].
 pub fn op_text(op: &Op, names: &Names) -> String {
     match op {
-        Op::Insert { node, .. } => format!("insert {}", short(*node)),
-        Op::Delete { node } => format!("delete {}", names.view(*node).text()),
-        Op::Replace { node, .. } => format!("replace {}", names.view(*node).text()),
-        Op::Move { node, .. } => format!("move {}", names.view(*node).text()),
+        Op::Insert { node, .. } => format!("insert {}", short(&hex(*node))),
+        Op::Delete { node } => format!("delete {}", node_text(&names.view(*node))),
+        Op::Replace { node, .. } => format!("replace {}", node_text(&names.view(*node))),
+        Op::Move { node, .. } => format!("move {}", node_text(&names.view(*node))),
         Op::Rename { from, to, .. } => format!("rename {from} -> {to}"),
         Op::Blob { path, from, to } => match (from, to) {
             (None, Some(_)) => format!("create {path}"),

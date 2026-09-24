@@ -11,7 +11,7 @@ pub fn run_import(json: bool, git_ref: String) -> Result<()> {
     let git_path = git_bridge::sibling_git(&store)?;
     let report = git_bridge::import_git(&mut store, &git_path, Some(&git_ref))?;
     if json {
-        output::print_json(&report.message())?;
+        output::print_json(&report)?;
     } else {
         println!(
             "imported git {} from {} ({} changes)",
@@ -29,9 +29,9 @@ pub fn run_export(json: bool, hord_ref: String) -> Result<()> {
     let git_path = git_bridge::sibling_git(&store)?;
     let report = git_bridge::export_tree(&store, &hord_ref, &git_path)?;
     if json {
-        output::print_json(&report.message())?;
+        output::print_json(&report)?;
     } else {
-        println!("exported {} to {}", report.hord_ref, report.git_path);
+        println!("exported {} to {}", report.r#ref, report.git_path);
         if let Some(tree) = report.git_tree {
             println!("git_tree {tree}");
         }

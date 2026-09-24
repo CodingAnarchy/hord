@@ -16,7 +16,7 @@ use tokio_stream::StreamExt;
 
 use crate::output;
 use crate::session::{Session, Target};
-use crate::txn::{self, block_on};
+use crate::txn::{self, block_on, short};
 
 /// The change ids an event is about (submitted and landed).
 fn changes(kind: &Kind) -> Vec<&str> {
@@ -48,10 +48,6 @@ fn queue_kind(kind: &Kind) -> bool {
             | Kind::Rejected(_)
             | Kind::Arbitrated(_)
     )
-}
-
-fn short(id: &str) -> &str {
-    &id[..12.min(id.len())]
 }
 
 fn text(kind: &Kind) -> String {

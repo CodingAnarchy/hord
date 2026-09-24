@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use hord_api::{ApiError, ApiResult, WorkspacesBackend, proto, wire};
-use hord_core::{Actor, ChangeRecord, Intent, ObjectId, Op};
+use hord_core::{Actor, ObjectId, Op};
 use hord_remote::RemoteRepo;
 use hord_store::WorkspaceId;
 use hord_txn::{Base, BeginOptions, Materialization, MaterializeMode, Repo};
@@ -281,15 +281,6 @@ pub fn op_message(op: &Op, names: &Names) -> proto::OpView {
     view
 }
 
-fn node_ref(names: &Names, node: hord_core::NodeId) -> proto::NodeRef {
-    let view = names.view(node);
-    proto::NodeRef {
-        id: view.id,
-        name: view.name,
-        path: view.path,
-    }
-}
-
 /// ADR 0012: a `Directory` workspace cannot see reads made by other tools.
 pub fn reads_label(observed: bool) -> &'static str {
     if observed { "observed" } else { "unobserved" }
@@ -301,17 +292,7 @@ fn status(repo: &Repo, request: &proto::StatusRequest) -> Result<proto::StatusRe
     let head = block_on(repo.head())?.change.map(hex);
     let mut ws = block_on(repo.open_workspace(meta.id, actor, session))?;
     ws.set_paranoid(request.paranoid);
-    let preview = Intent {
-        summary: "(status preview)".into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    };
-    let record: Option<ChangeRecord> = match block_on(ws.preview(preview)) {
-        Ok(proposal) => Some(proposal.record),
-        Err(hord_txn::Error::NothingToPropose) => None,
-        Err(err) => return Err(err.into()),
-    };
+    let record = txn::preview(&mut ws, "(status preview)")?;
     let skipped = ws
         .skipped()
         .iter()
@@ -336,16 +317,8 @@ fn status(repo: &Repo, request: &proto::StatusRequest) -> Result<proto::StatusRe
     if let Some(record) = &record {
         let names = Names::for_records(repo, &[record])?;
         response.ops = record.ops.iter().map(|op| op_message(op, &names)).collect();
-        response.read_set = record
-            .read_set
-            .iter()
-            .map(|n| node_ref(&names, *n))
-            .collect();
-        response.write_set = record
-            .write_set
-            .iter()
-            .map(|n| node_ref(&names, *n))
-            .collect();
+        response.read_set = record.read_set.iter().map(|n| names.view(*n)).collect();
+        response.write_set = record.write_set.iter().map(|n| names.view(*n)).collect();
     }
     Ok(response)
 }

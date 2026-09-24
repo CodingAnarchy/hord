@@ -51,28 +51,11 @@ fn parse_node_hex(spec: &str) -> Option<NodeId> {
         .strip_prefix("0x")
         .or_else(|| spec.strip_prefix("0X"))
         .unwrap_or(spec);
-    if spec.len() != 32 {
+    // `from_str_radix` alone would also take a leading `+`.
+    if spec.len() != 32 || !spec.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let bytes = spec.as_bytes();
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = hex_byte(bytes[i * 2], bytes[i * 2 + 1])?;
-    }
-    Some(NodeId::from_u128(u128::from_be_bytes(out)))
-}
-
-fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
-    Some(hex_nibble(hi)? << 4 | hex_nibble(lo)?)
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    u128::from_str_radix(spec, 16).ok().map(NodeId::from_u128)
 }
 
 fn split_path_line(spec: &str) -> Result<Option<(RepoPath, u32)>> {

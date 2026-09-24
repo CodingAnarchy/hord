@@ -31,19 +31,9 @@ pub fn discover_root() -> Result<std::path::PathBuf> {
     }
 }
 
-/// Walk from the current directory toward the filesystem root looking for `.hord/`.
+/// Open the store of the repository [`discover_root`] finds.
 pub fn discover() -> Result<Store> {
-    let cwd = std::env::current_dir().context("current directory")?;
-    let mut dir = cwd.as_path();
-    loop {
-        let hord_dir = dir.join(hord_store::HORD_DIR);
-        if hord_dir.is_dir() {
-            return Store::open(dir).map_err(Into::into);
-        }
-        dir = dir
-            .parent()
-            .ok_or_else(|| anyhow!("no .hord directory found; run `hord init`"))?;
-    }
+    Ok(Store::open(discover_root()?)?)
 }
 
 /// Resolve `--base <snap|ref>` to a snapshot id (a [`Snapshot`] object's

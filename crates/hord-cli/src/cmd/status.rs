@@ -5,16 +5,8 @@ use hord_api::proto;
 
 use crate::output;
 use crate::session::{Session, Target};
-use crate::txn::block_on;
+use crate::txn::{block_on, node_text};
 use crate::workspaces::this_caller;
-
-fn node_text(node: &proto::NodeRef) -> String {
-    match (&node.name, &node.path) {
-        (Some(name), Some(path)) => format!("{name} ({path})"),
-        (None, Some(path)) => format!("{} ({path})", node.id),
-        _ => node.id.clone(),
-    }
-}
 
 pub fn run(json: bool, target: &Target, workspace: Option<String>, paranoid: bool) -> Result<()> {
     let session = Session::open(target)?;

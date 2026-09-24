@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use hord_api::proto;
-use hord_core::{Actor, Intent};
+use hord_core::Actor;
 use hord_policy::{ActorClass, CompiledPolicy, Decision, EvidenceFact, POLICY_PATH};
 use hord_txn::Repo;
 use serde::{Deserialize, Serialize};
@@ -68,17 +68,7 @@ pub fn check(
     };
     let mut ws = block_on(repo.open_workspace(meta.id, actor, session))?;
     let actor = ActorClass::from(ws.actor());
-    let preview = Intent {
-        summary: "(policy check preview)".into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    };
-    let record = match block_on(ws.preview(preview)) {
-        Ok(proposal) => Some(proposal.record),
-        Err(hord_txn::Error::NothingToPropose) => None,
-        Err(err) => return Err(err.into()),
-    };
+    let record = txn::preview(&mut ws, "(policy check preview)")?;
     let mut result = CheckResult {
         workspace: meta.id.to_string(),
         policy_source: policy_source.to_owned(),

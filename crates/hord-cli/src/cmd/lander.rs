@@ -10,7 +10,7 @@ use tokio_stream::StreamExt;
 
 use crate::output;
 use crate::session::{Session, Target};
-use crate::txn::{self, block_on};
+use crate::txn::{self, block_on, node_text, short};
 
 fn status_name(entry: &proto::QueueEntry) -> &'static str {
     match entry.status() {
@@ -28,14 +28,14 @@ fn print_entry(entry: &proto::QueueEntry) {
     let mut line = format!(
         "{:>4} {} {:<10} {}",
         entry.seq,
-        &entry.change[..12.min(entry.change.len())],
+        short(&entry.change),
         status_name(entry),
         entry.summary
     );
     if let Some(landed) = &entry.landed
         && landed != &entry.change
     {
-        line.push_str(&format!(" (landed as {})", &landed[..12.min(landed.len())]));
+        line.push_str(&format!(" (landed as {})", short(landed)));
     }
     if entry.conflicts > 0 {
         line.push_str(&format!(
@@ -238,14 +238,6 @@ pub fn run_conflicts(json: bool, target: &Target, change: String) -> Result<()> 
     Ok(())
 }
 
-fn node_text(node: &proto::NodeRef) -> String {
-    match (&node.name, &node.path) {
-        (Some(name), Some(path)) => format!("{name} ({path})"),
-        (None, Some(path)) => format!("{} ({path})", node.id),
-        _ => node.id.clone(),
-    }
-}
-
 fn kind_name(kind: proto::ConflictKind) -> &'static str {
     match kind {
         proto::ConflictKind::WriteWrite => "write-write",
@@ -260,10 +252,7 @@ fn print_report(result: &proto::ConflictsResult) {
         return;
     };
     let status = result.entry.as_ref().map_or("not submitted", status_name);
-    println!(
-        "change {} ({status})",
-        &report.change[..12.min(report.change.len())]
-    );
+    println!("change {} ({status})", short(&report.change));
     let n = report.checked_against.len();
     println!(
         "checked against {n} landed change{} since its base",
@@ -278,7 +267,7 @@ fn print_report(result: &proto::ConflictsResult) {
         println!(
             "{} with {} \"{}\": {}",
             kind_name(c.kind()),
-            &c.landed[..12.min(c.landed.len())],
+            short(&c.landed),
             c.landed_summary,
             what.join(", ")
         );
