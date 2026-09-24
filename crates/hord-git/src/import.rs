@@ -68,6 +68,10 @@ fn import_revwalk<S: Store>(
     git_ref: &str,
     max_commits: Option<usize>,
 ) -> Result<ChangeId, Error> {
+    let store = &mut Staged {
+        store,
+        pending: HashMap::new(),
+    };
     let git_dir = git_dir.as_ref();
     let mut repo = open_repo(git_dir)?;
     repo.object_cache_size_if_unset(64 * 1024 * 1024);
@@ -116,6 +120,64 @@ fn import_revwalk<S: Store>(
     let last = last.ok_or_else(|| Error::EmptyHistory(git_ref.to_owned()))?;
     store.set_head(last)?;
     Ok(last)
+}
+
+/// A commit's new objects, held until something names them (the commit's
+/// log entry, a ref, or head) and then written together
+/// ([`Store::put_all`]), so their writes overlap. Reads see held objects.
+struct Staged<'a, S> {
+    store: &'a mut S,
+    pending: HashMap<ObjectId, Vec<u8>>,
+}
+
+impl<S: Store> Staged<'_, S> {
+    fn write(&mut self) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.store.put_all(self.pending.drain().collect())
+    }
+}
+
+impl<S: Store> Store for Staged<'_, S> {
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), Error> {
+        self.pending.insert(id, bytes);
+        Ok(())
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Vec<u8>, Error> {
+        match self.pending.get(&id) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => self.store.get(id),
+        }
+    }
+
+    fn append_log(&mut self, change: ChangeId) -> Result<(), Error> {
+        self.write()?;
+        self.store.append_log(change)
+    }
+
+    fn log(&self) -> Result<Vec<ChangeId>, Error> {
+        self.store.log()
+    }
+
+    fn set_head(&mut self, change: ChangeId) -> Result<(), Error> {
+        self.write()?;
+        self.store.set_head(change)
+    }
+
+    fn head(&self) -> Result<Option<ChangeId>, Error> {
+        self.store.head()
+    }
+
+    fn set_ref(&mut self, name: &str, id: ObjectId) -> Result<(), Error> {
+        self.write()?;
+        self.store.set_ref(name, id)
+    }
+
+    fn get_ref(&self, name: &str) -> Result<Option<ObjectId>, Error> {
+        self.store.get_ref(name)
+    }
 }
 
 /// Order `ids` so every parent that is also in `ids` appears before its children.

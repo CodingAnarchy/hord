@@ -25,7 +25,7 @@ pub(crate) struct GitLeaf {
     pub blob: ObjectId,
 }
 
-/// Parse a git mode octal as stored by [`mode_octal`].
+/// Parse a git mode octal as stored in [`GitLeaf::mode`].
 pub(crate) fn parse_mode(octal: &str) -> Option<EntryMode> {
     // `EntryMode::from_bytes` is built to parse the tree encoding, which has a
     // trailing space after the digits.
