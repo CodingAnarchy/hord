@@ -1,6 +1,8 @@
 //! The CLI through its per-repo daemon (ADR 0021, ADR 0024 amendment), and
 //! against a true remote (`hord serve`, `hord remote`).
 
+mod common;
+
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -35,7 +37,7 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         // A daemon exits once `.hord/` is gone (or idle).
-        let _ = fs::remove_dir_all(&self.0);
+        common::drop_tree(&self.0);
     }
 }
 

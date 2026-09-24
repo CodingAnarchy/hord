@@ -6,6 +6,8 @@
 //! `--json` is the protobuf JSON mapping (ADR 0024): lowerCamelCase keys,
 //! enums by value name.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -70,7 +72,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        common::drop_tree(&self.0);
     }
 }
 

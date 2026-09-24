@@ -2,6 +2,8 @@
 //! when they open it themselves (`--no-daemon`). With the daemon, see
 //! `daemon.rs`.
 
+mod common;
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,7 +34,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        common::drop_tree(&self.0);
     }
 }
 

@@ -1,5 +1,7 @@
 //! `hord log` filters, `hord blame`, and `hord query`.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -132,7 +134,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        common::drop_tree(&self.path);
     }
 }
 

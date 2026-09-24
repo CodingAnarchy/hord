@@ -10,7 +10,7 @@ async fn local_repo_passes_the_repo_backend_conformance_suite() -> TestResult {
     let dir = temp_dir("conformance")?;
     let repo = Repo::create(&dir).await?;
     let local = LocalRepo::new(repo)?;
-    hord_api::conformance::run(&local).await;
+    hord_api::conformance::run(&local).await?;
     local.shutdown().await;
     drop(local);
     let _ = remove_tree(&dir);

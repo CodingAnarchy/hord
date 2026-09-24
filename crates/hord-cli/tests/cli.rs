@@ -2,6 +2,8 @@
 //! mapping of `hord.proto` (ADR 0024): lowerCamelCase keys, 64-bit
 //! integers as strings.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -73,7 +75,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        common::drop_tree(&self.path);
     }
 }
 

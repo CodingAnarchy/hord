@@ -23,9 +23,44 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 struct Dir(PathBuf);
 
 impl Drop for Dir {
+    /// A drop cannot return an error, and panicking there could abort a
+    /// failing test and lose its failure, so a failed removal is reported
+    /// on stderr; `temp` fails loudly if the leftover is still there next
+    /// time.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Err(err) = remove_tree(&self.0) {
+            eprintln!("remove temp dir {}: {err}", self.0.display());
+        }
     }
+}
+
+/// Remove `path` and everything under it, if it exists. Directory
+/// workspaces keep a read-only pristine checkout under `.hord/pristine/`
+/// (ADR 0016), which `fs::remove_dir_all` alone cannot empty, so write
+/// access is restored to every directory first.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    make_writable(path)?;
+    std::fs::remove_dir_all(path)
+}
+
+fn make_writable(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))?;
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            make_writable(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn temp(tag: &str) -> std::io::Result<Dir> {
@@ -35,7 +70,9 @@ fn temp(tag: &str) -> std::io::Result<Dir> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&path);
+    // Paths repeat when the OS reuses a pid: clear a stale leftover, or
+    // fail here rather than collide later.
+    remove_tree(&path)?;
     std::fs::create_dir_all(&path)?;
     Ok(Dir(path))
 }
@@ -124,7 +161,7 @@ async fn remote_repo_passes_the_conformance_suite_over_tcp() -> TestResult {
     let hosts = Hosts::open_repo(&dir.0, RepoOptions::default()).await?;
     let running = serve(hosts, ServerConfig::default()).await?;
     let remote = RemoteRepo::connect(&running.url()).await?;
-    hord_api::conformance::run(&remote).await;
+    hord_api::conformance::run(&remote).await?;
     running.stop().await;
     Ok(())
 }
@@ -138,7 +175,7 @@ async fn a_root_server_routes_by_repo_prefix() -> TestResult {
     assert_eq!(hosts.names().collect::<Vec<_>>(), ["other", "team/app"]);
     let running = serve(hosts, ServerConfig::default()).await?;
     let app = RemoteRepo::connect(&format!("{}/r/team/app", running.url())).await?;
-    hord_api::conformance::run(&app).await;
+    hord_api::conformance::run(&app).await?;
     // The other repository saw none of it.
     let other = RemoteRepo::connect(&format!("{}/r/other", running.url())).await?;
     let head = other.head(proto::HeadRequest {}).await?;
@@ -195,7 +232,7 @@ async fn remote_repo_passes_the_conformance_suite_over_the_local_endpoint() -> T
         .await
         .expect_err("a second server on the same endpoint is refused");
     assert!(err.to_string().contains("already"), "{err}");
-    hord_api::conformance::run(&remote).await;
+    hord_api::conformance::run(&remote).await?;
     let _ = stop.send(());
     serving.await?;
     Ok(())

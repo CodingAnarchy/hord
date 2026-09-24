@@ -1,6 +1,8 @@
 //! `hord policy check`: a dry run of spec §7.2 policy against a
 //! workspace's current proposal.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -18,7 +20,7 @@ impl TempDir {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed),
         ));
-        let _ = fs::remove_dir_all(&path);
+        common::clear_stale(&path)?;
         fs::create_dir_all(&path)?;
         Ok(Self(path))
     }
@@ -26,7 +28,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        common::drop_tree(&self.0);
     }
 }
 
