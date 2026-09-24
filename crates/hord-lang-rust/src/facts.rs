@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use hord_lang::DefinitionFacts;
 
-use crate::cst;
+use crate::resolve::parse_ts;
 
 /// One [`DefinitionFacts`] per span. A span that holds no definition, or a
 /// source that does not parse, reports empty facts.
@@ -20,10 +20,7 @@ pub(crate) fn definition_facts(
     spans: &[Range<usize>],
     is_definition: impl Fn(&str) -> bool,
 ) -> Vec<DefinitionFacts> {
-    let tree = cst::with_parser(|parser| parser.parse(source, None))
-        .ok()
-        .flatten();
-    let Some(tree) = tree else {
+    let Some(tree) = parse_ts(source) else {
         return vec![DefinitionFacts::default(); spans.len()];
     };
     spans
