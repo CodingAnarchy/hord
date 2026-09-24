@@ -63,14 +63,13 @@ pub use error::{Error, Result};
 pub use gate::{
     EngineVerifier, FailClosedVerifier, PolicySource, RustFactory, StubVerifier, Verdict, Verifier,
     VerifierFactory, VerifyContext, VerifyFuture, VerifyRequest, WorkspaceVerification,
-    applicable_requirements, unverified_overlap,
 };
 pub use hord_store::{EdgeKind, WorkspaceId};
 pub use lander::{Lander, QueueEntry, QueueStatus, SPECULATIVE_WINDOW};
 pub use local::{LocalRepo, conflict_report_message, queue_entry_message};
 pub use materialize::MaterializeMode;
 pub use propose::ReadDeclaration;
-pub use query::{Query, line_start, touches_node};
+pub use query::{Query, line_start};
 pub use repo::{Base, BeginOptions, Head, Repo, RepoConfig, RepoOptions, default_adapters};
 pub use semantic::DefinitionInfo;
 pub use source::ObjectSource;

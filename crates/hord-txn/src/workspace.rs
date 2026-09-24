@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::materialize::{MaterializeMode, load_stat_index, read_checkout_file, walk_checkout};
 use crate::propose::{ProposeInput, ReadDeclaration};
 use crate::repo::{Inner, Repo, blocking, fs_path};
-use crate::semantic::{DefinitionInfo, definitions};
+use crate::semantic::{DefinitionInfo, carry, definitions};
 use crate::snapshot::blob_object_id;
 use crate::{Error, Result};
 
@@ -341,28 +341,6 @@ impl Workspace {
         }
     }
 
-    /// Definitions named `name` in any parsed file of the workspace view.
-    ///
-    /// This parses every file the first time it runs on a snapshot. Not a
-    /// content read.
-    pub async fn find_definitions(&mut self, name: &str) -> Result<Vec<DefinitionInfo>> {
-        let mut out = Vec::new();
-        for path in self.list_files().await? {
-            let Some(bytes) = self.current(&path).await? else {
-                continue;
-            };
-            if let Some(view) = self.view(&path, &bytes).await? {
-                out.extend(
-                    view.defs
-                        .iter()
-                        .filter(|d| d.name.as_ref().is_some_and(|n| n.as_str() == name))
-                        .cloned(),
-                );
-            }
-        }
-        Ok(out)
-    }
-
     /// Source text of definition `node` in `path`. Records `node` and every
     /// definition nested in it as read.
     pub async fn read_definition(&mut self, path: &RepoPath, node: NodeId) -> Result<Bytes> {
@@ -470,11 +448,7 @@ impl Workspace {
                 .ok()
                 .and_then(|p| changes.get(&p))
         {
-            let text = std::str::from_utf8(bytes.as_slice())
-                .map_err(|_| Error::Policy(format!("{} is not UTF-8", hord_policy::POLICY_PATH)))?;
-            if let Err(err) = hord_policy::parse(text) {
-                return Err(Error::Policy(format!("{}:{err}", hord_policy::POLICY_PATH)));
-            }
+            crate::gate::parse_policy_file(bytes.as_slice()).map_err(Error::Policy)?;
         }
         self.access_log
             .written_paths
@@ -598,11 +572,7 @@ fn view_of(
                 .and_then(|v| v.parsed.as_ref())
                 .map(|p| Arc::clone(&p.tree));
             let base_ref = base_tree.as_deref().unwrap_or(&empty);
-            let mapping = hord_identity::carry(adapter, path, Some(base), base_ref, &parsed, &[])
-                .map_err(|source| Error::Identity {
-                path: path.clone(),
-                source,
-            })?;
+            let mapping = carry(adapter, path, base, base_ref, &parsed)?;
             (
                 adapter.lang(),
                 Arc::new(IdentifiedTree::new((*parsed).clone(), mapping.nodes)),

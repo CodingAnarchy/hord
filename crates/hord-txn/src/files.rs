@@ -106,21 +106,15 @@ pub(crate) fn file_changes(inner: &Inner, record: &ChangeRecord) -> Result<Vec<F
     let mut sides = Vec::with_capacity(changes.len());
     let mut owners: BTreeMap<NodeId, Vec<usize>> = BTreeMap::new();
     for (i, change) in changes.iter().enumerate() {
-        let parsed = |snapshot| -> Result<Option<Arc<IdentifiedTree>>> {
-            Ok(inner
-                .file_view(snapshot, &change.path)?
-                .and_then(|v| v.parsed)
-                .map(|p| p.tree))
+        let tree = |snapshot, path| -> Result<Option<Arc<IdentifiedTree>>> {
+            Ok(inner.parsed_at(snapshot, path)?.map(|p| p.tree))
         };
         let side = Sides {
-            base: match &change.moved_from {
-                Some(from) => inner
-                    .file_view(record.base, from)?
-                    .and_then(|v| v.parsed)
-                    .map(|p| p.tree),
-                None => parsed(record.base)?,
-            },
-            result: parsed(record.result)?,
+            base: tree(
+                record.base,
+                change.moved_from.as_ref().unwrap_or(&change.path),
+            )?,
+            result: tree(record.result, &change.path)?,
         };
         owners
             .entry(NodeId::file_root(&change.path))
@@ -261,8 +255,7 @@ pub(crate) fn validate_except(
         let base_path = file.moved_from.as_ref().unwrap_or(path);
         let base = match (file.from, &file.moved_from) {
             (Some(_), _) | (None, Some(_)) => inner
-                .file_view(record.base, base_path)?
-                .and_then(|v| v.parsed)
+                .parsed_at(record.base, base_path)?
                 .map(|p| p.tree)
                 .ok_or_else(|| invalid(format!("base {base_path} does not parse")))?,
             (None, None) => Arc::new(IdentifiedTree::default()),

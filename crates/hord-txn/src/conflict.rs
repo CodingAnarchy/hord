@@ -97,6 +97,22 @@ pub struct ConflictReport {
 }
 
 impl ConflictReport {
+    /// A report on `change` (based on `base`) with nothing found yet.
+    pub(crate) fn empty(change: ChangeId, base: SnapshotId) -> Self {
+        Self {
+            change,
+            base,
+            head: None,
+            checked_against: Vec::new(),
+            strict_reads: false,
+            conflicts: Vec::new(),
+            merge: Vec::new(),
+            verification: None,
+            adapter_merged: Vec::new(),
+            policy: Vec::new(),
+        }
+    }
+
     /// No set overlap, no merge conflict, no verification failure, no
     /// policy denial.
     #[must_use]
@@ -216,41 +232,28 @@ pub(crate) fn check(
         let mut ww: BTreeSet<NodeId> = change.writes.intersection(&other.writes).copied().collect();
         ww.extend(change.touched.intersection(&other.coarse));
         ww.extend(change.coarse.intersection(&other.touched));
-        if !ww.is_empty() {
-            let (nodes, paths) = labels(ww.clone());
-            out.push(SetConflict {
-                kind: ConflictKind::WriteWrite,
-                landed: other.change,
-                nodes,
-                paths,
-            });
-        }
-        let rw: BTreeSet<NodeId> = change
-            .reads
-            .intersection(&other.writes)
-            .filter(|id| !ww.contains(id))
-            .copied()
-            .collect();
-        if !rw.is_empty() {
-            let (nodes, paths) = labels(rw);
-            out.push(SetConflict {
-                kind: ConflictKind::ReadWrite,
-                landed: other.change,
-                nodes,
-                paths,
-            });
-        }
-        if strict {
-            let wr: BTreeSet<NodeId> = change
-                .writes
-                .intersection(&other.reads)
+        // Read overlaps that are not already write-write.
+        let beyond_ww = |a: &BTreeSet<NodeId>, b: &BTreeSet<NodeId>| -> BTreeSet<NodeId> {
+            a.intersection(b)
                 .filter(|id| !ww.contains(id))
                 .copied()
-                .collect();
-            if !wr.is_empty() {
-                let (nodes, paths) = labels(wr);
+                .collect()
+        };
+        let rw = beyond_ww(&change.reads, &other.writes);
+        let wr = if strict {
+            beyond_ww(&change.writes, &other.reads)
+        } else {
+            BTreeSet::new()
+        };
+        for (kind, ids) in [
+            (ConflictKind::WriteWrite, ww),
+            (ConflictKind::ReadWrite, rw),
+            (ConflictKind::WriteRead, wr),
+        ] {
+            if !ids.is_empty() {
+                let (nodes, paths) = labels(ids);
                 out.push(SetConflict {
-                    kind: ConflictKind::WriteRead,
+                    kind,
                     landed: other.change,
                     nodes,
                     paths,

@@ -152,15 +152,13 @@ impl Inner {
             let refs = match cached {
                 Some(refs) => refs,
                 None => {
-                    let refs = match self.file_view(snapshot, &path)? {
-                        Some(view) => match view.parsed {
-                            Some(parsed) => match self.adapter_for(&path, parsed.lang) {
-                                Some(adapter) => Arc::new(file_refs(
-                                    view.bytes.as_slice(),
-                                    &definitions(adapter, &path, &parsed.tree),
-                                )),
-                                None => Arc::default(),
-                            },
+                    let view = self.file_view(snapshot, &path)?;
+                    let refs = match view.as_ref().and_then(|v| Some((v, v.parsed.as_ref()?))) {
+                        Some((view, parsed)) => match self.adapter_for(&path, parsed.lang) {
+                            Some(adapter) => Arc::new(file_refs(
+                                view.bytes.as_slice(),
+                                &definitions(adapter, &path, &parsed.tree),
+                            )),
                             None => Arc::default(),
                         },
                         None => Arc::default(),
@@ -229,11 +227,7 @@ impl<'a> SnapshotGraph<'a> {
         target: NodeId,
         name: &str,
     ) -> Result<bool> {
-        let Some(parsed) = self
-            .inner
-            .file_view(self.snapshot, path)?
-            .and_then(|v| v.parsed)
-        else {
+        let Some(parsed) = self.inner.parsed_at(self.snapshot, path)? else {
             return Ok(true);
         };
         if parsed.lang.as_str() != hord_lang_rust::LANG {

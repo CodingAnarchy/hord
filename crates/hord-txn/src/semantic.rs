@@ -125,6 +125,32 @@ impl Inner {
         }))
     }
 
+    /// The parsed, identified file at `path` in `snapshot`; `None` when it
+    /// is missing, blob tier, or does not parse.
+    pub(crate) fn parsed_at(
+        &self,
+        snapshot: SnapshotId,
+        path: &RepoPath,
+    ) -> Result<Option<Parsed>> {
+        Ok(self.file_view(snapshot, path)?.and_then(|view| view.parsed))
+    }
+
+    /// Definitions of `path` in `snapshot`; empty when it is missing, blob
+    /// tier, or does not parse.
+    pub(crate) fn definitions_at(
+        &self,
+        snapshot: SnapshotId,
+        path: &RepoPath,
+    ) -> Result<Vec<DefinitionInfo>> {
+        let Some(parsed) = self.parsed_at(snapshot, path)? else {
+            return Ok(Vec::new());
+        };
+        let Some(adapter) = self.adapter_for(path, parsed.lang) else {
+            return Ok(Vec::new());
+        };
+        Ok(definitions(adapter, path, &parsed.tree))
+    }
+
     /// Parse and identify `bytes`. With `identity`, ids come from that stored
     /// [`FileIdentity`], which must have been computed for this blob;
     /// otherwise from the fresh assignment.
@@ -242,8 +268,7 @@ impl Inner {
             &manifest_views,
             |path| {
                 Ok::<_, Error>(
-                    self.file_view(snapshot, path)?
-                        .and_then(|view| view.parsed)
+                    self.parsed_at(snapshot, path)?
                         .filter(|parsed| parsed.lang.as_str() == hord_lang_rust::LANG)
                         .map(|parsed| parsed.tree),
                 )
@@ -263,8 +288,7 @@ impl Inner {
         let mut manifests = Vec::new();
         for (path, blob) in self.list_files(snapshot)? {
             if rust.matches(&path, &[]) {
-                if let Some(view) = self.file_view(snapshot, &path)?
-                    && let Some(parsed) = view.parsed
+                if let Some(parsed) = self.parsed_at(snapshot, &path)?
                     && parsed.lang.as_str() == hord_lang_rust::LANG
                 {
                     trees.push((path, parsed.tree));
@@ -312,6 +336,24 @@ impl Inner {
         out.extend(self.store.edges(snapshot, source, EdgeKind::References)?);
         Ok(())
     }
+}
+
+/// [`hord_identity::carry`] of identity from `base_tree` (the file in
+/// snapshot `base`) to `tree`, the new parse of `path`, with no
+/// declarations.
+pub(crate) fn carry(
+    adapter: &dyn LangAdapter,
+    path: &RepoPath,
+    base: SnapshotId,
+    base_tree: &IdentifiedTree,
+    tree: &NodeTree,
+) -> Result<hord_lang::IdentityMapping> {
+    hord_identity::carry(adapter, path, Some(base), base_tree, tree, &[]).map_err(|source| {
+        Error::Identity {
+            path: path.clone(),
+            source,
+        }
+    })
 }
 
 /// The site → [`NodeId`] map a stored [`FileIdentity`] records, keeping

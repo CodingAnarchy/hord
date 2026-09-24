@@ -48,7 +48,7 @@
 //! changes this process proposed, and the lander checks queued changes from
 //! elsewhere a few entries ahead of itself, in parallel, off its own path.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use hord_api::EventStream;
@@ -61,10 +61,8 @@ use serde::{Deserialize, Serialize};
 use crate::conflict::{ConflictReport, Footprint, check};
 use crate::events;
 use crate::files::{validate, validate_except};
-use crate::gate::{
-    CandidateContext, PolicySource, Verdict, VerifyContext, VerifyRequest, applicable_requirements,
-    has_requirements,
-};
+use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRequest};
+use crate::propose::declared;
 use crate::rebase::rebase;
 use crate::repo::{Head, Inner, Repo, blocking, lock, now};
 use crate::sets::sets_between;
@@ -141,6 +139,11 @@ fn entry_names(entry: &QueueEntry) -> Vec<ChangeId> {
 }
 
 impl QueueEntry {
+    /// The entry at `seq` from its stored bytes.
+    fn decode(seq: u64, bytes: &[u8]) -> Result<Self> {
+        Ok(Self::from_stored(seq, hord_encoding::decode(bytes)?))
+    }
+
     fn from_stored(seq: u64, stored: StoredEntry) -> Self {
         Self {
             seq,
@@ -236,9 +239,6 @@ fn check_ahead() -> usize {
 /// stacked on the ones before it (ADR 0025, spec §6.7: K = 4).
 pub const SPECULATIVE_WINDOW: usize = 4;
 
-/// Head's policy for a candidate, as read at its landing base.
-type HeadPolicy = std::result::Result<(Arc<hord_policy::CompiledPolicy>, PolicySource), String>;
-
 /// A change ready to verify and land.
 struct Candidate {
     entry: QueueEntry,
@@ -315,7 +315,7 @@ impl Slot {
 }
 
 /// Whether `err` is about the store or the machine rather than about the
-/// change: I/O, the redb index, pack files, or a failed task. Those
+/// change: I/O, the redb index, or a failed task. Those
 /// propagate, and the entry stays queued for the next run. Everything else
 /// (a missing or undecodable object the record names, invalid ops, a
 /// merge, identity, or reproduction failure) is deterministic for the
@@ -328,7 +328,6 @@ pub(crate) fn is_transient(err: &Error) -> bool {
             hord_store::Error::Io(_)
                 | hord_store::Error::Index(_)
                 | hord_store::Error::CorruptIndex(_)
-                | hord_store::Error::InvalidPack(_)
         ),
         _ => false,
     }
@@ -445,15 +444,12 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
 
 /// Start verifying `candidate` on the runtime.
 fn spawn_verify(repo: &Repo, candidate: &Candidate) -> tokio::task::JoinHandle<Verdict> {
-    let context: Arc<dyn VerifyContext> = Arc::new(CandidateContext {
-        inner: Arc::clone(&repo.inner),
-        change: candidate.landed_id,
-        record: Arc::clone(&candidate.landed),
-        history: Vec::new(),
-        emit: true,
-        plan: std::sync::Mutex::new(None),
-        slot: std::sync::Mutex::new(None),
-    });
+    let context: Arc<dyn VerifyContext> = Arc::new(CandidateContext::new(
+        Arc::clone(&repo.inner),
+        candidate.landed_id,
+        Arc::clone(&candidate.landed),
+        true,
+    ));
     let request = VerifyRequest {
         change_id: candidate.landed_id,
         change: Arc::clone(&candidate.landed),
@@ -508,7 +504,7 @@ impl Inner {
         self.store
             .queue_entries()?
             .into_iter()
-            .map(|(seq, bytes)| Ok(QueueEntry::from_stored(seq, hord_encoding::decode(&bytes)?)))
+            .map(|(seq, bytes)| QueueEntry::decode(seq, &bytes))
             .collect()
     }
 
@@ -533,7 +529,7 @@ impl Inner {
         let mut out = Vec::new();
         for seq in self.store.queue_named(id)? {
             if let Some(bytes) = self.store.queue_entry(seq)? {
-                let entry = QueueEntry::from_stored(seq, hord_encoding::decode(&bytes)?);
+                let entry = QueueEntry::decode(seq, &bytes)?;
                 if entry.names(id) {
                     out.push(entry);
                 }
@@ -571,7 +567,7 @@ impl Inner {
             let Some(bytes) = self.store.queue_entry(next)? else {
                 break;
             };
-            let entry = QueueEntry::from_stored(next, hord_encoding::decode(&bytes)?);
+            let entry = QueueEntry::decode(next, &bytes)?;
             if entry.status == QueueStatus::Queued && !self.ops_checked(entry.change)? {
                 out.push(entry.change);
             }
@@ -593,7 +589,7 @@ impl Inner {
         };
         let mut seq = start;
         while let Some(bytes) = self.store.queue_entry(seq)? {
-            let entry = QueueEntry::from_stored(seq, hord_encoding::decode(&bytes)?);
+            let entry = QueueEntry::decode(seq, &bytes)?;
             if entry.status == QueueStatus::Queued {
                 return Ok(Some(entry));
             }
@@ -663,17 +659,17 @@ impl Inner {
                 // What verification must produce: the requirements head's
                 // policy applies to this change (ADR 0026).
                 let (facts, require, max_impact) = match &policy {
-                    Ok((policy, _)) if has_requirements(policy) => {
-                        let facts = self.policy_facts(&landed, false)?;
-                        let require = applicable_requirements(policy, &facts);
-                        (Some(facts), require, policy.land().max_impact)
+                    Ok((policy, _)) => {
+                        let (facts, require) = self.requirements(policy, &landed)?;
+                        (facts, require, policy.land().max_impact)
                     }
-                    Ok((policy, _)) => (None, Default::default(), policy.land().max_impact),
                     Err(_) => (None, Default::default(), None),
                 };
                 let footprint = Arc::new(self.footprint_of(landed_id, &landed)?);
                 let predicted = match (&policy, &facts) {
-                    (Ok((policy, _)), Some(facts)) => self.predict(policy, facts, &landed)?,
+                    (Ok((policy, _)), Some(facts)) => {
+                        self.predict(policy, facts, &require, &landed)?
+                    }
                     (Ok(_), None) => true,
                     (Err(_), _) => false,
                 };
@@ -704,7 +700,8 @@ impl Inner {
 
     /// Whether head's policy is expected to let `landed` through: it would
     /// with the evidence indexed for its snapshot now plus a pass for
-    /// every requirement a verifier can produce. Review evidence is signed
+    /// every requirement in `require` (what the policy applies to `facts`)
+    /// a verifier can produce. Review evidence is signed
     /// by a reviewer, not produced by verification, so it must be there
     /// already. A guess for stacking only (ADR 0025): a wrong one costs a
     /// re-preparation, never a wrong landing.
@@ -712,10 +709,11 @@ impl Inner {
         &self,
         policy: &hord_policy::CompiledPolicy,
         facts: &hord_policy::Facts,
+        require: &BTreeSet<String>,
         landed: &ChangeRecord,
     ) -> Result<bool> {
         let mut evidence = self.evidence_facts(landed.result)?;
-        for requirement in applicable_requirements(policy, facts) {
+        for requirement in require {
             let Ok(tag) = requirement.parse::<hord_policy::EvidenceTag>() else {
                 continue;
             };
@@ -764,12 +762,8 @@ impl Inner {
         }
         // ADR 0026: the landing base's policy judges the change.
         let policy = self.policy_at(head.snapshot)?;
-        let strict = self.config.strict_reads
-            || policy
-                .as_ref()
-                .is_ok_and(|(policy, _)| policy.land().strict_reads);
         let (set_report, landed_writes) =
-            self.set_check(entry.change, &record, head, staged, strict)?;
+            self.set_check(entry.change, &record, head, staged, &policy)?;
         let report = report.insert(set_report);
         if let Err(reason) = &policy {
             // Nothing weaker than a readable policy judges a change.
@@ -806,39 +800,33 @@ impl Inner {
             return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
         }
         let checked_files = rebased.checked;
-        let (landed_id, landed, attestation) = if rebased.result == record.result
-            && record.base == head.snapshot
-        {
-            (entry.change, record, None)
-        } else {
-            // ADR 0018: recompute what the landed record says it did from
-            // head → result; keep what the author depended on and why.
-            let declared: Vec<IdentityDelta> = record
-                .identity_deltas
-                .iter()
-                .filter(|d| !matches!(d, IdentityDelta::Birth { .. } | IdentityDelta::Death { .. }))
-                .cloned()
-                .collect();
-            let (write_set, identity_deltas) =
-                sets_between(self, head.snapshot, rebased.result, &rebased.ops, &declared)?;
-            let attestation = self.rebase_attestation(entry.change, &record, rebased.result);
-            let mut evidence = record.evidence.clone();
-            evidence.push(ObjectId::of(&attestation)?);
-            let landed = ChangeRecord {
-                base: head.snapshot,
-                result: rebased.result,
-                parents: head.change.into_iter().collect(),
-                ops: rebased.ops,
-                write_set,
-                identity_deltas,
-                evidence,
-                signature: None,
-                rebased_from: Some(entry.change),
-                ..record
+        let (landed_id, landed, attestation) =
+            if rebased.result == record.result && record.base == head.snapshot {
+                (entry.change, record, None)
+            } else {
+                // ADR 0018: recompute what the landed record says it did from
+                // head → result; keep what the author depended on and why.
+                let declared: Vec<IdentityDelta> = declared(&record.identity_deltas).collect();
+                let (write_set, identity_deltas) =
+                    sets_between(self, head.snapshot, rebased.result, &rebased.ops, &declared)?;
+                let attestation = self.rebase_attestation(entry.change, &record, rebased.result);
+                let mut evidence = record.evidence.clone();
+                evidence.push(ObjectId::of(&attestation)?);
+                let landed = ChangeRecord {
+                    base: head.snapshot,
+                    result: rebased.result,
+                    parents: head.change.into_iter().collect(),
+                    ops: rebased.ops,
+                    write_set,
+                    identity_deltas,
+                    evidence,
+                    signature: None,
+                    rebased_from: Some(entry.change),
+                    ..record
+                };
+                // Stored only when it lands (`finish`).
+                (ObjectId::of(&landed)?, landed, Some(attestation))
             };
-            // Stored only when it lands (`finish`).
-            (ObjectId::of(&landed)?, landed, Some(attestation))
-        };
         // Spec §3.5: the record that lands must reproduce its result. The
         // submitted record was checked above; a rebased record has rewritten
         // ops, so it is checked again.
@@ -1018,26 +1006,25 @@ impl Inner {
         record: &ChangeRecord,
         head: Head,
     ) -> Result<ConflictReport> {
-        let strict = self.config.strict_reads
-            || self
-                .policy_at(head.snapshot)?
-                .is_ok_and(|(policy, _)| policy.land().strict_reads);
-        Ok(self.set_check(change, record, head, &[], strict)?.0)
+        let policy = self.policy_at(head.snapshot)?;
+        Ok(self.set_check(change, record, head, &[], &policy)?.0)
     }
 
     /// [`Self::set_report`] plus everything `L` wrote (write sets and coarse
-    /// path ids), for the rebase's per-file fast path.
+    /// path ids), for the rebase's per-file fast path. Write-read conflicts
+    /// count when the repository or head's `policy` asks for strict reads.
     fn set_check(
         &self,
         change: ChangeId,
         record: &ChangeRecord,
         head: Head,
         staged: &[Arc<Footprint>],
-        strict_reads: bool,
-    ) -> Result<(
-        ConflictReport,
-        std::collections::BTreeSet<hord_core::NodeId>,
-    )> {
+        policy: &HeadPolicy,
+    ) -> Result<(ConflictReport, BTreeSet<hord_core::NodeId>)> {
+        let strict_reads = self.config.strict_reads
+            || policy
+                .as_ref()
+                .is_ok_and(|(policy, _)| policy.land().strict_reads);
         let mut landed = self.landed_since(record)?;
         landed.extend(staged.iter().cloned());
         let own = self.footprint_of(change, record)?;
@@ -1047,16 +1034,11 @@ impl Inner {
             .flat_map(|f| f.writes.iter().copied())
             .collect();
         let report = ConflictReport {
-            change,
-            base: record.base,
             head: head.change,
             checked_against: landed.iter().map(|f| f.change).collect(),
             strict_reads,
             conflicts,
-            merge: Vec::new(),
-            verification: None,
-            adapter_merged: Vec::new(),
-            policy: Vec::new(),
+            ..ConflictReport::empty(change, record.base)
         };
         Ok((report, written))
     }

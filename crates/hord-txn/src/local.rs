@@ -386,7 +386,7 @@ impl Inner {
                 continue;
             }
             if let Some(node) = node
-                && !crate::touches_node(&record, node)
+                && !crate::query::touches_node(&record, node)
             {
                 continue;
             }
@@ -460,14 +460,7 @@ impl Inner {
             }
             for snapshot in [record.base, record.result] {
                 for path in &paths {
-                    let Some(parsed) = self.file_view(snapshot, path)?.and_then(|v| v.parsed)
-                    else {
-                        continue;
-                    };
-                    let Some(adapter) = self.adapter_for(path, parsed.lang) else {
-                        continue;
-                    };
-                    for def in crate::semantic::definitions(adapter, path, &parsed.tree) {
+                    for def in self.definitions_at(snapshot, path)? {
                         known.entry(def.node).or_insert_with(|| {
                             (
                                 def.name.map(|n| n.as_str().to_owned()),

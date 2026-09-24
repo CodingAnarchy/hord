@@ -124,15 +124,15 @@ impl Verifier for StubVerifier {
     }
 }
 
-/// Why a change must not land unverified (spec §15), or `None`.
-///
-/// A clean report lands without verification. So do overlaps confined to
-/// files a purpose-built adapter merge resolved (ADR 0013 amendment,
-/// [`ConflictReport::only_adapter_merged`]). Anything else needs evidence.
-#[must_use]
-pub fn unverified_overlap(report: &ConflictReport) -> Option<String> {
+/// The verdict when nothing was verified (spec §15): a clean report
+/// passes. So do overlaps confined to files a purpose-built adapter merge
+/// resolved (ADR 0013 amendment, [`ConflictReport::only_adapter_merged`]).
+/// Anything else needs evidence and fails.
+fn fail_closed(report: &ConflictReport) -> Verdict {
     if report.only_adapter_merged() {
-        return None;
+        return Verdict::Pass {
+            evidence: Vec::new(),
+        };
     }
     let mut kinds: Vec<&str> = report
         .conflicts
@@ -145,24 +145,15 @@ pub fn unverified_overlap(report: &ConflictReport) -> Option<String> {
         .collect();
     kinds.sort_unstable();
     kinds.dedup();
-    Some(format!(
-        "unverified overlap: {} set conflict(s) [{}] and {} soft merge conflict(s); \
-         nothing verified the rebased change, so it does not land",
-        report.conflicts.len(),
-        kinds.join(", "),
-        report.merge.len(),
-    ))
-}
-
-fn fail_closed(report: &ConflictReport) -> Verdict {
-    match unverified_overlap(report) {
-        None => Verdict::Pass {
-            evidence: Vec::new(),
-        },
-        Some(reason) => Verdict::Fail {
-            evidence: Vec::new(),
-            reason,
-        },
+    Verdict::Fail {
+        evidence: Vec::new(),
+        reason: format!(
+            "unverified overlap: {} set conflict(s) [{}] and {} soft merge conflict(s); \
+             nothing verified the rebased change, so it does not land",
+            report.conflicts.len(),
+            kinds.join(", "),
+            report.merge.len(),
+        ),
     }
 }
 
@@ -367,38 +358,29 @@ impl PolicySource {
     }
 }
 
-/// The requirement names `policy` applies to `facts`: what verification
-/// must produce (the verdict on the facts without evidence).
-#[must_use]
-pub fn applicable_requirements(policy: &CompiledPolicy, facts: &Facts) -> BTreeSet<String> {
-    let bare = Facts {
-        evidence: Vec::new(),
-        ..facts.clone()
-    };
-    match policy.evaluate(&bare) {
-        Decision::Allow => BTreeSet::new(),
-        Decision::Deny { reasons } => reasons.iter().map(|r| r.requirement.to_string()).collect(),
-    }
+/// Parse the bytes of a `.hord-policy.toml`; the error is the message a
+/// rejection or a parked change reports, with the file's line and column.
+pub(crate) fn parse_policy_file(bytes: &[u8]) -> std::result::Result<CompiledPolicy, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| format!("{POLICY_PATH} is not UTF-8"))?;
+    hord_policy::parse(text).map_err(|err| format!("{POLICY_PATH}:{err}"))
 }
 
-/// Whether `policy` can require anything (a policy without requirements
-/// needs no facts).
-pub(crate) fn has_requirements(policy: &CompiledPolicy) -> bool {
-    let p = policy.policy();
-    !p.land.require.is_empty() || p.land.max_write_set.is_some() || !p.rules.is_empty()
+/// [`POLICY_PATH`] as a repository path.
+fn policy_path() -> Result<RepoPath> {
+    POLICY_PATH
+        .parse()
+        .map_err(|_| Error::InvalidPath(POLICY_PATH.into()))
 }
+
+/// Head's policy for a change, as read at its landing base: the policy and
+/// where it came from, or why the file does not parse.
+pub(crate) type HeadPolicy = std::result::Result<(Arc<CompiledPolicy>, PolicySource), String>;
 
 impl Inner {
     /// The policy in `snapshot` (ADR 0026). An unparseable file is an
     /// error message: the change is judged by nothing weaker.
-    pub(crate) fn policy_at(
-        &self,
-        snapshot: SnapshotId,
-    ) -> Result<std::result::Result<(Arc<CompiledPolicy>, PolicySource), String>> {
-        let path: RepoPath = POLICY_PATH
-            .parse()
-            .map_err(|_| Error::InvalidPath(POLICY_PATH.into()))?;
-        let Some(blob) = self.blob_id(snapshot, &path)? else {
+    pub(crate) fn policy_at(&self, snapshot: SnapshotId) -> Result<HeadPolicy> {
+        let Some(blob) = self.blob_id(snapshot, &policy_path()?)? else {
             return Ok(Ok((
                 Arc::new(CompiledPolicy::default()),
                 PolicySource::Default,
@@ -407,18 +389,35 @@ impl Inner {
         if let Some(policy) = lock(&self.policies).get(&blob) {
             return Ok(Ok((Arc::clone(policy), PolicySource::Head)));
         }
-        let bytes = self.blob_bytes(blob)?;
-        let Ok(text) = std::str::from_utf8(bytes.as_slice()) else {
-            return Ok(Err(format!("{POLICY_PATH} is not UTF-8")));
+        let policy = match parse_policy_file(self.blob_bytes(blob)?.as_slice()) {
+            Ok(policy) => Arc::new(policy),
+            Err(reason) => return Ok(Err(reason)),
         };
-        match hord_policy::parse(text) {
-            Ok(policy) => {
-                let policy = Arc::new(policy);
-                lock(&self.policies).insert(blob, Arc::clone(&policy));
-                Ok(Ok((policy, PolicySource::Head)))
-            }
-            Err(err) => Ok(Err(format!("{POLICY_PATH}:{err}"))),
+        lock(&self.policies).insert(blob, Arc::clone(&policy));
+        Ok(Ok((policy, PolicySource::Head)))
+    }
+
+    /// The policy facts of `record` without evidence, and the requirements
+    /// `policy` applies to them (its verdict on those facts): what
+    /// verification must produce. No facts when the policy can require
+    /// nothing.
+    pub(crate) fn requirements(
+        &self,
+        policy: &CompiledPolicy,
+        record: &ChangeRecord,
+    ) -> Result<(Option<Facts>, BTreeSet<String>)> {
+        let p = policy.policy();
+        if p.land.require.is_empty() && p.land.max_write_set.is_none() && p.rules.is_empty() {
+            return Ok((None, BTreeSet::new()));
         }
+        let facts = self.policy_facts(record, false)?;
+        let require = match policy.evaluate(&facts) {
+            Decision::Allow => BTreeSet::new(),
+            Decision::Deny { reasons } => {
+                reasons.iter().map(|r| r.requirement.to_string()).collect()
+            }
+        };
+        Ok((Some(facts), require))
     }
 
     /// ADR 0026 amendment: a change that writes a `.hord-policy.toml` that
@@ -431,9 +430,7 @@ impl Inner {
         base: SnapshotId,
         result: SnapshotId,
     ) -> Result<std::result::Result<(), String>> {
-        let path: RepoPath = POLICY_PATH
-            .parse()
-            .map_err(|_| Error::InvalidPath(POLICY_PATH.into()))?;
+        let path = policy_path()?;
         let after = self.blob_id(result, &path)?;
         if after.is_none() || after == self.blob_id(base, &path)? {
             return Ok(Ok(()));
@@ -568,6 +565,24 @@ impl Inner {
             hord_verify_rust::diff_rust_file(&mut facts, &path, version(&older), version(&newer));
         }
         Ok(facts)
+    }
+
+    /// The impact set of `record` in its result snapshot under `bound`, its
+    /// facts covering what changed since `since` (default: its base).
+    fn impact_set(
+        &self,
+        record: &ChangeRecord,
+        bound: ImpactBound,
+        since: Option<SnapshotId>,
+    ) -> Result<hord_verify::Result<ImpactSet>> {
+        let facts = self.verify_facts(since.unwrap_or(record.base), record.result)?;
+        let graph = crate::graph::SnapshotGraph::new(self, record.result)?;
+        Ok(hord_verify::impact_set(
+            &graph,
+            &record.write_set,
+            bound,
+            facts,
+        ))
     }
 
     /// Landed results, newest first, then `first` ahead of them: where to
@@ -749,16 +764,13 @@ impl SlotGuard {
 /// [`VerifyContext`] for a candidate: a record whose result is checked out
 /// in a slot.
 pub(crate) struct CandidateContext {
-    pub inner: Arc<Inner>,
-    pub change: ChangeId,
-    pub record: Arc<ChangeRecord>,
-    /// Coverage search order; empty: the landing base, then landed results
-    /// newest first.
-    pub history: Vec<SnapshotId>,
+    inner: Arc<Inner>,
+    change: ChangeId,
+    record: Arc<ChangeRecord>,
     /// Emit `Verifying` events (the lander) or record the plan.
-    pub emit: bool,
-    pub plan: Mutex<Option<VerifyPlan>>,
-    pub slot: Mutex<Option<SlotGuard>>,
+    emit: bool,
+    plan: Mutex<Option<VerifyPlan>>,
+    slot: Mutex<Option<SlotGuard>>,
 }
 
 fn verify_err(err: Error) -> hord_verify::Error {
@@ -774,13 +786,9 @@ impl VerifyContext for CandidateContext {
         bound: ImpactBound,
         since: Option<SnapshotId>,
     ) -> hord_verify::Result<ImpactSet> {
-        let facts = self
-            .inner
-            .verify_facts(since.unwrap_or(self.record.base), self.record.result)
-            .map_err(verify_err)?;
-        let graph = crate::graph::SnapshotGraph::new(&self.inner, self.record.result)
-            .map_err(verify_err)?;
-        hord_verify::impact_set(&graph, &self.record.write_set, bound, facts)
+        self.inner
+            .impact_set(&self.record, bound, since)
+            .map_err(verify_err)?
     }
 
     fn checkout(&self) -> hord_verify::Result<Checkout> {
@@ -801,10 +809,8 @@ impl VerifyContext for CandidateContext {
         &self.inner.store
     }
 
+    /// The landing base, then landed results newest first.
     fn history(&self) -> Vec<SnapshotId> {
-        if !self.history.is_empty() {
-            return self.history.clone();
-        }
         self.inner
             .snapshot_history(self.record.base, 64)
             .unwrap_or_else(|_| vec![self.record.base])
@@ -841,6 +847,23 @@ impl VerifyContext for CandidateContext {
 }
 
 impl CandidateContext {
+    /// A context for `record`, landing as `change`, with no checkout yet.
+    pub(crate) fn new(
+        inner: Arc<Inner>,
+        change: ChangeId,
+        record: Arc<ChangeRecord>,
+        emit: bool,
+    ) -> Self {
+        Self {
+            inner,
+            change,
+            record,
+            emit,
+            plan: Mutex::new(None),
+            slot: Mutex::new(None),
+        }
+    }
+
     /// The plan the verifier reported, if any.
     pub(crate) fn take_plan(&self) -> Option<VerifyPlan> {
         lock(&self.plan).take()
@@ -907,9 +930,8 @@ impl crate::Repo {
     /// it, 2 hops and within its package.
     pub async fn impact(&self, record: ChangeRecord) -> Result<ImpactSet> {
         crate::repo::blocking(&self.inner, move |inner| {
-            let facts = inner.verify_facts(record.base, record.result)?;
-            let graph = crate::graph::SnapshotGraph::new(inner, record.result)?;
-            hord_verify::impact_set(&graph, &record.write_set, ImpactBound::default(), facts)
+            inner
+                .impact_set(&record, ImpactBound::default(), None)?
                 .map_err(|err| Error::Verify(err.to_string()))
         })
         .await
@@ -939,40 +961,22 @@ impl crate::Repo {
             crate::repo::blocking(&self.inner, move |inner| {
                 let head = inner.head()?;
                 let (policy, source) = inner.policy_at(head.snapshot)?.map_err(Error::Policy)?;
-                let requirements = if has_requirements(&policy) {
-                    applicable_requirements(&policy, &inner.policy_facts(&record, false)?)
-                } else {
-                    BTreeSet::new()
-                };
+                let (_, requirements) = inner.requirements(&policy, &record)?;
                 Ok((source, requirements, policy.land().max_impact))
             })
             .await?
         };
         let (policy_source, requirements, max_impact) = prepared;
-        let context = Arc::new(CandidateContext {
+        let context = Arc::new(CandidateContext::new(
             inner,
-            change: proposal.change,
-            record: Arc::clone(&record),
-            history: Vec::new(),
-            emit: false,
-            plan: Mutex::new(None),
-            slot: Mutex::new(None),
-        });
+            proposal.change,
+            Arc::clone(&record),
+            false,
+        ));
         let request = VerifyRequest {
             change_id: proposal.change,
             change: Arc::clone(&record),
-            report: ConflictReport {
-                change: proposal.change,
-                base: record.base,
-                head: None,
-                checked_against: Vec::new(),
-                strict_reads: false,
-                conflicts: Vec::new(),
-                merge: Vec::new(),
-                verification: None,
-                adapter_merged: Vec::new(),
-                policy: Vec::new(),
-            },
+            report: ConflictReport::empty(proposal.change, record.base),
             policy: VerifyPolicy {
                 require: requirements.clone(),
                 max_impact,

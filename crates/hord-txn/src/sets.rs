@@ -116,10 +116,7 @@ fn parsed(
     snapshot: SnapshotId,
     path: &RepoPath,
 ) -> Result<Option<Arc<IdentifiedTree>>> {
-    Ok(inner
-        .file_view(snapshot, path)?
-        .and_then(|view| view.parsed)
-        .map(|parsed| parsed.tree))
+    Ok(inner.parsed_at(snapshot, path)?.map(|parsed| parsed.tree))
 }
 
 /// One definition of a changed file: where it is and under which parent.

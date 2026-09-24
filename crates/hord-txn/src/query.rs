@@ -12,7 +12,7 @@ use hord_lang::Anchor;
 use hord_store::EdgeKind;
 
 use crate::repo::{Inner, Repo, blocking};
-use crate::semantic::{DefinitionInfo, definitions, enclosing};
+use crate::semantic::enclosing;
 use crate::{Error, Result};
 
 /// Read-only queries over a [`Repo`]'s landed history. Cheap to clone.
@@ -30,11 +30,6 @@ impl Repo {
 }
 
 impl Query {
-    /// The snapshot queries read by default: `head`'s result.
-    pub async fn head_snapshot(&self) -> Result<SnapshotId> {
-        Ok(self.repo.head().await?.snapshot)
-    }
-
     /// The definition whose qualified name is `name`, else whose name ends
     /// in `::name`, in the newest snapshot that has one: `head`'s result,
     /// then older landed results, then their bases. Two matches in that
@@ -96,8 +91,7 @@ impl Query {
 /// Whether `change` touches `node` the way `node_history` counts it
 /// ([`hord_store::touched_nodes`]): its `write_set`, any [`NodeId`] an
 /// [`Op`](hord_core::Op) names, or any identity delta. The read set does not count.
-#[must_use]
-pub fn touches_node(change: &ChangeRecord, node: NodeId) -> bool {
+pub(crate) fn touches_node(change: &ChangeRecord, node: NodeId) -> bool {
     hord_store::touched_nodes(change).contains(&node)
 }
 
@@ -154,31 +148,14 @@ impl Inner {
     }
 
     fn resolve_name(&self, name: &str) -> Result<NodeId> {
-        let suffix = format!("::{name}");
         // A file version (path, blob, identity) that had no match in a newer
         // snapshot has none in an older one either.
         let mut scanned: HashSet<(RepoPath, ObjectId, Option<ObjectId>)> = HashSet::new();
         for snapshot in self.snapshots_newest_first()? {
-            let mut exact = BTreeSet::new();
-            let mut suffixed = BTreeSet::new();
-            for (path, blob) in self.list_files(snapshot)? {
-                let key = (path.clone(), blob, self.file_identity(snapshot, &path)?);
-                if scanned.contains(&key) {
-                    continue;
-                }
-                for def in self.definitions_at(snapshot, &path)? {
-                    let Some(qualified) = &def.name else {
-                        continue;
-                    };
-                    if qualified.as_str() == name {
-                        exact.insert(def.node);
-                    } else if qualified.as_str().ends_with(&suffix) {
-                        suffixed.insert(def.node);
-                    }
-                }
-                scanned.insert(key);
-            }
-            let hits = if exact.is_empty() { suffixed } else { exact };
+            let hits = self.named_in(snapshot, name, |path, blob| {
+                let key = (path.clone(), blob, self.file_identity(snapshot, path)?);
+                Ok(!scanned.insert(key))
+            })?;
             match hits.len() {
                 0 => {}
                 1 => return Ok(hits.into_iter().next().expect("one hit")),
@@ -197,10 +174,24 @@ impl Inner {
     /// name ends in `::name`, in id order (the per-snapshot form of
     /// [`Self::resolve_name`], for `RepoBackend::resolve_name`).
     pub(crate) fn resolve_in(&self, snapshot: SnapshotId, name: &str) -> Result<Vec<NodeId>> {
+        let hits = self.named_in(snapshot, name, |_, _| Ok(false))?;
+        Ok(hits.into_iter().collect())
+    }
+
+    /// [`Self::resolve_in`], without reading the files `skip` says to skip.
+    fn named_in(
+        &self,
+        snapshot: SnapshotId,
+        name: &str,
+        mut skip: impl FnMut(&RepoPath, ObjectId) -> Result<bool>,
+    ) -> Result<BTreeSet<NodeId>> {
         let suffix = format!("::{name}");
         let mut exact = BTreeSet::new();
         let mut suffixed = BTreeSet::new();
-        for (path, _) in self.list_files(snapshot)? {
+        for (path, blob) in self.list_files(snapshot)? {
+            if skip(&path, blob)? {
+                continue;
+            }
             for def in self.definitions_at(snapshot, &path)? {
                 let Some(qualified) = &def.name else {
                     continue;
@@ -212,8 +203,7 @@ impl Inner {
                 }
             }
         }
-        let hits = if exact.is_empty() { suffixed } else { exact };
-        Ok(hits.into_iter().collect())
+        Ok(if exact.is_empty() { suffixed } else { exact })
     }
 
     fn resolve_line(&self, path: &RepoPath, line: u32) -> Result<NodeId> {
@@ -239,18 +229,6 @@ impl Inner {
                 path: path.clone(),
                 line,
             })
-    }
-
-    /// Definitions of `path` in `snapshot`; empty when it is missing, blob
-    /// tier, or does not parse.
-    fn definitions_at(&self, snapshot: SnapshotId, path: &RepoPath) -> Result<Vec<DefinitionInfo>> {
-        let Some(parsed) = self.file_view(snapshot, path)?.and_then(|v| v.parsed) else {
-            return Ok(Vec::new());
-        };
-        let Some(adapter) = self.adapter_for(path, parsed.lang) else {
-            return Ok(Vec::new());
-        };
-        Ok(definitions(adapter, path, &parsed.tree))
     }
 
     pub(crate) fn touches_path(&self, change: &ChangeRecord, filter: &RepoPath) -> Result<bool> {
@@ -281,7 +259,7 @@ impl Inner {
         let mut out = HashSet::new();
         for (path, _) in self.files_under(snapshot, prefix)? {
             out.insert(NodeId::file_root(&path));
-            if let Some(parsed) = self.file_view(snapshot, &path)?.and_then(|v| v.parsed) {
+            if let Some(parsed) = self.parsed_at(snapshot, &path)? {
                 out.extend(parsed.tree.ids.values().copied());
             }
         }
@@ -301,7 +279,7 @@ impl Inner {
             .collect();
         if matches!(kind, EdgeKind::References | EdgeKind::Contains) {
             for (path, _) in self.list_files(snapshot)? {
-                let Some(parsed) = self.file_view(snapshot, &path)?.and_then(|v| v.parsed) else {
+                let Some(parsed) = self.parsed_at(snapshot, &path)? else {
                     continue;
                 };
                 let Some((site, _)) = parsed.tree.ids.iter().find(|(_, id)| **id == source) else {

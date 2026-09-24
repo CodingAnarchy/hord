@@ -46,7 +46,7 @@ use hord_lang::{Anchor, IdentifiedTree, NodeTree, Site, enclosing_site};
 use serde::{Deserialize, Serialize};
 
 use crate::repo::{Inner, now};
-use crate::semantic::{FileView, Parsed, RustCtx, definitions, enclosing, result_anchor};
+use crate::semantic::{FileView, Parsed, RustCtx, carry, enclosing, result_anchor};
 use crate::sets::sets_between;
 use crate::snapshot::IdentityEdits;
 use crate::workspace::{AccessLog, Proposal};
@@ -240,12 +240,7 @@ fn propose_file(inner: &Inner, base: SnapshotId, edit: &Edit, build: &mut Build)
             let empty = IdentifiedTree::default();
             let base_tree = base_parsed.map(|p| Arc::clone(&p.tree));
             let base_ref = base_tree.as_deref().unwrap_or(&empty);
-            let mapping =
-                hord_identity::carry(adapter, path, Some(base), base_ref, &result_tree, &[])
-                    .map_err(|source| Error::Identity {
-                        path: path.clone(),
-                        source,
-                    })?;
+            let mapping = carry(adapter, path, base, base_ref, &result_tree)?;
             let file_ops = hord_diff::diff(path, base_ref, &result_tree, &mapping);
             check_reproduces(adapter, path, base_ref, &file_ops, &result_tree, bytes)?;
             build.declared.extend(declared(&mapping.deltas));
@@ -309,11 +304,7 @@ fn propose_move(
     let result_tree = inner
         .parse(adapter, blob, bytes.as_slice())
         .ok_or_else(|| Error::NotParsed(path.clone()))?;
-    let mapping = hord_identity::carry(adapter, path, Some(base), &old.tree, &result_tree, &[])
-        .map_err(|source| Error::Identity {
-            path: path.clone(),
-            source,
-        })?;
+    let mapping = carry(adapter, path, base, &old.tree, &result_tree)?;
     let file_ops = hord_diff::diff(path, &old.tree, &result_tree, &mapping);
     check_reproduces(adapter, path, &old.tree, &file_ops, &result_tree, bytes)?;
     let (old_root, new_root) = (NodeId::file_root(&from.path), NodeId::file_root(path));
@@ -352,7 +343,7 @@ fn propose_move(
 }
 
 /// Deltas carrying recorded besides births and deaths.
-fn declared(deltas: &[IdentityDelta]) -> impl Iterator<Item = IdentityDelta> + '_ {
+pub(crate) fn declared(deltas: &[IdentityDelta]) -> impl Iterator<Item = IdentityDelta> + '_ {
     deltas
         .iter()
         .filter(|d| !matches!(d, IdentityDelta::Birth { .. } | IdentityDelta::Death { .. }))
@@ -566,9 +557,7 @@ fn declarations(
             ReadDeclaration::Path(path) => {
                 out.insert(NodeId::file_root(path));
                 for snapshot in [base, result] {
-                    if let Some(view) = inner.file_view(snapshot, path)?
-                        && let Some(parsed) = view.parsed
-                    {
+                    if let Some(parsed) = inner.parsed_at(snapshot, path)? {
                         out.extend(parsed.tree.ids.values().copied());
                     }
                 }
@@ -583,16 +572,7 @@ fn declarations(
     }
     for snapshot in [base, result] {
         for (path, _) in inner.list_files(snapshot)? {
-            let Some(view) = inner.file_view(snapshot, &path)? else {
-                continue;
-            };
-            let Some(parsed) = view.parsed else {
-                continue;
-            };
-            let Some(adapter) = inner.adapter_for(&path, parsed.lang) else {
-                continue;
-            };
-            for def in definitions(adapter, &path, &parsed.tree) {
+            for def in inner.definitions_at(snapshot, &path)? {
                 if let Some(name) = &def.name
                     && let Some(found) = names.get_mut(name.as_str())
                 {

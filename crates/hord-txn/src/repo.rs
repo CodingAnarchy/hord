@@ -398,22 +398,34 @@ impl Inner {
         // One fetch per object at a time: tasks sharing this cache must not
         // write the same loose object concurrently (a reader would see it
         // half written) or fetch it twice.
-        let _flight = lock(&self.fetching[usize::from(id.as_bytes()[0]) % FETCH_SHARDS]);
+        let _flight = self.fetch_lock(id);
         match self.store.get(id) {
             Ok(bytes) => Ok(bytes),
             Err(hord_store::Error::MissingObject(_)) => {
                 let bytes = source.get(id)?;
-                if ObjectId::from_canonical(&bytes) != id {
-                    return Err(Error::Corrupt {
-                        id,
-                        reason: "the object source returned bytes with another hash".into(),
-                    });
-                }
-                self.store.put(&bytes)?;
+                self.keep_fetched(id, &bytes)?;
                 Ok(bytes)
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// The single-flight lock for fetching `id`.
+    fn fetch_lock(&self, id: ObjectId) -> MutexGuard<'_, ()> {
+        lock(&self.fetching[usize::from(id.as_bytes()[0]) % FETCH_SHARDS])
+    }
+
+    /// Check that `bytes` the [`ObjectSource`] returned for `id` hash to it,
+    /// and keep them in the store.
+    fn keep_fetched(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
+        if ObjectId::from_canonical(bytes) != id {
+            return Err(Error::Corrupt {
+                id,
+                reason: "the object source returned bytes with another hash".into(),
+            });
+        }
+        self.store.put(bytes)?;
+        Ok(())
     }
 
     /// Fetch every id in `ids` the store lacks from the [`ObjectSource`],
@@ -432,17 +444,10 @@ impl Inner {
         }
         for batch in missing.chunks(PREFETCH_BATCH) {
             for (id, bytes) in batch.iter().zip(source.get_objects(batch)?) {
-                let _flight = lock(&self.fetching[usize::from(id.as_bytes()[0]) % FETCH_SHARDS]);
-                if self.store.contains(*id)? {
-                    continue;
+                let _flight = self.fetch_lock(*id);
+                if !self.store.contains(*id)? {
+                    self.keep_fetched(*id, &bytes)?;
                 }
-                if ObjectId::from_canonical(&bytes) != *id {
-                    return Err(Error::Corrupt {
-                        id: *id,
-                        reason: "the object source returned bytes with another hash".into(),
-                    });
-                }
-                self.store.put(&bytes)?;
             }
         }
         Ok(())
@@ -596,9 +601,21 @@ where
     F: FnOnce(&Inner) -> Result<T> + Send + 'static,
 {
     let inner = Arc::clone(inner);
-    tokio::task::spawn_blocking(move || f(&inner))
+    spawn_blocking(move || f(&inner)).await
+}
+
+/// Run `f` on tokio's blocking pool.
+async fn spawn_blocking<T, E>(
+    f: impl FnOnce() -> std::result::Result<T, E> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    Error: From<E>,
+{
+    Ok(tokio::task::spawn_blocking(f)
         .await
-        .map_err(|err| Error::Task(err.to_string()))?
+        .map_err(|err| Error::Task(err.to_string()))??)
 }
 
 impl Repo {
@@ -611,9 +628,7 @@ impl Repo {
     /// [`RepoConfig::strict_reads`], adapters, or a verifier).
     pub async fn create_with(root: impl AsRef<Path>, options: RepoOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let store = tokio::task::spawn_blocking(move || Store::create(root))
-            .await
-            .map_err(|err| Error::Task(err.to_string()))??;
+        let store = spawn_blocking(move || Store::create(root)).await?;
         Self::from_store(store, options).await
     }
 
@@ -625,17 +640,13 @@ impl Repo {
     /// Open the store at `<root>/.hord/` with `options`.
     pub async fn open_with(root: impl AsRef<Path>, options: RepoOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let store = tokio::task::spawn_blocking(move || Store::open(root))
-            .await
-            .map_err(|err| Error::Task(err.to_string()))??;
+        let store = spawn_blocking(move || Store::open(root)).await?;
         Self::from_store(store, options).await
     }
 
     /// Wrap an already-open [`Store`].
     pub async fn from_store(store: Store, options: RepoOptions) -> Result<Self> {
-        let inner = tokio::task::spawn_blocking(move || Inner::new(store, options))
-            .await
-            .map_err(|err| Error::Task(err.to_string()))??;
+        let inner = spawn_blocking(move || Inner::new(store, options)).await?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -683,16 +694,7 @@ impl Repo {
         path: RepoPath,
     ) -> Result<Vec<crate::DefinitionInfo>> {
         blocking(&self.inner, move |inner| {
-            let Some(view) = inner.file_view(snapshot, &path)? else {
-                return Ok(Vec::new());
-            };
-            let Some(parsed) = view.parsed else {
-                return Ok(Vec::new());
-            };
-            let Some(adapter) = inner.adapter_for(&path, parsed.lang) else {
-                return Ok(Vec::new());
-            };
-            Ok(crate::semantic::definitions(adapter, &path, &parsed.tree))
+            inner.definitions_at(snapshot, &path)
         })
         .await
     }

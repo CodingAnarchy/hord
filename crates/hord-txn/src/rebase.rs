@@ -10,6 +10,7 @@ use crate::conflict::{AdapterMerge, MergeConflict, MergeSeverity};
 use crate::files::{FileChange, file_changes};
 use crate::propose::check_reproduces;
 use crate::repo::Inner;
+use crate::semantic::carry;
 use crate::snapshot::IdentityEdits;
 use crate::{Error, Result};
 
@@ -39,7 +40,7 @@ fn adapter_merge(
 ) -> Result<AdapterMerge> {
     let mut nodes = BTreeSet::from([NodeId::file_root(path)]);
     for snapshot in [record.base, head, record.result] {
-        if let Some(parsed) = inner.file_view(snapshot, path)?.and_then(|v| v.parsed) {
+        if let Some(parsed) = inner.parsed_at(snapshot, path)? {
             nodes.extend(parsed.tree.ids.values().copied());
         }
     }
@@ -245,8 +246,8 @@ fn reapply(
         return Ok(None);
     }
     let (Some(ours), Some(theirs)) = (
-        inner.file_view(head, path)?.and_then(|v| v.parsed),
-        inner.file_view(record.result, path)?.and_then(|v| v.parsed),
+        inner.parsed_at(head, path)?,
+        inner.parsed_at(record.result, path)?,
     ) else {
         return Ok(None);
     };
@@ -337,8 +338,7 @@ fn parsed_or_empty(
     path: &RepoPath,
 ) -> Result<Arc<IdentifiedTree>> {
     Ok(inner
-        .file_view(snapshot, path)?
-        .and_then(|view| view.parsed)
+        .parsed_at(snapshot, path)?
         .map(|parsed| parsed.tree)
         .unwrap_or_default())
 }
@@ -430,9 +430,9 @@ fn merge_file(
     let adapter = inner.adapter(path, theirs_bytes.as_slice());
     let parsed = match (adapter, file.from) {
         (Some(_), Some(_)) => {
-            let base = inner.file_view(record.base, path)?.and_then(|v| v.parsed);
-            let ours_view = inner.file_view(head, path)?.and_then(|v| v.parsed);
-            let theirs_view = inner.file_view(record.result, path)?.and_then(|v| v.parsed);
+            let base = inner.parsed_at(record.base, path)?;
+            let ours_view = inner.parsed_at(head, path)?;
+            let theirs_view = inner.parsed_at(record.result, path)?;
             match (base, ours_view, theirs_view) {
                 (Some(b), Some(o), Some(t)) => Some((b.tree, o.tree, t.tree)),
                 _ => None,
@@ -523,13 +523,7 @@ fn finish_parsed(
         ));
     };
     let ours = parsed_or_empty(inner, head, path)?;
-    let mut mapping =
-        hord_identity::carry(adapter, path, Some(head), &ours, &tree, &[]).map_err(|source| {
-            Error::Identity {
-                path: path.clone(),
-                source,
-            }
-        })?;
+    let mut mapping = carry(adapter, path, head, &ours, &tree)?;
     if let Some(theirs) = theirs {
         keep_own_births(&mut mapping, &tree, theirs, own);
     }
