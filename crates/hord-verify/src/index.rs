@@ -20,6 +20,12 @@ pub trait EvidenceIndex: Send + Sync {
     fn get_raw(&self, id: ObjectId) -> Result<Vec<u8>>;
     /// Store `evidence` and index it under its key.
     fn put_evidence(&self, evidence: &Evidence) -> Result<ObjectId>;
+    /// Store and index several pieces of evidence, ids in input order. The
+    /// default puts them one at a time; an index that can commit them
+    /// together (the store: one durable commit) overrides it.
+    fn put_evidence_batch(&self, evidence: &[Evidence]) -> Result<Vec<ObjectId>> {
+        evidence.iter().map(|e| self.put_evidence(e)).collect()
+    }
     /// Evidence indexed under exactly this key.
     fn evidence_for_key(
         &self,
@@ -62,6 +68,10 @@ impl EvidenceIndex for Store {
 
     fn put_evidence(&self, evidence: &Evidence) -> Result<ObjectId> {
         Ok(Store::put_evidence(self, evidence)?)
+    }
+
+    fn put_evidence_batch(&self, evidence: &[Evidence]) -> Result<Vec<ObjectId>> {
+        Ok(Store::put_evidence_batch(self, evidence)?)
     }
 
     fn evidence_for_key(
@@ -215,6 +225,18 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(index.evidence_at(snap).unwrap(), vec![a]);
+        // A batch: the same ids and rows as putting each alone.
+        let batch = [ev(3, "cargo check"), ev(3, "cargo clippy")];
+        let ids = index.put_evidence_batch(&batch).unwrap();
+        let expected: Vec<ObjectId> = batch.iter().map(|e| ObjectId::of(e).unwrap()).collect();
+        assert_eq!(ids, expected);
+        let mut at = index.evidence_at(ObjectId::from_bytes([3; 32])).unwrap();
+        at.sort();
+        let mut want = expected.clone();
+        want.sort();
+        assert_eq!(at, want);
+        assert_eq!(get_evidence(index, ids[1]).unwrap(), batch[1]);
+        assert!(index.put_evidence_batch(&[]).unwrap().is_empty());
         assert!(matches!(
             index.get_raw(ObjectId::from_bytes([0; 32])),
             Err(Error::MissingObject(_))

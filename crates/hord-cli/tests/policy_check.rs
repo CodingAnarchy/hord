@@ -406,3 +406,29 @@ fn evidence_indexed_for_the_result_snapshot_counts() {
         ])
     );
 }
+
+/// ADR 0026 amendment: a workspace edit that breaks `.hord-policy.toml` is
+/// reported by `policy check` (and refused by `propose`) with the parse
+/// error's line and column; the lander would reject it.
+#[test]
+fn a_policy_edit_that_does_not_parse_is_reported_early() {
+    let f = fixture(Some("[land]\nrequire = [\"check\"]\n"));
+    fs::write(
+        f.checkout.join(".hord-policy.toml"),
+        "[land]\nrequire = [\"check\"]\nstrict_reads = 3\n",
+    )
+    .unwrap();
+    let out = hord(&f.repo.0, &["policy", "check"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains(".hord-policy.toml:3:16:"), "{stderr}");
+    let intent = f.repo.0.join("intent.md");
+    fs::write(&intent, "---\nsummary: break the policy\n---\n").unwrap();
+    let out = hord(
+        &f.repo.0,
+        &["propose", "--intent", intent.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains(".hord-policy.toml:3:16:"), "{stderr}");
+}

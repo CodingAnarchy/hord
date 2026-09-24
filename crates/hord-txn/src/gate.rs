@@ -421,6 +421,26 @@ impl Inner {
         }
     }
 
+    /// ADR 0026 amendment: a change that writes a `.hord-policy.toml` that
+    /// does not parse never lands, because once it is head's policy it
+    /// would park every change, including the one that fixes it. `Ok` when
+    /// the change leaves the file alone or it parses; otherwise the parse
+    /// error, with its line and column.
+    pub(crate) fn check_policy_file(
+        &self,
+        base: SnapshotId,
+        result: SnapshotId,
+    ) -> Result<std::result::Result<(), String>> {
+        let path: RepoPath = POLICY_PATH
+            .parse()
+            .map_err(|_| Error::InvalidPath(POLICY_PATH.into()))?;
+        let after = self.blob_id(result, &path)?;
+        if after.is_none() || after == self.blob_id(base, &path)? {
+            return Ok(Ok(()));
+        }
+        Ok(self.policy_at(result)?.map(|_| ()))
+    }
+
     /// Evidence indexed for `snapshot` as policy facts (ADR 0025).
     pub(crate) fn evidence_facts(&self, snapshot: SnapshotId) -> Result<Vec<EvidenceFact>> {
         let mut out = Vec::new();
@@ -859,6 +879,19 @@ impl crate::Repo {
                 Ok((policy, source)) => Ok((policy.as_ref().clone(), source)),
                 Err(reason) => Err(Error::Policy(reason)),
             }
+        })
+        .await
+    }
+
+    /// ADR 0026 amendment: [`Error::Policy`] when `record` writes a
+    /// `.hord-policy.toml` that does not parse (the lander would reject
+    /// it), for `hord policy check` to report early.
+    pub async fn check_policy_file(&self, record: &ChangeRecord) -> Result<()> {
+        let (base, result) = (record.base, record.result);
+        crate::repo::blocking(&self.inner, move |inner| {
+            inner
+                .check_policy_file(base, result)?
+                .map_err(Error::Policy)
         })
         .await
     }

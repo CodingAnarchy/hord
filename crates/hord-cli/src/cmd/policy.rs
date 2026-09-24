@@ -91,6 +91,9 @@ pub fn check(
         decision: None,
     };
     if let Some(record) = record {
+        // ADR 0026 amendment: a policy edit that does not parse would be
+        // rejected at landing; report it now.
+        block_on(repo.check_policy_file(&record))?;
         let facts = block_on(repo.policy_facts(record))?;
         result.write_set_size = facts.write_set_len;
         result.evidence = facts.evidence.clone();

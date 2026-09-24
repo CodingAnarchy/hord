@@ -797,6 +797,14 @@ impl Inner {
             };
             return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
         }
+        // ADR 0026 amendment: a policy file that does not parse never lands.
+        if let Err(reason) = self.check_policy_file(head.snapshot, rebased.result)? {
+            let reason = format!(
+                "the change's {} does not parse: {reason}",
+                hord_policy::POLICY_PATH
+            );
+            return Ok(Prepared::Park(QueueStatus::Rejected { reason }));
+        }
         let checked_files = rebased.checked;
         let (landed_id, landed, attestation) = if rebased.result == record.result
             && record.base == head.snapshot

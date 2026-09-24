@@ -6,7 +6,7 @@ use std::fs;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -235,8 +235,10 @@ impl Store {
     /// Store already-canonical CBOR bytes. The [`ObjectId`] is BLAKE3-256 of
     /// `canonical_cbor` (spec §3.1, §3.9).
     ///
-    /// Writes a loose object. Identical bytes are idempotent. An object this
-    /// process has already stored, loose or packed, is not written again.
+    /// Writes a loose object, atomically. Identical bytes are idempotent. An
+    /// object this process has already stored, loose or packed, or one
+    /// already whole on disk as a loose file, is not written again; a
+    /// damaged loose file is replaced.
     /// Does not pack; call [`Store::pack`] (spec §8.1: packing is a background
     /// job).
     pub fn put(&self, canonical_cbor: &[u8]) -> Result<ObjectId> {
@@ -244,7 +246,15 @@ impl Store {
         if self.remembered(id).is_some() {
             return Ok(id);
         }
-        self.write_loose(id, canonical_cbor)?;
+        // Already on disk and whole (written by another handle or process):
+        // nothing to write. A damaged copy is replaced, atomically.
+        let whole = self.loose_path(id).is_file()
+            && self
+                .read_loose(id)?
+                .is_some_and(|bytes| ObjectId::from_canonical(&bytes) == id);
+        if !whole {
+            self.write_loose(id, canonical_cbor)?;
+        }
         self.remember(id, Resident::Loose);
         Ok(id)
     }
@@ -610,18 +620,44 @@ impl Store {
         Ok(n)
     }
 
+    /// Write a loose object atomically: into a unique temporary file in its
+    /// shard, then renamed over the object's path, so a concurrent reader
+    /// sees either no file or the whole object, never a torn one. Objects
+    /// are content-addressed, so when the rename finds the object already
+    /// there (Windows does not replace an existing file), that copy is just
+    /// as good and the temporary file is dropped.
     fn write_loose(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
+        static TEMP: AtomicU64 = AtomicU64::new(0);
         let path = self.loose_path(id);
-        match fs::write(&path, bytes) {
-            Ok(()) => Ok(()),
+        let parent = path.parent().expect("a loose path has a shard directory");
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a loose name is hex");
+        // Leading `.`: `list_loose` skips it.
+        let temp = parent.join(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::write(&temp, bytes) {
+            Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&path, bytes)?;
+                fs::create_dir_all(parent)?;
+                fs::write(&temp, bytes)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        match fs::rename(&temp, &path) {
+            Ok(()) => Ok(()),
+            Err(_) if path.is_file() => {
+                let _ = fs::remove_file(&temp);
                 Ok(())
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                let _ = fs::remove_file(&temp);
+                Err(e.into())
+            }
         }
     }
 
@@ -1026,6 +1062,88 @@ mod refs_tests {
             ["release/1.0", "release/1.1"]
         );
         assert!(store.refs("zzz").unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use hord_core::ObjectId;
+
+    use super::Store;
+    use crate::Error;
+
+    /// Concurrent `put`s and `get`s of one object never see a torn loose
+    /// file (`Corrupt`): the object is either absent or whole. Writers use
+    /// separate handles, as separate processes or caches do, so none skips
+    /// the write because another remembered it. Before `write_loose` wrote a
+    /// temporary file and renamed it, a writer truncating the file under a
+    /// reader failed this within a few rounds.
+    #[test]
+    fn concurrent_puts_and_gets_never_read_a_torn_object() {
+        let dir = std::env::temp_dir().join(format!("hord-store-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::create(&dir).unwrap());
+        const WRITERS: usize = 4;
+        const READERS: usize = 4;
+        const PUTS: usize = 6;
+        for round in 0..20u32 {
+            // A large object widens the window a torn write would leave.
+            let mut bytes = vec![0x5a_u8; 4 << 20];
+            bytes[..4].copy_from_slice(&round.to_be_bytes());
+            let bytes = Arc::new(bytes);
+            let id = ObjectId::from_canonical(&bytes);
+            let barrier = Arc::new(Barrier::new(WRITERS + READERS));
+            let writing = Arc::new(AtomicUsize::new(WRITERS));
+            let mut threads = Vec::new();
+            for _ in 0..WRITERS {
+                let (store, bytes, barrier, writing) = (
+                    Arc::clone(&store),
+                    Arc::clone(&bytes),
+                    Arc::clone(&barrier),
+                    Arc::clone(&writing),
+                );
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..PUTS {
+                        // A fresh write each time: what another handle or
+                        // process that has not seen the object does.
+                        store.forget(ObjectId::from_canonical(&bytes));
+                        store.put(&bytes)?;
+                    }
+                    writing.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }));
+            }
+            for _ in 0..READERS {
+                let (store, barrier, writing) = (
+                    Arc::clone(&store),
+                    Arc::clone(&barrier),
+                    Arc::clone(&writing),
+                );
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    while writing.load(Ordering::SeqCst) > 0 {
+                        match store.get(id) {
+                            Ok(_) | Err(Error::MissingObject(_)) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            for thread in threads {
+                if let Err(err) = thread.join().unwrap() {
+                    panic!("round {round}: {err}");
+                }
+            }
+            assert_eq!(store.get(id).unwrap(), *bytes);
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

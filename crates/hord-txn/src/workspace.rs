@@ -441,7 +441,9 @@ impl Workspace {
     }
 
     /// Diff the workspace against its base, identify, and store a
-    /// [`ChangeRecord`] (spec §6.2 `propose`).
+    /// [`ChangeRecord`] (spec §6.2 `propose`). A `.hord-policy.toml` that
+    /// does not parse is [`Error::Policy`] (ADR 0026 amendment: the lander
+    /// would reject the change).
     ///
     /// The record's ops are checked to reproduce the result from the base
     /// before it is stored (spec §3.5). The workspace stays usable; proposing
@@ -460,6 +462,20 @@ impl Workspace {
     async fn build(&mut self, intent: Intent, store: bool) -> Result<Proposal> {
         let (changes, skipped) = self.changed_files().await?;
         self.skipped = skipped;
+        // ADR 0026 amendment: the lander rejects a change whose
+        // `.hord-policy.toml` does not parse; say so before proposing it.
+        if store
+            && let Some(Some(bytes)) = hord_policy::POLICY_PATH
+                .parse::<RepoPath>()
+                .ok()
+                .and_then(|p| changes.get(&p))
+        {
+            let text = std::str::from_utf8(bytes.as_slice())
+                .map_err(|_| Error::Policy(format!("{} is not UTF-8", hord_policy::POLICY_PATH)))?;
+            if let Err(err) = hord_policy::parse(text) {
+                return Err(Error::Policy(format!("{}:{err}", hord_policy::POLICY_PATH)));
+            }
+        }
         self.access_log
             .written_paths
             .extend(changes.keys().cloned());

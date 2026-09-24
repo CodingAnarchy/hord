@@ -126,8 +126,9 @@ pub fn verify(
             failures.push(format!("{} (reused): {summary}", reused.check.command()));
         }
     }
+    // One commit for everything this run produced.
+    evidence.extend(index.put_evidence_batch(&fresh)?);
     for ev in &fresh {
-        evidence.push(index.put_evidence(ev)?);
         if let EvidenceResult::Fail { summary } = &ev.result {
             failures.push(format!("{}: {summary}", ev.command));
         }

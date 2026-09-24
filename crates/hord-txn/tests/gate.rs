@@ -500,3 +500,44 @@ async fn policy_facts_carry_kinds_and_visibility() {
         "{facts:#?}"
     );
 }
+
+/// ADR 0026 amendment: `propose` refuses a `.hord-policy.toml` that does
+/// not parse, and the lander rejects such a change from anywhere else (a
+/// record stored directly), naming the parse error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unparseable_policy_file_never_lands() {
+    let t = repo(&fixture()).await;
+    let bad = "[land]\nrequire = [\"check\"]\nstrict_reads = 3\n";
+    let mut ws = begin(&t.repo, "a").await;
+    ws.write_file(&path(".hord-policy.toml"), bad)
+        .await
+        .unwrap();
+    let err = ws.propose(intent("bad policy")).await.unwrap_err();
+    assert!(
+        matches!(&err, hord_txn::Error::Policy(m) if m.contains(".hord-policy.toml:3:16")),
+        "{err}"
+    );
+    // The same change, stored without `propose`'s check.
+    let preview = ws.preview(intent("bad policy")).await.unwrap();
+    let stored = t.repo.store().put_object(&preview.record).unwrap();
+    assert_eq!(stored, preview.change);
+    let entry = land_one(&t.repo, preview.change).await;
+    let QueueStatus::Rejected { reason } = &entry.status else {
+        panic!("{entry:#?}");
+    };
+    assert!(
+        reason.contains("does not parse") && reason.contains(":3:16"),
+        "{reason}"
+    );
+    // A policy that parses lands, and a change that leaves it alone is not
+    // checked again.
+    let mut ws = begin(&t.repo, "b").await;
+    ws.write_file(&path(".hord-policy.toml"), "[land]\nrequire = []\n")
+        .await
+        .unwrap();
+    let good = ws.propose(intent("good policy")).await.unwrap().change;
+    assert_eq!(
+        land_one(&t.repo, good).await.status,
+        QueueStatus::Landed { landed: good }
+    );
+}

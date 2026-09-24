@@ -212,7 +212,7 @@ impl Verifier for FixtureVerifier {
 
 fn fixtures(request: &VerifyRequest) -> Verdict {
     let index = request.context.index();
-    let mut evidence = Vec::new();
+    let mut fixtures = Vec::new();
     for requirement in request
         .policy
         .require
@@ -230,36 +230,36 @@ fn fixtures(request: &VerifyRequest) -> Verdict {
             "bench" => EvidenceKind::Bench,
             other => EvidenceKind::Custom(other.to_owned()),
         };
-        let fixture = hord_verify::EvidenceFields {
-            kind,
-            qualifier,
-            snapshot: request.change.result,
-            toolchain: hord_core::ObjectId::from_canonical(b"hord-eval-m3 fixtures"),
-            command: format!("fixture {requirement}"),
-            scope: None,
-            result: EvidenceResult::Pass,
-            log: None,
-            cost_ms: 0,
-            produced_by: Actor::Agent {
-                id: "m3-fixture-ci".into(),
-                model: String::new(),
-                model_hash: hord_core::Bytes::default(),
-                harness: "hord-eval-m3".into(),
-            },
-            produced_at: Timestamp::from_millis(0),
-        }
-        .build();
-        match index.put_evidence(&fixture) {
-            Ok(id) => evidence.push(id),
-            Err(err) => {
-                return Verdict::Fail {
-                    evidence,
-                    reason: err.to_string(),
-                };
+        fixtures.push(
+            hord_verify::EvidenceFields {
+                kind,
+                qualifier,
+                snapshot: request.change.result,
+                toolchain: hord_core::ObjectId::from_canonical(b"hord-eval-m3 fixtures"),
+                command: format!("fixture {requirement}"),
+                scope: None,
+                result: EvidenceResult::Pass,
+                log: None,
+                cost_ms: 0,
+                produced_by: Actor::Agent {
+                    id: "m3-fixture-ci".into(),
+                    model: String::new(),
+                    model_hash: hord_core::Bytes::default(),
+                    harness: "hord-eval-m3".into(),
+                },
+                produced_at: Timestamp::from_millis(0),
             }
-        }
+            .build(),
+        );
     }
-    Verdict::Pass { evidence }
+    // One index commit for the candidate's evidence, as `hord_verify::verify`.
+    match index.put_evidence_batch(&fixtures) {
+        Ok(evidence) => Verdict::Pass { evidence },
+        Err(err) => Verdict::Fail {
+            evidence: Vec::new(),
+            reason: err.to_string(),
+        },
+    }
 }
 
 /// What `--policy` found.

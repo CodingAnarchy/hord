@@ -58,6 +58,34 @@ impl Store {
         Ok(id)
     }
 
+    /// Store every one of `evidence` and index them all in one write
+    /// transaction: one durable commit for a verification's evidence
+    /// instead of one per piece. Ids in input order.
+    pub fn put_evidence_batch(&self, evidence: &[Evidence]) -> Result<Vec<ObjectId>> {
+        let mut ids = Vec::with_capacity(evidence.len());
+        let mut rows = Vec::with_capacity(evidence.len());
+        for piece in evidence {
+            let id = self.put_object(piece)?;
+            let key = key_hash(piece.toolchain, &piece.command, piece.scope.as_ref())?;
+            rows.push(row(piece.snapshot, key, id));
+            ids.push(id);
+        }
+        if rows.is_empty() {
+            return Ok(ids);
+        }
+        let txn = self.db.begin_write().map_err(Error::index)?;
+        {
+            let mut table = txn.open_table(EVIDENCE).map_err(Error::index)?;
+            for row in &rows {
+                table
+                    .insert(row.as_slice(), [].as_slice())
+                    .map_err(Error::index)?;
+            }
+        }
+        txn.commit().map_err(Error::index)?;
+        Ok(ids)
+    }
+
     /// Index an evidence object that is already stored (for example one an
     /// author attached at `propose`, or one fetched from a remote).
     ///
@@ -183,6 +211,38 @@ mod tests {
             produced_by: Actor::Human { id: "t".into() },
             produced_at: Timestamp::from_millis(1),
         }
+    }
+
+    /// A batch indexes like one `put_evidence` per piece, in one commit,
+    /// and survives a reopen (the commit is durable).
+    #[test]
+    fn a_batch_indexes_every_piece() {
+        let mut repo = repo();
+        let batch = [
+            evidence(1, "cargo check", None),
+            evidence(1, "cargo test", Some(&[3])),
+            evidence(2, "cargo check", None),
+        ];
+        let ids = repo.1.as_ref().unwrap().put_evidence_batch(&batch).unwrap();
+        repo.1.take();
+        let store = Store::open(&repo.0).unwrap();
+        for (piece, id) in batch.iter().zip(&ids) {
+            assert_eq!(*id, ObjectId::of(piece).unwrap());
+            assert_eq!(
+                store
+                    .evidence_for_key(
+                        piece.snapshot,
+                        piece.toolchain,
+                        &piece.command,
+                        piece.scope.as_ref()
+                    )
+                    .unwrap(),
+                vec![*id]
+            );
+        }
+        assert_eq!(store.evidence_at(id(1)).unwrap().len(), 2);
+        assert!(store.put_evidence_batch(&[]).unwrap().is_empty());
+        repo.1 = Some(store);
     }
 
     #[test]
