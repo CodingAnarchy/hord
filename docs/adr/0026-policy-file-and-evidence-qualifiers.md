@@ -43,3 +43,7 @@ For qualifiers, two options: an optional field on `Evidence`, or encoding qualif
 - **Adapters report two new facts** for a changed definition: the node kinds inside it (for `touches_kind`) and its visibility (for `touches_visibility`). This is a `LangAdapter` method with an empty default, implemented for Rust.
 - **Git export** writes `.hord-policy.toml` like any other file.
 - Reading policy from anywhere other than head, or changing the qualifier rules, needs a new ADR.
+
+## Amendments (2026-09-24, from implementation)
+
+- **A policy that does not parse never lands.** Head's policy judges every change, and an unreadable head policy parks everything, including the change that would fix it. So the lander parses the `.hord-policy.toml` in each change's result, and rejects the change if it does not parse. `propose` and `hord policy check` report the same parse error early. A repository can still reach an unparseable head policy only through bootstrap or git import, and recovery from that is administrative.
