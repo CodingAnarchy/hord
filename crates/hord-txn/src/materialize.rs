@@ -44,7 +44,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{WalkBuilder, WalkState};
 use serde::{Deserialize, Serialize};
 
-use crate::repo::{Inner, fs_path};
+use crate::repo::{Inner, fs_path, lock};
 use crate::{Error, Result};
 
 /// How a `Directory` workspace's files were materialized (ADR 0016).
@@ -568,10 +568,6 @@ pub(crate) fn walk_checkout(
     walked.files.sort_by(|a, b| a.0.cmp(&b.0));
     walked.skipped.sort();
     Ok(walked)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn visit(

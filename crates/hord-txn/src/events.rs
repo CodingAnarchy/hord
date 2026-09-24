@@ -221,16 +221,14 @@ async fn replay(log: &Weak<EventLog>, seen: &mut EventCursor, tx: &Sink) -> bool
             return false;
         };
         let after = *seen;
-        let batch =
-            tokio::task::spawn_blocking(move || strong.read_after(after, REPLAY_BATCH)).await;
+        let batch = tokio::task::spawn_blocking(move || strong.read_after(after, REPLAY_BATCH))
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|read| read.map_err(|err| err.to_string()));
         let batch = match batch {
-            Ok(Ok(batch)) => batch,
-            Ok(Err(err)) => {
-                let _ = tx.send(Err(ApiError::Internal(err.to_string()))).await;
-                return false;
-            }
+            Ok(batch) => batch,
             Err(err) => {
-                let _ = tx.send(Err(ApiError::Internal(err.to_string()))).await;
+                let _ = tx.send(Err(ApiError::Internal(err))).await;
                 return false;
             }
         };

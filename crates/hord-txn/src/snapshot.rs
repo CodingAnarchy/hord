@@ -8,8 +8,8 @@
 //! each CST node. The identity tree holds a [`hord_core::FileIdentity`] for
 //! each parsed file whose ids differ from the fresh assignment.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use hord_core::{
     Blob, Bytes, IdentityEntry, IdentityTree, ObjectId, RepoPath, Snapshot, SnapshotId, Tree,
@@ -40,6 +40,20 @@ const MAX_CACHED_SNAPSHOTS: usize = 16_384;
 /// object, or `None` when the file is gone or takes the fresh assignment.
 pub(crate) type IdentityEdits = BTreeMap<RepoPath, Option<ObjectId>>;
 
+/// Insert into a cache that is emptied when it reaches `cap` entries.
+fn cache_insert<K: Eq + std::hash::Hash, V>(
+    cache: &Mutex<HashMap<K, Arc<V>>>,
+    cap: usize,
+    key: K,
+    value: Arc<V>,
+) {
+    let mut cache = lock(cache);
+    if cache.len() >= cap {
+        cache.clear();
+    }
+    cache.insert(key, value);
+}
+
 /// [`ObjectId`] of `bytes` stored as a [`Blob`], without storing it.
 pub(crate) fn blob_object_id(bytes: &[u8]) -> Result<ObjectId> {
     Ok(ObjectId::of(&Blob::new(bytes.to_vec()))?)
@@ -62,11 +76,12 @@ impl Inner {
             Err(err) => return Err(err),
         };
         let snapshot = Arc::new(snapshot);
-        let mut cache = lock(&self.snapshots);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::clone(&snapshot));
+        cache_insert(
+            &self.snapshots,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::clone(&snapshot),
+        );
         Ok(snapshot)
     }
 
@@ -96,11 +111,12 @@ impl Inner {
             Err(err) => return Err(err),
         };
         let tree = Arc::new(tree);
-        let mut cache = lock(&self.identity_trees);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::clone(&tree));
+        cache_insert(
+            &self.identity_trees,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::clone(&tree),
+        );
         Ok(tree)
     }
 
@@ -134,11 +150,12 @@ impl Inner {
     pub(crate) fn put_snapshot(&self, tree: ObjectId, identity: ObjectId) -> Result<SnapshotId> {
         let snapshot = Snapshot::new(tree, identity);
         let id = self.store.put_object(&snapshot)?;
-        let mut cache = lock(&self.snapshots);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::new(snapshot));
+        cache_insert(
+            &self.snapshots,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::new(snapshot),
+        );
         Ok(id)
     }
 
@@ -234,11 +251,12 @@ impl Inner {
             return Ok(None);
         }
         let id = self.store.put_object(&out)?;
-        let mut cache = lock(&self.identity_trees);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::new(out));
+        cache_insert(
+            &self.identity_trees,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::new(out),
+        );
         Ok(Some(id))
     }
 
@@ -247,11 +265,7 @@ impl Inner {
             return Ok(Arc::clone(tree));
         }
         let tree: Arc<Tree> = Arc::new(self.get_object(id)?);
-        let mut cache = lock(&self.trees);
-        if cache.len() >= MAX_CACHED_TREES {
-            cache.clear();
-        }
-        cache.insert(id, Arc::clone(&tree));
+        cache_insert(&self.trees, MAX_CACHED_TREES, id, Arc::clone(&tree));
         Ok(tree)
     }
 
@@ -502,13 +516,7 @@ impl Inner {
             return Ok(None);
         }
         let id = self.store.put_object(&out)?;
-        {
-            let mut cache = lock(&self.trees);
-            if cache.len() >= MAX_CACHED_TREES {
-                cache.clear();
-            }
-            cache.insert(id, Arc::new(out));
-        }
+        cache_insert(&self.trees, MAX_CACHED_TREES, id, Arc::new(out));
         Ok(Some(id))
     }
 }
