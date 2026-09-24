@@ -7,13 +7,16 @@ use hord_lang::LangAdapter;
 
 use common::{has_kind, identify_result, parse_identified, project, rust};
 
-fn round_trip(base_src: &[u8], result_src: &[u8]) -> Vec<hord_core::Op> {
+fn round_trip(
+    base_src: &[u8],
+    result_src: &[u8],
+) -> Result<Vec<hord_core::Op>, Box<dyn std::error::Error>> {
     let adapter = rust();
     let base = parse_identified(&adapter, base_src);
     let (result, mapping) = identify_result(&adapter, &base, result_src);
     let ops = diff(&common::file(), &base, &result, &mapping);
     let applied = apply(&common::file(), &base, &ops, &result)
-        .unwrap_or_else(|e| panic!("apply failed: {e}; ops={ops:?}"));
+        .map_err(|e| format!("apply failed: {e}; ops={ops:?}"))?;
     let got = project(&adapter, &applied.tree);
     assert_eq!(
         got.as_slice(),
@@ -22,40 +25,43 @@ fn round_trip(base_src: &[u8], result_src: &[u8]) -> Vec<hord_core::Op> {
         String::from_utf8_lossy(&got),
         String::from_utf8_lossy(result_src)
     );
-    ops
+    Ok(ops)
 }
 
 #[test]
-fn insert_a_function() {
+fn insert_a_function() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() {}\nfn b() {}\n";
     let result = b"fn a() {}\nfn c() {}\nfn b() {}\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "insert"),
         "expected Insert for new function, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn delete_a_function() {
+fn delete_a_function() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() {}\nfn b() {}\nfn c() {}\n";
     let result = b"fn a() {}\nfn c() {}\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "delete"),
         "expected Delete for removed function, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn replace_a_function() {
+fn replace_a_function() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() { let x = 1; }\nfn b() {}\n";
     let result = b"fn a() { let x = 2; }\nfn b() {}\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "replace"),
         "expected Replace for edited function, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
@@ -93,28 +99,31 @@ fn move_a_definition() {
 }
 
 #[test]
-fn reorder_sibling_functions_applies() {
+fn reorder_sibling_functions_applies() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() {}\nfn b() {}\n";
     let result = b"fn b() {}\nfn a() {}\n";
-    round_trip(base, result);
+    round_trip(base, result)?;
+    Ok(())
 }
 
 #[test]
-fn identical_trees_empty_ops() {
+fn identical_trees_empty_ops() -> Result<(), Box<dyn std::error::Error>> {
     let src = b"fn a() {}\nfn b() {}\n";
-    let ops = round_trip(src, src);
+    let ops = round_trip(src, src)?;
     assert!(ops.is_empty(), "expected no ops, got {ops:?}");
+    Ok(())
 }
 
 #[test]
-fn trivia_only_replace_still_applies() {
+fn trivia_only_replace_still_applies() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() { let x = 1; }\n";
     let result = b"fn a() { let x  =  1; }\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "replace") || ops.is_empty(),
         "trivia-only should Replace or be a no-op if normalized+raw match, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
