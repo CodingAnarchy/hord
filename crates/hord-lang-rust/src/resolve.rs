@@ -2912,7 +2912,9 @@ mod incremental {
     /// Deterministic ids per (path, site, salt), so a salt change models a
     /// carried identity that differs while the bytes stay the same.
     fn identify(path: &RepoPath, source: &str, salt: u8) -> IdentifiedTree {
-        let tree = RustAdapter.parse(source.as_bytes()).unwrap();
+        let tree = RustAdapter
+            .parse(source.as_bytes())
+            .expect("parse Rust test source");
         let mut ids = BTreeMap::new();
         fn walk(
             tree: &hord_lang::NodeTree,
@@ -2921,7 +2923,7 @@ mod incremental {
             seed: &str,
             ids: &mut BTreeMap<Site, NodeId>,
         ) {
-            let node = tree.get(oid).unwrap();
+            let node = tree.get(oid).expect("walk visits only ids the tree holds");
             if RustAdapter.is_definition(&node.kind) {
                 let h = ObjectId::of_byte_string(format!("{seed}{site:?}").as_bytes());
                 let mut b = [0u8; 16];
@@ -2929,7 +2931,7 @@ mod incremental {
                 ids.insert(site.clone(), NodeId::from_u128(u128::from_le_bytes(b)));
             }
             for (i, child) in node.children.iter().enumerate() {
-                site.push(u32::try_from(i).unwrap());
+                site.push(u32::try_from(i).expect("test files have fewer than 2^32 children"));
                 walk(tree, *child, site, seed, ids);
                 site.pop();
             }
@@ -3006,13 +3008,12 @@ mod incremental {
                 .map(|(p, (s, salt))| (p.clone(), Self::key(p, s, *salt)))
                 .collect();
             let mut loaded = HashSet::new();
-            let inc = RustAdapter
-                .resolve_context_incremental(prev, &keys, &manifest_views, |path| {
+            let Ok(inc) =
+                RustAdapter.resolve_context_incremental(prev, &keys, &manifest_views, |path| {
                     loaded.insert(path.clone());
                     let (s, salt) = &self.files[path];
                     Ok::<_, Infallible>(Some(Arc::new(identify(path, s, *salt))))
-                })
-                .unwrap();
+                });
             (full, inc, loaded)
         }
     }
@@ -3089,7 +3090,11 @@ mod incremental {
             (
                 "move a file to mod.rs",
                 |s| {
-                    let body = s.files.remove(&rp("a/src/y.rs")).unwrap().0;
+                    let body = s
+                        .files
+                        .remove(&rp("a/src/y.rs"))
+                        .expect("a/src/y.rs is in the snapshot")
+                        .0;
                     s.set("a/src/y/mod.rs", &body);
                 },
                 &["a/src/y/mod.rs"],
@@ -3112,7 +3117,12 @@ mod incremental {
             ),
             (
                 "carried identity changes, bytes do not",
-                |s| s.files.get_mut(&rp("b/src/lib.rs")).unwrap().1 = 7,
+                |s| {
+                    s.files
+                        .get_mut(&rp("b/src/lib.rs"))
+                        .expect("b/src/lib.rs is in the snapshot")
+                        .1 = 7;
+                },
                 &["b/src/lib.rs"],
             ),
             (

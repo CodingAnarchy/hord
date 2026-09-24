@@ -205,13 +205,17 @@ mod tests {
     #[test]
     fn matches_rs_suffix_only() {
         let a = adapter();
-        let rs = RepoPath::from_str("src/lib.rs").unwrap();
-        let toml = RepoPath::from_str("Cargo.toml").unwrap();
-        let nested = RepoPath::from_str("crates/foo/src/main.rs").unwrap();
+        let rs = RepoPath::from_str("src/lib.rs").expect("parse repo path src/lib.rs");
+        let toml = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
+        let nested = RepoPath::from_str("crates/foo/src/main.rs")
+            .expect("parse repo path crates/foo/src/main.rs");
         assert!(a.matches(&rs, b"fn main() {}"));
         assert!(a.matches(&nested, &[]));
         assert!(!a.matches(&toml, b"[package]"));
-        assert!(!a.matches(&RepoPath::from_str("foo.rs.bak").unwrap(), &[]));
+        assert!(!a.matches(
+            &RepoPath::from_str("foo.rs.bak").expect("parse repo path foo.rs.bak"),
+            &[]
+        ));
         // ADR 0003: matches ignores head; parse has no size cutoff.
         assert!(a.matches(&rs, &[]));
     }
@@ -249,7 +253,8 @@ mod tests {
 
     #[test]
     fn is_definition_covers_tier1_kinds() {
-        let bytes = fs::read(testdata_dir().join("definitions.rs")).unwrap();
+        let bytes =
+            fs::read(testdata_dir().join("definitions.rs")).expect("read testdata/definitions.rs");
         let tree = parse_ok(&bytes);
         let kinds = kinds_in(&tree);
         let a = adapter();
@@ -285,9 +290,11 @@ mod tests {
 
     #[test]
     fn impls_and_macros_kinds() {
-        let impls = parse_ok(&fs::read(testdata_dir().join("impls.rs")).unwrap());
+        let impls =
+            parse_ok(&fs::read(testdata_dir().join("impls.rs")).expect("read testdata/impls.rs"));
         assert!(kinds_in(&impls).contains("impl_item"));
-        let macros = parse_ok(&fs::read(testdata_dir().join("macros.rs")).unwrap());
+        let macros =
+            parse_ok(&fs::read(testdata_dir().join("macros.rs")).expect("read testdata/macros.rs"));
         assert!(kinds_in(&macros).contains("macro_definition"));
         assert!(kinds_in(&macros).contains("macro_invocation"));
     }
@@ -322,7 +329,7 @@ mod tests {
             .map(|(_, n)| n)
             .find(|n| n.kind.as_str() == "function_item")
             .expect("function_item");
-        let raw = std::str::from_utf8(func.raw.as_slice()).unwrap();
+        let raw = std::str::from_utf8(func.raw.as_slice()).expect("function raw is UTF-8");
         assert!(
             raw.starts_with("/// doc"),
             "doc comment should move with the function, got {raw:?}"
@@ -337,13 +344,11 @@ mod tests {
             .iter()
             .map(|(_, n)| n)
             .find(|n| {
-                std::str::from_utf8(n.raw.as_slice())
-                    .unwrap()
-                    .contains("fn a")
+                std::str::from_utf8(n.raw.as_slice()).is_ok_and(|raw| raw.contains("fn a"))
                     && n.kind.as_str() == "function_item"
             })
             .expect("fn a");
-        let raw_a = std::str::from_utf8(a.raw.as_slice()).unwrap();
+        let raw_a = std::str::from_utf8(a.raw.as_slice()).expect("fn a raw is UTF-8");
         assert!(
             raw_a.contains("// note"),
             "same-line trailing comment should stay with fn a, got {raw_a:?}"

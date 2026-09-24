@@ -31,7 +31,11 @@ fn fixtures() -> Vec<(String, String)> {
         .map(|e| e.expect("entry").path())
         .filter(|p| p.extension().is_some_and(|e| e == "lock"))
         .map(|p| {
-            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let name = p
+                .file_name()
+                .expect("a read_dir entry has a file name")
+                .to_string_lossy()
+                .into_owned();
             // Normalize, so the tests do not depend on how git checked the
             // fixtures out (`core.autocrlf` on Windows). CRLF is covered by
             // `crlf` below.
@@ -121,7 +125,7 @@ fn def_names(tree: &NodeTree, kind: &str) -> Vec<String> {
 #[test]
 fn matches_only_cargo_lock() {
     let a = CargoLockAdapter;
-    let path = |s| RepoPath::from_str(s).unwrap();
+    let path = |s| RepoPath::from_str(s).expect("parse repo path");
     assert!(a.matches(&path("Cargo.lock"), &[]));
     assert!(a.matches(&path("crates/foo/Cargo.lock"), &[]));
     assert!(!a.matches(&path("Cargo.toml"), &[]));
@@ -168,7 +172,9 @@ fn packages_are_named_by_package_id() {
         assert!(names.iter().all(|n| n.starts_with("package::")));
     }
     let text = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.0", &[])]);
-    let tree = CargoLockAdapter.parse(text.as_bytes()).unwrap();
+    let tree = CargoLockAdapter
+        .parse(text.as_bytes())
+        .expect("parse lockfile");
     let packages = def_names(&tree, "table_array_element");
     assert!(packages.contains(&"package::serde".to_owned()));
     assert!(packages.contains(&"package::app".to_owned()));
@@ -180,7 +186,9 @@ fn packages_are_named_by_package_id() {
         pkg("syn", "1.0.0", &[]),
         pkg("syn", "2.0.0", &[]),
     ]);
-    let tree = CargoLockAdapter.parse(text.as_bytes()).unwrap();
+    let tree = CargoLockAdapter
+        .parse(text.as_bytes())
+        .expect("parse lockfile");
     let packages = def_names(&tree, "table_array_element");
     assert!(packages.contains(&"package::syn 1.0.0".to_owned()));
     assert!(packages.contains(&"package::syn 2.0.0".to_owned()));
@@ -195,7 +203,9 @@ fn package_name_is_independent_of_position() {
         pkg("serde", "1.0.0", &[]),
     ]);
     let serde_of = |text: &str| {
-        let tree = CargoLockAdapter.parse(text.as_bytes()).unwrap();
+        let tree = CargoLockAdapter
+            .parse(text.as_bytes())
+            .expect("parse lockfile");
         tree.iter()
             .find(|(_, n)| {
                 n.name
@@ -218,12 +228,17 @@ fn ambiguous_versions_are_named_with_source() {
          {}[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"{git}\"\n",
         pkg("serde", "1.0.0", &[])
     );
-    let tree = CargoLockAdapter.parse(text.as_bytes()).unwrap();
+    let tree = CargoLockAdapter
+        .parse(text.as_bytes())
+        .expect("parse lockfile");
     let names = def_names(&tree, "table_array_element");
     assert!(names.contains(&format!("package::serde 1.0.0 {REGISTRY}")));
     assert!(names.contains(&format!("package::serde 1.0.0 {git}")));
     // Cargo's own spelling and order round-trip.
-    assert_eq!(merge(&text, &text, &text).unwrap(), text);
+    assert_eq!(
+        merge(&text, &text, &text).expect("merge unchanged lockfile"),
+        text
+    );
 }
 
 // ------------------------------------------------------------------ merge
@@ -263,7 +278,9 @@ fn concurrent_dependency_additions_merge_cleanly() {
         pkg("serde", "1.0.0", &[]),
     ]);
     assert_eq!(merge_both(&base, &ours, &theirs), Ok(want.clone()));
-    let tree = CargoLockAdapter.parse(want.as_bytes()).unwrap();
+    let tree = CargoLockAdapter
+        .parse(want.as_bytes())
+        .expect("parse merged lockfile");
     assert_eq!(CargoLockAdapter.project(&tree).as_slice(), want.as_bytes());
 }
 
@@ -351,9 +368,13 @@ fn packages_sort_by_semver_not_text() {
         root("lib", &["foo"]),
         pkg("foo", "0.10.0", &[]),
     ]);
-    let got = merge_both(&base, &ours, &theirs).unwrap();
-    let nine = got.find("version = \"0.9.0\"").unwrap();
-    let ten = got.find("version = \"0.10.0\"").unwrap();
+    let got = merge_both(&base, &ours, &theirs).expect("merge both version additions");
+    let nine = got
+        .find("version = \"0.9.0\"")
+        .expect("merged lockfile has 0.9.0");
+    let ten = got
+        .find("version = \"0.10.0\"")
+        .expect("merged lockfile has 0.10.0");
     assert!(nine < ten, "0.9.0 sorts before 0.10.0");
 }
 
@@ -362,7 +383,8 @@ fn version_conflict_is_reported() {
     let base = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.0", &[])]);
     let ours = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.1", &[])]);
     let theirs = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.2", &[])]);
-    let conflicts = merge_both(&base, &ours, &theirs).unwrap_err();
+    let conflicts = merge_both(&base, &ours, &theirs)
+        .expect_err("both sides changing serde's version conflicts");
     assert_eq!(
         conflicts[0],
         CargoLockConflict::Toml(TomlConflict {
@@ -375,7 +397,8 @@ fn version_conflict_is_reported() {
     let base = lockfile(&[root("app", &[])]);
     let ours = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.1", &[])]);
     let theirs = lockfile(&[root("app", &["serde"]), pkg("serde", "1.0.2", &[])]);
-    let conflicts = merge_both(&base, &ours, &theirs).unwrap_err();
+    let conflicts =
+        merge_both(&base, &ours, &theirs).expect_err("adding serde at two versions conflicts");
     assert!(matches!(
         conflicts.as_slice(),
         [CargoLockConflict::AmbiguousDependency { package, dependency }]
@@ -438,7 +461,8 @@ fn dangling_dependency_is_a_conflict() {
         root("tool", &["log"]),
         pkg("log", "0.4.0", &[]),
     ]);
-    let conflicts = merge_both(&base, &ours, &theirs).unwrap_err();
+    let conflicts = merge_both(&base, &ours, &theirs)
+        .expect_err("removing a dependency another side uses conflicts");
     assert!(matches!(
         conflicts.as_slice(),
         [CargoLockConflict::DanglingDependency { package, dependency }]
@@ -611,7 +635,9 @@ proptest! {
         prop_assume!(x != y);
         // Removing one must not also edit the other's block.
         let block = |n: &str| {
-            let start = full.find(&format!("[[package]]\nname = \"{n}\"\n")).unwrap();
+            let start = full
+                .find(&format!("[[package]]\nname = \"{n}\"\n"))
+                .expect("removable package has a block in the lockfile");
             let end = full[start + 1..].find("[[package]]").map_or(full.len(), |i| start + 1 + i);
             full[start..end].to_owned()
         };
@@ -675,15 +701,15 @@ proptest! {
             let projected = CargoLockAdapter.project(&tree);
             prop_assert_eq!(projected.as_slice(), merged.as_bytes());
             // Idempotent: merging the result with itself changes nothing.
-            prop_assert_eq!(merge(&merged, &merged, &merged).unwrap(), merged);
+            prop_assert_eq!(merge(&merged, &merged, &merged).expect("merge merged lockfile with itself"), merged);
         }
     }
 
     #[test]
     fn one_sided_change_is_taken_verbatim(base in arb_lock(), ours in arb_lock()) {
-        let canon = |s: &str| merge(s, s, s).unwrap();
-        prop_assert_eq!(merge(&base, &ours, &base).unwrap(), canon(&ours));
-        prop_assert_eq!(merge(&base, &base, &ours).unwrap(), canon(&ours));
+        let canon = |s: &str| merge(s, s, s).expect("merge unchanged lockfile");
+        prop_assert_eq!(merge(&base, &ours, &base).expect("merge ours-only change"), canon(&ours));
+        prop_assert_eq!(merge(&base, &base, &ours).expect("merge theirs-only change"), canon(&ours));
     }
 }
 

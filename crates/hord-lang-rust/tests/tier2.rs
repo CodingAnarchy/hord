@@ -22,7 +22,7 @@ fn parse_one(path: &str, src: &str) -> Owned {
     let tree = adapter().parse(src.as_bytes()).expect("parse");
     let ids = assign_ids(&tree);
     Owned {
-        path: RepoPath::from_str(path).unwrap(),
+        path: RepoPath::from_str(path).expect("parse fixture repo path"),
         tree,
         ids,
     }
@@ -52,7 +52,7 @@ fn assign_walk(
         *n += 1;
     }
     for (i, child) in node.children.clone().into_iter().enumerate() {
-        site.push(u32::try_from(i).unwrap());
+        site.push(u32::try_from(i).expect("test files have fewer than 2^32 children"));
         assign_walk(tree, child, site, ids, n);
         site.pop();
     }
@@ -68,7 +68,7 @@ fn site_of(tree: &NodeTree, oid: ObjectId) -> Vec<u32> {
             return false;
         };
         for (i, child) in node.children.iter().enumerate() {
-            path.push(u32::try_from(i).unwrap());
+            path.push(u32::try_from(i).expect("test files have fewer than 2^32 children"));
             if walk(tree, *child, want, path) {
                 return true;
             }
@@ -153,16 +153,16 @@ fn testdata() -> PathBuf {
 }
 
 #[test]
-fn every_fixture_definition_has_a_qualified_name() {
+fn every_fixture_definition_has_a_qualified_name() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = adapter();
     let mut files = 0;
-    for entry in std::fs::read_dir(testdata()).unwrap() {
-        let path = entry.unwrap().path();
+    for entry in std::fs::read_dir(testdata())? {
+        let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let bytes = std::fs::read(&path).unwrap();
-        let tree = adapter.parse(&bytes).unwrap();
+        let bytes = std::fs::read(&path)?;
+        let tree = adapter.parse(&bytes)?;
         let Some(root) = tree.root() else {
             continue;
         };
@@ -171,6 +171,7 @@ fn every_fixture_definition_has_a_qualified_name() {
         files += 1;
     }
     assert!(files >= 5);
+    Ok(())
 }
 
 fn check_names(
@@ -179,11 +180,18 @@ fn check_names(
     oid: ObjectId,
     ancestors: &mut Vec<ObjectId>,
 ) {
-    let node = tree.get(oid).unwrap().clone();
+    let node = tree
+        .get(oid)
+        .expect("check_names visits only ids the tree holds")
+        .clone();
     if adapter.is_definition(&node.kind) {
         let owned: Vec<Node> = ancestors
             .iter()
-            .map(|id| tree.get(*id).unwrap().clone())
+            .map(|id| {
+                tree.get(*id)
+                    .expect("ancestors are ids the tree holds")
+                    .clone()
+            })
             .collect();
         let path: Vec<&Node> = owned.iter().collect();
         let named = adapter.qualified_name(&path, &node);
@@ -226,7 +234,7 @@ fn path_dependency_resolves_across_crates() {
     );
     let mut files = [lib, test];
     reassign_ids(&mut files);
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -271,7 +279,7 @@ fn linked_crate_method_is_a_candidate() {
     );
     let mut files = [lib, test];
     reassign_ids(&mut files);
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -311,7 +319,7 @@ fn unresolved_call_includes_linked_crate_functions() {
     );
     let mut files = [lib, test];
     reassign_ids(&mut files);
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -396,7 +404,7 @@ fn outer_attribute_belongs_to_the_next_definition() {
 fn registry_dependency_stays_unresolved() {
     let lib = parse_one("src/lib.rs", "fn caller() { serde::json(); }\n");
     let files = [lib];
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -606,7 +614,10 @@ fn paint(a: &A) { a.draw(); }
         .collect();
     assert_eq!(draws.len(), 2);
     for (_, node) in draws {
-        let id = files[0].ids[&site_of(&files[0].tree, ObjectId::of(node).unwrap())];
+        let id = files[0].ids[&site_of(
+            &files[0].tree,
+            ObjectId::of(node).expect("encode draw node"),
+        )];
         assert!(edges.contains(&id), "missing draw candidate {id}");
     }
 }
@@ -617,12 +628,10 @@ fn external_paths_do_not_resolve_inside_the_crate() {
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
     let refs = adapter().references(&ctx, find(&files[0], "f"));
-    let std_ref = refs.iter().find(|r| r.name.as_str().contains("std::"));
-    assert!(
-        std_ref.is_some(),
-        "lexical path should be reported: {refs:?}"
-    );
-    assert!(std_ref.unwrap().resolved.is_none());
+    let Some(std_ref) = refs.iter().find(|r| r.name.as_str().contains("std::")) else {
+        panic!("lexical path should be reported: {refs:?}");
+    };
+    assert!(std_ref.resolved.is_none());
 }
 
 #[test]
@@ -1192,8 +1201,9 @@ fn custom_lib_path_resolves_a_workspace_dependency() {
     );
     let mut files = [lib, caller];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
-    let member = RepoPath::from_str("crates/crates-io/Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
+    let member = RepoPath::from_str("crates/crates-io/Cargo.toml")
+        .expect("parse repo path crates/crates-io/Cargo.toml");
     let root_src = br#"
 [package]
 name = "cargo"
@@ -1241,7 +1251,7 @@ fn table_form_workspace_dep_resolves_from_a_nested_module() {
     );
     let mut files = [lib, main, inner];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = br#"
 [package]
 name = "app"
@@ -1276,7 +1286,7 @@ fn registry_and_git_deps_stay_unresolved_when_source_is_present() {
     );
     let mut files = [serde, gix, caller];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = br#"
 [package]
 name = "app"
@@ -1316,7 +1326,7 @@ fn bare_call_includes_same_crate_and_linked_functions_only() {
     );
     let mut files = [linked, unlinked, caller];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = br#"
 [package]
 name = "app"
@@ -1354,7 +1364,10 @@ fn defs_with(
             let Some(oid) = hord_lang::oid_at(&file.tree, site) else {
                 continue;
             };
-            let node = file.tree.get(oid).unwrap();
+            let node = file
+                .tree
+                .get(oid)
+                .expect("oid_at returns an id the tree holds");
             let raw = String::from_utf8_lossy(node.raw.as_slice()).into_owned();
             if node.kind.as_str() == kind && needles.iter().all(|n| raw.contains(n)) {
                 out.push((f, site.clone(), *id, oid));
@@ -1371,7 +1384,10 @@ fn anchored_targets(files: &[Owned]) -> [BTreeSet<NodeId>; 2] {
     let helpers = defs_with(files, "function_item", &["fn helper"]);
     assert_eq!(helpers.len(), 2);
     let resolve = |(file, _, id, oid): &(usize, Vec<u32>, NodeId, ObjectId)| {
-        let node = files[*file].tree.get(*oid).unwrap();
+        let node = files[*file]
+            .tree
+            .get(*oid)
+            .expect("defs_with returns ids the tree holds");
         adapter()
             .references_at(&ctx, &hord_lang::Anchor::Definition(*id), node)
             .iter()
@@ -1446,7 +1462,10 @@ fn identical_helpers_in_two_files_resolve_types_in_their_own_module() {
     // a superset that includes each copy's own target.
     let ctx = context(&files);
     let helper = defs_with(&files, "function_item", &["fn helper"])[1].clone();
-    let node = files[helper.0].tree.get(helper.3).unwrap();
+    let node = files[helper.0]
+        .tree
+        .get(helper.3)
+        .expect("defs_with returns ids the tree holds");
     let union: BTreeSet<NodeId> = adapter()
         .references(&ctx, node)
         .iter()
