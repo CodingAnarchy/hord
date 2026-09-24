@@ -100,25 +100,26 @@ mod tests {
     }
 
     #[test]
-    fn blame_target_splits_path_line_and_names() {
-        let line = parse_blame_target("src/lib.rs:12").unwrap();
+    fn blame_target_splits_path_line_and_names() -> anyhow::Result<()> {
+        let line = parse_blame_target("src/lib.rs:12")?;
         match line {
             BlameTarget::Line { path, line } => {
                 assert_eq!(path.to_string(), "src/lib.rs");
                 assert_eq!(line, 12);
             }
-            BlameTarget::Node(_) | BlameTarget::Name(_) => panic!("expected path:line"),
+            BlameTarget::Node(_) | BlameTarget::Name(_) => anyhow::bail!("expected path:line"),
         }
         assert!(matches!(
-            parse_blame_target("crate::alpha").unwrap(),
+            parse_blame_target("crate::alpha")?,
             BlameTarget::Name(name) if name == "crate::alpha"
         ));
         let id = node(1);
         assert!(matches!(
-            parse_blame_target(&id.to_string()).unwrap(),
+            parse_blame_target(&id.to_string())?,
             BlameTarget::Node(parsed) if parsed == id
         ));
         assert!(parse_blame_target("src/lib.rs:0").is_err());
         assert!(parse_blame_target("/src/lib.rs:1").is_err());
+        Ok(())
     }
 }

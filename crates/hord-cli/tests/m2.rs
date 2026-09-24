@@ -16,6 +16,8 @@ use hord_lang::LangAdapter;
 use hord_lang_rust::RustAdapter;
 use hord_store::{EdgeKind, Store};
 
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
 const ADA: &str = "Ada <ada@example.com>";
 const AGENT: &str = "agent-7";
 const BODY_SECRET: &str = "INTENT-BODY-SECRET";
@@ -28,12 +30,13 @@ fn hord_bin() -> Command {
     cmd
 }
 
-fn hord_in(dir: &Path, args: &[&str]) -> Output {
-    hord_bin()
+fn hord_in(dir: &Path, args: &[&str]) -> TestResult<Output> {
+    let out = hord_bin()
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap_or_else(|err| panic!("run hord {args:?}: {err}"))
+        .map_err(|err| format!("run hord {args:?}: {err}"))?;
+    Ok(out)
 }
 
 fn stdout(out: &Output) -> String {
@@ -63,41 +66,45 @@ fn assert_err(out: &Output, args: &[&str]) {
     );
 }
 
-fn json_stdout(out: &Output, args: &[&str]) -> serde_json::Value {
+fn json_stdout(out: &Output, args: &[&str]) -> TestResult<serde_json::Value> {
     assert_ok(out, args);
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
-        panic!("json ({err}) from hord {args:?}\n{}", stdout(out));
-    })
+    let value = serde_json::from_slice(&out.stdout)
+        .map_err(|err| format!("json ({err}) from hord {args:?}\n{}", stdout(out)))?;
+    Ok(value)
 }
 
-fn json_error(out: &Output, args: &[&str]) -> String {
+fn json_error(out: &Output, args: &[&str]) -> TestResult<String> {
     assert_err(out, args);
-    let value: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_else(|err| {
-        panic!("error json ({err}) from hord {args:?}\n{}", stderr(out));
-    });
-    value["error"].as_str().unwrap_or("").to_owned()
+    let value: serde_json::Value = serde_json::from_slice(&out.stderr)
+        .map_err(|err| format!("error json ({err}) from hord {args:?}\n{}", stderr(out)))?;
+    Ok(value["error"].as_str().unwrap_or("").to_owned())
 }
 
-fn strings(value: &serde_json::Value, key: &str) -> Vec<String> {
+fn strings(value: &serde_json::Value, key: &str) -> TestResult<Vec<String>> {
     value[key]
         .as_array()
-        .unwrap_or_else(|| panic!("missing array {key} in {value}"))
+        .ok_or_else(|| format!("missing array {key} in {value}"))?
         .iter()
         .map(|item| {
             item.as_str()
-                .unwrap_or_else(|| panic!("non-string in {key}: {item}"))
-                .to_owned()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("non-string in {key}: {item}").into())
         })
         .collect()
 }
 
 /// Ids of `hord log --json`'s changes (`LogResult`), oldest first.
-fn log_ids(value: &serde_json::Value) -> Vec<String> {
+fn log_ids(value: &serde_json::Value) -> TestResult<Vec<String>> {
     value["changes"]
         .as_array()
-        .unwrap_or_else(|| panic!("missing changes in {value}"))
+        .ok_or_else(|| format!("missing changes in {value}"))?
         .iter()
-        .map(|c| c["change"].as_str().unwrap().to_owned())
+        .map(|c| {
+            c["change"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("non-string change in {value}").into())
+        })
         .collect()
 }
 
@@ -106,19 +113,16 @@ struct TempDir {
 }
 
 impl TempDir {
-    fn new(prefix: &str) -> Self {
+    fn new(prefix: &str) -> TestResult<Self> {
         static N: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "{prefix}-{}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
     }
 
     fn path(&self) -> &Path {
@@ -167,36 +171,24 @@ fn id_list(ids: &[&ObjectId]) -> Vec<String> {
     ids.iter().map(|id| id.to_string()).collect()
 }
 
-fn seed() -> Seed {
-    let dir = TempDir::new("hord-m2");
+fn seed() -> TestResult<Seed> {
+    let dir = TempDir::new("hord-m2")?;
     let alpha = NodeId::from_u128(1);
     let beta = NodeId::from_u128(2);
     let other = NodeId::from_u128(9);
     let test_node = NodeId::from_u128(8);
     let decoy = NodeId::from_u128(4);
 
-    let store = Store::create(dir.path()).unwrap();
-    let snapshot = snapshot(&store, &[("src/lib.rs", LIB_SRC, &[alpha, beta])]);
-    let empty_tree = empty_snapshot(&store);
-    store
-        .put_edge(empty_tree, EdgeKind::References, alpha, decoy)
-        .unwrap();
-    store
-        .put_edge(snapshot, EdgeKind::References, alpha, beta)
-        .unwrap();
-    store
-        .put_edge(snapshot, EdgeKind::References, alpha, other)
-        .unwrap();
-    store
-        .put_edge(snapshot, EdgeKind::Depends, beta, alpha)
-        .unwrap();
-    store
-        .put_edge(snapshot, EdgeKind::Tests, test_node, alpha)
-        .unwrap();
+    let store = Store::create(dir.path())?;
+    let snapshot = snapshot(&store, &[("src/lib.rs", LIB_SRC, &[alpha, beta])])?;
+    let empty_tree = empty_snapshot(&store)?;
+    store.put_edge(empty_tree, EdgeKind::References, alpha, decoy)?;
+    store.put_edge(snapshot, EdgeKind::References, alpha, beta)?;
+    store.put_edge(snapshot, EdgeKind::References, alpha, other)?;
+    store.put_edge(snapshot, EdgeKind::Depends, beta, alpha)?;
+    store.put_edge(snapshot, EdgeKind::Tests, test_node, alpha)?;
 
-    let evidence = store
-        .put_object(&Blob::new(EVIDENCE_SECRET.as_bytes().to_vec()))
-        .unwrap();
+    let evidence = store.put_object(&Blob::new(EVIDENCE_SECRET.as_bytes().to_vec()))?;
     let ghost = ObjectId::from_bytes([0xee; 32]);
 
     let add_alpha = land(
@@ -204,34 +196,34 @@ fn seed() -> Seed {
         Draft::new("add alpha", ada(), 1_000, snapshot, snapshot)
             .write([alpha])
             .evidence([evidence, ghost]),
-    );
+    )?;
     let rewrite = land(
         &store,
         Draft::new("rewrite from base", ada(), 3_000, snapshot, empty_tree).write([alpha]),
-    );
+    )?;
     let edit_both = land(
         &store,
         Draft::new("edit both", agent(), 5_000, snapshot, snapshot).write([alpha, beta]),
-    );
+    )?;
     let edit_beta = land(
         &store,
         Draft::new("edit beta", ada(), 9_000, snapshot, snapshot).write([beta]),
-    );
+    )?;
     let delete_beta = land(
         &store,
         Draft::new("delete beta", ada(), 9_001, snapshot, snapshot)
             .ops(vec![Op::Delete { node: beta }]),
-    );
+    )?;
     let read_alpha = land(
         &store,
         Draft::new("read alpha", ada(), 1_500, snapshot, snapshot).read([alpha]),
-    );
-    store.set_head(read_alpha).unwrap();
-    store.append_log(evidence).unwrap();
-    store.flush().unwrap();
+    )?;
+    store.set_head(read_alpha)?;
+    store.append_log(evidence)?;
+    store.flush()?;
     drop(store);
 
-    Seed {
+    Ok(Seed {
         dir,
         alpha,
         beta,
@@ -247,7 +239,7 @@ fn seed() -> Seed {
         delete_beta,
         read_alpha,
         blob: evidence,
-    }
+    })
 }
 
 /// `alpha` covers lines 1-3 and `beta` lines 4-6.
@@ -256,15 +248,13 @@ const LIB_SRC: &str = "fn alpha() {\n    1\n}\nfn beta() {\n    2\n}\n";
 /// A snapshot of Rust `files` (ADR 0017): the content tree, and an identity
 /// tree whose [`FileIdentity`] gives each file's definitions `ids` in
 /// preorder (the rest keep the fresh assignment).
-fn snapshot(store: &Store, files: &[(&str, &str, &[NodeId])]) -> ObjectId {
+fn snapshot(store: &Store, files: &[(&str, &str, &[NodeId])]) -> TestResult<ObjectId> {
     let mut content = Vec::new();
     let mut identity = Vec::new();
     for (path, source, ids) in files {
-        let path: RepoPath = path.parse().unwrap();
-        let blob = store
-            .put_object(&Blob::new(source.as_bytes().to_vec()))
-            .unwrap();
-        let tree = RustAdapter.parse(source.as_bytes()).unwrap();
+        let path: RepoPath = path.parse()?;
+        let blob = store.put_object(&Blob::new(source.as_bytes().to_vec()))?;
+        let tree = RustAdapter.parse(source.as_bytes())?;
         let fresh = hord_identity::assign(&RustAdapter, &path, None, &tree);
         let mut nodes: Vec<(Vec<u32>, NodeId)> = fresh.nodes.into_iter().collect();
         assert!(
@@ -275,7 +265,7 @@ fn snapshot(store: &Store, files: &[(&str, &str, &[NodeId])]) -> ObjectId {
         for (slot, id) in nodes.iter_mut().zip(ids.iter()) {
             slot.1 = *id;
         }
-        let file = store.put_object(&FileIdentity { blob, nodes }).unwrap();
+        let file = store.put_object(&FileIdentity { blob, nodes })?;
         content.push((path.components().to_vec(), blob));
         identity.push((path.components().to_vec(), file));
     }
@@ -286,7 +276,7 @@ fn snapshot(store: &Store, files: &[(&str, &str, &[NodeId])]) -> ObjectId {
         TreeEntry::Tree,
         Tree::default(),
         |t: &mut Tree| &mut t.entries,
-    );
+    )?;
     let ids = put_dir(
         store,
         &identity,
@@ -294,8 +284,8 @@ fn snapshot(store: &Store, files: &[(&str, &str, &[NodeId])]) -> ObjectId {
         IdentityEntry::Dir,
         IdentityTree::default(),
         |t: &mut IdentityTree| &mut t.entries,
-    );
-    store.put_object(&Snapshot::new(tree, ids)).unwrap()
+    )?;
+    Ok(store.put_object(&Snapshot::new(tree, ids))?)
 }
 
 /// Store a directory (content or identity) of `files` and return its id.
@@ -306,7 +296,7 @@ fn put_dir<T: serde::Serialize + Clone, E>(
     dir: fn(ObjectId) -> E,
     empty: T,
     entries: fn(&mut T) -> &mut BTreeMap<String, E>,
-) -> ObjectId {
+) -> TestResult<ObjectId> {
     let mut out = empty.clone();
     let mut nested: BTreeMap<String, Vec<(Vec<String>, ObjectId)>> = BTreeMap::new();
     for (path, id) in files {
@@ -322,17 +312,17 @@ fn put_dir<T: serde::Serialize + Clone, E>(
         }
     }
     for (name, sub) in nested {
-        let id = put_dir(store, &sub, leaf, dir, empty.clone(), entries);
+        let id = put_dir(store, &sub, leaf, dir, empty.clone(), entries)?;
         entries(&mut out).insert(name, dir(id));
     }
-    store.put_object(&out).unwrap()
+    Ok(store.put_object(&out)?)
 }
 
 /// [`Snapshot::empty`], stored with the objects it names.
-fn empty_snapshot(store: &Store) -> ObjectId {
-    store.put_object(&Tree::default()).unwrap();
-    store.put_object(&IdentityTree::default()).unwrap();
-    store.put_object(&Snapshot::empty()).unwrap()
+fn empty_snapshot(store: &Store) -> TestResult<ObjectId> {
+    store.put_object(&Tree::default())?;
+    store.put_object(&IdentityTree::default())?;
+    Ok(store.put_object(&Snapshot::empty())?)
 }
 
 fn mark(n: u8) -> ObjectId {
@@ -430,17 +420,17 @@ impl Draft {
     }
 }
 
-fn land(store: &Store, draft: Draft) -> ObjectId {
-    let id = store.put_object(&draft.build()).unwrap();
-    store.append_log(id).unwrap();
-    store.index_change(id).unwrap();
-    id
+fn land(store: &Store, draft: Draft) -> TestResult<ObjectId> {
+    let id = store.put_object(&draft.build())?;
+    store.append_log(id)?;
+    store.index_change(id)?;
+    Ok(id)
 }
 
-fn append_change(store: &Store, change: &ChangeRecord) -> ObjectId {
-    let id = store.put_object(change).unwrap();
-    store.append_log(id).unwrap();
-    id
+fn append_change(store: &Store, change: &ChangeRecord) -> TestResult<ObjectId> {
+    let id = store.put_object(change)?;
+    store.append_log(id)?;
+    Ok(id)
 }
 
 fn node_hex(id: NodeId) -> String {
@@ -448,44 +438,47 @@ fn node_hex(id: NodeId) -> String {
 }
 
 #[test]
-fn log_help_lists_filters() {
-    let out = hord_bin().args(["log", "--help"]).output().unwrap();
+fn log_help_lists_filters() -> TestResult {
+    let out = hord_bin().args(["log", "--help"]).output()?;
     assert_ok(&out, &["log", "--help"]);
     let text = stdout(&out);
     for flag in ["--node", "--path", "--actor", "--since"] {
         assert!(text.contains(flag), "help missing {flag}:\n{text}");
     }
+    Ok(())
 }
 
 #[test]
-fn query_help_lists_edges() {
-    let out = hord_bin().args(["query", "--help"]).output().unwrap();
+fn query_help_lists_edges() -> TestResult {
+    let out = hord_bin().args(["query", "--help"]).output()?;
     assert_ok(&out, &["query", "--help"]);
     let text = stdout(&out);
     for name in ["references", "dependents", "tests-of"] {
         assert!(text.contains(name), "help missing {name}:\n{text}");
     }
+    Ok(())
 }
 
 #[test]
-fn unfiltered_log_lists_every_landed_id() {
-    let seed = seed();
-    let out = hord_in(seed.dir.path(), &["log", "--json"]);
-    let value = json_stdout(&out, &["log", "--json"]);
+fn unfiltered_log_lists_every_landed_id() -> TestResult {
+    let seed = seed()?;
+    let out = hord_in(seed.dir.path(), &["log", "--json"])?;
+    let value = json_stdout(&out, &["log", "--json"])?;
     let mut expected = id_list(&seed.changes());
     expected.push(seed.blob.to_string());
-    assert_eq!(log_ids(&value), expected);
+    assert_eq!(log_ids(&value)?, expected);
     let head = seed.read_alpha.to_string();
     assert_eq!(value["head"].as_str(), Some(head.as_str()));
+    Ok(())
 }
 
 #[test]
-fn log_filters_by_node_path_actor_and_since() {
-    let seed = seed();
+fn log_filters_by_node_path_actor_and_since() -> TestResult {
+    let seed = seed()?;
     let dir = seed.dir.path();
     let alpha = seed.alpha.to_string();
-    let by_ulid = hord_in(dir, &["log", "--json", "--node", &alpha]);
-    let by_hex = hord_in(dir, &["log", "--json", "--node", &node_hex(seed.alpha)]);
+    let by_ulid = hord_in(dir, &["log", "--json", "--node", &alpha])?;
+    let by_hex = hord_in(dir, &["log", "--json", "--node", &node_hex(seed.alpha)])?;
     let by_upper = hord_in(
         dir,
         &[
@@ -494,8 +487,8 @@ fn log_filters_by_node_path_actor_and_since() {
             "--node",
             &node_hex(seed.alpha).to_ascii_uppercase(),
         ],
-    );
-    let by_name = hord_in(dir, &["log", "--json", "--node", "alpha"]);
+    )?;
+    let by_name = hord_in(dir, &["log", "--json", "--node", "alpha"])?;
     let expected = id_list(&[&seed.add_alpha, &seed.rewrite, &seed.edit_both]);
     for (out, args) in [
         (&by_ulid, "--node ulid"),
@@ -503,58 +496,58 @@ fn log_filters_by_node_path_actor_and_since() {
         (&by_upper, "--node HEX"),
         (&by_name, "--node name"),
     ] {
-        assert_eq!(log_ids(&json_stdout(out, &[args])), expected, "{args}");
+        assert_eq!(log_ids(&json_stdout(out, &[args])?)?, expected, "{args}");
     }
 
-    let beta = hord_in(dir, &["log", "--json", "--node", &seed.beta.to_string()]);
+    let beta = hord_in(dir, &["log", "--json", "--node", &seed.beta.to_string()])?;
     assert_eq!(
-        log_ids(&json_stdout(&beta, &["log", "--node", "beta"])),
+        log_ids(&json_stdout(&beta, &["log", "--node", "beta"])?)?,
         id_list(&[&seed.edit_both, &seed.edit_beta, &seed.delete_beta])
     );
 
-    let path = hord_in(dir, &["log", "--json", "--path", "src/lib.rs"]);
+    let path = hord_in(dir, &["log", "--json", "--path", "src/lib.rs"])?;
     let path_ids = id_list(&[
         &seed.add_alpha,
         &seed.rewrite,
         &seed.edit_both,
         &seed.edit_beta,
     ]);
-    assert_eq!(log_ids(&json_stdout(&path, &["log", "--path"])), path_ids);
-    let dir_path = hord_in(dir, &["log", "--json", "--path", "src"]);
+    assert_eq!(log_ids(&json_stdout(&path, &["log", "--path"])?)?, path_ids);
+    let dir_path = hord_in(dir, &["log", "--json", "--path", "src"])?;
     assert_eq!(
-        log_ids(&json_stdout(&dir_path, &["log", "--path", "src"])),
+        log_ids(&json_stdout(&dir_path, &["log", "--path", "src"])?)?,
         path_ids
     );
-    let missed = hord_in(dir, &["log", "--json", "--path", "src/lib"]);
+    let missed = hord_in(dir, &["log", "--json", "--path", "src/lib"])?;
     assert_eq!(
-        log_ids(&json_stdout(&missed, &["log", "--path", "src/lib"])),
+        log_ids(&json_stdout(&missed, &["log", "--path", "src/lib"])?)?,
         Vec::<String>::new()
     );
 
-    let actor = hord_in(dir, &["log", "--json", "--actor", AGENT]);
+    let actor = hord_in(dir, &["log", "--json", "--actor", AGENT])?;
     assert_eq!(
-        log_ids(&json_stdout(&actor, &["log", "--actor"])),
+        log_ids(&json_stdout(&actor, &["log", "--actor"])?)?,
         id_list(&[&seed.edit_both])
     );
-    let model = hord_in(dir, &["log", "--json", "--actor", "model"]);
+    let model = hord_in(dir, &["log", "--json", "--actor", "model"])?;
     assert_eq!(
-        log_ids(&json_stdout(&model, &["log", "--actor", "model"])),
+        log_ids(&json_stdout(&model, &["log", "--actor", "model"])?)?,
         Vec::<String>::new()
     );
 
-    let since = hord_in(dir, &["log", "--json", "--since", "5000"]);
+    let since = hord_in(dir, &["log", "--json", "--since", "5000"])?;
     assert_eq!(
-        log_ids(&json_stdout(&since, &["log", "--since"])),
+        log_ids(&json_stdout(&since, &["log", "--since"])?)?,
         id_list(&[&seed.edit_both, &seed.edit_beta, &seed.delete_beta])
     );
-    let boundary = hord_in(dir, &["log", "--json", "--since", "9000"]);
+    let boundary = hord_in(dir, &["log", "--json", "--since", "9000"])?;
     assert_eq!(
-        log_ids(&json_stdout(&boundary, &["log", "--since", "9000"])),
+        log_ids(&json_stdout(&boundary, &["log", "--since", "9000"])?)?,
         id_list(&[&seed.edit_beta, &seed.delete_beta])
     );
-    let all_changes = hord_in(dir, &["log", "--json", "--since", "0"]);
+    let all_changes = hord_in(dir, &["log", "--json", "--since", "0"])?;
     assert_eq!(
-        log_ids(&json_stdout(&all_changes, &["log", "--since", "0"])),
+        log_ids(&json_stdout(&all_changes, &["log", "--since", "0"])?)?,
         id_list(&seed.changes())
     );
 
@@ -572,85 +565,85 @@ fn log_filters_by_node_path_actor_and_since() {
             "--since",
             "5000",
         ],
-    );
+    )?;
     assert_eq!(
-        log_ids(&json_stdout(&combined, &["log", "combined"])),
+        log_ids(&json_stdout(&combined, &["log", "combined"])?)?,
         id_list(&[&seed.edit_both])
     );
 
-    let empty = hord_in(dir, &["log", "--actor", "nobody"]);
+    let empty = hord_in(dir, &["log", "--actor", "nobody"])?;
     assert_ok(&empty, &["log", "--actor", "nobody"]);
     assert!(stdout(&empty).contains("(empty log)"), "{}", stdout(&empty));
+    Ok(())
 }
 
 #[test]
-fn log_rejects_a_bad_path_and_an_unknown_name() {
-    let seed = seed();
-    let bad = hord_in(seed.dir.path(), &["log", "--json", "--path", "/src"]);
-    let err = json_error(&bad, &["log", "--path", "/src"]);
+fn log_rejects_a_bad_path_and_an_unknown_name() -> TestResult {
+    let seed = seed()?;
+    let bad = hord_in(seed.dir.path(), &["log", "--json", "--path", "/src"])?;
+    let err = json_error(&bad, &["log", "--path", "/src"])?;
     assert!(err.contains("path"), "{err}");
     let missing = hord_in(
         seed.dir.path(),
         &["log", "--json", "--node", "crate::missing"],
-    );
-    let err = json_error(&missing, &["log", "--node", "missing"]);
+    )?;
+    let err = json_error(&missing, &["log", "--node", "missing"])?;
     assert!(err.contains("cannot resolve node"), "{err}");
+    Ok(())
 }
 
 #[test]
-fn blame_prints_history_from_the_index() {
-    let seed = seed();
+fn blame_prints_history_from_the_index() -> TestResult {
+    let seed = seed()?;
     let dir = seed.dir.path();
-    let by_name = hord_in(dir, &["blame", "--json", "alpha"]);
-    let value = json_stdout(&by_name, &["blame", "alpha"]);
-    assert_no_secrets(&value, &stdout(&by_name));
+    let by_name = hord_in(dir, &["blame", "--json", "alpha"])?;
+    let value = json_stdout(&by_name, &["blame", "alpha"])?;
+    assert_no_secrets(&value, &stdout(&by_name))?;
     let alpha = seed.alpha.to_string();
     let add_alpha = seed.add_alpha.to_string();
     assert_eq!(value["node"].as_str(), Some(alpha.as_str()));
-    let history = value["history"].as_array().unwrap();
+    let history = value["history"].as_array().ok_or("history array")?;
     assert_eq!(history.len(), 3);
     assert_eq!(history[0]["change"].as_str(), Some(add_alpha.as_str()));
     assert_eq!(history[0]["intent"].as_str(), Some("add alpha"));
     assert_eq!(history[0]["actor"].as_str(), Some(ADA));
     assert_eq!(
-        strings(&history[0], "evidence"),
+        strings(&history[0], "evidence")?,
         vec![seed.evidence.to_string(), seed.ghost.to_string()]
     );
     assert_eq!(history[1]["intent"].as_str(), Some("rewrite from base"));
-    assert_eq!(strings(&history[1], "evidence"), Vec::<String>::new());
+    assert_eq!(strings(&history[1], "evidence")?, Vec::<String>::new());
     let edit_both = seed.edit_both.to_string();
     assert_eq!(history[2]["change"].as_str(), Some(edit_both.as_str()));
     assert_eq!(history[2]["intent"].as_str(), Some("edit both"));
     assert_eq!(history[2]["actor"].as_str(), Some(AGENT));
-    let text = serde_json::to_string(&value).unwrap();
+    let text = serde_json::to_string(&value)?;
     assert!(!text.contains("read alpha"), "{text}");
     assert!(!text.contains("edit beta"), "{text}");
 
-    let by_id = hord_in(dir, &["blame", "--json", &node_hex(seed.alpha)]);
-    let by_id = json_stdout(&by_id, &["blame", "node"]);
+    let by_id = hord_in(dir, &["blame", "--json", &node_hex(seed.alpha)])?;
+    let by_id = json_stdout(&by_id, &["blame", "node"])?;
     assert_eq!(by_id["node"], value["node"]);
     assert_eq!(by_id["history"], value["history"]);
 
-    let by_line = hord_in(dir, &["blame", "--json", "src/lib.rs:2"]);
-    let by_line = json_stdout(&by_line, &["blame", "src/lib.rs:2"]);
+    let by_line = hord_in(dir, &["blame", "--json", "src/lib.rs:2"])?;
+    let by_line = json_stdout(&by_line, &["blame", "src/lib.rs:2"])?;
     assert_eq!(by_line["node"].as_str(), Some(alpha.as_str()));
     assert_eq!(by_line["history"], value["history"]);
 
-    let beta_line = hord_in(dir, &["blame", "--json", "src/lib.rs:5"]);
-    let beta_line = json_stdout(&beta_line, &["blame", "src/lib.rs:5"]);
+    let beta_line = hord_in(dir, &["blame", "--json", "src/lib.rs:5"])?;
+    let beta_line = json_stdout(&beta_line, &["blame", "src/lib.rs:5"])?;
     let beta = seed.beta.to_string();
     assert_eq!(beta_line["node"].as_str(), Some(beta.as_str()));
-    assert_eq!(
-        beta_line["history"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| entry["intent"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec!["edit both", "edit beta", "delete beta"]
-    );
+    let beta_intents = beta_line["history"]
+        .as_array()
+        .ok_or("beta history array")?
+        .iter()
+        .map(|entry| entry["intent"].as_str().ok_or("intent string"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(beta_intents, vec!["edit both", "edit beta", "delete beta"]);
 
-    let human = hord_in(dir, &["blame", "beta"]);
+    let human = hord_in(dir, &["blame", "beta"])?;
     assert_ok(&human, &["blame", "beta"]);
     let text = stdout(&human);
     let edit_beta = seed.edit_beta.to_string();
@@ -661,33 +654,37 @@ fn blame_prints_history_from_the_index() {
     assert!(!text.contains(BODY_SECRET), "{text}");
     assert!(!text.contains(EVIDENCE_SECRET), "{text}");
 
-    let outside = hord_in(dir, &["blame", "--json", "src/lib.rs:7"]);
-    let err = json_error(&outside, &["blame", "src/lib.rs:7"]);
+    let outside = hord_in(dir, &["blame", "--json", "src/lib.rs:7"])?;
+    let err = json_error(&outside, &["blame", "src/lib.rs:7"])?;
     assert!(
         err.contains("outside") || err.contains("no definition"),
         "{err}"
     );
-    let unknown = hord_in(dir, &["blame", "--json", "missing"]);
-    let err = json_error(&unknown, &["blame", "missing"]);
+    let unknown = hord_in(dir, &["blame", "--json", "missing"])?;
+    let err = json_error(&unknown, &["blame", "missing"])?;
     assert!(err.contains("cannot resolve node"), "{err}");
+    Ok(())
 }
 
 #[test]
-fn query_reads_edges_from_the_latest_change_result() {
-    let seed = seed();
+fn query_reads_edges_from_the_latest_change_result() -> TestResult {
+    let seed = seed()?;
     let dir = seed.dir.path();
     let alpha = seed.alpha.to_string();
-    let refs = hord_in(dir, &["query", "--json", "references", &alpha]);
-    let refs = json_stdout(&refs, &["query", "references"]);
+    let refs = hord_in(dir, &["query", "--json", "references", &alpha])?;
+    let refs = json_stdout(&refs, &["query", "references"])?;
     let snapshot = seed.snapshot.to_hex();
     let beta = seed.beta.to_string();
     let other = seed.other.to_string();
     assert_eq!(refs["snapshot"].as_str(), Some(snapshot.as_str()));
     assert_eq!(refs["edge"].as_str(), Some("references"));
     assert_eq!(refs["node"].as_str(), Some(alpha.as_str()));
-    assert_eq!(strings(&refs, "targets"), vec![beta.clone(), other.clone()]);
+    assert_eq!(
+        strings(&refs, "targets")?,
+        vec![beta.clone(), other.clone()]
+    );
 
-    let human = hord_in(dir, &["query", "references", &node_hex(seed.alpha)]);
+    let human = hord_in(dir, &["query", "references", &node_hex(seed.alpha)])?;
     assert_ok(&human, &["query", "references"]);
     let lines: Vec<String> = stdout(&human)
         .lines()
@@ -697,151 +694,152 @@ fn query_reads_edges_from_the_latest_change_result() {
         .collect();
     assert_eq!(lines, vec![beta, other]);
 
-    let deps = hord_in(dir, &["query", "--json", "dependents", &alpha]);
-    let deps = json_stdout(&deps, &["query", "dependents"]);
-    assert_eq!(strings(&deps, "targets"), Vec::<String>::new());
+    let deps = hord_in(dir, &["query", "--json", "dependents", &alpha])?;
+    let deps = json_stdout(&deps, &["query", "dependents"])?;
+    assert_eq!(strings(&deps, "targets")?, Vec::<String>::new());
     let from_beta = hord_in(
         dir,
         &["query", "--json", "dependents", &seed.beta.to_string()],
-    );
-    let from_beta = json_stdout(&from_beta, &["query", "dependents", "beta"]);
-    assert_eq!(strings(&from_beta, "targets"), vec![alpha.clone()]);
+    )?;
+    let from_beta = json_stdout(&from_beta, &["query", "dependents", "beta"])?;
+    assert_eq!(strings(&from_beta, "targets")?, vec![alpha.clone()]);
 
     let tests = hord_in(
         dir,
         &["query", "--json", "tests-of", &seed.test_node.to_string()],
-    );
-    let tests = json_stdout(&tests, &["query", "tests-of"]);
-    assert_eq!(strings(&tests, "targets"), vec![seed.alpha.to_string()]);
-    let not_target = hord_in(dir, &["query", "--json", "tests-of", &alpha]);
-    let not_target = json_stdout(&not_target, &["query", "tests-of", "alpha"]);
-    assert_eq!(strings(&not_target, "targets"), Vec::<String>::new());
+    )?;
+    let tests = json_stdout(&tests, &["query", "tests-of"])?;
+    assert_eq!(strings(&tests, "targets")?, vec![seed.alpha.to_string()]);
+    let not_target = hord_in(dir, &["query", "--json", "tests-of", &alpha])?;
+    let not_target = json_stdout(&not_target, &["query", "tests-of", "alpha"])?;
+    assert_eq!(strings(&not_target, "targets")?, Vec::<String>::new());
 
-    let none = hord_in(dir, &["query", "dependents", &alpha]);
+    let none = hord_in(dir, &["query", "dependents", &alpha])?;
     assert_ok(&none, &["query", "dependents"]);
     assert!(stdout(&none).contains("(none)"), "{}", stdout(&none));
+    Ok(())
 }
 
 #[test]
-fn query_prefers_the_newest_result_over_an_older_identity_snapshot() {
-    let dir = TempDir::new("hord-m2-query-latest");
+fn query_prefers_the_newest_result_over_an_older_identity_snapshot() -> TestResult {
+    let dir = TempDir::new("hord-m2-query-latest")?;
     let source = NodeId::from_u128(1);
     let older_target = NodeId::from_u128(2);
     let newer_target = NodeId::from_u128(3);
     let new_hex = {
-        let store = Store::create(dir.path()).unwrap();
-        let old = snapshot(&store, &[("a.rs", "fn source() {}\n", &[source])]);
-        let new = snapshot(&store, &[("a.rs", "fn source() { }\n", &[source])]);
-        store
-            .put_edge(old, EdgeKind::References, source, older_target)
-            .unwrap();
-        store
-            .put_edge(new, EdgeKind::References, source, newer_target)
-            .unwrap();
-        append_change(&store, &plain_change(old, source, "old"));
-        let head = append_change(&store, &plain_change(new, source, "new"));
-        store.set_head(head).unwrap();
+        let store = Store::create(dir.path())?;
+        let old = snapshot(&store, &[("a.rs", "fn source() {}\n", &[source])])?;
+        let new = snapshot(&store, &[("a.rs", "fn source() { }\n", &[source])])?;
+        store.put_edge(old, EdgeKind::References, source, older_target)?;
+        store.put_edge(new, EdgeKind::References, source, newer_target)?;
+        append_change(&store, &plain_change(old, source, "old"))?;
+        let head = append_change(&store, &plain_change(new, source, "new"))?;
+        store.set_head(head)?;
         new.to_hex()
     };
     let out = hord_in(
         dir.path(),
         &["query", "--json", "references", &source.to_string()],
-    );
-    let value = json_stdout(&out, &["query", "latest"]);
+    )?;
+    let value = json_stdout(&out, &["query", "latest"])?;
     assert_eq!(value["snapshot"].as_str(), Some(new_hex.as_str()));
-    assert_eq!(strings(&value, "targets"), vec![newer_target.to_string()]);
+    assert_eq!(strings(&value, "targets")?, vec![newer_target.to_string()]);
+    Ok(())
 }
 
 #[test]
-fn qualified_name_uses_the_newest_identity_snapshot() {
-    let dir = TempDir::new("hord-m2-name");
+fn qualified_name_uses_the_newest_identity_snapshot() -> TestResult {
+    let dir = TempDir::new("hord-m2-name")?;
     let old_node = NodeId::from_u128(1);
     let new_node = NodeId::from_u128(2);
     let (c_old, c_new) = {
-        let store = Store::create(dir.path()).unwrap();
+        let store = Store::create(dir.path())?;
         let old = snapshot(
             &store,
             &[("lib.rs", "fn alpha() { /* 1 */ }\n", &[old_node])],
-        );
+        )?;
         let new = snapshot(
             &store,
             &[("lib.rs", "fn alpha() { /* 2 */ }\n", &[new_node])],
-        );
-        let c_old = append_change(&store, &plain_change(old, old_node, "old alpha"));
-        let c_new = append_change(&store, &plain_change(new, new_node, "new alpha"));
-        store.set_head(c_new).unwrap();
+        )?;
+        let c_old = append_change(&store, &plain_change(old, old_node, "old alpha"))?;
+        let c_new = append_change(&store, &plain_change(new, new_node, "new alpha"))?;
+        store.set_head(c_new)?;
         (c_old, c_new)
     };
-    let out = hord_in(dir.path(), &["log", "--json", "--node", "alpha"]);
-    let value = json_stdout(&out, &["log", "--node", "alpha"]);
-    assert_eq!(log_ids(&value), vec![c_new.to_string()]);
+    let out = hord_in(dir.path(), &["log", "--json", "--node", "alpha"])?;
+    let value = json_stdout(&out, &["log", "--node", "alpha"])?;
+    assert_eq!(log_ids(&value)?, vec![c_new.to_string()]);
     let by_old = hord_in(
         dir.path(),
         &["log", "--json", "--node", &old_node.to_string()],
-    );
-    let by_old = json_stdout(&by_old, &["log", "--node", "old"]);
-    assert_eq!(log_ids(&by_old), vec![c_old.to_string()]);
+    )?;
+    let by_old = json_stdout(&by_old, &["log", "--node", "old"])?;
+    assert_eq!(log_ids(&by_old)?, vec![c_old.to_string()]);
+    Ok(())
 }
 
 #[test]
-fn ambiguous_qualified_name_fails() {
-    let tmp = TempDir::new("hord-m2-ambiguous");
+fn ambiguous_qualified_name_fails() -> TestResult {
+    let tmp = TempDir::new("hord-m2-ambiguous")?;
     {
-        let store = Store::create(tmp.path()).unwrap();
+        let store = Store::create(tmp.path())?;
         let left = NodeId::from_u128(1);
         let right = NodeId::from_u128(2);
         let snapshot = snapshot(
             &store,
             &[("lib.rs", "fn alpha() {}\nfn alpha() { }\n", &[left, right])],
-        );
-        let head = append_change(&store, &plain_change(snapshot, left, "two alphas"));
-        store.set_head(head).unwrap();
+        )?;
+        let head = append_change(&store, &plain_change(snapshot, left, "two alphas"))?;
+        store.set_head(head)?;
     }
-    let out = hord_in(tmp.path(), &["log", "--json", "--node", "alpha"]);
-    let err = json_error(&out, &["log", "--node", "alpha"]);
+    let out = hord_in(tmp.path(), &["log", "--json", "--node", "alpha"])?;
+    let err = json_error(&out, &["log", "--node", "alpha"])?;
     assert!(err.contains("multiple"), "{err}");
+    Ok(())
 }
 
 #[test]
-fn log_path_uses_the_result_location_when_the_node_moved() {
-    let dir = TempDir::new("hord-m2-moved-path");
+fn log_path_uses_the_result_location_when_the_node_moved() -> TestResult {
+    let dir = TempDir::new("hord-m2-moved-path")?;
     let alpha = NodeId::from_u128(1);
     let moved = {
-        let store = Store::create(dir.path()).unwrap();
-        let old = snapshot(&store, &[("src/old.rs", "fn alpha() {}\n", &[alpha])]);
-        let new = snapshot(&store, &[("src/new.rs", "fn alpha() {}\n", &[alpha])]);
-        let empty = empty_snapshot(&store);
+        let store = Store::create(dir.path())?;
+        let old = snapshot(&store, &[("src/old.rs", "fn alpha() {}\n", &[alpha])])?;
+        let new = snapshot(&store, &[("src/new.rs", "fn alpha() {}\n", &[alpha])])?;
+        let empty = empty_snapshot(&store)?;
         let moved = append_change(
             &store,
             &Draft::new("move alpha", ada(), 1, old, new)
                 .write([alpha])
                 .build(),
-        );
+        )?;
         let dropped = append_change(
             &store,
             &Draft::new("drop alpha", ada(), 2, new, empty)
                 .write([alpha])
                 .build(),
-        );
-        store.set_head(dropped).unwrap();
+        )?;
+        store.set_head(dropped)?;
         moved
     };
 
-    let at_old = hord_in(dir.path(), &["log", "--json", "--path", "src/old.rs"]);
+    let at_old = hord_in(dir.path(), &["log", "--json", "--path", "src/old.rs"])?;
     assert_eq!(
-        log_ids(&json_stdout(&at_old, &["log", "--path", "src/old.rs"])),
+        log_ids(&json_stdout(&at_old, &["log", "--path", "src/old.rs"])?)?,
         Vec::<String>::new()
     );
-    let at_new = hord_in(dir.path(), &["log", "--json", "--path", "src/new.rs"]);
-    let ids = log_ids(&json_stdout(&at_new, &["log", "--path", "src/new.rs"]));
+    let at_new = hord_in(dir.path(), &["log", "--json", "--path", "src/new.rs"])?;
+    let ids = log_ids(&json_stdout(&at_new, &["log", "--path", "src/new.rs"])?)?;
     assert_eq!(ids.len(), 2, "{ids:?}");
     assert_eq!(ids[0], moved.to_string());
+    Ok(())
 }
 
 #[test]
-fn query_without_a_snapshot_fails() {
-    let dir = TempDir::new("hord-m2-empty");
-    assert_ok(&hord_in(dir.path(), &["init"]), &["init"]);
+fn query_without_a_snapshot_fails() -> TestResult {
+    let dir = TempDir::new("hord-m2-empty")?;
+    assert_ok(&hord_in(dir.path(), &["init"])?, &["init"]);
     let out = hord_in(
         dir.path(),
         &[
@@ -850,31 +848,33 @@ fn query_without_a_snapshot_fails() {
             "references",
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         ],
-    );
-    let err = json_error(&out, &["query"]);
+    )?;
+    let err = json_error(&out, &["query"])?;
     assert!(err.contains("cannot resolve a snapshot"), "{err}");
 
     let log = hord_in(
         dir.path(),
         &["log", "--json", "--node", "01ARZ3NDEKTSV4RRFFQ69G5FAV"],
-    );
-    let log = json_stdout(&log, &["log", "--node"]);
-    assert_eq!(log_ids(&log), Vec::<String>::new());
+    )?;
+    let log = json_stdout(&log, &["log", "--node"])?;
+    assert_eq!(log_ids(&log)?, Vec::<String>::new());
 
-    let bad = hord_in(dir.path(), &["query", "--json", "references", "not-a-node"]);
-    let err = json_error(&bad, &["query", "not-a-node"]);
+    let bad = hord_in(dir.path(), &["query", "--json", "references", "not-a-node"])?;
+    let err = json_error(&bad, &["query", "not-a-node"])?;
     assert!(err.contains("invalid NodeId"), "{err}");
 
-    let edge = hord_in(dir.path(), &["query", "nope", "01ARZ3NDEKTSV4RRFFQ69G5FAV"]);
+    let edge = hord_in(dir.path(), &["query", "nope", "01ARZ3NDEKTSV4RRFFQ69G5FAV"])?;
     assert_err(&edge, &["query", "nope"]);
+    Ok(())
 }
 
-fn assert_no_secrets(value: &serde_json::Value, text: &str) {
-    let rendered = serde_json::to_string(value).unwrap();
+fn assert_no_secrets(value: &serde_json::Value, text: &str) -> TestResult {
+    let rendered = serde_json::to_string(value)?;
     assert!(!rendered.contains(BODY_SECRET), "{rendered}");
     assert!(!rendered.contains(EVIDENCE_SECRET), "{rendered}");
     assert!(!text.contains(BODY_SECRET), "{text}");
     assert!(!text.contains(EVIDENCE_SECRET), "{text}");
+    Ok(())
 }
 
 fn plain_change(result: ObjectId, write: NodeId, summary: &'static str) -> ChangeRecord {

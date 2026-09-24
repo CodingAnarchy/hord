@@ -182,9 +182,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_intent_file() {
+    fn full_intent_file() -> anyhow::Result<()> {
         let text = "---\nsummary: Make beta return 20\nrefs:\n  - https://example.com/x\n  - PROJ-1\n  - issue: 12\n  - git: abc123\nacceptance:\n  - test: beta_is_20\n  - check: cargo test\n  - never panics\nreads:\n  - gamma\n  - path: src/lib.rs\n  - node: 01ARZ3NDEKTSV4RRFFQ69G5FAV\n---\n\nThe body.\n\nMore.\n";
-        let file = parse(text).unwrap();
+        let file = parse(text)?;
         assert_eq!(file.intent.summary, "Make beta return 20");
         assert_eq!(file.intent.body, "The body.\n\nMore.");
         assert_eq!(
@@ -209,6 +209,7 @@ mod tests {
         ));
         assert_eq!(file.reads.len(), 3);
         assert_eq!(file.reads[0], ReadDeclaration::Name("gamma".into()));
+        Ok(())
     }
 
     #[test]

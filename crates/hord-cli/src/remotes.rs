@@ -102,22 +102,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn add_default_remove_round_trip() {
+    fn add_default_remove_round_trip() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("hord-remotes-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut remotes = Remotes::load(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
+        let mut remotes = Remotes::load(&dir)?;
         assert_eq!(remotes, Remotes::default());
-        remotes.add("origin", "http://127.0.0.1:1").unwrap();
+        remotes.add("origin", "http://127.0.0.1:1")?;
         assert!(remotes.add("origin", "http://x").is_err());
         assert!(remotes.add("a/b", "http://x").is_err());
         assert!(remotes.add("tls", "https://x").is_err());
-        remotes.set_default(Some("origin")).unwrap();
+        remotes.set_default(Some("origin"))?;
         assert!(remotes.set_default(Some("nope")).is_err());
-        remotes.save(&dir).unwrap();
-        let mut loaded = Remotes::load(&dir).unwrap();
+        remotes.save(&dir)?;
+        let mut loaded = Remotes::load(&dir)?;
         assert_eq!(loaded, remotes);
-        loaded.remove("origin").unwrap();
+        loaded.remove("origin")?;
         assert_eq!(loaded.default, None);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
