@@ -134,17 +134,17 @@ mod tests {
     }
 
     #[test]
-    fn fixtures_are_lossless() {
+    fn fixtures_are_lossless() -> Result<(), Box<dyn std::error::Error>> {
         let mut found = 0;
         for entry in fs::read_dir(testdata_dir()).expect("testdata") {
             let path = entry.expect("entry").path();
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let bytes = fs::read(&path).map_err(|e| format!("read {path:?}: {e}"))?;
             let tree = adapter()
                 .parse(&bytes)
-                .unwrap_or_else(|e| panic!("parse {path:?}: {e}"));
+                .map_err(|e| format!("parse {path:?}: {e}"))?;
             let projected = adapter().project(&tree);
             assert_eq!(
                 projected.as_slice(),
@@ -153,10 +153,11 @@ mod tests {
                 path.display()
             );
             tree.check_concat()
-                .unwrap_or_else(|e| panic!("concat {}: {e}", path.display()));
+                .map_err(|e| format!("concat {}: {e}", path.display()))?;
             found += 1;
         }
         assert!(found >= 5, "expected several fixtures, found {found}");
+        Ok(())
     }
 
     #[test]
