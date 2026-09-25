@@ -116,13 +116,20 @@ pub enum Outcome {
 pub struct Attempt {
     /// Attempt number.
     pub attempt: u32,
-    /// `proposed`, `gave_up`, `killed`, `over_budget`, `failed`, or
-    /// `running`.
+    /// `proposed`, `gave_up`, `killed`, `over_budget`, `tampered`,
+    /// `failed`, or `running`.
     pub outcome: String,
     /// Wall-clock time.
     pub elapsed_ms: u64,
     /// Reported tokens.
     pub tokens: Option<u64>,
+    /// Reported cost in US dollars (ADR 0028).
+    pub cost_usd: Option<f64>,
+    /// The model that ran it, as the harness reported it (ADR 0029).
+    pub model: Option<String>,
+    /// For a tampered attempt, the protected tests it changed (ADR 0034).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tampered: Vec<String>,
     /// The lander's note.
     pub detail: Option<String>,
 }
@@ -819,6 +826,13 @@ async fn drive(
             outcome: attempt_outcome(a.outcome()).into(),
             elapsed_ms: a.elapsed_ms,
             tokens: a.tokens,
+            cost_usd: a.cost_micros.map(|c| c as f64 / 1_000_000.0),
+            model: a.model.clone(),
+            tampered: a
+                .tampered
+                .iter()
+                .map(|n| n.name.clone().unwrap_or_else(|| n.id.clone()))
+                .collect(),
             detail: a.detail.clone(),
         })
         .collect();

@@ -39,6 +39,17 @@ pub struct Summary {
     /// Results rejected for changing a protected acceptance test (ADR
     /// 0034).
     pub tampered: usize,
+    /// Cost of every attempt, in US dollars, as the harness reported it.
+    pub total_cost_usd: f64,
+    /// Tokens of every attempt, as the harness reported them.
+    pub total_tokens: u64,
+    /// Wall-clock time of every attempt, in seconds.
+    pub attempt_seconds: f64,
+    /// Wall-clock time of every case (build, landing, replays, grading),
+    /// in seconds.
+    pub case_seconds: f64,
+    /// Attempts by the model that ran them (ADR 0029).
+    pub models: BTreeMap<String, usize>,
     /// Conflicts the lander saw, by kind (`hard`, `semantic`).
     pub observed_conflicts: BTreeMap<String, usize>,
     /// Correctness failures, each a reason the run fails.
@@ -66,8 +77,15 @@ pub fn summarize(results: &[(Case, CaseResult)], max_attempts: usize) -> Summary
         if let Some(kind) = &r.observed_conflict {
             *s.observed_conflicts.entry(kind.clone()).or_default() += 1;
         }
+        s.case_seconds += r.seconds;
         for a in &r.attempts {
             *s.attempts.entry(a.outcome.clone()).or_default() += 1;
+            s.total_cost_usd += a.cost_usd.unwrap_or(0.0);
+            s.total_tokens += a.tokens.unwrap_or(0);
+            s.attempt_seconds += a.elapsed_ms as f64 / 1000.0;
+            if let Some(model) = &a.model {
+                *s.models.entry(model.clone()).or_default() += 1;
+            }
             match a.outcome.as_str() {
                 "killed" => s.killed += 1,
                 "over_budget" => s.over_budget += 1,
@@ -175,6 +193,15 @@ pub fn text(summary: &Summary, gated_share: bool) -> String {
         "attempts: {:?}; killed at budget: {}; over budget: {}; tampered with acceptance tests: {}",
         summary.attempts, summary.killed, summary.over_budget, summary.tampered
     );
+    let _ = writeln!(
+        out,
+        "spent: ${:.4}, {} tokens, {:.0}s in attempts ({:.0}s in cases); models {:?}",
+        summary.total_cost_usd,
+        summary.total_tokens,
+        summary.attempt_seconds,
+        summary.case_seconds,
+        summary.models
+    );
     if summary.failures.is_empty() {
         let _ = writeln!(
             out,
@@ -241,8 +268,11 @@ mod tests {
                 .map(|(i, o)| Attempt {
                     attempt: u32::try_from(i + 1).unwrap_or(u32::MAX),
                     outcome: (*o).into(),
-                    elapsed_ms: 0,
-                    tokens: None,
+                    elapsed_ms: 1_500,
+                    tokens: Some(100),
+                    cost_usd: Some(0.25),
+                    model: Some("m".into()),
+                    tampered: Vec::new(),
                     detail: None,
                 })
                 .collect(),
@@ -270,6 +300,18 @@ mod tests {
             summarize(&[(sleeper.clone(), unkilled)], 2).failures.len(),
             1
         );
+        // Run totals come from the attempts' reported usage.
+        let totals = summarize(
+            &[(
+                sleeper.clone(),
+                result(sleeper, Outcome::ResolvedByReplay, &["killed", "proposed"]),
+            )],
+            2,
+        );
+        assert_eq!(totals.total_tokens, 200);
+        assert!((totals.total_cost_usd - 0.5).abs() < 1e-9);
+        assert!((totals.attempt_seconds - 3.0).abs() < 1e-9);
+        assert_eq!(totals.models.get("m"), Some(&2));
         let parked = result(sleeper, Outcome::Parked, &["killed", "proposed"]);
         let summary = summarize(&[(sleeper.clone(), parked)], 2);
         assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
