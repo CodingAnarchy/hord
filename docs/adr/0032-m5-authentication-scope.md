@@ -24,3 +24,5 @@ For each item, the choice was between doing it in M5, scheduling it for a named 
 
 - Spec §12: M6's Deliver line gains TLS, and M7's candidates gain OIDC login.
 - M5's auth acceptance is judged on loopback and on the local daemon. No M5 test depends on TLS.
+
+**Amendment (2026-09-25):** `hord serve` (`--repo` or `--root`) also serves each hosted repository on its local endpoint (ADR 0021), sharing that repository's lander, so a replay harness's `hord propose` has something to connect to. Like the daemon's, that endpoint belongs to the server's OS user and takes no tokens; network clients still go through the authenticated endpoint.
