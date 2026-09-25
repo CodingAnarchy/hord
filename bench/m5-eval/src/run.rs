@@ -622,13 +622,21 @@ async fn drive(
     let ws_b = workspace(remote, "agent-b").await?;
     let a = propose(remote, &ws_a, case.first(), "agent-a").await?;
     let b = propose(remote, &ws_b, case.second(), "agent-b").await?;
-    let settled = |e: &proto::QueueEntry| {
-        !matches!(
-            e.status(),
-            proto::QueueStatus::Queued
-                | proto::QueueStatus::Replaying
-                | proto::QueueStatus::Unspecified
-        )
+    // Terminal states only. With a harness, `Conflicted` is not one: the
+    // lander puts a conflicted change on the ladder (`Replaying`, or
+    // `NeedsArbitration` when no replay is allowed) as it settles it.
+    let with_harness = !matches!(cfg.harness, Harness::None);
+    let settled = |e: &proto::QueueEntry| match e.status() {
+        proto::QueueStatus::Queued
+        | proto::QueueStatus::Replaying
+        | proto::QueueStatus::Unspecified => false,
+        proto::QueueStatus::Conflicted => !with_harness,
+        proto::QueueStatus::Landed
+        | proto::QueueStatus::Rejected
+        | proto::QueueStatus::Parked
+        | proto::QueueStatus::NeedsArbitration
+        | proto::QueueStatus::Replayed
+        | proto::QueueStatus::Arbitrated => true,
     };
     remote
         .submit(proto::SubmitRequest { change: a.clone() })

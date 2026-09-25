@@ -234,6 +234,9 @@ pub(crate) struct Inner {
     pub ladder: Mutex<()>,
     /// Replays running in this process.
     pub replays: crate::escalation::Replays,
+    /// Replays of changes that entered the ladder as they settled, for the
+    /// lander to start ([`crate::lander`]).
+    pub pending_replays: Mutex<Vec<crate::escalation::ReplayJob>>,
 }
 
 impl Drop for Inner {
@@ -434,6 +437,7 @@ impl Inner {
             harness: options.harness,
             ladder: Mutex::new(()),
             replays: crate::escalation::Replays::default(),
+            pending_replays: Mutex::new(Vec::new()),
         })
     }
 

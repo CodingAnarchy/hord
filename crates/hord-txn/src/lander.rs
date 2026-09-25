@@ -523,9 +523,13 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                 }
             }
         }
-        // Rung 2 and 3 (spec §6.4): replay a conflicted change, or move the
-        // escalation of the change this one replays or resolves.
-        let (done, jobs) = blocking(&repo.inner, move |inner| inner.escalate(done)).await?;
+        // Rung 2 and 3 (spec §6.4): start the replays of a change that
+        // entered the ladder when it settled, and move the escalation of
+        // the change this one replays or resolves.
+        let (done, mut jobs) = blocking(&repo.inner, move |inner| inner.escalate(done)).await?;
+        jobs.extend(std::mem::take(&mut *crate::repo::lock(
+            &repo.inner.pending_replays,
+        )));
         for job in jobs {
             crate::replay::spawn_replay(repo, job);
         }
@@ -866,9 +870,16 @@ impl Inner {
         Ok(policy.evaluate(&assumed).is_allow())
     }
 
-    /// Write an entry settled at prepare, and announce it.
+    /// Write a settled entry, and announce it. A conflicted change that
+    /// goes on to rung 2 is written once, already replaying (or parked for
+    /// arbitration when no replay is allowed): it is never visible, or
+    /// announced, as conflicted in between ([`Inner::enter_ladder`]).
     fn settle(&self, mut entry: QueueEntry) -> Result<QueueEntry> {
         entry.updated_at = now();
+        if let Some(jobs) = self.enter_ladder(&mut entry)? {
+            crate::repo::lock(&self.pending_replays).extend(jobs);
+            return Ok(entry);
+        }
         self.put_entry(&entry)?;
         self.emit(events::settled(&entry))?;
         Ok(entry)

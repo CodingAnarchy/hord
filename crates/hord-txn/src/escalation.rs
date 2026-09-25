@@ -359,21 +359,32 @@ impl Inner {
                 self.resolution_settled(of, &entry)?;
                 Ok((entry, Vec::new()))
             }
-            None if entry.status == QueueStatus::Conflicted && self.harness.is_some() => {
-                let mut entry = entry;
-                let summary = entry
-                    .report
-                    .as_ref()
-                    .and_then(|report| self.conflict_summary(entry.change, report).ok());
-                entry.escalation = Some(Escalation {
-                    summary,
-                    ..Escalation::default()
-                });
-                let jobs = self.next_attempt(&mut entry, None)?;
-                Ok((entry, jobs))
-            }
             None => Ok((entry, Vec::new())),
         }
+    }
+
+    /// Put `entry`, a change settling as conflicted, on rung 2 (or, with no
+    /// replay allowed, rung 3) in the same write that settles it, so no
+    /// reader sees it conflicted first. `None` when it does not enter the
+    /// ladder: a replay or a resolution (their original's escalation moves
+    /// instead, [`Self::escalate`]), or no harness.
+    pub(crate) fn enter_ladder(&self, entry: &mut QueueEntry) -> Result<Option<Vec<ReplayJob>>> {
+        if entry.status != QueueStatus::Conflicted
+            || entry.origin.is_some()
+            || self.harness.is_none()
+        {
+            return Ok(None);
+        }
+        let _ladder = lock(&self.ladder);
+        let summary = entry
+            .report
+            .as_ref()
+            .and_then(|report| self.conflict_summary(entry.change, report).ok());
+        entry.escalation = Some(Escalation {
+            summary,
+            ..Escalation::default()
+        });
+        self.next_attempt(entry, None).map(Some)
     }
 
     /// Start the next attempt on `entry` (conflicted, with an escalation),

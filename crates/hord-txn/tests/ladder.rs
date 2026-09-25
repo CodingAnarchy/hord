@@ -899,3 +899,93 @@ async fn an_edit_against_a_moved_definition_never_lands_a_duplicate() -> TestRes
     }
     Ok(())
 }
+
+/// Events about `change`, in order.
+async fn events_of(repo: &Repo, change: ChangeId) -> TestResult<Vec<Kind>> {
+    let id = change.to_hex();
+    Ok(events(repo)
+        .await?
+        .into_iter()
+        .filter(|k| match k {
+            Kind::Parked(p) => p.change == id,
+            Kind::Replaying(r) => r.change == id,
+            Kind::ConflictCheck(c) => c.change == id,
+            _ => false,
+        })
+        .collect())
+}
+
+/// The race behind a flaky M5 corpus run: a conflicted change that goes on
+/// to replay was first written and announced as conflicted (`Parked`), and
+/// only then moved to `Replaying`, so a reader woken in between took it for
+/// settled. It must enter the ladder in the write that settles it: never a
+/// `Parked` for the conflict itself, and `Replaying` as soon as it is
+/// visible. Deterministic: the old code always emitted that `Parked`.
+#[tokio::test]
+async fn a_change_entering_the_ladder_is_never_announced_as_parked_first() -> TestResult {
+    let harness = Scripted::new([Step::GiveUp, Step::GiveUp]);
+    let t = ladder_repo(
+        TWO_ATTEMPTS,
+        Some(Arc::new(harness.clone())),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (_, cb) = collide(&t.repo).await?;
+    t.repo.land_local().await?;
+    let kinds = events_of(&t.repo, cb).await?;
+    let parked: Vec<proto::ParkReason> = kinds
+        .iter()
+        .filter_map(|k| match k {
+            Kind::Parked(p) => Some(p.reason()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        parked,
+        vec![proto::ParkReason::NeedsArbitration],
+        "parked only once replays ran out: {kinds:#?}"
+    );
+    let first = kinds
+        .iter()
+        .position(|k| matches!(k, Kind::Replaying(_)))
+        .ok_or("a Replaying event")?;
+    assert!(
+        matches!(
+            kinds.get(first.wrapping_sub(1)),
+            Some(Kind::ConflictCheck(_))
+        ),
+        "Replaying follows the conflict check directly: {kinds:#?}"
+    );
+    assert_eq!(
+        t.repo.status(cb).await?.status,
+        QueueStatus::NeedsArbitration
+    );
+    Ok(())
+}
+
+/// With no replay allowed, the conflicted change is parked for arbitration
+/// in one write: never announced as a plain merge conflict first.
+#[tokio::test]
+async fn with_no_replays_allowed_a_conflict_parks_straight_for_arbitration() -> TestResult {
+    let harness = Scripted::new([]);
+    let t = ladder_repo(
+        "[land]\nmax_replay_attempts = 0\n",
+        Some(Arc::new(harness.clone())),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (_, cb) = collide(&t.repo).await?;
+    t.repo.land_local().await?;
+    let kinds = events_of(&t.repo, cb).await?;
+    assert!(
+        kinds.iter().all(|k| !matches!(k, Kind::Parked(p)
+            if p.reason() != proto::ParkReason::NeedsArbitration)),
+        "{kinds:#?}"
+    );
+    assert!(harness.requests().is_empty());
+    assert_eq!(
+        t.repo.status(cb).await?.status,
+        QueueStatus::NeedsArbitration
+    );
+    Ok(())
+}
