@@ -393,6 +393,11 @@ pub fn escalation_message(escalation: &Escalation) -> proto::Escalation {
         summary: escalation.summary.as_ref().map(summary_message),
         resolution: escalation.resolution.as_ref().map(|r| wire::id(r.change)),
         note: escalation.note.clone(),
+        whole_file: escalation
+            .whole_file
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
     }
 }
 

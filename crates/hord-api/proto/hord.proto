@@ -712,6 +712,10 @@ message Escalation {
   optional string resolution = 4;
   // Why the last resolution or replay did not help, if it did not.
   optional string note = 5;
+  // Files the last "take theirs" resolution took whole from the parked
+  // change: hord cannot merge them by definition (blob-tier or unparseable
+  // files, or a conflict on the file itself).
+  repeated string whole_file = 6;
 }
 
 // `hord replay`.

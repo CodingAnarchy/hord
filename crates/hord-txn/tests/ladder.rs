@@ -604,3 +604,101 @@ async fn an_arbiter_can_ask_for_one_more_replay_with_a_note() -> TestResult {
     );
     Ok(())
 }
+
+/// "Take theirs" is definition-level: the parked change wins the contested
+/// definition, and a non-conflicting edit head gained in the same file (a
+/// third agent's landed change) is kept, not reverted.
+#[tokio::test]
+async fn taking_theirs_keeps_heads_other_definitions_in_the_file() -> TestResult {
+    let t = ladder_repo(TWO_ATTEMPTS, None, Arc::new(StubVerifier)).await?;
+    let mut a = begin(&t.repo, "a").await?;
+    let mut b = begin(&t.repo, "b").await?;
+    let mut c = begin(&t.repo, "c").await?;
+    edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    edit(&mut b, "src/lib.rs", LIB, "    2\n", "    21\n").await?;
+    edit(&mut c, "src/lib.rs", LIB, "    4\n", "    40\n").await?;
+    let ca = submit(&t.repo, &mut a, "beta returns 20").await?;
+    let cc = submit(&t.repo, &mut c, "delta returns 40").await?;
+    let cb = submit(&t.repo, &mut b, "beta returns 21").await?;
+    t.repo.land_local().await?;
+    assert!(matches!(
+        t.repo.status(cc).await?.status,
+        QueueStatus::Landed { .. }
+    ));
+    assert_eq!(t.repo.status(cb).await?.status, QueueStatus::Conflicted);
+    let before = head_lib(&t.repo).await?;
+    assert!(
+        before.contains("    20\n") && before.contains("    40\n"),
+        "{before}"
+    );
+
+    let (resolution, pending) = t
+        .repo
+        .arbitrate(
+            cb,
+            Arbitration::PickTheirs,
+            Arbiter {
+                actor: actor("arbiter"),
+                signature: None,
+            },
+        )
+        .await?;
+    assert!(escalation(&pending)?.whole_file.is_empty());
+    t.repo.land_local().await?;
+    assert_eq!(
+        t.repo.status(cb).await?.status,
+        QueueStatus::Arbitrated { landed: resolution }
+    );
+    let after = head_lib(&t.repo).await?;
+    assert!(
+        after.contains("    21\n"),
+        "the parked side of beta: {after}"
+    );
+    assert!(!after.contains("    20\n"), "{after}");
+    assert!(
+        after.contains("    40\n"),
+        "head's delta edit is kept: {after}"
+    );
+    let record = t.repo.change(resolution).await?;
+    assert!(record.parents.contains(&ca) && record.parents.contains(&cb));
+    Ok(())
+}
+
+/// A file hord cannot merge by definition (here a blob-tier README whose
+/// line edits overlap) is taken whole from the parked change, and the
+/// escalation says so.
+#[tokio::test]
+async fn taking_theirs_reports_files_taken_whole() -> TestResult {
+    let t = ladder_repo(TWO_ATTEMPTS, None, Arc::new(StubVerifier)).await?;
+    let mut a = begin(&t.repo, "a").await?;
+    let mut b = begin(&t.repo, "b").await?;
+    edit(&mut a, "README.md", README, "line one", "line ONE").await?;
+    edit(&mut b, "README.md", README, "line one", "line uno").await?;
+    submit(&t.repo, &mut a, "shout line one").await?;
+    let cb = submit(&t.repo, &mut b, "translate line one").await?;
+    t.repo.land_local().await?;
+    assert_eq!(t.repo.status(cb).await?.status, QueueStatus::Conflicted);
+    let (_, pending) = t
+        .repo
+        .arbitrate(
+            cb,
+            Arbitration::PickTheirs,
+            Arbiter {
+                actor: actor("arbiter"),
+                signature: None,
+            },
+        )
+        .await?;
+    assert_eq!(escalation(&pending)?.whole_file, vec![path("README.md")]);
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    assert!(
+        matches!(entry.status, QueueStatus::Arbitrated { .. }),
+        "{entry:#?}"
+    );
+    assert_eq!(escalation(&entry)?.whole_file, vec![path("README.md")]);
+    let mut ws = begin(&t.repo, "reader").await?;
+    let readme = ws.read_file(&path("README.md")).await?.ok_or("README")?;
+    assert!(String::from_utf8(readme.as_slice().to_vec())?.contains("line uno"));
+    Ok(())
+}

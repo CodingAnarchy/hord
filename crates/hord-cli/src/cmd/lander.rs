@@ -286,6 +286,12 @@ fn print_escalation(escalation: &proto::Escalation) {
     if let Some(note) = &escalation.note {
         println!("note: {note}");
     }
+    if !escalation.whole_file.is_empty() {
+        println!(
+            "taken whole from the parked change (not mergeable by definition): {}",
+            escalation.whole_file.join(", ")
+        );
+    }
 }
 
 fn kind_name(kind: proto::ConflictKind) -> &'static str {

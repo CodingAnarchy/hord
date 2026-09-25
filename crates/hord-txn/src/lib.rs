@@ -59,6 +59,7 @@ mod sets;
 mod snapshot;
 mod source;
 mod summary;
+mod theirs;
 mod workspace;
 
 pub use conflict::{

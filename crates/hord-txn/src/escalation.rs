@@ -30,8 +30,8 @@ use std::sync::Mutex;
 
 use hord_core::sign::{self, PublicKey, SigningKey};
 use hord_core::{
-    Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, ObjectId, Provenance, Signature,
-    SnapshotId,
+    Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, ObjectId, Provenance, RepoPath,
+    Signature, SnapshotId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +143,11 @@ pub struct Escalation {
     pub resolution: Option<PendingResolution>,
     /// Why the last resolution or replay did not help, if it did not.
     pub note: Option<String>,
+    /// Files the last "take theirs" resolution took whole from the parked
+    /// change, because hord cannot merge them by definition (blob-tier or
+    /// unparseable files, or a conflict on the file itself).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub whole_file: Vec<RepoPath>,
 }
 
 /// What an arbiter decided (spec §10.5.2 `Arbitration`).
@@ -853,6 +858,9 @@ impl Repo {
             .chain(colliders.iter().copied())
             .map(|change| IntentRef::Change { change })
             .collect();
+        let parked_summary = record.intent.summary.clone();
+        let parked_acceptance = record.intent.acceptance.clone();
+        let mut whole_file: Vec<RepoPath> = Vec::new();
         let resolution = match action {
             Arbitration::Replay { note } => {
                 if self.inner.harness.is_none() {
@@ -893,12 +901,6 @@ impl Repo {
                 )
             }
             Arbitration::PickTheirs => {
-                let intent = Intent {
-                    summary: format!("Arbitrate: take \"{}\"", record.intent.summary),
-                    body: summary_body(&entry),
-                    refs,
-                    acceptance: record.intent.acceptance.clone(),
-                };
                 let mut ws = self
                     .begin(BeginOptions {
                         base: Base::Head,
@@ -906,21 +908,26 @@ impl Repo {
                         session: None,
                     })
                     .await?;
-                let theirs = blocking(&self.inner, move |inner| {
-                    inner
-                        .changed_paths(record.base, record.result)?
-                        .into_iter()
-                        .map(|delta| {
-                            let bytes = match delta.to {
-                                Some(blob) => Some(inner.blob_bytes(blob)?),
-                                None => None,
-                            };
-                            Ok((delta.path, bytes))
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .await?;
-                for (path, bytes) in theirs {
+                let on = ws.base();
+                let theirs =
+                    blocking(&self.inner, move |inner| inner.merge_theirs(&record, on)).await?;
+                let mut body = summary_body(&entry);
+                if !theirs.whole_file.is_empty() {
+                    let list: Vec<String> =
+                        theirs.whole_file.iter().map(ToString::to_string).collect();
+                    body.push_str(&format!(
+                        "\nTaken whole from the parked change (hord cannot merge them by definition): {}\n",
+                        list.join(", ")
+                    ));
+                }
+                whole_file = theirs.whole_file;
+                let intent = Intent {
+                    summary: format!("Arbitrate: take \"{}\"", parked_summary),
+                    body,
+                    refs,
+                    acceptance: parked_acceptance,
+                };
+                for (path, bytes) in theirs.files {
                     match bytes {
                         Some(bytes) => ws.write_file(&path, bytes.as_slice().to_vec()).await?,
                         None => {
@@ -978,6 +985,7 @@ impl Repo {
                 signature: arbiter.signature,
             });
             escalation.note = None;
+            escalation.whole_file = whole_file;
             inner.rewrite(&mut entry)?;
             inner.submit_as(id, Some(Origin::Arbitration { of: change }))?;
             Ok((id, entry))

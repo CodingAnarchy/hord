@@ -279,9 +279,11 @@ pub enum Command {
         change: String,
         /// `ours` (keep what landed), `theirs` (take the parked change), or
         /// a change id that resolves it, such as a replay candidate.
-        /// `theirs` is whole-file: every file the parked change touched gets
-        /// the parked change's version, including edits that landed in
-        /// those files since its base. For a finer resolution, use `--edit`.
+        /// `theirs` merges the parked change onto head definition by
+        /// definition and takes the parked side of each contested
+        /// definition, keeping what head gained elsewhere in the same
+        /// files. Files hord cannot merge by definition (blob-tier or
+        /// unparseable) are taken whole, and `hord conflicts` lists them.
         #[arg(long, value_name = "ours|theirs|CHANGE")]
         pick: Option<String>,
         /// Open a workspace on head to resolve it by hand, then `hord
