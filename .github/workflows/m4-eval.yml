@@ -1,6 +1,7 @@
 # ADR 0023 selection-safety gate, as amended 2026-09-24: 150 real cargo
 # commits graded as 15 independent chains of 10 consecutive first-parent
-# commits, each chain on its own runner, exactly as the lander sees them
+# commits (windows 35 commits apart, all after cargo 89e13501a), each chain
+# on its own runner, exactly as the lander sees them
 # (ADR 0022: fresh per-test coverage, refreshed by every instrumented run).
 # Up to 5 seeded faults per commit where selection (b) does not contain (a);
 # one probe-graded fault where it does. A merge job gives one report and the
@@ -83,7 +84,13 @@ env:
   FAULTS_PER_COMMIT: ${{ inputs.faults_per_commit || '5' }}
   CHAINS: "15"
   COMMITS_PER_CHAIN: "10"
-  CHAIN_STRIDE: "100"
+  # 15 chains x stride 35 = 525 first-parent commits, all after cargo
+  # 89e13501a (2026-01-03; 531 commits before the pinned head). Before it,
+  # cargo-test-support names every test's scratch dir `cit/t0` in a fresh
+  # process, so per-test coverage processes running in parallel delete each
+  # other's projects (run 36145004665: 1,100-2,800 spurious failures per run
+  # in chains 6-14). Moving `corpus_head` later keeps the windows after it.
+  CHAIN_STRIDE: "35"
   FULL_SAMPLE: "20"
   SAMPLE_SHARDS: "4"
   HORD_CORPORA: /mnt/corpora
