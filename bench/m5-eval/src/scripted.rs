@@ -61,6 +61,13 @@ pub fn run(case_path: &Path) -> Result<()> {
             write_files(resolution()?)?;
             report_usage(TOO_MANY_TOKENS)
         }
+        Step::TamperOwn => {
+            write_files(resolution()?)?;
+            let second = case.second();
+            let weakened = format!("#[test]\nfn {}() {{\n    assert!(true);\n}}\n", second.test);
+            write_files(&BTreeMap::from([(second.test_path.clone(), weakened)]))?;
+            report_usage(TOKENS)
+        }
         Step::Tamper => {
             write_files(resolution()?)?;
             let first = case.first();

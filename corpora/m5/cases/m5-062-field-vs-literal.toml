@@ -2,7 +2,7 @@ id = "m5-062"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: field-vs-literal #12 (Profile.score/default_profile)"
+made_by = "hord-eval-m5 generate v3: field-vs-literal #12 (Profile.score/default_profile)"
 script = ["resolve"]
 
 [base]

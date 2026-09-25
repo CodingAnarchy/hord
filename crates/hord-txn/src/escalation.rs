@@ -187,6 +187,15 @@ pub struct Arbiter {
     pub signature: Option<Signature>,
 }
 
+/// One of the replayed change's own acceptance tests, as it wrote it.
+struct OwnTest {
+    name: String,
+    qualified: String,
+    path: RepoPath,
+    node: NodeId,
+    normalized: ObjectId,
+}
+
 /// How the lander words a replay rejected for changing a protected test
 /// (ADR 0034); a rejection reason starts with it.
 pub(crate) const TAMPERED: &str = "changes acceptance tests it must satisfy";
@@ -533,10 +542,9 @@ impl Inner {
                 let attempt = u32::try_from(escalation.attempts.len() + 1).unwrap_or(u32::MAX);
                 let record = self.change_record(replay.change)?;
                 let tampered = self
-                    .protected_tests(of, record.base)?
+                    .tampered_tests(of, &record)?
                     .into_iter()
                     .map(|(node, _)| node)
-                    .filter(|node| record.write_set.contains(node))
                     .collect();
                 escalation.attempts.push(ReplayAttempt {
                     attempt,
@@ -774,11 +782,7 @@ impl Inner {
         }
         // ADR 0034: a replay may not change the acceptance tests it must
         // satisfy. Rejected before verification, like an over-budget result.
-        let protected = self.protected_tests(of, base)?;
-        let touched: Vec<(NodeId, String)> = protected
-            .into_iter()
-            .filter(|(node, _)| record.write_set.contains(node))
-            .collect();
+        let touched = self.tampered_tests(of, &record)?;
         if !touched.is_empty() {
             let names: Vec<&str> = touched.iter().map(|(_, name)| name.as_str()).collect();
             let why = format!("{TAMPERED}: {} (proposed change {id})", names.join(", "));
@@ -838,19 +842,115 @@ impl Inner {
 
     /// Names of the protected tests (ADR 0034) that `record`, a replay of
     /// `of`, changes: in its write set, resolved at its base.
+    ///
+    /// Two kinds are protected (ADR 0034). Tests that exist at the replay's
+    /// base (the landed side's, or ones the change inherited) must not be
+    /// in its write set. The replayed change's own tests do not exist
+    /// there, so each must be in the replay's result as the original change
+    /// wrote it: a definition with the same qualified name and the same
+    /// `normalized` content (the tokens, not the layout).
     pub(crate) fn tampered_tests(
         &self,
         of: ChangeId,
         record: &ChangeRecord,
-    ) -> Result<Vec<String>> {
-        let mut out: Vec<String> = self
+    ) -> Result<Vec<(NodeId, String)>> {
+        let mut out: Vec<(NodeId, String)> = self
             .protected_tests(of, record.base)?
             .into_iter()
             .filter(|(node, _)| record.write_set.contains(node))
-            .map(|(_, name)| name)
             .collect();
-        out.dedup();
+        let original = self.change_record(of)?;
+        for own in self.own_tests(&original)? {
+            if self.defines(record.result, &own)? {
+                continue;
+            }
+            if !out.iter().any(|(node, _)| *node == own.node) {
+                out.push((own.node, own.name.clone()));
+            }
+        }
         Ok(out)
+    }
+
+    /// The tests the change's own intent names, as its result defines them.
+    fn own_tests(&self, record: &ChangeRecord) -> Result<Vec<OwnTest>> {
+        let names: Vec<&String> = record
+            .intent
+            .acceptance
+            .iter()
+            .filter_map(|a| match a {
+                Acceptance::Test { name } => Some(name),
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        if names.is_empty() {
+            return Ok(out);
+        }
+        for (path, _) in self.list_files(record.result)? {
+            for def in self.definitions_at(record.result, &path)? {
+                let Some(qualified) = def.name.as_ref().map(|n| n.as_str().to_owned()) else {
+                    continue;
+                };
+                let Some(name) = names.iter().find(|name| {
+                    qualified == name.as_str() || qualified.ends_with(&format!("::{name}"))
+                }) else {
+                    continue;
+                };
+                if let Some(normalized) = self.normalized_at(record.result, &path, def.node)? {
+                    out.push(OwnTest {
+                        name: (*name).clone(),
+                        qualified,
+                        path: path.clone(),
+                        node: def.node,
+                        normalized,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `snapshot` has `test` as written: a definition with its
+    /// qualified name (in its file, else anywhere) and its `normalized`
+    /// content.
+    fn defines(&self, snapshot: SnapshotId, test: &OwnTest) -> Result<bool> {
+        let mut files = vec![test.path.clone()];
+        files.extend(
+            self.list_files(snapshot)?
+                .into_iter()
+                .map(|(path, _)| path)
+                .filter(|path| *path != test.path),
+        );
+        for path in files {
+            for def in self.definitions_at(snapshot, &path)? {
+                if def.name.as_ref().map(|n| n.as_str()) == Some(test.qualified.as_str())
+                    && self.normalized_at(snapshot, &path, def.node)? == Some(test.normalized)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The `normalized` hash of definition `node` of `path` in `snapshot`.
+    fn normalized_at(
+        &self,
+        snapshot: SnapshotId,
+        path: &RepoPath,
+        node: NodeId,
+    ) -> Result<Option<ObjectId>> {
+        let Some(parsed) = self.parsed_at(snapshot, path)? else {
+            return Ok(None);
+        };
+        let tree = &parsed.tree;
+        Ok(tree
+            .ids
+            .iter()
+            .find(|(_, id)| **id == node)
+            .and_then(|(site, _)| hord_lang::oid_at(&tree.tree, site))
+            .and_then(|oid| tree.tree.get(oid))
+            .map(|n| n.normalized))
     }
 
     /// [`Self::protected_test_names`] resolved to definitions in `snapshot`

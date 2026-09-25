@@ -2,7 +2,7 @@ id = "m5-066"
 kind = "variant-vs-match"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: variant-vs-match #3 (Status::Closed/weight)"
+made_by = "hord-eval-m5 generate v3: variant-vs-match #3 (Status::Closed/weight)"
 script = [
     "give_up",
     "give_up",

@@ -2,7 +2,7 @@ id = "m5-047"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: move-vs-edit #9 (parse_year into dates)"
+made_by = "hord-eval-m5 generate v3: move-vs-edit #9 (parse_year into dates)"
 script = [
     "tamper",
     "resolve",

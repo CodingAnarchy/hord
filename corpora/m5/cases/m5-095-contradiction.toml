@@ -2,7 +2,7 @@ id = "m5-095"
 kind = "contradiction"
 conflict = "hard"
 ambiguous = true
-made_by = "hord-eval-m5 generate v2: contradiction #7 (TIMEOUT_SECS = 26 or 36)"
+made_by = "hord-eval-m5 generate v3: contradiction #7 (TIMEOUT_SECS = 26 or 36)"
 script = ["give_up"]
 
 [base]

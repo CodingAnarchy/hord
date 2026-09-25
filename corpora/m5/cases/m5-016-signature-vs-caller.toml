@@ -2,8 +2,11 @@ id = "m5-016"
 kind = "signature-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: signature-vs-caller #3 (stretch/stretch_once_more)"
-script = ["resolve"]
+made_by = "hord-eval-m5 generate v3: signature-vs-caller #3 (stretch/stretch_once_more)"
+script = [
+    "tamper_own",
+    "resolve",
+]
 
 [base]
 ".gitignore" = """

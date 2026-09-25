@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use crate::corpus::{Case, Step, Task};
 
 /// Written into every case's `made_by`; bump it when a template changes.
-pub const VERSION: &str = "hord-eval-m5 generate v2";
+pub const VERSION: &str = "hord-eval-m5 generate v3";
 
 /// Its own `[workspace]`, so a case built inside another workspace (such
 /// as hord's `target/`) is not taken for a member of it.
@@ -534,6 +534,8 @@ fn script(n: usize, ambiguous: bool) -> Vec<Step> {
     }
     if n % 17 == 12 {
         vec![Step::Tamper, Step::Resolve]
+    } else if n % 19 == 15 {
+        vec![Step::TamperOwn, Step::Resolve]
     } else if n % 11 == 10 {
         vec![Step::GiveUp, Step::GiveUp]
     } else if n % 13 == 6 {

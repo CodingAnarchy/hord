@@ -1004,6 +1004,11 @@ fn test_file(name: &str, body: &str) -> String {
     format!("#[test]\nfn {name}() {{\n    {body}\n}}\n")
 }
 
+/// b's own acceptance test, as b wrote it.
+fn own_test() -> String {
+    test_file("beta_is_21", "assert_eq!(fixture::beta(), 21);")
+}
+
 /// a and b each add an acceptance test and name it in their intent; b
 /// collides with a on `beta`. Returns (a, b).
 async fn collide_with_tests(repo: &Repo) -> TestResult<(ChangeId, ChangeId)> {
@@ -1020,11 +1025,7 @@ async fn collide_with_tests(repo: &Repo) -> TestResult<(ChangeId, ChangeId)> {
     )
     .await?;
     edit(&mut b, "src/lib.rs", LIB, "    2\n", "    21\n").await?;
-    b.write_file(
-        &path("tests/b.rs"),
-        test_file("beta_is_21", "assert_eq!(fixture::beta(), 21);"),
-    )
-    .await?;
+    b.write_file(&path("tests/b.rs"), own_test()).await?;
     let ca = a
         .propose(accepts("beta returns 20", "beta_is_20"))
         .await?
@@ -1048,14 +1049,17 @@ async fn a_replay_that_changes_a_protected_test_is_tampered() -> TestResult {
         // Makes beta 21 and "fixes" a's test to match: tampering.
         Step::Write(vec![
             ("src/lib.rs", lib_21.clone()),
+            ("tests/b.rs", own_test()),
             (
                 "tests/a.rs",
                 test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
             ),
         ]),
-        // Makes beta 21 and adds a test of its own: allowed.
+        // Makes beta 21, keeps its own change's test as written, and adds
+        // a test of its own: allowed.
         Step::Write(vec![
             ("src/lib.rs", lib_21),
+            ("tests/b.rs", own_test()),
             (
                 "tests/replay.rs",
                 test_file("beta_is_positive", "assert!(fixture::beta() > 0);"),
@@ -1128,6 +1132,7 @@ async fn a_manual_replay_that_changes_a_protected_test_is_rejected() -> TestResu
     let mut ws = begin(&t.repo, "replayer").await?;
     ws.write_file(&path("src/lib.rs"), LIB.replace("    2\n", "    21\n"))
         .await?;
+    ws.write_file(&path("tests/b.rs"), own_test()).await?;
     ws.write_file(
         &path("tests/a.rs"),
         test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
@@ -1151,5 +1156,64 @@ async fn a_manual_replay_that_changes_a_protected_test_is_rejected() -> TestResu
     assert_eq!(attempt.outcome, ReplayOutcome::Tampered, "{attempt:#?}");
     assert_eq!(attempt.harness, "manual");
     assert_eq!(attempt.tampered.len(), 1);
+    Ok(())
+}
+
+/// ADR 0034 covers the replayed change's own tests too, which do not exist
+/// at head: a replay must carry each as the original change wrote it. One
+/// that weakens b's test is TAMPERED; one that drops it is too; one that
+/// keeps it verbatim and fixes the code lands.
+#[tokio::test]
+async fn a_replay_must_keep_its_own_changes_tests_as_written() -> TestResult {
+    let lib_21 = LIB.replace("    2\n", "    21\n");
+    let harness = Scripted::new([
+        Step::Write(vec![
+            ("src/lib.rs", lib_21.clone()),
+            (
+                "tests/b.rs",
+                test_file("beta_is_21", "assert!(fixture::beta() > 0);"),
+            ),
+        ]),
+        Step::Write(vec![("src/lib.rs", lib_21.clone())]),
+        Step::Write(vec![("src/lib.rs", lib_21), ("tests/b.rs", own_test())]),
+    ]);
+    let t = ladder_repo(
+        "[land]\nmax_replay_attempts = 3\n",
+        Some(Arc::new(harness.clone())),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (_, cb) = collide_with_tests(&t.repo).await?;
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    assert!(
+        matches!(entry.status, QueueStatus::Replayed { .. }),
+        "{entry:#?}"
+    );
+    let attempts = &escalation(&entry)?.attempts;
+    let outcomes: Vec<ReplayOutcome> = attempts.iter().map(|a| a.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            ReplayOutcome::Tampered,
+            ReplayOutcome::Tampered,
+            ReplayOutcome::Proposed
+        ],
+        "{attempts:#?}"
+    );
+    for attempt in &attempts[..2] {
+        assert!(
+            attempt
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("beta_is_21")),
+            "{attempt:#?}"
+        );
+        assert_eq!(attempt.tampered.len(), 1, "{attempt:#?}");
+    }
+    let b_now = file_at_head(&t.repo, "tests/b.rs")
+        .await?
+        .ok_or("tests/b.rs")?;
+    assert_eq!(b_now, own_test());
     Ok(())
 }

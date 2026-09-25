@@ -2,7 +2,7 @@ id = "m5-033"
 kind = "rename-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: rename-vs-caller #7 (summarize->sum_entries/summarize_twice)"
+made_by = "hord-eval-m5 generate v3: rename-vs-caller #7 (summarize->sum_entries/summarize_twice)"
 script = [
     "give_up",
     "give_up",

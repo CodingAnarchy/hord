@@ -2,7 +2,7 @@ id = "m5-063"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: field-vs-literal #13 (Badge.tier/starter_badge)"
+made_by = "hord-eval-m5 generate v3: field-vs-literal #13 (Badge.tier/starter_badge)"
 script = ["resolve"]
 
 [base]

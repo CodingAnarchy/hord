@@ -2,7 +2,7 @@ id = "m5-058"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: field-vs-literal #8 (Device.port/loopback_device)"
+made_by = "hord-eval-m5 generate v3: field-vs-literal #8 (Device.port/loopback_device)"
 script = ["resolve"]
 
 [base]

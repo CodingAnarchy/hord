@@ -2,7 +2,7 @@ id = "m5-053"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: field-vs-literal #3 (Order.priority/rush_order)"
+made_by = "hord-eval-m5 generate v3: field-vs-literal #3 (Order.priority/rush_order)"
 script = [
     "over_budget",
     "resolve",

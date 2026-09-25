@@ -2,7 +2,7 @@ id = "m5-092"
 kind = "contradiction"
 conflict = "semantic"
 ambiguous = true
-made_by = "hord-eval-m5 generate v2: contradiction #4 (rate x3 or x8)"
+made_by = "hord-eval-m5 generate v3: contradiction #4 (rate x3 or x8)"
 script = [
     "wrong",
     "wrong",

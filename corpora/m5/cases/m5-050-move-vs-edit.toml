@@ -2,7 +2,7 @@ id = "m5-050"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v2: move-vs-edit #12 (parse_seed into seeds)"
+made_by = "hord-eval-m5 generate v3: move-vs-edit #12 (parse_seed into seeds)"
 script = [
     "wrong",
     "resolve",

@@ -151,6 +151,7 @@ fn scripted_expectations(
         (Step::Sleep, "killed"),
         (Step::OverBudget, "over_budget"),
         (Step::Tamper, "tampered"),
+        (Step::TamperOwn, "tampered"),
     ] {
         if played[..until].contains(&step) && !r.attempts.iter().any(|a| a.outcome == outcome) {
             failures.push(format!(
