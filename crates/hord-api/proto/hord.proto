@@ -41,7 +41,8 @@ service RepoBackend {
   rpc Submit(SubmitRequest) returns (SubmitResponse);
   // Lander queue entries, in submission order.
   rpc Queue(QueueQuery) returns (QueueResponse);
-  // Resolve a parked change (spec §6.4 rung 3). UNIMPLEMENTED until M5.
+  // Resolve a parked change (spec §6.4 rung 3): FAILED_PRECONDITION
+  // unless it is conflicted or needs arbitration.
   rpc Arbitrate(ArbitrateRequest) returns (ArbitrateResponse);
 
   // Landed changes that touched a node, in landing order.
@@ -321,6 +322,16 @@ enum QueueStatus {
   // (such as a review); see the report's `policy`. Attach it and submit
   // again.
   QUEUE_STATUS_PARKED = 5;
+  // The replay harness is working on it, or its replay is in the queue
+  // (spec §6.4 rung 2); see `escalation`.
+  QUEUE_STATUS_REPLAYING = 6;
+  // Replays ran out: parked for an arbiter (spec §6.4 rung 3); see
+  // `escalation`.
+  QUEUE_STATUS_NEEDS_ARBITRATION = 7;
+  // Resolved: a replay of it landed as `landed`.
+  QUEUE_STATUS_REPLAYED = 8;
+  // Resolved: an arbiter's resolution landed as `landed`.
+  QUEUE_STATUS_ARBITRATED = 9;
 }
 
 // One submission in the lander queue (`hord queue`).
@@ -349,6 +360,9 @@ message QueueEntry {
   bool hard = 11;
   // The lander's findings; unset while queued.
   ConflictReport report = 12;
+  // Replay attempts, arbitration candidates, and the conflict summary, once
+  // the change entered the escalation ladder (spec §6.4).
+  Escalation escalation = 13;
 }
 
 // Which rule of spec §6.3 a set conflict broke.
@@ -467,12 +481,245 @@ message ArbitrateRequest {
   string change = 1;
   // What to do.
   Arbitration action = 2;
+  // Who resolves it: the resolution's author and the `Arbitrated` event's
+  // `by`. Unset: the backend's own actor.
+  Actor arbiter = 3;
+  // With `replay`: a note for the harness, added to the replay request.
+  optional string note = 4;
+  // Id of the key that made `signature` (spec §10.5.4).
+  optional string key_id = 5;
+  // The arbiter's Ed25519 signature over the decision (domain
+  // `hord.arbitration`: the parked change, the action, the resolving change,
+  // and the note), stored on the `Arbitrated` event. It must verify; with
+  // tokens, the key must be bound to the arbiter, who is the token's actor.
+  optional bytes signature = 6;
 }
 
 // The change that resolved it.
 message ArbitrateResponse {
-  // ChangeId of the resolution.
+  // ChangeId of the resolution as submitted to the lander; for `replay`,
+  // the parked change itself.
   string change = 1;
+  // The parked change's queue entry after the request.
+  QueueEntry entry = 2;
+}
+
+// ---------------------------------------------------------------- replay and arbitration
+
+// What one replay attempt may spend (spec §6.6 `Budget`, ADR 0028).
+message Budget {
+  // Wall-clock time; the lander kills a harness that runs longer.
+  uint64 wall_time_ms = 1;
+  // Model tokens the harness may report; unset is no limit.
+  optional uint64 tokens = 2;
+  // Cost the harness may report, in millionths of a US dollar; unset is
+  // no limit.
+  optional uint64 cost_micros = 3;
+}
+
+// A tagged intent item: a ref (`issue`, `url`, `change`, `git`) or an
+// acceptance criterion (`test`, `check`, `invariant`), as in intent files.
+message IntentItem {
+  // The tag.
+  string kind = 1;
+  // Its value.
+  string value = 2;
+}
+
+// A change's intent (spec §3.5 `Intent`).
+message ChangeIntent {
+  // One line.
+  string summary = 1;
+  // The full task description.
+  string body = 2;
+  // Issue ids, URLs, changes, git commits.
+  repeated IntentItem refs = 3;
+  // Machine-checkable acceptance criteria.
+  repeated IntentItem acceptance = 4;
+}
+
+// A change's provenance (spec §3.5 `Provenance`).
+message ChangeProvenance {
+  // Its author.
+  Actor actor = 1;
+  // Toolchain object id.
+  string toolchain = 2;
+  // When it was created.
+  uint64 created_at_ms = 3;
+  // Harness session id.
+  optional string session = 4;
+  // The change it replays, if it is a replay.
+  optional string parent_intent = 5;
+}
+
+// One side of a collision in a conflict summary.
+message ConflictSide {
+  // The change.
+  string change = 1;
+  // Its intent summary.
+  string intent = 2;
+  // Its author.
+  Actor actor = 3;
+  // Whether it landed (ours) or is the parked change (theirs).
+  bool landed = 4;
+  // What it did to the contested definitions and files, one line each.
+  repeated string changed = 5;
+}
+
+// Machine-generated conflict summary (spec §6.4 rung 3): which nodes,
+// which intents collided, and what each side changed.
+message ConflictSummary {
+  // The parked change.
+  string change = 1;
+  // Contested definitions, with names where known.
+  repeated NodeRef nodes = 2;
+  // Contested files.
+  repeated string paths = 3;
+  // The parked change first, then each landed change it collided with.
+  repeated ConflictSide sides = 4;
+  // Why it could not land, in words: merge conflicts or the verification
+  // failure.
+  repeated string reasons = 5;
+  // The whole summary as text, for a prompt or a terminal.
+  string text = 6;
+}
+
+// Sent to a replay harness as one JSON line on stdin (spec §6.6), in the
+// canonical protobuf JSON mapping.
+message ReplayRequest {
+  // The change being replayed (its intent is re-executed).
+  string change = 1;
+  // Attempt number, from 1.
+  uint32 attempt = 2;
+  // The change's intent.
+  ChangeIntent intent = 3;
+  // The change's provenance.
+  ChangeProvenance provenance = 4;
+  // The new base snapshot the workspace is on.
+  string base = 5;
+  // The workspace to work in, on `base`.
+  string workspace = 6;
+  // Its directory.
+  string workspace_path = 7;
+  // The repository root, where `hord` commands run.
+  string repo = 8;
+  // Why the change did not land.
+  ConflictReport conflict = 9;
+  // The conflict in brief.
+  ConflictSummary summary = 10;
+  // What this attempt may spend.
+  Budget budget = 11;
+  // An arbiter's note, when an arbiter asked for this replay.
+  optional string note = 12;
+}
+
+// The harness proposed a change.
+message ReplayProposed {
+  // Its ChangeId, proposed from the request's workspace.
+  string change = 1;
+}
+
+// The harness gave up.
+message ReplayGaveUp {
+  // Why.
+  string reason = 1;
+}
+
+// A replay harness's answer: one JSON line on stdout (spec §6.6).
+message ReplayResult {
+  oneof status {
+    // A change was proposed.
+    ReplayProposed proposed = 1;
+    // No change.
+    ReplayGaveUp gave_up = 2;
+  }
+  // Model tokens used, as the harness reports them.
+  optional uint64 tokens = 3;
+  // Cost, in millionths of a US dollar, as the harness reports it.
+  optional uint64 cost_micros = 4;
+  // Model name, for tracing a result (ADR 0029).
+  optional string model = 5;
+}
+
+// How a replay attempt ended.
+enum ReplayOutcome {
+  REPLAY_OUTCOME_UNSPECIFIED = 0;
+  // Still running.
+  REPLAY_OUTCOME_RUNNING = 1;
+  // Proposed a change, submitted to the lander as `change`.
+  REPLAY_OUTCOME_PROPOSED = 2;
+  // The harness gave up.
+  REPLAY_OUTCOME_GAVE_UP = 3;
+  // Killed: it ran past its wall-clock budget.
+  REPLAY_OUTCOME_KILLED = 4;
+  // Rejected: it reported tokens or cost over its budget.
+  REPLAY_OUTCOME_OVER_BUDGET = 5;
+  // The harness failed or broke the protocol.
+  REPLAY_OUTCOME_FAILED = 6;
+}
+
+// One replay attempt (ADR 0029: one replay per attempt).
+message ReplayAttempt {
+  // Attempt number, from 1.
+  uint32 attempt = 1;
+  // The harness that ran it.
+  string harness = 2;
+  // How it ended.
+  ReplayOutcome outcome = 3;
+  // The replay change submitted to the lander (with `parent_intent` set).
+  optional string change = 4;
+  // What happened, in words: the harness's reason, or how the replay
+  // change settled.
+  optional string detail = 5;
+  // Wall-clock time the harness ran.
+  uint64 elapsed_ms = 6;
+  // Tokens the harness reported.
+  optional uint64 tokens = 7;
+  // Cost the harness reported, in micro-dollars.
+  optional uint64 cost_micros = 8;
+  // Model the harness reported.
+  optional string model = 9;
+  // The arbiter's note it ran with.
+  optional string note = 10;
+}
+
+// A replay result offered to the arbiter. Attempts with equal semantic
+// ops are one candidate (ADR 0029).
+message ArbitrationCandidate {
+  // The replay change; `--pick` lands it with `Arbitration.resolved`.
+  string change = 1;
+  // The attempts that produced it.
+  repeated uint32 attempts = 2;
+  // Its base snapshot.
+  string base = 3;
+  // Result snapshot.
+  string result = 4;
+  // Number of ops.
+  uint32 ops = 5;
+  // How it settled in the lander.
+  string settled = 6;
+}
+
+// A change's way up the escalation ladder (spec §6.4).
+message Escalation {
+  // Replay attempts, oldest first.
+  repeated ReplayAttempt attempts = 1;
+  // Candidates for the arbiter, once parked.
+  repeated ArbitrationCandidate candidates = 2;
+  // The conflict summary.
+  ConflictSummary summary = 3;
+  // A resolution submitted by an arbiter, not yet landed.
+  optional string resolution = 4;
+  // Why the last resolution or replay did not help, if it did not.
+  optional string note = 5;
+}
+
+// `hord replay`.
+message ReplayRunResult {
+  // The replayed change.
+  string change = 1;
+  // The attempt that ran.
+  ReplayAttempt attempt = 2;
 }
 
 // ---------------------------------------------------------------- queries
@@ -720,6 +967,10 @@ message Arbitrated {
   Actor by = 2;
   // The resolving change.
   string result = 3;
+  // Id of the key that made `signature`.
+  optional string key_id = 4;
+  // The arbiter's signature over the decision, as given to Arbitrate.
+  optional bytes signature = 5;
 }
 
 // A change landed.

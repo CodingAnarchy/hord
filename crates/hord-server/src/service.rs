@@ -14,7 +14,7 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{AuthStore, Principal};
 use crate::hosts::Hosts;
-use crate::ingest::{check_evidence_async, check_submit};
+use crate::ingest::{check_arbitration, check_evidence_async, check_submit};
 use crate::route::RepoName;
 
 type GrpcResult<T> = Result<Response<T>, Status>;
@@ -165,7 +165,11 @@ impl GrpcTrait for GrpcRepoBackend {
         &self,
         request: Request<proto::ArbitrateRequest>,
     ) -> GrpcResult<proto::ArbitrateResponse> {
-        unary!(self, request, arbitrate)
+        let backend = self.backend(&request)?;
+        let principal = request.extensions().get::<Principal>().cloned();
+        let mut request = request.into_inner();
+        check_arbitration(self.auth.clone(), principal, &mut request).await?;
+        Ok(Response::new(backend.arbitrate(request).await?))
     }
 
     async fn node_history(

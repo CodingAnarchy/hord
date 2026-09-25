@@ -311,3 +311,135 @@ async fn tokens_scopes_provenance_and_signatures_are_enforced() -> TestResult {
     assert!(sign::verify_evidence(&stored, &bot_key.public()).is_err());
     Ok(())
 }
+
+/// Spec §6.4 rung 3 over a server that requires tokens: arbitrating needs
+/// the `arbitrate` scope, the arbiter is the token's actor, and the
+/// decision is signed with a key bound to it; the `Arbitrated` event
+/// carries that signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arbitration_is_scoped_and_signed_by_the_arbiter() -> TestResult {
+    use hord_txn::{Arbitration, BeginOptions};
+    let dir = temp("arbitrate")?;
+    let repo_dir = dir.0.join("repo");
+    let repo = Repo::create(&repo_dir).await?;
+    let lib: RepoPath = "src/lib.rs".parse()?;
+    let seed_actor = Actor::Human { id: "seed".into() };
+    repo.bootstrap(
+        vec![(lib.clone(), b"pub fn a() -> u32 {\n    1\n}\n".to_vec())],
+        Intent::from_summary("seed"),
+        seed_actor.clone(),
+    )
+    .await?;
+    let mut changes = Vec::new();
+    for n in [2, 3] {
+        let mut ws = repo
+            .begin(BeginOptions::at_head(seed_actor.clone()))
+            .await?;
+        ws.write_file(&lib, format!("pub fn a() -> u32 {{\n    {n}\n}}\n"))
+            .await?;
+        let proposal = ws
+            .propose(Intent::from_summary(format!("a is {n}")))
+            .await?;
+        repo.submit(proposal.change).await?;
+        changes.push(proposal.change);
+    }
+    repo.land_local().await?;
+    let parked = changes[1];
+    assert_eq!(
+        repo.status(parked).await?.status,
+        hord_txn::QueueStatus::Conflicted
+    );
+    drop(repo);
+
+    let auth = dir.0.join("auth.toml");
+    AuthStore::add_user(&auth, "ann", "pw", &[Scope::Read, Scope::Arbitrate])?;
+    AuthStore::add_user(&auth, "rita", "pw", &[Scope::Read])?;
+    let (url, _stop) = serve(&repo_dir, &auth).await?;
+    let anonymous = RemoteRepo::connect(&url).await?;
+    let connect = |user: &'static str, key_id: String| {
+        let anonymous = anonymous.clone();
+        let url = url.clone();
+        async move {
+            let token = anonymous
+                .auth()
+                .login(proto::LoginRequest {
+                    user: user.into(),
+                    password: "pw".into(),
+                    key_id,
+                })
+                .await?
+                .token;
+            Ok::<_, Box<dyn std::error::Error>>(RemoteRepo::connect_with_token(&url, &token).await?)
+        }
+    };
+    let ann_key = SigningKey::generate()?;
+    let ann = connect("ann", ann_key.public().key_id()).await?;
+    let rita_key = SigningKey::generate()?;
+    let rita = connect("rita", rita_key.public().key_id()).await?;
+
+    let theirs = Arbitration::PickTheirs;
+    let request =
+        |signature: Option<hord_core::Signature>, arbiter: Option<Actor>| proto::ArbitrateRequest {
+            change: wire::id(parked),
+            action: Some(proto::Arbitration {
+                action: Some(proto::arbitration::Action::PickTheirs(true)),
+            }),
+            arbiter: arbiter.as_ref().map(wire::actor),
+            note: None,
+            key_id: signature.as_ref().map(|s| s.key_id.clone()),
+            signature: signature.map(|s| s.bytes.as_slice().to_vec()),
+        };
+    let signed = |key: &SigningKey| hord_txn::sign_arbitration(parked, &theirs, key);
+    denied(
+        rita.arbitrate(request(Some(signed(&rita_key)?), None))
+            .await,
+        "requires scope arbitrate",
+    )?;
+    denied(ann.arbitrate(request(None, None)).await, "unsigned")?;
+    denied(
+        ann.arbitrate(request(Some(signed(&SigningKey::generate()?)?), None))
+            .await,
+        "not bound to any actor",
+    )?;
+    denied(
+        ann.arbitrate(request(
+            Some(signed(&ann_key)?),
+            Some(Actor::Human { id: "rita".into() }),
+        ))
+        .await,
+        "cannot submit a decision by human rita",
+    )?;
+    // A signature over another decision does not verify.
+    let ours = hord_txn::sign_arbitration(parked, &Arbitration::PickOurs, &ann_key)?;
+    let err = ann.arbitrate(request(Some(ours), None)).await;
+    assert!(
+        matches!(err, Err(ApiError::InvalidArgument(ref m)) if m.contains("bad signature")),
+        "{err:?}"
+    );
+
+    let mut events = ann.events(proto::EventsRequest { from: Some(0) }).await?;
+    let reply = ann
+        .arbitrate(request(Some(signed(&ann_key)?), None))
+        .await?;
+    let arbitrated = loop {
+        use tokio_stream::StreamExt;
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), events.next())
+            .await?
+            .ok_or("event stream ended")??;
+        if let Some(proto::event::Kind::Arbitrated(a)) = envelope.event.and_then(|e| e.kind) {
+            break a;
+        }
+    };
+    assert_eq!(arbitrated.change, wire::id(parked));
+    assert_eq!(arbitrated.result, reply.change);
+    assert_eq!(
+        arbitrated.by,
+        Some(wire::actor(&Actor::Human { id: "ann".into() }))
+    );
+    let signature = hord_core::Signature {
+        key_id: arbitrated.key_id.ok_or("key id")?,
+        bytes: Bytes::new(arbitrated.signature.ok_or("signature")?),
+    };
+    hord_txn::verify_arbitration(parked, &theirs, &signature, &ann_key.public())?;
+    Ok(())
+}

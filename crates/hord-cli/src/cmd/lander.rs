@@ -19,6 +19,10 @@ fn status_name(entry: &proto::QueueEntry) -> &'static str {
         proto::QueueStatus::Conflicted => "conflicted",
         proto::QueueStatus::Rejected => "rejected",
         proto::QueueStatus::Parked => "parked",
+        proto::QueueStatus::Replaying => "replaying",
+        proto::QueueStatus::NeedsArbitration => "arbitration",
+        proto::QueueStatus::Replayed => "replayed",
+        proto::QueueStatus::Arbitrated => "arbitrated",
         proto::QueueStatus::Unspecified => "unknown",
     }
 }
@@ -235,6 +239,55 @@ pub fn run_conflicts(json: bool, target: &Target, change: String) -> Result<()> 
     Ok(())
 }
 
+/// The conflict summary, replay attempts, and arbitration candidates.
+fn print_escalation(escalation: &proto::Escalation) {
+    if let Some(summary) = &escalation.summary {
+        println!();
+        for line in summary.text.lines() {
+            println!("  {line}");
+        }
+        println!();
+    }
+    for attempt in &escalation.attempts {
+        let outcome = match attempt.outcome() {
+            proto::ReplayOutcome::Running => "running",
+            proto::ReplayOutcome::Proposed => "proposed",
+            proto::ReplayOutcome::GaveUp => "gave up",
+            proto::ReplayOutcome::Killed => "killed (over its time budget)",
+            proto::ReplayOutcome::OverBudget => "over budget",
+            proto::ReplayOutcome::Failed => "failed",
+            proto::ReplayOutcome::Unspecified => "unknown",
+        };
+        let mut line = format!(
+            "replay {} by {}: {outcome}",
+            attempt.attempt, attempt.harness
+        );
+        if let Some(change) = &attempt.change {
+            line.push_str(&format!(" {}", short(change)));
+        }
+        if let Some(detail) = &attempt.detail {
+            line.push_str(&format!(" ({detail})"));
+        }
+        println!("{line}");
+    }
+    for candidate in &escalation.candidates {
+        let attempts: Vec<String> = candidate.attempts.iter().map(ToString::to_string).collect();
+        println!(
+            "candidate {} from attempt{} {} ({} ops)",
+            candidate.change,
+            if attempts.len() == 1 { "" } else { "s" },
+            attempts.join(", "),
+            candidate.ops
+        );
+    }
+    if let Some(resolution) = &escalation.resolution {
+        println!("resolution {} is in the queue", short(resolution));
+    }
+    if let Some(note) = &escalation.note {
+        println!("note: {note}");
+    }
+}
+
 fn kind_name(kind: proto::ConflictKind) -> &'static str {
     match kind {
         proto::ConflictKind::WriteWrite => "write-write",
@@ -306,8 +359,19 @@ fn print_report(result: &proto::ConflictsResult) {
             println!("  because {trigger}");
         }
     }
+    if let Some(escalation) = result.entry.as_ref().and_then(|e| e.escalation.as_ref()) {
+        print_escalation(escalation);
+    }
     match result.entry.as_ref().map(status_name) {
-        Some("conflicted") => println!("parked: needs replay (spec §6.4)"),
+        Some("conflicted") => println!(
+            "parked: no replay harness ran; resolve with `hord arbitrate {}` or `hord replay`",
+            report.change
+        ),
+        Some("replaying") => println!("replaying (spec §6.4 rung 2)"),
+        Some("arbitration") => println!(
+            "parked for arbitration: `hord arbitrate {} --pick ours|theirs|<candidate>`",
+            report.change
+        ),
         Some("parked") => println!("parked: attach the evidence policy requires and submit again"),
         Some("landed") if !report.clean => println!("landed, flagged for re-verification"),
         _ => {}

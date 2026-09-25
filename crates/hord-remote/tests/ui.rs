@@ -8,6 +8,7 @@
 //! - `hord serve` mounts the same router at `/` and `/r/<name>/`.
 //! - The recording plays back to the end on the landing strip.
 
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
@@ -15,6 +16,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -30,7 +32,7 @@ use hord_remote::RemoteRepo;
 use hord_server::{
     AuthStore, Hosts, ServeOptions, Server, ServerConfig, UI_REVIEW_KIND, UiSigner, save_recording,
 };
-use hord_txn::{BeginOptions, Repo, RepoOptions};
+use hord_txn::{BeginOptions, ReplayFuture, ReplayHarness, Repo, RepoOptions};
 use hord_ui::UI_TOKEN_COOKIE;
 use hord_ui::audit::{AuditLog, Audited, unlisted};
 use hord_ui::{SingleRepo, UiRepo};
@@ -114,10 +116,19 @@ async fn serve(root: &Path) -> TestResult<Running> {
 }
 
 async fn serve_with(root: &Path, setup: impl FnOnce(Server) -> Server) -> TestResult<Running> {
+    serve_harness(root, None, setup).await
+}
+
+async fn serve_harness(
+    root: &Path,
+    harness: Option<Arc<dyn ReplayHarness>>,
+    setup: impl FnOnce(Server) -> Server,
+) -> TestResult<Running> {
     let hosts = Hosts::open_repo(
         root,
         RepoOptions {
             verifier: Some(Arc::new(hord_txn::StubVerifier)),
+            harness,
             ..RepoOptions::default()
         },
     )
@@ -275,6 +286,7 @@ async fn every_view_renders_over_the_wire_and_calls_only_listed_rpcs() -> TestRe
         backend: Arc::new(Audited::new(Arc::new(remote.clone()), log.clone())),
         changes: Arc::new(Audited::new(Arc::new(remote.changes()), log.clone())),
         review: None,
+        arbiter: None,
         name: "ui-test".into(),
         base: String::new(),
     })));
@@ -328,7 +340,7 @@ async fn every_view_renders_over_the_wire_and_calls_only_listed_rpcs() -> TestRe
         "action=workspace",
     )
     .await?;
-    has(&ws, "hord ws new --base")?;
+    has(&ws, &format!("hord arbitrate {} --edit", sc.parked))?;
 
     // Playback: the recording is listed, and scrubbing to the end shows
     // what the live strip shows.
@@ -613,4 +625,319 @@ async fn with_auth_the_ui_checks_scopes_and_signs_reviews() -> TestResult {
     sign::verify_evidence(&evidence, &ada_key.public())?;
     running.stop().await;
     Ok(())
+}
+
+/// The arbitration round-trip (M5): a parked change resolved from the
+/// workbench lands as a change with both parents, and the `Arbitrated`
+/// event carries the arbiter's signature over the decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_change_resolved_from_the_workbench_lands_with_both_parents() -> TestResult {
+    let sc = scenario().await?;
+    sc.running.stop().await;
+    let key = Arc::new(SigningKey::generate()?);
+    let signer = UiSigner {
+        actor: Actor::Human {
+            id: "arbiter".into(),
+        },
+        key: Arc::clone(&key),
+    };
+    let running = serve_with(&sc.dir.0, |server| server.with_ui_signer(signer)).await?;
+    let addr = running.addr;
+
+    // The workbench offers the decision while the change is parked.
+    let (status, bench) = http1(addr, &format!("/arbitrate/{}", sc.parked), false).await?;
+    assert_eq!(status, 200, "{bench}");
+    has(&bench, "value=\"pick_theirs\"")?;
+    has(&bench, "conflict check")?;
+
+    let (status, _, acted) = with_cookie(
+        addr,
+        "POST",
+        &format!("/arbitrate/{}", sc.parked),
+        "",
+        "action=pick_theirs",
+    )
+    .await?;
+    assert_eq!(status, 200, "{acted}");
+    has(&acted, "lands with both as parents")?;
+
+    // The lander lands the resolution.
+    let remote = RemoteRepo::connect(&running.url()).await?;
+    let mut entry = None;
+    for _ in 0..300 {
+        let queue = remote
+            .queue(proto::QueueQuery {
+                change: Some(sc.parked.clone()),
+                ..Default::default()
+            })
+            .await?;
+        if let Some(last) = queue.entries.last()
+            && last.status() == proto::QueueStatus::Arbitrated
+        {
+            entry = Some(last.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let entry = entry.ok_or("the parked change was never arbitrated")?;
+    let landed = entry.landed.clone().ok_or("the resolution landed")?;
+
+    // Both parents: the parked change and what it collided with.
+    let resolution = remote
+        .changes()
+        .get_change(proto::GetChangeRequest {
+            change: landed.clone(),
+        })
+        .await?;
+    assert!(
+        resolution.parents.contains(&sc.parked),
+        "{:?}",
+        resolution.parents
+    );
+    let collided = remote
+        .changes()
+        .get_change(proto::GetChangeRequest {
+            change: sc.landed.clone(),
+        })
+        .await?
+        .queue
+        .and_then(|q| q.landed)
+        .unwrap_or_else(|| sc.landed.clone());
+    assert!(
+        resolution.parents.contains(&collided),
+        "{:?}",
+        resolution.parents
+    );
+
+    // A signed Arbitrated event, verifiable with the arbiter's key. The
+    // queue entry can settle before the event is in the log: wait for it.
+    let mut arbitrated = None;
+    for _ in 0..300 {
+        let view = remote
+            .changes()
+            .get_change(proto::GetChangeRequest {
+                change: sc.parked.clone(),
+            })
+            .await?;
+        arbitrated = view.history.iter().find_map(|e| {
+            match e.event.as_ref().and_then(|e| e.kind.as_ref()) {
+                Some(Kind::Arbitrated(a)) => Some(a.clone()),
+                _ => None,
+            }
+        });
+        if arbitrated.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let arbitrated = arbitrated.ok_or("an Arbitrated event")?;
+    assert_eq!(
+        arbitrated.key_id.as_deref(),
+        Some(key.public().key_id().as_str())
+    );
+    let signature = hord_core::Signature {
+        key_id: arbitrated.key_id.clone().ok_or("key id")?,
+        bytes: Bytes::new(arbitrated.signature.clone().ok_or("signature")?),
+    };
+    hord_txn::verify_arbitration(
+        wire::object_id("parked", &sc.parked)?,
+        &hord_txn::Arbitration::PickTheirs,
+        &signature,
+        &key.public(),
+    )?;
+
+    // The workbench and the strip now say it was resolved.
+    let (_, after) = http1(addr, &format!("/arbitrate/{}", sc.parked), false).await?;
+    has(&after, "arbitrated, landed as")?;
+    assert!(
+        !after.contains("value=\"pick_theirs\""),
+        "no decision left to make"
+    );
+    has(&after, "signed with")?;
+    let (_, strip) = http1(addr, "/", false).await?;
+    has(&strip, "stage-arbitrated")?;
+    running.stop().await;
+    Ok(())
+}
+
+/// One scripted replay: give up (`None`), or replace `from` with `to`.
+type Step = Option<(&'static str, &'static str)>;
+
+/// A replay harness that plays a script in process: `None` gives up, and
+/// `Some((from, to))` edits `src/lib.rs` in the replay workspace and
+/// proposes. It records the notes it was sent.
+#[derive(Clone, Default)]
+struct Scripted {
+    steps: Arc<Mutex<VecDeque<Step>>>,
+    notes: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl ReplayHarness for Scripted {
+    fn name(&self) -> String {
+        "scripted".into()
+    }
+
+    fn replay(&self, request: proto::ReplayRequest, repo: Repo) -> ReplayFuture {
+        if let Ok(mut notes) = self.notes.lock() {
+            notes.push(request.note.clone());
+        }
+        let step = self.steps.lock().ok().and_then(|mut s| s.pop_front());
+        Box::pin(async move {
+            use proto::replay_result::Status;
+            let Some(Some((from, to))) = step else {
+                return Ok(proto::ReplayResult {
+                    status: Some(Status::GaveUp(proto::ReplayGaveUp {
+                        reason: "the script says no".into(),
+                    })),
+                    ..Default::default()
+                });
+            };
+            let id = request
+                .workspace
+                .parse()
+                .map_err(|e| format!("workspace: {e:?}"))?;
+            let mut ws = repo
+                .open_workspace(id, agent("replayer"), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let file: RepoPath = "src/lib.rs".parse().map_err(|e| format!("{e:?}"))?;
+            let text = ws
+                .read_file(&file)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("src/lib.rs")?;
+            let text = String::from_utf8(text.as_slice().to_vec()).map_err(|e| e.to_string())?;
+            ws.write_file(&file, text.replacen(from, to, 1))
+                .await
+                .map_err(|e| e.to_string())?;
+            let proposal = ws
+                .propose(Intent::from_summary("replay: keep both"))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(proto::ReplayResult {
+                status: Some(Status::Proposed(proto::ReplayProposed {
+                    change: proposal.change.to_hex(),
+                })),
+                tokens: Some(42),
+                cost_micros: Some(1_500),
+                model: Some("scripted".into()),
+            })
+        })
+    }
+}
+
+/// Rung 2 from the workbench: a replay with the arbiter's note reaches the
+/// harness, each attempt shows how it ended, and a replay that proposes a
+/// change resolves the parked one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_workbench_reruns_replay_with_a_note_and_shows_each_attempt() -> TestResult {
+    let sc = scenario().await?;
+    sc.running.stop().await;
+    let harness = Scripted {
+        steps: Arc::new(Mutex::new(VecDeque::from([
+            None,
+            Some(("    20\n", "    22\n")),
+        ]))),
+        notes: Arc::default(),
+    };
+    let key = Arc::new(SigningKey::generate()?);
+    let signer = UiSigner {
+        actor: Actor::Human {
+            id: "arbiter".into(),
+        },
+        key,
+    };
+    let running = serve_harness(
+        &sc.dir.0,
+        Some(Arc::new(harness.clone()) as Arc<dyn ReplayHarness>),
+        |server| server.with_ui_signer(signer),
+    )
+    .await?;
+    let addr = running.addr;
+    let remote = RemoteRepo::connect(&running.url()).await?;
+
+    // First replay: the harness gives up.
+    let (status, _, acted) = with_cookie(
+        addr,
+        "POST",
+        &format!("/arbitrate/{}", sc.parked),
+        "",
+        "action=replay&note=keep+both+values",
+    )
+    .await?;
+    assert_eq!(status, 200, "{acted}");
+    has(&acted, "Replay requested")?;
+    let mut settled = false;
+    for _ in 0..300 {
+        let e = latest(&remote, &sc.parked).await?;
+        let done = e.escalation.as_ref().is_some_and(|x| {
+            x.attempts
+                .iter()
+                .any(|a| a.outcome() == proto::ReplayOutcome::GaveUp)
+        });
+        if done && present_status_is_open(&e) {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(settled, "the first replay never settled");
+    let notes = harness.notes.lock().map(|n| n.clone()).unwrap_or_default();
+    assert_eq!(notes.first(), Some(&Some("keep both values".to_owned())));
+    let (_, bench) = http1(addr, &format!("/arbitrate/{}", sc.parked), false).await?;
+    has(&bench, "Replay attempts")?;
+    has(&bench, "gave up: the script says no")?;
+    has(&bench, "keep both values")?;
+    has(&bench, "replay #1 (scripted)")?;
+
+    // Second replay: the harness proposes a change, which lands and
+    // resolves the parked one.
+    with_cookie(
+        addr,
+        "POST",
+        &format!("/arbitrate/{}", sc.parked),
+        "",
+        "action=replay",
+    )
+    .await?;
+    let mut resolved = None;
+    for _ in 0..300 {
+        let e = latest(&remote, &sc.parked).await?;
+        if e.status() == proto::QueueStatus::Replayed {
+            resolved = Some(e);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let resolved = resolved.ok_or("the second replay never resolved it")?;
+    assert!(resolved.landed.is_some());
+    let (_, bench) = http1(addr, &format!("/arbitrate/{}", sc.parked), false).await?;
+    has(&bench, "resolved by replay, landed as")?;
+    has(&bench, "proposed a change")?;
+    has(&bench, "42 tokens")?;
+    assert!(
+        !bench.contains("value=\"pick_theirs\""),
+        "no decision left to make"
+    );
+    running.stop().await;
+    Ok(())
+}
+
+/// The latest queue entry naming `change`.
+async fn latest(remote: &RemoteRepo, change: &str) -> TestResult<proto::QueueEntry> {
+    let queue = remote
+        .queue(proto::QueueQuery {
+            change: Some(change.to_owned()),
+            ..Default::default()
+        })
+        .await?;
+    Ok(queue.entries.last().cloned().ok_or("a queue entry")?)
+}
+
+/// Whether an arbiter can act on the entry (conflicted or out of replays).
+fn present_status_is_open(entry: &proto::QueueEntry) -> bool {
+    matches!(
+        entry.status(),
+        proto::QueueStatus::Conflicted | proto::QueueStatus::NeedsArbitration
+    )
 }

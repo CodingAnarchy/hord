@@ -219,12 +219,19 @@ impl Strip {
     /// then follows events, which carry no summary.
     pub fn seed(&mut self, entry: &proto::QueueEntry) {
         let i = self.row_for(&entry.change);
-        if let Some(landed) = entry.landed.as_ref().filter(|l| **l != entry.change) {
+        // A landed entry's `landed` is the same change rebased (ADR 0018);
+        // a replayed or arbitrated entry's is the resolution, which has a
+        // queue entry and a row of its own.
+        let rebased = (entry.status() == proto::QueueStatus::Landed)
+            .then(|| entry.landed.clone())
+            .flatten()
+            .filter(|l| *l != entry.change);
+        if let Some(landed) = &rebased {
             self.index.insert(landed.clone(), i);
         }
         let row = &mut self.rows[i];
         row.submission = Some(entry.seq);
-        row.landed = entry.landed.clone().filter(|l| *l != entry.change);
+        row.landed = rebased;
         if !entry.summary.is_empty() {
             row.summary = Some(entry.summary.clone());
         }
@@ -232,27 +239,27 @@ impl Strip {
             row.actor.clone_from(&entry.actor);
         }
         row.at_ms = row.at_ms.max(entry.updated_at_ms);
-        row.stage =
-            match entry.status() {
-                proto::QueueStatus::Landed => Stage::Landed {
-                    position: match row.stage {
-                        Stage::Landed { position } => position,
-                        _ => None,
-                    },
+        row.stage = match entry.status() {
+            proto::QueueStatus::Landed => Stage::Landed {
+                position: match row.stage {
+                    Stage::Landed { position } => position,
+                    _ => None,
                 },
-                proto::QueueStatus::Conflicted => Stage::Parked {
-                    reason: if entry
-                        .report
-                        .as_ref()
-                        .is_some_and(|r| r.verification.is_some())
-                    {
-                        proto::ParkReason::VerificationFailed
-                    } else {
-                        proto::ParkReason::MergeConflict
-                    },
-                    detail: String::new(),
+            },
+            proto::QueueStatus::Conflicted => Stage::Parked {
+                reason: if entry
+                    .report
+                    .as_ref()
+                    .is_some_and(|r| r.verification.is_some())
+                {
+                    proto::ParkReason::VerificationFailed
+                } else {
+                    proto::ParkReason::MergeConflict
                 },
-                proto::QueueStatus::Parked => Stage::Parked {
+                detail: String::new(),
+            },
+            proto::QueueStatus::Parked => {
+                Stage::Parked {
                     reason: if entry.report.as_ref().is_some_and(|r| {
                         r.policy.iter().any(|p| p.requirement.starts_with("review"))
                     }) {
@@ -261,13 +268,30 @@ impl Strip {
                         proto::ParkReason::Policy
                     },
                     detail: String::new(),
-                },
-                proto::QueueStatus::Rejected => Stage::Rejected {
-                    reason: entry.reason.clone().unwrap_or_default(),
-                },
-                // Queued: keep what events said (verifying, replaying).
-                proto::QueueStatus::Queued | proto::QueueStatus::Unspecified => row.stage.clone(),
-            };
+                }
+            }
+            proto::QueueStatus::Rejected => Stage::Rejected {
+                reason: entry.reason.clone().unwrap_or_default(),
+            },
+            proto::QueueStatus::Replaying => {
+                let last = entry.escalation.as_ref().and_then(|e| e.attempts.last());
+                Stage::Replaying {
+                    attempt: last.map_or(1, |a| a.attempt),
+                    harness: last.map(|a| a.harness.clone()).unwrap_or_default(),
+                }
+            }
+            proto::QueueStatus::NeedsArbitration => Stage::Parked {
+                reason: proto::ParkReason::NeedsArbitration,
+                detail: String::new(),
+            },
+            // Resolved by a replay or an arbiter: what landed is the
+            // resolution.
+            proto::QueueStatus::Replayed | proto::QueueStatus::Arbitrated => Stage::Arbitrated {
+                result: entry.landed.clone().unwrap_or_default(),
+            },
+            // Queued: keep what events said (verifying, replaying).
+            proto::QueueStatus::Queued | proto::QueueStatus::Unspecified => row.stage.clone(),
+        };
     }
 
     /// Changes whose rows have no summary yet, in row order.
@@ -552,6 +576,7 @@ mod tests {
                 change: "s".into(),
                 by: Some(agent("human")),
                 result: "r".into(),
+                ..Default::default()
             }),
         ));
         let row = &strip.rows()[0];
@@ -604,6 +629,37 @@ mod tests {
         let row = strip.row("l").expect("landed id is indexed");
         assert_eq!(row.stage, Stage::Landed { position: Some(3) });
         assert_eq!(row.summary.as_deref(), Some("Add a flag"));
+    }
+
+    #[test]
+    fn a_resolution_keeps_its_own_row() {
+        let mut strip = Strip::new();
+        strip.seed(&proto::QueueEntry {
+            seq: 1,
+            change: "parked".into(),
+            status: proto::QueueStatus::Arbitrated.into(),
+            landed: Some("resolution".into()),
+            summary: "Make two twenty-two".into(),
+            ..Default::default()
+        });
+        strip.seed(&proto::QueueEntry {
+            seq: 2,
+            change: "resolution".into(),
+            status: proto::QueueStatus::Landed.into(),
+            summary: "Arbitrate: take it".into(),
+            ..Default::default()
+        });
+        assert_eq!(strip.rows().len(), 2);
+        assert_eq!(
+            strip.rows()[0].stage,
+            Stage::Arbitrated {
+                result: "resolution".into()
+            }
+        );
+        assert_eq!(
+            strip.rows()[1].summary.as_deref(),
+            Some("Arbitrate: take it")
+        );
     }
 
     #[test]

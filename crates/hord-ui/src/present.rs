@@ -8,8 +8,9 @@ use hord_api::proto;
 use hord_api::proto::event::Kind;
 
 use crate::view::{
-    ChangeSide, ContestedView, EvidenceView, NodeView, OpLine, RungView, actor_label,
-    evidence_kind_label, evidence_result_label, park_reason_label, short_id,
+    AttemptView, CandidateView, ChangeSide, ContestedView, EvidenceView, NodeView, OpLine,
+    RungView, SideChange, actor_label, evidence_kind_label, evidence_result_label,
+    park_reason_label, short_id,
 };
 
 /// Intent and ops of a change.
@@ -96,6 +97,18 @@ pub fn status(entry: &proto::QueueEntry) -> String {
         },
         proto::QueueStatus::Conflicted => "parked: conflict".to_owned(),
         proto::QueueStatus::Parked => "parked: policy".to_owned(),
+        proto::QueueStatus::Replaying => "replaying".to_owned(),
+        proto::QueueStatus::NeedsArbitration => {
+            "parked: replays ran out, needs an arbiter".to_owned()
+        }
+        proto::QueueStatus::Replayed => match &entry.landed {
+            Some(landed) => format!("resolved by replay, landed as {}", short_id(landed)),
+            None => "resolved by replay".to_owned(),
+        },
+        proto::QueueStatus::Arbitrated => match &entry.landed {
+            Some(landed) => format!("arbitrated, landed as {}", short_id(landed)),
+            None => "arbitrated".to_owned(),
+        },
         proto::QueueStatus::Rejected => format!(
             "rejected: {}",
             entry.reason.as_deref().unwrap_or("no reason given")
@@ -145,7 +158,10 @@ fn kind(envelope: &proto::EventEnvelope) -> Option<&Kind> {
 /// outcomes, parking, arbitration, landing. Times are seconds since the
 /// first event.
 #[must_use]
-pub fn rungs(history: &[proto::EventEnvelope]) -> Vec<RungView> {
+pub fn rungs(
+    history: &[proto::EventEnvelope],
+    escalation: Option<&proto::Escalation>,
+) -> Vec<RungView> {
     let start = history.first().map_or(0, |e| e.at_ms);
     let mut out: Vec<RungView> = Vec::new();
     for envelope in history {
@@ -191,19 +207,28 @@ pub fn rungs(history: &[proto::EventEnvelope]) -> Vec<RungView> {
                 evidence_result_label(e.result.as_ref()).1,
             ),
             Some(Kind::Replaying(r)) => {
-                // A replay's outcome is whatever the change did next.
+                // The ladder records how the attempt ended; without that,
+                // its outcome is whatever the change did next.
+                let recorded = escalation
+                    .and_then(|e| e.attempts.iter().find(|a| a.attempt == r.attempt))
+                    .filter(|a| a.outcome() != proto::ReplayOutcome::Running)
+                    .map(attempt_outcome);
                 (
                     format!("replay #{} ({})", r.attempt, r.harness),
-                    "running".to_owned(),
+                    recorded.unwrap_or_else(|| "running".to_owned()),
                 )
             }
             Some(Kind::Parked(p)) => ("park".to_owned(), park_reason_label(p.reason()).to_owned()),
             Some(Kind::Arbitrated(a)) => (
                 "arbitrate".to_owned(),
                 format!(
-                    "{} resolved it as {}",
+                    "{} resolved it as {} ({})",
                     actor_label(a.by.as_ref()),
-                    short_id(&a.result)
+                    short_id(&a.result),
+                    match (&a.key_id, &a.signature) {
+                        (Some(key), Some(_)) => format!("signed with {key}"),
+                        _ => "unsigned".to_owned(),
+                    }
                 ),
             ),
             Some(Kind::Landed(l)) => ("land".to_owned(), format!("landed at #{}", l.position)),
@@ -299,6 +324,138 @@ pub fn contested(
     (contested, paths)
 }
 
+/// Whether an arbiter may act on the entry now (spec §6.4 rung 3).
+#[must_use]
+pub fn arbitrable(entry: Option<&proto::QueueEntry>) -> bool {
+    entry.is_some_and(|e| {
+        matches!(
+            e.status(),
+            proto::QueueStatus::Conflicted | proto::QueueStatus::NeedsArbitration
+        )
+    })
+}
+
+/// How a replay attempt ended, in words.
+#[must_use]
+pub fn attempt_outcome(attempt: &proto::ReplayAttempt) -> String {
+    let words = match attempt.outcome() {
+        proto::ReplayOutcome::Running => "running",
+        proto::ReplayOutcome::Proposed => "proposed a change",
+        proto::ReplayOutcome::GaveUp => "gave up",
+        proto::ReplayOutcome::Killed => "killed at its time budget",
+        proto::ReplayOutcome::OverBudget => "over its token or cost budget",
+        proto::ReplayOutcome::Failed => "harness failed",
+        proto::ReplayOutcome::Unspecified => "ended",
+    };
+    let mut out = words.to_owned();
+    if let Some(change) = &attempt.change {
+        out.push_str(&format!(" {}", short_id(change)));
+    }
+    if let Some(detail) = attempt.detail.as_ref().filter(|d| !d.is_empty()) {
+        out.push_str(&format!(": {detail}"));
+    }
+    out
+}
+
+/// Replay attempts for the workbench, oldest first.
+#[must_use]
+pub fn attempts(escalation: Option<&proto::Escalation>) -> Vec<AttemptView> {
+    escalation
+        .map(|e| e.attempts.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|a| {
+            let mut spent = vec![format!("{:.1}s", a.elapsed_ms as f64 / 1000.0)];
+            if let Some(tokens) = a.tokens {
+                spent.push(format!("{tokens} tokens"));
+            }
+            if let Some(micros) = a.cost_micros {
+                spent.push(format!("${:.4}", micros as f64 / 1_000_000.0));
+            }
+            if let Some(model) = &a.model {
+                spent.push(model.clone());
+            }
+            AttemptView {
+                attempt: a.attempt,
+                harness: a.harness.clone(),
+                class: match a.outcome() {
+                    proto::ReplayOutcome::Proposed => "pass",
+                    proto::ReplayOutcome::Running | proto::ReplayOutcome::Unspecified => "unknown",
+                    _ => "fail",
+                },
+                outcome: attempt_outcome(a),
+                change: a.change.clone(),
+                spent: spent.join(" · "),
+                note: a.note.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Arbitration candidates: one per distinct replay result (ADR 0029: the
+/// ladder already merged attempts with equal semantic ops).
+#[must_use]
+pub fn candidates(escalation: Option<&proto::Escalation>) -> Vec<CandidateView> {
+    escalation
+        .map(|e| e.candidates.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|c| CandidateView {
+            change: c.change.clone(),
+            short: short_id(&c.change).to_owned(),
+            attempts: c
+                .attempts
+                .iter()
+                .map(|a| format!("#{a}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            ops: c.ops,
+            settled: c.settled.clone(),
+        })
+        .collect()
+}
+
+/// The machine summary's reasons and each side's changes.
+#[must_use]
+pub fn summary(escalation: Option<&proto::Escalation>) -> (Vec<String>, Vec<SideChange>) {
+    let Some(summary) = escalation.and_then(|e| e.summary.as_ref()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let sides = summary
+        .sides
+        .iter()
+        .map(|s| SideChange {
+            label: format!(
+                "{} · {} · {}",
+                if s.landed {
+                    "ours (landed)"
+                } else {
+                    "theirs (parked)"
+                },
+                s.intent,
+                actor_label(s.actor.as_ref())
+            ),
+            change: s.change.clone(),
+            changed: s.changed.clone(),
+        })
+        .collect();
+    (summary.reasons.clone(), sides)
+}
+
+/// A resolution waiting to land, or why the last one did not help.
+#[must_use]
+pub fn pending(escalation: Option<&proto::Escalation>) -> Option<String> {
+    let e = escalation?;
+    match (&e.resolution, &e.note) {
+        (Some(resolution), _) => Some(format!(
+            "Resolution {} is in the lander.",
+            short_id(resolution)
+        )),
+        (None, Some(note)) if !note.is_empty() => Some(note.clone()),
+        _ => None,
+    }
+}
+
 /// Landed changes a parked change's report names, in order, without
 /// duplicates.
 #[must_use]
@@ -347,38 +504,94 @@ mod tests {
 
     #[test]
     fn replay_attempts_show_what_came_of_them() {
-        let rungs = rungs(&[
-            env(
-                1,
-                1_000,
-                Kind::Parked(proto::Parked {
-                    change: "c".into(),
-                    reason: proto::ParkReason::MergeConflict.into(),
-                    detail: String::new(),
-                }),
-            ),
-            env(
-                2,
-                2_500,
-                Kind::Replaying(proto::Replaying {
-                    change: "c".into(),
-                    attempt: 1,
-                    harness: "ref".into(),
-                }),
-            ),
-            env(
-                3,
-                4_000,
-                Kind::Rejected(proto::Rejected {
-                    change: "c".into(),
-                    reason: "acceptance test failed".into(),
-                }),
-            ),
-        ]);
+        let rungs = rungs(
+            &[
+                env(
+                    1,
+                    1_000,
+                    Kind::Parked(proto::Parked {
+                        change: "c".into(),
+                        reason: proto::ParkReason::MergeConflict.into(),
+                        detail: String::new(),
+                    }),
+                ),
+                env(
+                    2,
+                    2_500,
+                    Kind::Replaying(proto::Replaying {
+                        change: "c".into(),
+                        attempt: 1,
+                        harness: "ref".into(),
+                    }),
+                ),
+                env(
+                    3,
+                    4_000,
+                    Kind::Rejected(proto::Rejected {
+                        change: "c".into(),
+                        reason: "acceptance test failed".into(),
+                    }),
+                ),
+            ],
+            None,
+        );
         assert_eq!(rungs.len(), 3);
         assert_eq!(rungs[1].rung, "replay #1 (ref)");
         assert_eq!(rungs[1].outcome, "then reject: acceptance test failed");
         assert_eq!(rungs[1].at, "+1.5s");
+    }
+
+    #[test]
+    fn the_ladder_reports_recorded_attempt_outcomes_and_candidates() {
+        let escalation = proto::Escalation {
+            attempts: vec![
+                proto::ReplayAttempt {
+                    attempt: 1,
+                    harness: "ref".into(),
+                    outcome: proto::ReplayOutcome::Killed.into(),
+                    elapsed_ms: 30_000,
+                    ..Default::default()
+                },
+                proto::ReplayAttempt {
+                    attempt: 2,
+                    harness: "ref".into(),
+                    outcome: proto::ReplayOutcome::Proposed.into(),
+                    change: Some("abcdef0123456789".into()),
+                    tokens: Some(1200),
+                    cost_micros: Some(4_500),
+                    note: Some("keep both".into()),
+                    ..Default::default()
+                },
+            ],
+            candidates: vec![proto::ArbitrationCandidate {
+                change: "abcdef0123456789".into(),
+                attempts: vec![2, 3],
+                ops: 2,
+                settled: "conflicted".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let replaying = |attempt| {
+            env(
+                u64::from(attempt),
+                0,
+                Kind::Replaying(proto::Replaying {
+                    change: "c".into(),
+                    attempt,
+                    harness: "ref".into(),
+                }),
+            )
+        };
+        let rungs = rungs(&[replaying(1), replaying(2)], Some(&escalation));
+        assert_eq!(rungs[0].outcome, "killed at its time budget");
+        assert_eq!(rungs[1].outcome, "proposed a change abcdef012345");
+        let attempts = attempts(Some(&escalation));
+        assert_eq!(attempts[1].class, "pass");
+        assert_eq!(attempts[1].spent, "0.0s · 1200 tokens · $0.0045");
+        let candidates = candidates(Some(&escalation));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].attempts, "#2, #3");
     }
 
     #[test]

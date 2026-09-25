@@ -2,7 +2,10 @@
 {% block content %}
 <h1>Arbitration: {{ theirs.summary }}</h1>
 <p class="reason">{{ reason }}</p>
+<p class="legend">{{ status }}</p>
 {% if let Some(flash) = flash %}<p class="flash">{{ flash }}</p>{% endif %}
+{% if let Some(pending) = pending %}<p class="flash">{{ pending }}</p>{% endif %}
+{% if !reasons.is_empty() %}<ul class="reasons">{% for r in reasons %}<li>{{ r }}</li>{% endfor %}</ul>{% endif %}
 <div class="sides">
   <section class="side ours">
     <h2>Ours (landed)</h2>
@@ -33,8 +36,42 @@
   </tbody>
 </table>
 {% if !paths.is_empty() %}<p>Files in contention: {% for p in paths %}<code>{{ p }}</code> {% endfor %}</p>{% endif %}
+{% if !sides.is_empty() %}
+<h2>What each side changed</h2>
+{% for s in sides %}<h3><a href="{{ base }}/changes/{{ s.change }}">{{ s.label }}</a></h3>
+<ul>{% for c in s.changed %}<li>{{ c }}</li>{% endfor %}</ul>
+{% endfor %}
+{% endif %}
 <h2>Ladder history</h2>
 <ol class="ladder">{% for r in ladder %}<li><span class="at">{{ r.at }}</span> <strong>{{ r.rung }}</strong>: {{ r.outcome }}</li>{% endfor %}</ol>
+{% if !attempts.is_empty() %}
+<h2>Replay attempts</h2>
+<table class="contested attempts">
+  <thead><tr><th>#</th><th>harness</th><th>outcome</th><th>spent</th><th>note</th></tr></thead>
+  <tbody>
+  {% for a in attempts %}<tr>
+    <td>{{ a.attempt }}</td><td>{{ a.harness }}</td>
+    <td class="ev-{{ a.class }}">{% if let Some(c) = a.change %}<a href="{{ base }}/changes/{{ c }}">{{ a.outcome }}</a>{% else %}{{ a.outcome }}{% endif %}</td>
+    <td>{{ a.spent }}</td><td>{% if let Some(n) = a.note %}{{ n }}{% endif %}</td>
+  </tr>{% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if !candidates.is_empty() %}
+<h2>Candidates</h2>
+<p class="legend">Distinct replay results; attempts with the same semantic ops are one candidate.</p>
+<table class="contested candidates">
+  <thead><tr><th>candidate</th><th>attempts</th><th>ops</th><th>in the lander</th><th></th></tr></thead>
+  <tbody>
+  {% for c in candidates %}<tr>
+    <td><a href="{{ base }}/changes/{{ c.change }}"><code>{{ c.short }}</code></a></td>
+    <td>{{ c.attempts }}</td><td>{{ c.ops }}</td><td>{{ c.settled }}</td>
+    <td>{% if open %}<form method="post" action="{{ base }}/arbitrate/{{ theirs.change }}"><input type="hidden" name="resolved" value="{{ c.change }}"><button name="action" value="resolved">pick this candidate</button></form>{% endif %}</td>
+  </tr>{% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if open %}
 <form class="arbitrate" method="post" action="{{ base }}/arbitrate/{{ theirs.change }}">
   <h2>Decide</h2>
   <textarea name="note" rows="3" placeholder="note for the replay harness"></textarea>
@@ -43,13 +80,14 @@
   <button name="action" value="replay">re-run replay with the note</button>
   <button name="action" value="workspace">open a workspace to edit</button>
 </form>
+{% endif %}
 {% if show_workspace %}
 <section class="workspace">
   <h2>Resolve in a workspace</h2>
-  <p>Start a workspace at head, make the edit both intents need, and propose it:</p>
-  <pre>hord ws new{% if let Some(head) = head %} --base {{ head }}{% endif %}
+  <p>Open a workspace on head, make the edit both intents need, propose it, and pick it here:</p>
+  <pre>hord arbitrate {{ theirs.change }} --edit
 # edit, then
-hord propose --intent intent.md</pre>
+hord propose -w &lt;workspace&gt; --intent intent.md</pre>
   <form class="arbitrate" method="post" action="{{ base }}/arbitrate/{{ theirs.change }}">
     <label>resolving change <input name="resolved" size="66" placeholder="ChangeId"></label>
     <button name="action" value="resolved">resolve with this change</button>

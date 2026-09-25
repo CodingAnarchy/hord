@@ -1,0 +1,22 @@
+[package]
+name = "hord-replay-ref"
+description = "Reference replay harness (spec §6.6): runs a configurable command in the replay workspace and proposes through hord"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hord-replay-ref"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["env"] }
+hord-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+

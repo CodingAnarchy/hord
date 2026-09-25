@@ -19,6 +19,7 @@ members = [
     "crates/hord-verify",
     "crates/hord-verify-rust",
     "crates/hord-ui",
+    "crates/hord-replay-ref",
     "bench/m0-eval",
     "bench/m1-eval",
     "bench/m2-eval",

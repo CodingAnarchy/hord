@@ -20,6 +20,7 @@ use redb::{Database, Durability, ReadableTable, TableDefinition};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::conflict::{ConflictReport, MergeSeverity};
+use crate::escalation::Arbiter;
 use crate::lander::{QueueEntry, QueueStatus};
 use crate::repo::{Inner, lock, now};
 use crate::{Error, Result};
@@ -356,8 +357,45 @@ pub(crate) fn settled(entry: &QueueEntry) -> Vec<Kind> {
                 detail: reason.clone(),
             })]
         }
-        QueueStatus::Queued | QueueStatus::Landed { .. } => Vec::new(),
+        QueueStatus::Queued
+        | QueueStatus::Landed { .. }
+        | QueueStatus::Replaying { .. }
+        | QueueStatus::NeedsArbitration
+        | QueueStatus::Replayed { .. }
+        | QueueStatus::Arbitrated { .. } => Vec::new(),
     }
+}
+
+/// `Replaying` for attempt `attempt` on `change`.
+pub(crate) fn replaying(change: ChangeId, attempt: u32, harness: &str) -> Kind {
+    Kind::Replaying(proto::Replaying {
+        change: wire::id(change),
+        attempt,
+        harness: harness.into(),
+    })
+}
+
+/// `Parked` for a change that entered the arbitration queue.
+pub(crate) fn needs_arbitration(change: ChangeId, detail: String) -> Kind {
+    Kind::Parked(proto::Parked {
+        change: wire::id(change),
+        reason: proto::ParkReason::NeedsArbitration.into(),
+        detail,
+    })
+}
+
+/// `Arbitrated`: `change` was resolved by `arbiter`, landing as `result`.
+pub(crate) fn arbitrated(change: ChangeId, arbiter: &Arbiter, result: ChangeId) -> Kind {
+    Kind::Arbitrated(proto::Arbitrated {
+        change: wire::id(change),
+        by: Some(wire::actor(&arbiter.actor)),
+        result: wire::id(result),
+        key_id: arbiter.signature.as_ref().map(|s| s.key_id.clone()),
+        signature: arbiter
+            .signature
+            .as_ref()
+            .map(|s| s.bytes.as_slice().to_vec()),
+    })
 }
 
 /// `Landed` then `HeadMoved` for a landing at `position`.

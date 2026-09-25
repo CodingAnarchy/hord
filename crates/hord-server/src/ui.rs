@@ -8,9 +8,9 @@
 //! checks it on the wire), provenance and signature checks on ingest, and
 //! the re-queue of a parked change after a review.
 //!
-//! Reviews from the UI are signed with the server's signer
+//! Reviews and arbitration decisions from the UI are signed with the server's signer
 //! ([`Server::with_ui_signer`](crate::Server::with_ui_signer)): the key of
-//! whoever runs `hord serve`. With auth, ingest accepts the review only when
+//! whoever runs `hord serve`. With auth, ingest accepts them only when
 //! the signed-in actor is that key's actor, so the UI never signs for
 //! someone else.
 
@@ -25,7 +25,7 @@ use hord_api::proto::repo_backend_server::RepoBackend as GrpcTrait;
 use hord_api::{ApiError, ApiResult, ChangesBackend, EventStream, RepoBackend, proto, wire};
 use hord_core::sign::{self, SigningKey};
 use hord_core::{Actor, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, Timestamp};
-use hord_ui::{ReviewBackend, UiHosts, UiRepo};
+use hord_ui::{ArbitrationSigner, ReviewBackend, UiHosts, UiRepo};
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
@@ -91,6 +91,10 @@ impl UiHosts for HostedUi {
             principal: extensions.get::<Principal>().cloned(),
             auth_required: self.auth.is_some(),
         });
+        let arbiter = self
+            .signer
+            .clone()
+            .map(|signer| Arc::new(SigningArbiter { signer }) as Arc<dyn ArbitrationSigner>);
         let review = self.signer.clone().map(|signer| {
             Arc::new(SigningReviewer {
                 caller: Arc::clone(&caller),
@@ -101,6 +105,7 @@ impl UiHosts for HostedUi {
             backend: Arc::clone(&caller) as Arc<dyn RepoBackend>,
             changes: caller,
             review,
+            arbiter,
             name,
             base: prefix.map_or_else(String::new, |RepoName(name)| format!("/r/{name}")),
         })
@@ -423,6 +428,25 @@ impl ReviewBackend for SigningReviewer {
             })
             .await?;
         Ok(attached.evidence)
+    }
+}
+
+/// Signs arbitration decisions made in the UI with the server's signer,
+/// as `hord arbitrate` signs with the user's key (domain
+/// `hord.arbitration`).
+struct SigningArbiter {
+    signer: UiSigner,
+}
+
+impl ArbitrationSigner for SigningArbiter {
+    fn sign(&self, request: &mut proto::ArbitrateRequest) -> ApiResult<()> {
+        request.arbiter = Some(wire::actor(&self.signer.actor));
+        let (change, decision, _) = hord_txn::arbitrate_request(request)?;
+        let signature = hord_txn::sign_arbitration(change, &decision, &self.signer.key)
+            .map_err(|e| ApiError::Internal(format!("sign the decision: {e}")))?;
+        request.key_id = Some(signature.key_id);
+        request.signature = Some(signature.bytes.as_slice().to_vec());
+        Ok(())
     }
 }
 

@@ -1,5 +1,6 @@
 //! Command implementations.
 
+pub mod arbitrate;
 pub mod blame;
 pub mod git;
 pub mod init;
@@ -11,6 +12,7 @@ pub mod policy;
 pub mod propose;
 pub mod query;
 pub mod remote;
+pub mod replay;
 pub mod review;
 pub mod serve;
 pub mod status;

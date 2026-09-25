@@ -27,8 +27,7 @@ pub enum ApiError {
     /// [`crate::MAX_BATCH_BYTES`] (`RESOURCE_EXHAUSTED`).
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
-    /// The backend does not implement this call yet (`UNIMPLEMENTED`), for
-    /// example [`crate::RepoBackend::arbitrate`] before M5.
+    /// The backend does not implement this call (`UNIMPLEMENTED`).
     #[error("unimplemented: {0}")]
     Unimplemented(String),
     /// The backend is shutting down or unreachable (`UNAVAILABLE`).

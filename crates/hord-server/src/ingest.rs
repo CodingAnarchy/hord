@@ -53,6 +53,49 @@ pub(crate) async fn check_submit(
     .await
 }
 
+/// Check an arbiter's decision before the lander acts on it (spec §6.4
+/// rung 3, §10.5.4): with a principal, the arbiter is the token's actor
+/// (set here when the request leaves it out) and the decision is signed
+/// with a key bound to it. Without auth, a signature that is present must
+/// verify. A malformed request is left for the backend to report.
+pub(crate) async fn check_arbitration(
+    auth: Option<Arc<AuthStore>>,
+    principal: Option<Principal>,
+    request: &mut proto::ArbitrateRequest,
+) -> Result<(), Status> {
+    if let (Some(_), Some(principal)) = (&auth, &principal) {
+        match &request.arbiter {
+            Some(claimed) => {
+                let claimed = wire::actor_from("arbiter", claimed)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+                claimed_by(&claimed, principal, "a decision by")?;
+            }
+            None => request.arbiter = Some(wire::actor(&principal.actor)),
+        }
+    }
+    let Ok((change, action, arbiter)) = hord_txn::arbitrate_request(request) else {
+        return Ok(());
+    };
+    blocking(move || {
+        let message = hord_txn::arbitration_message(change, &action)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let verify = |key: &PublicKey| {
+            key.verify(
+                hord_txn::ARBITRATION_DOMAIN,
+                message.as_bytes(),
+                arbiter.signature.as_ref().ok_or(SignError::Unsigned)?,
+            )
+        };
+        match (auth, principal) {
+            (Some(auth), Some(principal)) => {
+                signed_by(&auth, &principal, arbiter.signature.as_ref(), verify)
+            }
+            _ => self_consistent(arbiter.signature.as_ref(), verify),
+        }
+    })
+    .await
+}
+
 /// [`check_evidence`] on the blocking pool (it may read the auth file).
 pub(crate) async fn check_evidence_async(
     auth: Option<Arc<AuthStore>>,

@@ -69,6 +69,16 @@ pub trait ReviewBackend: Send + Sync {
     async fn review(&self, change: String, approve: bool, message: String) -> ApiResult<String>;
 }
 
+/// Signs an arbiter's decision before it goes to `Arbitrate` (spec §6.4
+/// rung 3, §10.5.4): sets `arbiter`, `key_id`, and `signature` on the
+/// request. The server provides it with the key it signs UI decisions
+/// with; without one, decisions go unsigned, which only a server without
+/// auth accepts.
+pub trait ArbitrationSigner: Send + Sync {
+    /// Sign `request` in place.
+    fn sign(&self, request: &mut proto::ArbitrateRequest) -> ApiResult<()>;
+}
+
 /// One repository as the UI sees it: the API it calls and nothing else.
 #[derive(Clone)]
 pub struct UiRepo {
@@ -78,6 +88,8 @@ pub struct UiRepo {
     pub changes: Arc<dyn ChangesBackend>,
     /// The review seam, when the server provides one.
     pub review: Option<Arc<dyn ReviewBackend>>,
+    /// Signs arbitration decisions, when the server provides a key.
+    pub arbiter: Option<Arc<dyn ArbitrationSigner>>,
     /// Repository name, for titles.
     pub name: String,
     /// URL prefix of its pages: `""`, or `/r/<name>`.
@@ -90,6 +102,7 @@ impl std::fmt::Debug for UiRepo {
             .field("name", &self.name)
             .field("base", &self.base)
             .field("review", &self.review.is_some())
+            .field("arbiter", &self.arbiter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -369,7 +382,10 @@ async fn change_page_with(repo: &UiRepo, id: String, flash: Option<String>) -> P
         reads: view.read_set.iter().map(view::NodeView::from).collect(),
         writes: view.write_set.iter().map(view::NodeView::from).collect(),
         diff,
-        history: present::rungs(&view.history),
+        history: present::rungs(
+            &view.history,
+            view.queue.as_ref().and_then(|q| q.escalation.as_ref()),
+        ),
         reviewable: repo.review.is_some(),
         review_note: repo.review.is_none().then(|| {
             "Review signing is not available on this server yet (it arrives with `hord review`, spec §10.5.4).".to_owned()
@@ -452,6 +468,8 @@ async fn workbench_with(
         .change;
     let (contested, paths) = present::contested(&theirs, &ours);
     let side = present::side(&theirs);
+    let escalation = theirs.queue.as_ref().and_then(|q| q.escalation.as_ref());
+    let (reasons, sides) = present::summary(escalation);
     Ok(html(&ArbitrationPage {
         title: format!("Arbitration: {}", side.summary),
         base: repo.base.clone(),
@@ -460,7 +478,17 @@ async fn workbench_with(
         theirs: side,
         contested,
         paths,
-        ladder: present::rungs(&theirs.history),
+        ladder: present::rungs(&theirs.history, escalation),
+        status: theirs
+            .queue
+            .as_ref()
+            .map_or_else(|| "not submitted".to_owned(), present::status),
+        open: present::arbitrable(theirs.queue.as_ref()),
+        attempts: present::attempts(escalation),
+        candidates: present::candidates(escalation),
+        reasons,
+        sides,
+        pending: present::pending(escalation),
         head,
         show_workspace,
         flash,
@@ -501,21 +529,40 @@ async fn arbitrate(
             ));
         }
     };
-    let replay = matches!(action, Action::Replay(_));
-    let request = proto::ArbitrateRequest {
+    let note = form.note.trim();
+    let mut request = proto::ArbitrateRequest {
         change: id.clone(),
+        note: (matches!(action, Action::Replay(_)) && !note.is_empty()).then(|| note.to_owned()),
         action: Some(proto::Arbitration {
             action: Some(action),
         }),
+        ..Default::default()
     };
-    let mut flash = match repo.backend.arbitrate(request).await {
-        Ok(reply) => format!("Resolved as {}", reply.change),
-        Err(e) => format!("Arbitration failed: {e}"),
+    let signed = match &repo.arbiter {
+        Some(arbiter) => arbiter.sign(&mut request),
+        None => Ok(()),
     };
-    if replay && !form.note.trim().is_empty() {
-        // Needs a note field on `Arbitration` (agent `ladder`).
-        flash.push_str(". The note was not sent: the Arbitrate RPC has no note field yet");
-    }
+    let flash = match signed {
+        Err(e) => format!("Could not sign the decision: {e}"),
+        Ok(()) => match repo.backend.arbitrate(request).await {
+            Ok(reply) => {
+                let now = reply
+                    .entry
+                    .as_ref()
+                    .map(present::status)
+                    .unwrap_or_default();
+                if reply.change == id {
+                    format!("Replay requested ({now})")
+                } else {
+                    format!(
+                        "Resolution {} submitted; it lands with both as parents ({now})",
+                        view::short_id(&reply.change)
+                    )
+                }
+            }
+            Err(e) => format!("Arbitration failed: {e}"),
+        },
+    };
     workbench_with(&repo, id, Some(flash), false).await
 }
 

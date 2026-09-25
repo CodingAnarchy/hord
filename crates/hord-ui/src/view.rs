@@ -397,12 +397,73 @@ pub struct ArbitrationPage {
     pub paths: Vec<String>,
     /// Ladder history, oldest first.
     pub ladder: Vec<RungView>,
+    /// Where the parked change is now, in words.
+    pub status: String,
+    /// Whether it can be arbitrated now (conflicted or out of replays).
+    pub open: bool,
+    /// Replay attempts, oldest first (spec §6.4 rung 2).
+    pub attempts: Vec<AttemptView>,
+    /// Replay results offered to the arbiter, one per distinct result
+    /// (ADR 0029).
+    pub candidates: Vec<CandidateView>,
+    /// The machine summary's reasons it could not land.
+    pub reasons: Vec<String>,
+    /// What each side changed, from the machine summary.
+    pub sides: Vec<SideChange>,
+    /// A resolution submitted and not landed yet, or why the last one did
+    /// not help.
+    pub pending: Option<String>,
     /// Head at render time, for the workspace instructions.
     pub head: Option<String>,
     /// Whether to show how to resolve in a workspace.
     pub show_workspace: bool,
     /// Outcome of an action just taken, in words.
     pub flash: Option<String>,
+}
+
+/// One replay attempt on the workbench.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptView {
+    /// Attempt number.
+    pub attempt: u32,
+    /// Harness.
+    pub harness: String,
+    /// CSS class: `pass` (proposed), `fail`, or `unknown` (running).
+    pub class: &'static str,
+    /// How it ended, with the harness's detail.
+    pub outcome: String,
+    /// The replay change it proposed.
+    pub change: Option<String>,
+    /// Time, tokens, cost, model.
+    pub spent: String,
+    /// The arbiter's note it ran with.
+    pub note: Option<String>,
+}
+
+/// One arbitration candidate: a distinct replay result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateView {
+    /// The replay change (picked with `resolved`).
+    pub change: String,
+    /// Shortened.
+    pub short: String,
+    /// The attempts that produced it: `#1, #3`.
+    pub attempts: String,
+    /// Number of ops.
+    pub ops: u32,
+    /// How it settled in the lander.
+    pub settled: String,
+}
+
+/// One side of the collision as the machine summary words it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SideChange {
+    /// `ours (landed)` or `theirs (parked)`, with the intent.
+    pub label: String,
+    /// The side's change.
+    pub change: String,
+    /// What it did to the contested definitions and files.
+    pub changed: Vec<String>,
 }
 
 /// One registered recording.
@@ -534,6 +595,27 @@ mod tests {
                 rung: "replay #1 (ref)".into(),
                 outcome: "failed".into(),
             }],
+            status: "parked".into(),
+            open: true,
+            attempts: vec![AttemptView {
+                attempt: 1,
+                harness: "ref".into(),
+                class: "fail",
+                outcome: "gave up".into(),
+                change: None,
+                spent: "1.0s".into(),
+                note: Some("keep both".into()),
+            }],
+            candidates: vec![CandidateView {
+                change: "cand".into(),
+                short: "cand".into(),
+                attempts: "#2".into(),
+                ops: 1,
+                settled: "conflicted".into(),
+            }],
+            reasons: vec!["both replaced two".into()],
+            sides: Vec::new(),
+            pending: None,
             head: Some("h".into()),
             show_workspace: true,
             flash: None,

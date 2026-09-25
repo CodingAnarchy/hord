@@ -783,6 +783,13 @@ pub(crate) async fn analyze(
             QueueStatus::Rejected { .. } => report.rejected += 1,
             QueueStatus::Parked { .. } => report.parked += 1,
             QueueStatus::Queued => bail!("change of agent {b} still queued after land_local"),
+            // The simulation runs no replay harness (spec §6.4 rung 2).
+            QueueStatus::Replaying { .. }
+            | QueueStatus::NeedsArbitration
+            | QueueStatus::Replayed { .. }
+            | QueueStatus::Arbitrated { .. } => {
+                bail!("change of agent {b} escalated without a replay harness")
+            }
         }
         let mut reported: BTreeMap<usize, Vec<ConflictKind>> = BTreeMap::new();
         let mut merge_conflicts = Vec::new();
@@ -984,5 +991,9 @@ pub(crate) fn status_name(status: &QueueStatus) -> String {
         QueueStatus::Conflicted => "conflicted".into(),
         QueueStatus::Rejected { reason } => format!("rejected: {reason}"),
         QueueStatus::Parked { reason } => format!("parked: {reason}"),
+        QueueStatus::Replaying { attempt } => format!("replaying (attempt {attempt})"),
+        QueueStatus::NeedsArbitration => "needs arbitration".into(),
+        QueueStatus::Replayed { .. } => "replayed".into(),
+        QueueStatus::Arbitrated { .. } => "arbitrated".into(),
     }
 }

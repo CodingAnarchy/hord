@@ -364,8 +364,16 @@ pub(crate) async fn run(
                 hord_txn::QueueStatus::Rejected { .. },
                 Some(Stage::Rejected { .. })
             ) | (
-                hord_txn::QueueStatus::Conflicted | hord_txn::QueueStatus::Parked { .. },
+                hord_txn::QueueStatus::Conflicted
+                    | hord_txn::QueueStatus::Parked { .. }
+                    | hord_txn::QueueStatus::NeedsArbitration,
                 Some(Stage::Parked { .. } | Stage::Arbitrated { .. }),
+            ) | (
+                hord_txn::QueueStatus::Replaying { .. },
+                Some(Stage::Replaying { .. } | Stage::Parked { .. })
+            ) | (
+                hord_txn::QueueStatus::Replayed { .. } | hord_txn::QueueStatus::Arbitrated { .. },
+                Some(Stage::Arbitrated { .. } | Stage::Landed { .. } | Stage::Parked { .. })
             )
         );
         if !ok {

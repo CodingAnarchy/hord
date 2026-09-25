@@ -49,6 +49,10 @@ M5 identity and authorization dependencies (spec §10.5.4):
 - `blake3` 1 and `hex` 0.4 (hord-server, hord-core; already workspace dependencies): the auth file stores each bearer token's BLAKE3 hash, never the token; key ids are hex.
 - `rpassword` 7 (hord-cli): reads the `hord login` / `hord user add` password from the terminal without echo. Small and maintained; the alternative is platform terminal code, which would need `unsafe` in hord-cli.
 
+`serde_json` 1 (hord-txn; already a workspace dependency) and tokio's `process` feature (hord-txn): the replay protocol's JSON lines in the canonical protobuf JSON mapping, and the harness process the lander runs and kills at its budget (spec §6.6, ADR 0028).
+
+`hord-replay-ref` (new crate, spec §11): `clap` (feature `env`), `hord-api`, `serde`, `serde_json`, `serde_yaml_ng`, `thiserror`, all already workspace dependencies. `serde_yaml_ng` writes the intent file's front matter for `hord propose`.
+
 `askama` 0.16 (hord-ui only): compiled, HTML-escaping templates for the server-rendered web UI. Spec §10.4 names it (DECIDED stack), so the views need no frontend build pipeline and no hand-rolled HTML escaping.
 
 `axum` 0.8 with `form` and `query`, `serde`, `serde_json`, `tokio`, `tokio-stream`, `async-trait` (hord-ui; all already in the tree) and `diffy` (hord-server; already a workspace dependency, AGENTS.md prefers it): the web UI's routes, form and query decoding, the SSE relay, and the `Changes` service's text diff (ADR 0030).

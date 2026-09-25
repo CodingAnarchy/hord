@@ -82,6 +82,11 @@ fn run(dir: &Path, args: &[&str]) -> TestResult<Output> {
         .current_dir(dir)
         .env("HORD_ACTOR", "tester")
         .env("HORD_NO_DAEMON", "1")
+        // `hord arbitrate` signs with a key under `HORD_HOME/keys/`.
+        .env(
+            "HORD_HOME",
+            std::env::temp_dir().join(format!("hord-m3-home-{}", std::process::id())),
+        )
         .env_remove("HORD_AGENT_MODEL")
         .output()
         .map_err(|err| format!("run hord {args:?}: {err}"))?)
@@ -320,7 +325,67 @@ fn a_conflicting_pair_is_parked_and_explained() -> TestResult {
     assert!(text.contains("gamma plus two"), "{text}");
     assert!(text.contains("gamma (src/lib.rs)"), "{text}");
     assert!(text.contains("merge hard src/lib.rs"), "{text}");
-    assert!(text.contains("needs replay"), "{text}");
+    assert!(text.contains("no replay harness ran"), "{text}");
+    // Spec §6.4 rung 3: the conflict summary names both intents.
+    assert!(text.contains("Parked (theirs)"), "{text}");
+    assert!(text.contains("Landed (ours)"), "{text}");
+    let summary = &result["entry"]["escalation"]["summary"];
+    assert_eq!(
+        summary["sides"].as_array().map(Vec::len),
+        Some(2),
+        "{summary:#}"
+    );
+    Ok(())
+}
+
+/// `hord arbitrate --pick theirs`: the resolution lands with both colliding
+/// changes as parents, and the parked change is arbitrated.
+#[test]
+fn arbitrate_picks_theirs_and_lands_with_both_parents() -> TestResult {
+    let (_source, repo) = setup()?;
+    let dir = &repo.0;
+    let (a, ca) = ws_new(dir)?;
+    let (b, cb) = ws_new(dir)?;
+    edit(&ca, "alpha() + 1", "alpha() + 2")?;
+    edit(&cb, "alpha() + 1", "alpha() + 3")?;
+    let first = propose(dir, &a, &intent(dir, "a", "gamma plus two", "")?)?;
+    let second = propose(dir, &b, &intent(dir, "b", "gamma plus three", "")?)?;
+    json(dir, &["submit", &first])?;
+    json(dir, &["submit", &second])?;
+    json(dir, &["land", "--local"])?;
+
+    let reply = json(dir, &["arbitrate", &second, "--pick", "theirs"])?;
+    let resolution = reply["change"].as_str().ok_or("resolution id")?.to_owned();
+    let out = json(dir, &["land", "--local"])?;
+    assert_eq!(out["head"], resolution.as_str(), "{out:#}");
+    let result = json(dir, &["conflicts", &second])?;
+    assert_eq!(
+        result["entry"]["status"], "QUEUE_STATUS_ARBITRATED",
+        "{result:#}"
+    );
+    assert_eq!(result["entry"]["landed"], resolution.as_str());
+    let log = json(dir, &["log"])?;
+    let landed = log["changes"]
+        .as_array()
+        .ok_or("changes")?
+        .iter()
+        .find(|c| c["change"] == resolution.as_str())
+        .ok_or("the resolution is in the log")?;
+    assert_eq!(
+        landed["parents"],
+        serde_json::json!([first, second]),
+        "{landed:#}"
+    );
+    let (_, checkout) = ws_new(dir)?;
+    assert!(fs::read_to_string(checkout.join("src/lib.rs"))?.contains("alpha() + 3"));
+
+    // Arbitrated is final; a bad pick is refused.
+    assert!(
+        !run(dir, &["arbitrate", &second, "--pick", "ours"])?
+            .status
+            .success()
+    );
+    assert!(!run(dir, &["arbitrate", &second])?.status.success());
     Ok(())
 }
 
@@ -365,7 +430,7 @@ fn read_write_through_references_is_explained() -> TestResult {
     );
     let text = ok(dir, &["conflicts", &second])?;
     assert!(text.contains("verification failed: "), "{text}");
-    assert!(text.contains("parked: needs replay"), "{text}");
+    assert!(text.contains("parked: no replay harness ran"), "{text}");
     Ok(())
 }
 
