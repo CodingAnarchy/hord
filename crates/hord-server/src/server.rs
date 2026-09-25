@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use hord_api::MAX_MESSAGE_BYTES;
+use hord_api::proto::changes_server::ChangesServer;
 use hord_api::proto::repo_backend_server::RepoBackendServer;
 use hord_api::proto::schema_server::SchemaServer;
 use hord_api::proto::workspaces_server::WorkspacesServer;
 use tokio::net::TcpListener;
 use tonic::service::Routes;
 
+use crate::changes::GrpcChanges;
 use crate::config::ServerConfig;
 use crate::hosts::Hosts;
 use crate::route::RepoPrefixLayer;
@@ -97,7 +99,11 @@ impl Server {
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         // gRPC-Web wraps only the gRPC services: tonic-web answers any
         // other HTTP/1 request with 400, which would hide `/schema.json`.
-        let mut routes = Routes::new(backend).add_service(SchemaServer::new(GrpcSchema));
+        let mut routes = Routes::new(backend)
+            .add_service(SchemaServer::new(GrpcSchema))
+            .add_service(ChangesServer::new(GrpcChanges::new(Arc::clone(
+                &self.hosts,
+            ))));
         if let Some(workspaces) = &self.workspaces {
             routes = routes.add_service(
                 WorkspacesServer::new(crate::service::GrpcWorkspaces::new(Arc::clone(workspaces)))
@@ -176,7 +182,7 @@ impl Server {
         let serving = tonic::transport::Server::builder()
             .accept_http1(true)
             .layer(crate::activity::ActivityLayer(Arc::clone(&self.activity)))
-            .layer(RepoPrefixLayer)
+            .layer(RepoPrefixLayer::new(self.hosts.names().map(str::to_owned)))
             .add_routes(self.routes())
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = stopped.changed().await;

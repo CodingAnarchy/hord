@@ -22,6 +22,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod activity;
+mod changes;
 mod config;
 mod error;
 mod hosts;
@@ -32,6 +33,7 @@ mod service;
 mod webhook;
 
 pub use activity::Activity;
+pub use changes::{LocalChanges, RECORDINGS_DIR, save_recording};
 pub use config::{ServerConfig, WebhookConfig};
 pub use error::{Error, Result};
 pub use hosts::Hosts;

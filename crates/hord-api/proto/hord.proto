@@ -1124,6 +1124,169 @@ message ErrorResult {
   optional double waited_secs = 5;
 }
 
+// ---------------------------------------------------------------- changes
+
+// Read-only views of changes and flight recordings for the web UI (ADR
+// 0030): what spec §10.5.2's route sketch served as `/changes/{id}`,
+// `/changes/{id}/diff`, and `/recordings/{id}`. A separate service, so
+// `RepoBackend` stays §10.5.2 method for method.
+service Changes {
+  // One change decoded: intent, named ops, read and write sets,
+  // provenance, evidence, its queue entry, and the events that name it.
+  rpc GetChange(GetChangeRequest) returns (ChangeView);
+  // A change's text diff, base → result, file by file.
+  rpc ChangeDiff(ChangeDiffRequest) returns (ChangeDiffResponse);
+  // Flight recordings registered under `.hord/recordings/`.
+  rpc ListRecordings(ListRecordingsRequest) returns (ListRecordingsResponse);
+  // One flight recording, parsed.
+  rpc GetRecording(GetRecordingRequest) returns (GetRecordingResponse);
+}
+
+// Arguments to GetChange.
+message GetChangeRequest {
+  // The ChangeId (submitted or landed).
+  string change = 1;
+}
+
+// A change's intent (spec §3.5), worded.
+message IntentView {
+  // One-line summary.
+  string summary = 1;
+  // Full task description, prompt, or spec excerpt.
+  string body = 2;
+  // References: `issue:<id>`, `url:<url>`, `change:<id>`, `git:<sha>`.
+  repeated string refs = 3;
+  // Acceptance criteria: `test: <name>`, `check: <command>`, or
+  // `invariant: <text>`.
+  repeated string acceptance = 4;
+}
+
+// Who produced a change, with what (spec §3.5).
+message ProvenanceView {
+  // Author.
+  Actor actor = 1;
+  // ObjectId of the toolchain object.
+  string toolchain = 2;
+  // When the record was created.
+  uint64 created_at_ms = 3;
+  // Harness session id.
+  optional string session = 4;
+  // The change this one replays, if a replay.
+  optional string parent_intent = 5;
+  // Key id of the record's signature, when signed.
+  optional string signature_key = 6;
+}
+
+// One piece of evidence about a change.
+message ChangeEvidence {
+  // ObjectId of the Evidence object.
+  string id = 1;
+  // Its kind.
+  EvidenceKind kind = 2;
+  // Its result.
+  EvidenceResult result = 3;
+  // Its qualifier (ADR 0026).
+  optional string qualifier = 4;
+  // The command that produced it.
+  string command = 5;
+  // Who produced it.
+  Actor produced_by = 6;
+  // When.
+  uint64 produced_at_ms = 7;
+  // What it cost.
+  uint64 cost_ms = 8;
+  // Where it was found: `author` (in the record, attached at propose),
+  // `snapshot` (indexed for the record's result, ADR 0025), or `landed`
+  // (indexed for the result of the record it landed as).
+  string source = 9;
+}
+
+// One change, decoded with names (the semantic change view).
+message ChangeView {
+  // The ChangeId asked for.
+  string change = 1;
+  // Base snapshot.
+  string base = 2;
+  // Result snapshot.
+  string result = 3;
+  // Parent changes.
+  repeated string parents = 4;
+  // Intent.
+  IntentView intent = 5;
+  // Provenance.
+  ProvenanceView provenance = 6;
+  // Operations, with names where known.
+  repeated OpView ops = 7;
+  // Read set.
+  repeated NodeRef read_set = 8;
+  // Write set.
+  repeated NodeRef write_set = 9;
+  // Evidence: the author's, then the result snapshot's.
+  repeated ChangeEvidence evidence = 10;
+  // The submitted record this landed record was rebased from (ADR 0018).
+  optional string rebased_from = 11;
+  // The latest queue entry that names this change, submitted or landed.
+  QueueEntry queue = 12;
+  // Recorded events that name this change (submitted or landed id), in
+  // cursor order: its path through the lander and the escalation ladder.
+  repeated EventEnvelope history = 13;
+}
+
+// Arguments to ChangeDiff.
+message ChangeDiffRequest {
+  // The ChangeId.
+  string change = 1;
+}
+
+// One file's text diff.
+message FileDiff {
+  // The file.
+  string path = 1;
+  // Unified diff, base → result; empty when binary.
+  string unified = 2;
+  // Whether either side is not UTF-8 text.
+  bool binary = 3;
+}
+
+// A change's text diff.
+message ChangeDiffResponse {
+  // Changed files, in path order.
+  repeated FileDiff files = 1;
+}
+
+// Arguments to ListRecordings.
+message ListRecordingsRequest {}
+
+// One registered flight recording.
+message RecordingInfo {
+  // ObjectId of the recording's Blob.
+  string id = 1;
+  // Its header.
+  RecordingHeader header = 2;
+  // Number of events in it.
+  uint64 events = 3;
+}
+
+// Registered flight recordings, in id order.
+message ListRecordingsResponse {
+  // The recordings.
+  repeated RecordingInfo recordings = 1;
+}
+
+// Arguments to GetRecording.
+message GetRecordingRequest {
+  // ObjectId of the recording's Blob.
+  string id = 1;
+}
+
+// One flight recording, parsed.
+message GetRecordingResponse {
+  // Its header.
+  RecordingHeader header = 1;
+  // Its events, in cursor order.
+  repeated EventEnvelope events = 2;
+}
+
 // ---------------------------------------------------------------- recordings
 
 // First line of a flight-recorder log (spec §10.4, M5 `GET

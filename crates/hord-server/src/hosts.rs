@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hord_api::{ApiError, RepoBackend};
+use hord_api::{ApiError, ChangesBackend, RepoBackend};
 use hord_txn::{LocalRepo, Repo, RepoOptions};
 
+use crate::changes::LocalChanges;
 use crate::route::RepoName;
 use crate::{Error, Result};
 
@@ -17,6 +18,7 @@ const ROOT_DEPTH: usize = 4;
 /// `/r/<name>/` prefix, or many (`--root`), each reached only by its name.
 pub struct Hosts {
     repos: BTreeMap<String, Arc<dyn RepoBackend>>,
+    changes: BTreeMap<String, Arc<dyn ChangesBackend>>,
     single: Option<String>,
     locals: Vec<Arc<LocalRepo>>,
 }
@@ -82,14 +84,24 @@ impl Hosts {
             .flatten();
         Self {
             repos,
+            changes: BTreeMap::new(),
             single,
             locals: Vec::new(),
         }
     }
 
+    /// Also serve the `Changes` service (ADR 0030) for the repository
+    /// `name`, over `changes`.
+    #[must_use]
+    pub fn with_changes(mut self, name: &str, changes: Arc<dyn ChangesBackend>) -> Self {
+        self.changes.insert(name.to_owned(), changes);
+        self
+    }
+
     fn empty() -> Self {
         Self {
             repos: BTreeMap::new(),
+            changes: BTreeMap::new(),
             single: None,
             locals: Vec::new(),
         }
@@ -97,7 +109,9 @@ impl Hosts {
 
     fn insert_local(&mut self, name: String, local: Arc<LocalRepo>) {
         self.repos
-            .insert(name, Arc::clone(&local) as Arc<dyn RepoBackend>);
+            .insert(name.clone(), Arc::clone(&local) as Arc<dyn RepoBackend>);
+        self.changes
+            .insert(name, Arc::new(LocalChanges::new(Arc::clone(&local))));
         self.locals.push(local);
     }
 
@@ -117,19 +131,39 @@ impl Hosts {
         &self,
         name: Option<&RepoName>,
     ) -> Result<Arc<dyn RepoBackend>, ApiError> {
-        let name = match (name, &self.single) {
-            (Some(RepoName(name)), _) => name,
-            (None, Some(single)) => single,
-            (None, None) => {
-                return Err(ApiError::InvalidArgument(
-                    "this server hosts several repositories; address one as /r/<name>/".into(),
-                ));
-            }
-        };
+        let name = self.addressed(name)?;
         self.repos
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("no repository {name:?} on this server")))
+    }
+
+    /// The `Changes` backend a request names, or the only one.
+    pub(crate) fn resolve_changes(
+        &self,
+        name: Option<&RepoName>,
+    ) -> Result<Arc<dyn ChangesBackend>, ApiError> {
+        let name = self.addressed(name)?;
+        if !self.repos.contains_key(name) {
+            return Err(ApiError::NotFound(format!(
+                "no repository {name:?} on this server"
+            )));
+        }
+        self.changes.get(name).cloned().ok_or_else(|| {
+            ApiError::Unimplemented(format!("repository {name:?} serves no Changes service"))
+        })
+    }
+
+    /// The repository name a request addresses: its `/r/<name>/` prefix,
+    /// else the only one.
+    pub(crate) fn addressed<'a>(&'a self, name: Option<&'a RepoName>) -> Result<&'a str, ApiError> {
+        match (name, &self.single) {
+            (Some(RepoName(name)), _) => Ok(name),
+            (None, Some(single)) => Ok(single),
+            (None, None) => Err(ApiError::InvalidArgument(
+                "this server hosts several repositories; address one as /r/<name>/".into(),
+            )),
+        }
     }
 
     /// Stop every lander this server started.
