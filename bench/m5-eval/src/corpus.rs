@@ -148,9 +148,17 @@ impl Case {
     }
 }
 
+/// A case file's text with LF line endings. A checkout may have converted
+/// the files to CRLF (git on Windows); the fixture files a case writes must
+/// not depend on that.
+pub fn read_text(path: &Path) -> Result<String> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text.replace("\r\n", "\n"))
+}
+
 /// Read one case file.
 pub fn read(path: &Path) -> Result<Case> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let text = read_text(path)?;
     let case: Case = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     case.validate()?;
     Ok(case)

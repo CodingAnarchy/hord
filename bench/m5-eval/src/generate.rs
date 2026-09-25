@@ -627,7 +627,7 @@ mod tests {
             "regenerate: hord-eval-m5 generate"
         );
         for ((path, _), case) in loaded.iter().zip(&generated) {
-            let text = std::fs::read_to_string(path)?;
+            let text = crate::corpus::read_text(path)?;
             assert_eq!(
                 text,
                 crate::corpus::write(case)?,
@@ -635,6 +635,23 @@ mod tests {
                 path.display()
             );
         }
+        Ok(())
+    }
+
+    /// A case file converted to CRLF (git on Windows) reads as the same case.
+    #[test]
+    fn a_crlf_checkout_reads_the_same_case() -> anyhow::Result<()> {
+        let case = &corpus()[0];
+        let lf = crate::corpus::write(case)?;
+        let dir = std::env::temp_dir().join(format!("hord-m5-crlf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("case.toml");
+        std::fs::write(&path, lf.replace('\n', "\r\n"))?;
+        let read = crate::corpus::read(&path);
+        let text = crate::corpus::read_text(&path);
+        std::fs::remove_dir_all(&dir)?;
+        assert_eq!(text?, lf);
+        assert_eq!(crate::corpus::write(&read?)?, lf);
         Ok(())
     }
 }
