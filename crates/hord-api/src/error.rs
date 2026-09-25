@@ -37,6 +37,14 @@ pub enum ApiError {
     /// Anything else: store I/O, a failed task (`INTERNAL`).
     #[error("internal: {0}")]
     Internal(String),
+    /// The call needs a valid bearer token (`UNAUTHENTICATED`, spec
+    /// §10.5.4).
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    /// The token lacks the scope, or the request claims another actor
+    /// (`PERMISSION_DENIED`, spec §10.5.4).
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 /// Result alias for [`crate::RepoBackend`] calls.
@@ -54,6 +62,8 @@ impl ApiError {
             Self::Unimplemented(_) => tonic::Code::Unimplemented,
             Self::Unavailable(_) => tonic::Code::Unavailable,
             Self::Internal(_) => tonic::Code::Internal,
+            Self::Unauthenticated(_) => tonic::Code::Unauthenticated,
+            Self::PermissionDenied(_) => tonic::Code::PermissionDenied,
         }
     }
 
@@ -67,7 +77,9 @@ impl ApiError {
             | Self::ResourceExhausted(m)
             | Self::Unimplemented(m)
             | Self::Unavailable(m)
-            | Self::Internal(m) => m,
+            | Self::Internal(m)
+            | Self::Unauthenticated(m)
+            | Self::PermissionDenied(m) => m,
         }
     }
 }
@@ -89,6 +101,8 @@ impl From<tonic::Status> for ApiError {
             }
             tonic::Code::ResourceExhausted => Self::ResourceExhausted(m),
             tonic::Code::Unimplemented => Self::Unimplemented(m),
+            tonic::Code::Unauthenticated => Self::Unauthenticated(m),
+            tonic::Code::PermissionDenied => Self::PermissionDenied(m),
             tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => {
                 Self::Unavailable(m)
             }
@@ -111,6 +125,8 @@ mod tests {
             ApiError::Unimplemented("e".into()),
             ApiError::Unavailable("f".into()),
             ApiError::Internal("g".into()),
+            ApiError::Unauthenticated("h".into()),
+            ApiError::PermissionDenied("i".into()),
         ];
         for err in all {
             let back = ApiError::from(tonic::Status::from(err.clone()));

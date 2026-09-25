@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use hord_api::MAX_MESSAGE_BYTES;
+use hord_api::proto::auth_server::AuthServer;
 use hord_api::proto::changes_server::ChangesServer;
 use hord_api::proto::repo_backend_server::RepoBackendServer;
 use hord_api::proto::schema_server::SchemaServer;
@@ -13,6 +14,9 @@ use hord_api::proto::workspaces_server::WorkspacesServer;
 use tokio::net::TcpListener;
 use tonic::service::Routes;
 
+use crate::auth::AuthStore;
+use crate::auth_service::GrpcAuth;
+use crate::authz::AuthLayer;
 use crate::changes::GrpcChanges;
 use crate::config::ServerConfig;
 use crate::hosts::Hosts;
@@ -47,6 +51,7 @@ pub struct Server {
     config: ServerConfig,
     workspaces: Option<Arc<dyn hord_api::WorkspacesBackend>>,
     activity: Arc<crate::activity::Activity>,
+    auth: Option<Arc<AuthStore>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -55,6 +60,7 @@ impl std::fmt::Debug for Server {
             .field("hosts", &self.hosts)
             .field("config", &self.config)
             .field("workspaces", &self.workspaces.is_some())
+            .field("auth", &self.auth.as_ref().map(|a| a.path()))
             .finish()
     }
 }
@@ -68,7 +74,16 @@ impl Server {
             config,
             workspaces: None,
             activity: Arc::default(),
+            auth: None,
         }
+    }
+
+    /// Require a bearer token on every call but the public ones, checked
+    /// against `auth`, and enforce each RPC's scope (spec §10.5.4).
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthStore) -> Self {
+        self.auth = Some(Arc::new(auth));
+        self
     }
 
     /// Also serve `hord.v1.Workspaces` over `workspaces`: a repository's
@@ -96,13 +111,17 @@ impl Server {
     /// (ADR 0030).
     #[must_use]
     pub fn routes(&self) -> Routes {
-        let backend = RepoBackendServer::new(GrpcRepoBackend::new(Arc::clone(&self.hosts)))
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        let backend = RepoBackendServer::new(GrpcRepoBackend::new(
+            Arc::clone(&self.hosts),
+            self.auth.clone(),
+        ))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
         // gRPC-Web wraps only the gRPC services: tonic-web answers any
         // other HTTP/1 request with 400, which would hide `/schema.json`.
         let mut routes = Routes::new(backend)
             .add_service(SchemaServer::new(GrpcSchema))
+            .add_service(AuthServer::new(GrpcAuth::new(self.auth.clone())))
             .add_service(ChangesServer::new(GrpcChanges::new(Arc::clone(
                 &self.hosts,
             ))));
@@ -188,6 +207,7 @@ impl Server {
             .accept_http1(true)
             .layer(crate::activity::ActivityLayer(Arc::clone(&self.activity)))
             .layer(RepoPrefixLayer::new(self.hosts.names().map(str::to_owned)))
+            .layer(AuthLayer(self.auth.clone()))
             .add_routes(self.routes())
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = stopped.changed().await;

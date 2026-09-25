@@ -41,6 +41,14 @@ ADR 0024 server-foundation dependencies (`hord-api`, `hord-server`, `hord-remote
 
 `rustc-demangle` 0.1 (hord-verify-rust only, ADR 0022): demangles the Rust symbol names in `llvm-cov export` so a test's own function maps to its definition. It is the demangler the standard library uses, and AGENTS.md forbids a hand-rolled parser.
 
+M5 identity and authorization dependencies (spec §10.5.4):
+
+- `ed25519-dalek` 3 (hord-core, feature `pem`): Ed25519 signatures on `ChangeRecord.signature`, `Evidence.signature`, and other signed hord messages, with PKCS#8 PEM key files. It is the maintained dalek-cryptography implementation (RustCrypto `signature` traits); AGENTS.md forbids a hand-rolled format, and PKCS#8 is the standard one for private keys.
+- `getrandom` 0.4 (hord-core, hord-server; already in the tree): the OS random source for key seeds and bearer tokens, without pulling in a `rand` stack.
+- `argon2` 0.6 (hord-server): Argon2id password hashes (PHC strings) for the `hord login` user table. It is RustCrypto's implementation of the current OWASP-recommended password hash; AGENTS.md forbids hand-rolled hashing.
+- `blake3` 1 and `hex` 0.4 (hord-server, hord-core; already workspace dependencies): the auth file stores each bearer token's BLAKE3 hash, never the token; key ids are hex.
+- `rpassword` 7 (hord-cli): reads the `hord login` / `hord user add` password from the terminal without echo. Small and maintained; the alternative is platform terminal code, which would need `unsafe` in hord-cli.
+
 `askama` 0.16 (hord-ui only): compiled, HTML-escaping templates for the server-rendered web UI. Spec §10.4 names it (DECIDED stack), so the views need no frontend build pipeline and no hand-rolled HTML escaping.
 
 `axum` 0.8 with `form` and `query`, `serde`, `serde_json`, `tokio`, `tokio-stream`, `async-trait` (hord-ui; all already in the tree) and `diffy` (hord-server; already a workspace dependency, AGENTS.md prefers it): the web UI's routes, form and query decoding, the SSE relay, and the `Changes` service's text diff (ADR 0030).
