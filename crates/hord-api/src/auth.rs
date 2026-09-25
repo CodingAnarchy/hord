@@ -151,6 +151,11 @@ const TABLE: &[(&str, Req)] = &[
     ("/hord.v1.Workspaces/Shutdown", Req::Admin),
     // Schema.
     ("/hord.v1.Schema/GetSchema", Req::Public),
+    // Changes: read-only views for the web UI (ADR 0030).
+    ("/hord.v1.Changes/GetChange", Req::Read),
+    ("/hord.v1.Changes/ChangeDiff", Req::Read),
+    ("/hord.v1.Changes/ListRecordings", Req::Read),
+    ("/hord.v1.Changes/GetRecording", Req::Read),
     // Auth.
     ("/hord.v1.Auth/Login", Req::Public),
     ("/hord.v1.Auth/MintToken", Req::Admin),

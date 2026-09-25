@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Flight recorder</h1>
+<p class="legend">{{ description }} · recording <code>{{ recording }}</code></p>
+<form id="transport" class="transport" data-frames="{{ base }}/recordings/{{ recording }}/frames" data-total="{{ total }}">
+  <button type="button" name="play" value="play">play</button>
+  <label>speed
+    <select name="speed">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="4">4×</option>
+      <option value="16">16×</option>
+      <option value="64">64×</option>
+    </select>
+  </label>
+  <input type="range" name="at" min="0" max="{{ total }}" value="{{ position }}" aria-label="scrubber">
+  <output name="where">{{ position }} / {{ total }}</output>
+</form>
+<ol id="strip" class="strip">
+{% for row in rows %}{% include "strip_row.html" %}
+{% endfor %}
+</ol>
+{% endblock %}
+{% block scripts %}<script src="{{ base }}/static/playback.js" defer></script>{% endblock %}

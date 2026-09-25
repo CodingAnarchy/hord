@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_core::{
-    Actor, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
+    Actor, Bytes, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
     RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
 };
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
@@ -925,6 +925,25 @@ impl Repo {
     ) -> Result<hord_api::EventStream> {
         let log = blocking(&self.inner, Inner::event_log).await?;
         Ok(log.subscribe(from))
+    }
+
+    /// Up to `limit` recorded events with a cursor greater than `after`, in
+    /// cursor order: the persisted event log read back, without following
+    /// live events (the web UI's per-change history, ADR 0030).
+    pub async fn recorded_events(
+        &self,
+        after: hord_api::EventCursor,
+        limit: usize,
+    ) -> Result<Vec<hord_api::proto::EventEnvelope>> {
+        blocking(&self.inner, move |inner| {
+            inner.event_log()?.read_after(after, limit)
+        })
+        .await
+    }
+
+    /// Bytes of the file at `path` in `snapshot`; `None` when absent.
+    pub async fn file_bytes(&self, snapshot: SnapshotId, path: RepoPath) -> Result<Option<Bytes>> {
+        blocking(&self.inner, move |inner| inner.file_bytes(snapshot, &path)).await
     }
 
     /// Explain a change's conflicts (`hord conflicts`).

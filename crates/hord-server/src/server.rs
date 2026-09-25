@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::routing::get;
 use hord_api::MAX_MESSAGE_BYTES;
 use hord_api::proto::auth_server::AuthServer;
+use hord_api::proto::changes_server::ChangesServer;
 use hord_api::proto::repo_backend_server::RepoBackendServer;
 use hord_api::proto::schema_server::SchemaServer;
 use hord_api::proto::workspaces_server::WorkspacesServer;
@@ -16,10 +17,12 @@ use tonic::service::Routes;
 use crate::auth::AuthStore;
 use crate::auth_service::GrpcAuth;
 use crate::authz::AuthLayer;
+use crate::changes::GrpcChanges;
 use crate::config::ServerConfig;
 use crate::hosts::Hosts;
 use crate::route::RepoPrefixLayer;
 use crate::service::{GrpcRepoBackend, GrpcSchema};
+use crate::ui::{HostedUi, UiSigner};
 use crate::{Error, Result};
 
 /// How long shutdown waits for open calls (such as event streams) to end.
@@ -49,6 +52,7 @@ pub struct Server {
     workspaces: Option<Arc<dyn hord_api::WorkspacesBackend>>,
     activity: Arc<crate::activity::Activity>,
     auth: Option<Arc<AuthStore>>,
+    ui_signer: Option<UiSigner>,
 }
 
 impl std::fmt::Debug for Server {
@@ -58,6 +62,7 @@ impl std::fmt::Debug for Server {
             .field("config", &self.config)
             .field("workspaces", &self.workspaces.is_some())
             .field("auth", &self.auth.as_ref().map(|a| a.path()))
+            .field("ui_signer", &self.ui_signer)
             .finish()
     }
 }
@@ -72,7 +77,17 @@ impl Server {
             workspaces: None,
             activity: Arc::default(),
             auth: None,
+            ui_signer: None,
         }
+    }
+
+    /// Sign reviews made in the web UI with `signer` (ADR 0030): the key of
+    /// whoever runs the server. With auth, ingest accepts such a review
+    /// only from a signed-in actor who is `signer`'s actor.
+    #[must_use]
+    pub fn with_ui_signer(mut self, signer: UiSigner) -> Self {
+        self.ui_signer = Some(signer);
+        self
     }
 
     /// Require a bearer token on every call but the public ones, checked
@@ -104,7 +119,8 @@ impl Server {
         Ok(TcpListener::bind(addr).await?)
     }
 
-    /// Every route: the gRPC services and `GET /schema.json`.
+    /// Every route: the gRPC services, `GET /schema.json`, and the web UI
+    /// (ADR 0030).
     #[must_use]
     pub fn routes(&self) -> Routes {
         let backend = RepoBackendServer::new(GrpcRepoBackend::new(
@@ -117,7 +133,10 @@ impl Server {
         // other HTTP/1 request with 400, which would hide `/schema.json`.
         let mut routes = Routes::new(backend)
             .add_service(SchemaServer::new(GrpcSchema))
-            .add_service(AuthServer::new(GrpcAuth::new(self.auth.clone())));
+            .add_service(AuthServer::new(GrpcAuth::new(self.auth.clone())))
+            .add_service(ChangesServer::new(GrpcChanges::new(Arc::clone(
+                &self.hosts,
+            ))));
         if let Some(workspaces) = &self.workspaces {
             routes = routes.add_service(
                 WorkspacesServer::new(crate::service::GrpcWorkspaces::new(Arc::clone(workspaces)))
@@ -128,7 +147,12 @@ impl Server {
         let router = routes
             .into_axum_router()
             .layer(tonic_web::GrpcWebLayer::new())
-            .route("/schema.json", get(schema_json));
+            .route("/schema.json", get(schema_json))
+            .merge(hord_ui::router(Arc::new(HostedUi::new(
+                Arc::clone(&self.hosts),
+                self.auth.clone(),
+                self.ui_signer.clone(),
+            ))));
         Routes::from(router)
     }
 
@@ -196,7 +220,7 @@ impl Server {
         let serving = tonic::transport::Server::builder()
             .accept_http1(true)
             .layer(crate::activity::ActivityLayer(Arc::clone(&self.activity)))
-            .layer(RepoPrefixLayer)
+            .layer(RepoPrefixLayer::new(self.hosts.names().map(str::to_owned)))
             .layer(AuthLayer(self.auth.clone()))
             .add_routes(self.routes())
             .serve_with_incoming_shutdown(incoming, async move {

@@ -28,6 +28,7 @@ axum.workspace = true
 bytes.workspace = true
 hord-api = { workspace = true, features = ["conformance"] }
 hord-server.workspace = true
+hord-ui.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 prost.workspace = true

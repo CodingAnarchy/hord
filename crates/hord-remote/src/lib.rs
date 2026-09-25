@@ -35,12 +35,14 @@ macro_rules! call {
 }
 
 mod auth;
+mod changes;
 mod client;
 mod push;
 mod transport;
 mod workspaces;
 
 pub use auth::RemoteAuth;
+pub use changes::RemoteChanges;
 pub use client::{RemoteRepo, open_cache};
 pub use push::push_change;
 pub use workspaces::RemoteWorkspaces;

@@ -103,6 +103,12 @@ impl RemoteRepo {
         crate::RemoteWorkspaces::new(self.transport.clone())
     }
 
+    /// The read-only `Changes` service (ADR 0030) on the same connection.
+    #[must_use]
+    pub fn changes(&self) -> crate::RemoteChanges {
+        crate::RemoteChanges::new(self.transport.clone())
+    }
+
     /// The address this connected to.
     #[must_use]
     pub fn address(&self) -> &str {

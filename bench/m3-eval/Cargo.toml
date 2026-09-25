@@ -23,6 +23,7 @@ hord-remote.workspace = true
 hord-server.workspace = true
 hord-store.workspace = true
 hord-txn.workspace = true
+hord-ui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
