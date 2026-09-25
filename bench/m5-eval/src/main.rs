@@ -50,8 +50,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    // Boxed: `RunArgs` is far larger than the other variants (clippy
+    // `large_enum_variant` on Windows, where paths are bigger).
     /// Run the corpus.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Write the corpus files from the generator.
     Generate {
         /// Directory to write the case files to.
@@ -153,7 +155,7 @@ fn main() -> Result<()> {
         Command::Run(args) => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run(args)),
+            .block_on(run(*args)),
     }
 }
 
