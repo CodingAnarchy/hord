@@ -783,3 +783,115 @@ async fn taking_theirs_follows_a_definition_moved_to_another_file() -> TestResul
     assert!(record.parents.contains(&cb));
     Ok(())
 }
+
+/// Take theirs follows a move within the file: head moved `delta` into
+/// `pub mod math` and a third change edited it there; the parked edit of
+/// `delta` goes into `math`, and no top-level `delta` comes back.
+#[tokio::test]
+async fn taking_theirs_follows_a_definition_moved_within_its_file() -> TestResult {
+    let t = ladder_repo(TWO_ATTEMPTS, None, Arc::new(StubVerifier)).await?;
+    let mut parked = begin(&t.repo, "parked").await?;
+    edit(&mut parked, "src/lib.rs", LIB, "    4\n", "    44\n").await?;
+    let moved_lib = format!(
+        "{}\npub mod math {{\n    pub fn delta() -> u32 {{\n        4\n    }}\n}}\n",
+        LIB.replace(&format!("\n{DELTA}"), "")
+    );
+    let mut mover = begin(&t.repo, "mover").await?;
+    mover
+        .write_file(&path("src/lib.rs"), moved_lib.clone())
+        .await?;
+    submit(&t.repo, &mut mover, "move delta into math").await?;
+    t.repo.land_local().await?;
+    let mut third = begin(&t.repo, "third").await?;
+    edit(
+        &mut third,
+        "src/lib.rs",
+        &moved_lib,
+        "        4\n",
+        "        40\n",
+    )
+    .await?;
+    submit(&t.repo, &mut third, "math::delta returns 40").await?;
+    t.repo.land_local().await?;
+
+    let cb = submit(&t.repo, &mut parked, "delta returns 44").await?;
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    assert_eq!(entry.status, QueueStatus::Conflicted, "{entry:#?}");
+    t.repo
+        .arbitrate(
+            cb,
+            Arbitration::PickTheirs,
+            Arbiter {
+                actor: actor("arbiter"),
+                signature: None,
+            },
+        )
+        .await?;
+    t.repo.land_local().await?;
+    assert!(matches!(
+        t.repo.status(cb).await?.status,
+        QueueStatus::Arbitrated { .. }
+    ));
+    let lib = head_lib(&t.repo).await?;
+    assert_eq!(lib.matches("fn delta").count(), 1, "no duplicate: {lib}");
+    assert!(
+        lib.contains("pub mod math {\n    pub fn delta() -> u32 {"),
+        "{lib}"
+    );
+    assert!(lib.contains("44"), "the parked edit, in math: {lib}");
+    Ok(())
+}
+
+/// The rung-1 regression (the probe from `_open-ladder`): head moved
+/// `delta` (within its file, or to another file under ADR 0033) and a
+/// change on the old base edited it. The rebase must not land the edit as
+/// a second `delta` beside the moved one: it is a hard conflict.
+#[tokio::test]
+async fn an_edit_against_a_moved_definition_never_lands_a_duplicate() -> TestResult {
+    for across_files in [false, true] {
+        let t = ladder_repo(TWO_ATTEMPTS, None, Arc::new(StubVerifier)).await?;
+        let mut parked = begin(&t.repo, "parked").await?;
+        edit(&mut parked, "src/lib.rs", LIB, "    4\n", "    44\n").await?;
+        let mut mover = begin(&t.repo, "mover").await?;
+        let without = LIB.replace(&format!("\n{DELTA}"), "");
+        if across_files {
+            mover
+                .write_file(
+                    &path("src/lib.rs"),
+                    without.replace(
+                        "mod other;",
+                        "mod other;\nmod moved;\n\npub use moved::delta;",
+                    ),
+                )
+                .await?;
+            mover.write_file(&path("src/moved.rs"), DELTA).await?;
+        } else {
+            mover
+                .write_file(
+                    &path("src/lib.rs"),
+                    format!(
+                        "{without}\npub mod math {{\n    pub fn delta() -> u32 {{\n        4\n    }}\n}}\n"
+                    ),
+                )
+                .await?;
+        }
+        submit(&t.repo, &mut mover, "move delta").await?;
+        let cb = submit(&t.repo, &mut parked, "delta returns 44").await?;
+        t.repo.land_local().await?;
+        let entry = t.repo.status(cb).await?;
+        assert_eq!(
+            entry.status,
+            QueueStatus::Conflicted,
+            "across files: {across_files}: {entry:#?}"
+        );
+        assert!(entry.report.as_ref().is_some_and(|r| r.has_hard()));
+        let mut all = head_lib(&t.repo).await?;
+        if let Some(moved) = file_at_head(&t.repo, "src/moved.rs").await? {
+            all.push_str(&moved);
+        }
+        assert_eq!(all.matches("fn delta").count(), 1, "{all}");
+        assert!(!all.contains("44"), "{all}");
+    }
+    Ok(())
+}

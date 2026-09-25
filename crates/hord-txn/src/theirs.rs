@@ -272,6 +272,20 @@ impl Inner {
                 return Ok(None);
             };
             if next == ours_text.as_slice() {
+                // Every contested definition already has the parked text at
+                // head's place of it (a move one side made, against the
+                // other's edit, spec §5.2). Head's text is the answer when
+                // the parked side changed nothing outside them.
+                let base_text = adapter.project(&base.tree.tree);
+                let changed = changed_definitions(
+                    base_text.as_slice(),
+                    &base_defs,
+                    theirs_text.as_slice(),
+                    &theirs_defs,
+                );
+                if changed.is_subset(&contested) {
+                    return Ok(Some(ours_text));
+                }
                 return Ok(None);
             }
             match self.identify_on_head(adapter, path, head, &head_view.tree, next)? {
@@ -329,6 +343,34 @@ struct Relocated {
     node: NodeId,
     to: RepoPath,
     text: Vec<u8>,
+}
+
+/// `span` of `bytes` without leading and trailing ASCII whitespace.
+fn trimmed(bytes: &[u8], span: Range<usize>) -> Option<Range<usize>> {
+    let text = bytes.get(span.clone())?;
+    let start = text.iter().position(|b| !b.is_ascii_whitespace())?;
+    let end = text.iter().rposition(|b| !b.is_ascii_whitespace())? + 1;
+    Some(span.start + start..span.start + end)
+}
+
+/// Definitions whose text differs between `base` and `theirs`, or that
+/// only one of them has.
+fn changed_definitions(
+    base: &[u8],
+    base_defs: &BTreeMap<NodeId, DefinitionInfo>,
+    theirs: &[u8],
+    theirs_defs: &BTreeMap<NodeId, DefinitionInfo>,
+) -> BTreeSet<NodeId> {
+    let text = |bytes: &[u8], d: &DefinitionInfo| bytes.get(d.span.clone()).map(<[u8]>::to_vec);
+    base_defs
+        .keys()
+        .chain(theirs_defs.keys())
+        .filter(|node| {
+            base_defs.get(node).and_then(|d| text(base, d))
+                != theirs_defs.get(node).and_then(|d| text(theirs, d))
+        })
+        .copied()
+        .collect()
 }
 
 fn by_node(defs: Vec<DefinitionInfo>) -> BTreeMap<NodeId, DefinitionInfo> {
@@ -399,7 +441,17 @@ fn take_theirs(
         }
         let text = |d: &DefinitionInfo| theirs.get(d.span.clone()).map(<[u8]>::to_vec);
         match (ours_defs.get(node), theirs_defs.get(node)) {
-            (Some(o), Some(t)) => splices.push((o.span.clone(), text(t)?)),
+            (Some(o), Some(t)) => {
+                // Only the definition's own text: head keeps its trivia
+                // around it (indentation at a moved place), and a
+                // definition that already has the parked text is left.
+                let ours_span = trimmed(ours, o.span.clone())?;
+                let theirs_span = trimmed(theirs, t.span.clone())?;
+                let body = theirs.get(theirs_span)?.to_vec();
+                if ours.get(ours_span.clone())? != body.as_slice() {
+                    splices.push((ours_span, body));
+                }
+            }
             (Some(o), None) => splices.push((o.span.clone(), Vec::new())),
             (None, Some(t)) => {
                 let (at, after) = old_place(*node, ours, ours_defs, base_defs);
