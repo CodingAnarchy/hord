@@ -70,13 +70,22 @@ impl LocalRepo {
         &self.repo
     }
 
-    /// Stop the lander and wait for it to finish its current step.
+    /// Stop the lander and wait for it to finish its current step, then
+    /// close the repository ([`Repo::close`]): afterwards no task it spawned
+    /// holds it.
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         let task = crate::repo::lock(&self.lander).take();
         if let Some(task) = task {
             let _ = task.await;
         }
+        self.repo.close().await;
+    }
+
+    /// End every event stream this serves (see [`Repo::close_events`]),
+    /// so a server's connections can drain before [`Self::shutdown`].
+    pub async fn close_events(&self) {
+        self.repo.close_events().await;
     }
 }
 
@@ -132,7 +141,9 @@ where
     F: FnOnce(&Inner) -> ApiResult<T> + Send + 'static,
 {
     let inner = Arc::clone(&repo.inner);
-    tokio::task::spawn_blocking(move || f(&inner))
+    repo.inner
+        .tasks
+        .spawn_blocking(move || f(&inner))
         .await
         .map_err(|err| ApiError::Internal(format!("background task failed: {err}")))?
 }
@@ -672,7 +683,9 @@ impl RepoBackend for LocalRepo {
         check_batch("ids", request.ids.len())?;
         let ids = wire::object_ids("ids", &request.ids)?;
         let repo = self.repo.clone();
-        let present = tokio::task::spawn_blocking(move || ObjectSource::has(&repo, &ids))
+        let tasks = self.repo.inner.tasks.clone();
+        let present = tasks
+            .spawn_blocking(move || ObjectSource::has(&repo, &ids))
             .await
             .map_err(|err| ApiError::Internal(err.to_string()))??;
         Ok(proto::HasResponse { present })

@@ -424,7 +424,7 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                     state.checking.entry(change)
                 {
                     let inner = Arc::clone(&repo.inner);
-                    slot.insert(tokio::task::spawn_blocking(move || {
+                    slot.insert(repo.inner.tasks.spawn_blocking(move || {
                         // A failure is found again, and classified, in `prepare`.
                         let _ = inner.check_ops(change);
                     }));
@@ -538,7 +538,9 @@ fn spawn_verify(
         plan_only: false,
     };
     let verifier = Arc::clone(&repo.inner.verifier);
-    tokio::spawn(async move { verifier.verify(request).await })
+    repo.inner
+        .tasks
+        .spawn(async move { verifier.verify(request).await })
 }
 
 impl Inner {
