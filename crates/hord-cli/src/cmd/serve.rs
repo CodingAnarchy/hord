@@ -47,7 +47,9 @@ pub async fn run(
     // Fail on a bad address before opening anything.
     hord_server::check_bind(addr, insecure_bind)?;
     let hosts = match (&repo_root, &root) {
-        (Some(path), _) => Hosts::open_repo(path, hord_txn::RepoOptions::default()).await?,
+        (Some(path), _) => {
+            Hosts::open_repo(path, crate::cmd::replay::lander_options(path)?).await?
+        }
         (None, Some(dir)) => Hosts::open_root(dir, hord_txn::RepoOptions::default).await?,
         (None, None) => unreachable!("one of --repo or --root"),
     };

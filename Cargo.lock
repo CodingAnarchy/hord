@@ -2008,6 +2008,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hord-replay-ref"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "hord-api",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror",
+]
+
+[[package]]
 name = "hord-server"
 version = "0.0.0"
 dependencies = [

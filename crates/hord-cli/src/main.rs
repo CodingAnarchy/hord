@@ -3,7 +3,7 @@
 //! Commands: `init`, `ws new|list|rm|gc`, `status`, `verify`, `propose`, `submit`,
 //! `queue`, `land --local`, `conflicts`, `log`, `blame`, `query`, `watch`,
 //! `remote add|rm|list|set-default`, `serve`, `git import`, `git export`,
-//! `policy check`.
+//! `policy check`, `replay`, `arbitrate`.
 //!
 //! `--json` is the canonical agent output: the protobuf JSON mapping of the
 //! command's `hord.proto` message (ADR 0024). Human-oriented text is
@@ -131,5 +131,31 @@ fn run_blocking(cli: Cli) -> Result<()> {
                 cmd::policy::run_check(json, &target, workspace, policy)
             }
         },
+        Command::Replay {
+            change,
+            harness,
+            wall_time_secs,
+            tokens,
+            cost_usd,
+            note,
+        } => cmd::replay::run(
+            json,
+            &target,
+            change,
+            harness,
+            cmd::replay::Limits {
+                wall_time_secs,
+                tokens,
+                cost_usd,
+            },
+            note,
+        ),
+        Command::Arbitrate {
+            change,
+            pick,
+            edit,
+            replay,
+            note,
+        } => cmd::arbitrate::run(json, &target, change, pick, edit, replay, note),
     }
 }

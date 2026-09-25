@@ -184,6 +184,53 @@ pub enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Run the replay protocol on a change by hand (spec §6.6): give the
+    /// harness a workspace on head, and submit what it proposes as a
+    /// replay. Needs the repository's daemon or a remote (the harness
+    /// proposes through it).
+    Replay {
+        /// The conflicted change (64 hex digits).
+        #[arg(value_name = "CHANGE")]
+        change: String,
+        /// The harness command, run by the shell: it reads a ReplayRequest
+        /// line on stdin and writes a ReplayResult line on stdout.
+        #[arg(long, value_name = "CMD")]
+        harness: String,
+        /// Wall-clock budget; the harness is killed past it.
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        wall_time_secs: u64,
+        /// Token budget; a result reporting more is rejected.
+        #[arg(long, value_name = "N")]
+        tokens: Option<u64>,
+        /// Cost budget in US dollars; a result reporting more is rejected.
+        #[arg(long, value_name = "USD")]
+        cost_usd: Option<f64>,
+        /// A note for the harness, added to the request.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// Resolve a parked change (spec §6.4 rung 3). The resolution lands as a
+    /// change whose parents include both colliding changes.
+    #[command(group(clap::ArgGroup::new("how").required(true).args(["pick", "edit", "replay"])))]
+    Arbitrate {
+        /// The parked change (64 hex digits).
+        #[arg(value_name = "CHANGE")]
+        change: String,
+        /// `ours` (keep what landed), `theirs` (take the parked change), or
+        /// a change id that resolves it, such as a replay candidate.
+        #[arg(long, value_name = "ours|theirs|CHANGE")]
+        pick: Option<String>,
+        /// Open a workspace on head to resolve it by hand, then `hord
+        /// propose` there and `hord arbitrate <change> --pick <proposed>`.
+        #[arg(long)]
+        edit: bool,
+        /// Hand it to the repository's replay harness once more.
+        #[arg(long)]
+        replay: bool,
+        /// With `--replay`: a note for the harness.
+        #[arg(long, value_name = "TEXT", requires = "replay")]
+        note: Option<String>,
+    },
 }
 
 /// `hord policy` subcommands.

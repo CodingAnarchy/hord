@@ -67,7 +67,7 @@ pub use conflict::{
 pub use error::{Error, Result};
 pub use escalation::{
     Arbiter, Arbitration, ArbitrationCandidate, Escalation, Origin, PendingResolution,
-    ReplayAttempt, ReplayOutcome,
+    ReplayAttempt, ReplayOutcome, as_replay,
 };
 pub use gate::{
     Built, EngineVerifier, FailClosedVerifier, InstrumentedTests, PolicySource, RustFactory,

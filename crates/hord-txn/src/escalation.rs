@@ -676,21 +676,29 @@ impl Inner {
             None => {}
         }
         let checked = self.was_proposed(id) || self.store.is_checked(id)?;
-        let replay = ChangeRecord {
-            provenance: Provenance {
-                parent_intent: Some(of),
-                ..record.provenance
-            },
-            // The author signed the record without `parent_intent`.
-            signature: None,
-            ..record
-        };
+        let replay = as_replay(record, of);
         let replay_id = self.store.put_object(&replay)?;
         if checked {
             // Same base, result, and ops as the checked record.
             self.store.mark_checked(replay_id)?;
         }
         Ok(Ok(replay_id))
+    }
+}
+
+/// `record` as a replay of `of`: `provenance.parent_intent = of`, with the
+/// author's signature dropped (it covered the record without it). Base,
+/// result, and ops are unchanged, so a check of `record`'s ops holds for
+/// the replay (spec §6.6: Hord records `parent_intent`).
+#[must_use]
+pub fn as_replay(record: ChangeRecord, of: ChangeId) -> ChangeRecord {
+    ChangeRecord {
+        provenance: Provenance {
+            parent_intent: Some(of),
+            ..record.provenance
+        },
+        signature: None,
+        ..record
     }
 }
 
