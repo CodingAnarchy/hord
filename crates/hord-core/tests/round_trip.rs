@@ -6,8 +6,8 @@ use hord_core::{
     Acceptance, Actor, Blob, Bytes, ChangeRecord, Evidence, EvidenceKind, EvidenceResult,
     FileIdentity, IdentityDelta, IdentityEntry, IdentityMap, IdentityTree, IndexPointers, Intent,
     IntentRef, LandPolicy, LangId, Node, NodeFile, NodeId, NodeKind, NodePath, ObjectId, Op,
-    Policy, PolicyRule, PolicyWhen, Provenance, QualifiedName, RepoPath, Signature, Snapshot,
-    SnapshotMetadata, Timestamp, Tree, TreeEntry, TreeOpKind,
+    Policy, PolicyRule, PolicyWhen, Provenance, QualifiedName, ReplayPolicy, RepoPath, Signature,
+    Snapshot, SnapshotMetadata, Timestamp, Tree, TreeEntry, TreeOpKind,
 };
 use hord_encoding::{decode, encode};
 use serde::Serialize;
@@ -203,6 +203,7 @@ fn sample_policy() -> Policy {
             },
             require: vec!["review:human".into()],
         }],
+        replay: ReplayPolicy::default(),
     }
 }
 

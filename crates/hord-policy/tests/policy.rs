@@ -678,3 +678,50 @@ fn location_counts_characters() {
     );
     assert_eq!(Location::of("ab", 99), Location { line: 1, column: 3 });
 }
+
+/// ADR 0028: `[replay] budget` next to `[land] max_replay_attempts`.
+#[test]
+fn replay_budget_parses_with_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let default = parse("[land]\nmax_replay_attempts = 3\n")?;
+    assert_eq!(default.land().max_replay_attempts, 3);
+    assert_eq!(
+        default.replay().budget,
+        hord_core::ReplayBudget {
+            wall_time_ms: 600_000,
+            tokens: None,
+            cost_micros: None,
+        }
+    );
+    let limited = parse(
+        "[land]\nmax_replay_attempts = 1\n\n[replay]\nbudget = { wall_time_secs = 30, tokens = 50000, cost_usd = 1.25 }\n",
+    )?;
+    assert_eq!(
+        limited.replay().budget,
+        hord_core::ReplayBudget {
+            wall_time_ms: 30_000,
+            tokens: Some(50_000),
+            cost_micros: Some(1_250_000),
+        }
+    );
+    // A table form and an integral cost work too.
+    let table = parse("[replay.budget]\ncost_usd = 2\n")?;
+    assert_eq!(table.replay().budget.cost_micros, Some(2_000_000));
+    assert_eq!(table.replay().budget.wall_time_ms, 600_000);
+    Ok(())
+}
+
+#[test]
+fn unknown_replay_keys_and_bad_budgets_are_located() {
+    let (location, message) = error("[replay]\nbudgets = {}\n");
+    assert_eq!(location.map(|l| l.line), Some(2));
+    assert!(message.contains("budgets"), "{message}");
+    let (location, message) = error("[replay]\nbudget = { wall_time = 3 }\n");
+    assert_eq!(location.map(|l| l.line), Some(2));
+    assert!(message.contains("wall_time"), "{message}");
+    let (location, message) = error("[replay]\nbudget = { wall_time_secs = 0 }\n");
+    assert_eq!(location, at(2, 29));
+    assert!(message.contains("wall_time_secs"), "{message}");
+    let (location, message) = error("[replay]\nbudget = { cost_usd = -1.0 }\n");
+    assert_eq!(location, at(2, 23));
+    assert!(message.contains("cost_usd"), "{message}");
+}

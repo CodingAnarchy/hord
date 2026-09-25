@@ -40,6 +40,6 @@ pub use identity::{
     IdentityTrees, NodePath, edit_identity_tree,
 };
 pub use node::{AdapterId, LangId, Node, NodeKind, QualifiedName};
-pub use policy::{LandPolicy, Policy, PolicyRule, PolicyWhen};
+pub use policy::{LandPolicy, Policy, PolicyRule, PolicyWhen, ReplayBudget, ReplayPolicy};
 pub use snapshot::{IndexPointers, Snapshot, SnapshotMetadata};
 pub use tree::{NodeFile, RepoPath, Tree, TreeEntry};

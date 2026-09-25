@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use hord_core::{LandPolicy, Policy, PolicyRule, PolicyWhen};
+use hord_core::{LandPolicy, Policy, PolicyRule, PolicyWhen, ReplayBudget, ReplayPolicy};
 use serde::Deserialize;
 use toml::Spanned;
 
@@ -51,6 +51,7 @@ impl Default for CompiledPolicy {
                     max_impact: None,
                 },
                 rules: Vec::new(),
+                replay: ReplayPolicy::default(),
             },
             land_require: Vec::new(),
             rules: Vec::new(),
@@ -98,6 +99,12 @@ impl CompiledPolicy {
     pub fn land(&self) -> &LandPolicy {
         &self.policy.land
     }
+
+    /// The `[replay]` table (ADR 0028): the budget of each replay attempt.
+    #[must_use]
+    pub fn replay(&self) -> &ReplayPolicy {
+        &self.policy.replay
+    }
 }
 
 /// Parse `.hord-policy.toml` as spec §7.2 shows it.
@@ -106,7 +113,9 @@ impl CompiledPolicy {
 /// `strict_reads = false`, no `max_write_set`, `max_replay_attempts = 2`.
 /// `max_impact` (ADR 0022) is optional and unset by default.
 /// `[[rule]]` tables are optional and need `name`, `when`, and `require`.
-/// Unknown keys are errors. Errors carry the 1-based line and column of the
+/// `[replay]` is optional (ADR 0028): `budget = { wall_time_secs, tokens,
+/// cost_usd }`, each key optional, with a ten-minute wall-clock default and
+/// no token or cost limit. Unknown keys are errors. Errors carry the 1-based line and column of the
 /// offending value.
 pub fn parse(source: &str) -> Result<CompiledPolicy, ParseError> {
     let raw: RawPolicy = toml::from_str(source)
@@ -135,6 +144,7 @@ pub fn parse(source: &str) -> Result<CompiledPolicy, ParseError> {
             .collect(),
     };
     let unspan = |s: &Spanned<String>| s.get_ref().clone();
+    let replay = replay_policy(source, &raw.replay)?;
     let policy = Policy {
         land: LandPolicy {
             require: raw.land.require.iter().map(unspan).collect(),
@@ -166,8 +176,55 @@ pub fn parse(source: &str) -> Result<CompiledPolicy, ParseError> {
                 }
             })
             .collect(),
+        replay,
     };
     draft.compile(Some(source), policy)
+}
+
+/// Millionths of a US dollar in one dollar (`cost_usd` is stored as
+/// micro-dollars, so the policy object stays integral and hashable).
+const MICROS_PER_USD: f64 = 1_000_000.0;
+
+/// The `[replay]` table with its defaults filled in.
+fn replay_policy(source: &str, raw: &RawReplay) -> Result<ReplayPolicy, ParseError> {
+    let Some(budget) = &raw.budget else {
+        return Ok(ReplayPolicy::default());
+    };
+    let wall_time_ms = match &budget.wall_time_secs {
+        None => ReplayBudget::DEFAULT_WALL_TIME_MS,
+        Some(secs) => match secs.get_ref().checked_mul(1_000) {
+            Some(ms) if ms > 0 => ms,
+            _ => {
+                return Err(ParseError::at(
+                    Some(source),
+                    Some(secs.span()),
+                    "`wall_time_secs` must be at least 1 and at most u64::MAX / 1000".into(),
+                ));
+            }
+        },
+    };
+    let cost_micros = match &budget.cost_usd {
+        None => None,
+        Some(usd) => {
+            let micros = (usd.get_ref() * MICROS_PER_USD).round();
+            if !micros.is_finite() || micros < 0.0 || micros >= u64::MAX as f64 {
+                return Err(ParseError::at(
+                    Some(source),
+                    Some(usd.span()),
+                    "`cost_usd` must be a non-negative number of dollars".into(),
+                ));
+            }
+            // In range and integral: checked just above.
+            Some(micros as u64)
+        }
+    };
+    Ok(ReplayPolicy {
+        budget: ReplayBudget {
+            wall_time_ms,
+            tokens: budget.tokens,
+            cost_micros,
+        },
+    })
 }
 
 #[derive(Deserialize)]
@@ -177,6 +234,22 @@ struct RawPolicy {
     land: RawLand,
     #[serde(default)]
     rule: Vec<RawRule>,
+    #[serde(default)]
+    replay: RawReplay,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReplay {
+    budget: Option<RawBudget>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBudget {
+    wall_time_secs: Option<Spanned<u64>>,
+    tokens: Option<u64>,
+    cost_usd: Option<Spanned<f64>>,
 }
 
 #[derive(Default, Deserialize)]

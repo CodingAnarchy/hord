@@ -12,6 +12,55 @@ pub struct Policy {
     pub land: LandPolicy,
     /// Conditional rules, evaluated in order.
     pub rules: Vec<PolicyRule>,
+    /// `[replay]` table (ADR 0028): limits on each replay attempt. Omitted
+    /// from the encoding when it is the default, so policies written before
+    /// it keep their ids.
+    #[serde(default, skip_serializing_if = "ReplayPolicy::is_default")]
+    pub replay: ReplayPolicy,
+}
+
+/// `[replay]` table of `.hord-policy.toml` (ADR 0028, spec §6.4 rung 2).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct ReplayPolicy {
+    /// What one replay attempt may spend (spec §6.6 `Budget`).
+    pub budget: ReplayBudget,
+}
+
+impl ReplayPolicy {
+    /// Whether every key has its default value.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The spec §6.6 `Budget` of one replay attempt (ADR 0028, ADR 0029): the
+/// lander kills a harness that runs past `wall_time_ms` and rejects a
+/// result whose reported tokens or cost exceed their limits.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct ReplayBudget {
+    /// Wall-clock time for one attempt, in milliseconds.
+    pub wall_time_ms: u64,
+    /// Model tokens the harness may report using; `None` is no limit.
+    pub tokens: Option<u64>,
+    /// Cost the harness may report, in millionths of a US dollar; `None` is
+    /// no limit.
+    pub cost_micros: Option<u64>,
+}
+
+impl ReplayBudget {
+    /// `wall_time_ms` when the policy leaves it out: ten minutes.
+    pub const DEFAULT_WALL_TIME_MS: u64 = 600_000;
+}
+
+impl Default for ReplayBudget {
+    fn default() -> Self {
+        Self {
+            wall_time_ms: Self::DEFAULT_WALL_TIME_MS,
+            tokens: None,
+            cost_micros: None,
+        }
+    }
 }
 
 /// `[land]` table of `.hord-policy.toml`. Every key is optional in the file
@@ -102,6 +151,47 @@ mod tests {
         assert_ne!(with, bytes);
         let back: LandPolicy = hord_encoding::decode(&with)?;
         assert_eq!(back.max_impact, Some(40));
+        Ok(())
+    }
+
+    /// [`Policy`] as it was before `[replay]` (ADR 0028).
+    #[derive(Serialize)]
+    struct PolicyV0 {
+        land: LandPolicy,
+        rules: Vec<PolicyRule>,
+    }
+
+    #[test]
+    fn a_default_replay_table_is_omitted_from_the_encoding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = Policy {
+            land: land(None),
+            rules: Vec::new(),
+            replay: ReplayPolicy::default(),
+        };
+        let bytes = hord_encoding::encode(&policy)?;
+        let v0 = PolicyV0 {
+            land: land(None),
+            rules: Vec::new(),
+        };
+        assert_eq!(bytes, hord_encoding::encode(&v0)?);
+        let back: Policy = hord_encoding::decode(&bytes)?;
+        assert_eq!(back, policy);
+
+        let limited = Policy {
+            replay: ReplayPolicy {
+                budget: ReplayBudget {
+                    wall_time_ms: 1_000,
+                    tokens: Some(10),
+                    cost_micros: Some(5),
+                },
+            },
+            ..policy
+        };
+        let with = hord_encoding::encode(&limited)?;
+        assert_ne!(with, bytes);
+        let back: Policy = hord_encoding::decode(&with)?;
+        assert_eq!(back, limited);
         Ok(())
     }
 }

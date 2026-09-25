@@ -2,7 +2,7 @@
 
 use hord_core::{
     Blob, Bytes, EvidenceKind, EvidenceResult, LandPolicy, LangId, Node, NodeKind, ObjectId,
-    Policy, PolicyRule, PolicyWhen, QualifiedName,
+    Policy, PolicyRule, PolicyWhen, QualifiedName, ReplayPolicy,
 };
 use hord_encoding::{decode, encode};
 use proptest::prelude::*;
@@ -90,6 +90,7 @@ proptest! {
                 },
                 require: vec!["review:human".into()],
             }],
+            replay: ReplayPolicy::default(),
         };
         let encoded = encode(&policy)?;
         let back: Policy = decode(&encoded)?;
