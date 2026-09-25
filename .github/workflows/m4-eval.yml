@@ -150,6 +150,10 @@ jobs:
           # Everything the eval and cargo write goes to /mnt, from the next
           # step on. rustup's toolchains stay in ~/.rustup (fixed size).
           echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
+          # rustup's proxies (cargo, rustc) stay in ~/.cargo/bin, and cargo's
+          # own tests require `$CARGO_HOME/bin/cargo` (`requires_rustup_stable`),
+          # so the new CARGO_HOME links to them.
+          ln -sfn "$HOME/.cargo/bin" /mnt/cargo-home/bin
           echo "CARGO_HOME=/mnt/cargo-home" >> "$GITHUB_ENV"
           echo "/mnt/cargo-home/bin" >> "$GITHUB_PATH"
       - &corpus-cache
