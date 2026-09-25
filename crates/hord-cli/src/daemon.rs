@@ -56,7 +56,8 @@ pub fn connect_or_start(root: &Path) -> Result<Option<RemoteRepo>> {
         std::thread::sleep(Duration::from_millis(50));
     }
     eprintln!(
-        "hord: the daemon did not answer within {}s; working without it (see {})",
+        "hord: the daemon did not answer on {} within {}s; working without it (see {})",
+        hord_api::local::endpoint(root).unwrap_or_else(|e| format!("<no endpoint: {e}>")),
         START_TIMEOUT.as_secs(),
         log_path(root).display()
     );
@@ -169,6 +170,10 @@ pub async fn serve(root: &Path) -> Result<()> {
             }
         }
     };
+    eprintln!(
+        "hord daemon {}: listening on {endpoint}",
+        std::process::id()
+    );
     server.serve_local(&endpoint, shutdown).await?;
     Ok(())
 }
