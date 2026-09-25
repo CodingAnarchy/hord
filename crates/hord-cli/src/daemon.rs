@@ -55,6 +55,11 @@ pub fn connect_or_start(root: &Path) -> Result<Option<RemoteRepo>> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    eprintln!(
+        "hord: the daemon did not answer within {}s; working without it (see {})",
+        START_TIMEOUT.as_secs(),
+        log_path(root).display()
+    );
     Ok(None)
 }
 
@@ -82,9 +87,20 @@ fn store_free(root: &Path) -> bool {
     hord_store::Store::open_with_lock_timeout(root, Duration::ZERO).is_ok()
 }
 
-/// Start `hord serve --repo <root> --daemon`, detached.
+/// Where a daemon started by the CLI writes its errors.
+pub fn log_path(root: &Path) -> std::path::PathBuf {
+    root.join(hord_store::HORD_DIR).join("daemon.log")
+}
+
+/// Start `hord serve --repo <root> --daemon`, detached. Its stderr goes to
+/// [`log_path`], so a daemon that fails to start leaves the reason behind.
 fn spawn(root: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("locate the hord executable")?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path(root))
+        .with_context(|| format!("open {}", log_path(root).display()))?;
     let mut command = std::process::Command::new(exe);
     command
         .arg("serve")
@@ -93,7 +109,7 @@ fn spawn(root: &Path) -> Result<()> {
         .arg("--daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(log);
     detach(&mut command);
     command.spawn().context("start the hord daemon")?;
     Ok(())

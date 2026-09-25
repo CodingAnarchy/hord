@@ -203,12 +203,22 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Kill `child` and, on Unix, its whole process group.
+/// Kill `child` and everything it started: its process group on Unix, its
+/// process tree on Windows (which has no process groups), so a hung
+/// grandchild cannot keep holding the output pipes.
 fn kill_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
             .args(["-9", &format!("-{}", child.id())])
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
