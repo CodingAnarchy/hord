@@ -141,7 +141,18 @@ pub async fn serve(root: &Path) -> Result<()> {
         move || hord_store::Store::open_with_lock_timeout(&root, Duration::from_secs(2))
     })
     .await??;
+    eprintln!(
+        "DIAG daemon {} opened store at {} (canonical {:?}); index.redb exists={}",
+        std::process::id(),
+        root.display(),
+        std::fs::canonicalize(root).ok(),
+        root.join(".hord").join("index.redb").is_file()
+    );
     let repo = hord_txn::Repo::from_store(store, hord_txn::RepoOptions::default()).await?;
+    eprintln!(
+        "DIAG daemon {} built repo; still holding the store",
+        std::process::id()
+    );
     let stop = Arc::new(tokio::sync::Notify::new());
     let workspaces: Arc<dyn WorkspacesBackend> = Arc::new(LocalWorkspaces::local(
         repo.clone(),

@@ -141,6 +141,54 @@ fn the_daemon_serves_workspaces_and_lands_on_submit() -> TestResult {
         return Err(format!("ws new: {}", describe(&started)).into());
     }
     let ws: serde_json::Value = serde_json::from_slice(&started.stdout)?;
+    {
+        let hord_dir = dir.join(".hord");
+        eprintln!(
+            "DIAG test dir {} (canonical {:?})",
+            dir.display(),
+            fs::canonicalize(dir).ok()
+        );
+        eprintln!(
+            "DIAG ws new stderr: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        eprintln!(
+            "DIAG daemon.log:\n{}",
+            fs::read_to_string(hord_dir.join("daemon.log")).unwrap_or_default()
+        );
+        eprintln!(
+            "DIAG index.pid: {:?}",
+            fs::read_to_string(hord_dir.join("index.pid")).ok()
+        );
+        if let Ok(out) = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq hord.exe", "/FO", "CSV"])
+            .output()
+        {
+            eprintln!("DIAG tasklist:\n{}", String::from_utf8_lossy(&out.stdout));
+        }
+        for attempt in 0..2 {
+            match hord_store::Store::open_with_lock_timeout(dir, Duration::ZERO) {
+                Ok(store) => {
+                    eprintln!(
+                        "DIAG attempt {attempt}: open SUCCEEDED (index.pid now {:?})",
+                        fs::read_to_string(hord_dir.join("index.pid")).ok()
+                    );
+                    drop(store);
+                }
+                Err(err) => eprintln!("DIAG attempt {attempt}: open failed: {err:?}"),
+            }
+        }
+        let status = hord(dir, &["status", "-w", str_field(&ws, "id")?, "--json"]).output()?;
+        eprintln!(
+            "DIAG status after probes: ok={} stderr={}",
+            status.status.success(),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        eprintln!(
+            "DIAG daemon.log after:\n{}",
+            fs::read_to_string(hord_dir.join("daemon.log")).unwrap_or_default()
+        );
+    }
     assert!(
         store_held(dir),
         "ws new started a daemon that owns the store\nws new stderr:\n{}\ndaemon.log:\n{}",
