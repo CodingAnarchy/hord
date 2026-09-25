@@ -26,5 +26,5 @@ jobs:
         run: |
           for i in 1 2 3 4 5; do
             echo "===== RUN $i"
-            cargo test -q -p hord-cli --test daemon the_daemon_serves_workspaces_and_lands_on_submit -- --nocapture 2>&1 | grep -E "DIAG|panicked|test result|hord daemon|listening|\"hord.exe\"|Image Name|^  " | head -60
+            cargo test -q -p hord-cli --test daemon the_daemon_serves_workspaces_and_lands_on_submit -- --nocapture 2>&1 | tail -150
           done

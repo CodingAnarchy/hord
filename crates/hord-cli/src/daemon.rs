@@ -169,9 +169,10 @@ pub async fn serve(root: &Path) -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
-                () = stop.notified() => return,
+                () = stop.notified() => { eprintln!("DIAG daemon {}: stop notified", std::process::id()); return },
                 _ = tick.tick() => {
                     if activity.idle() >= idle || !hord_dir.is_dir() {
+                        eprintln!("DIAG daemon {}: exit idle={:?} (limit {:?}) hord_dir_is_dir={}", std::process::id(), activity.idle(), idle, hord_dir.is_dir());
                         return;
                     }
                 }
@@ -182,6 +183,8 @@ pub async fn serve(root: &Path) -> Result<()> {
         "hord daemon {}: listening on {endpoint}",
         std::process::id()
     );
-    server.serve_local(&endpoint, shutdown).await?;
+    let served = server.serve_local(&endpoint, shutdown).await;
+    eprintln!("DIAG daemon {}: serve_local returned {:?}", std::process::id(), served.as_ref().map_err(|e| e.to_string()));
+    served?;
     Ok(())
 }

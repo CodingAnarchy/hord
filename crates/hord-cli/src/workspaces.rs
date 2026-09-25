@@ -466,6 +466,7 @@ impl WorkspacesBackend for LocalWorkspaces {
     ) -> ApiResult<proto::ShutdownResponse> {
         match &self.shutdown {
             Some(stop) => {
+                eprintln!("DIAG daemon {}: Shutdown RPC received", std::process::id());
                 stop.notify_one();
                 Ok(proto::ShutdownResponse {})
             }
