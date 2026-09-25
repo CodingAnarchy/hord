@@ -40,3 +40,7 @@ ADR 0024 server-foundation dependencies (`hord-api`, `hord-server`, `hord-remote
 - `toml` 1 (hord-server, hord-cli; already a workspace dependency): `server.toml` and `.hord/remotes.toml`.
 
 `rustc-demangle` 0.1 (hord-verify-rust only, ADR 0022): demangles the Rust symbol names in `llvm-cov export` so a test's own function maps to its definition. It is the demangler the standard library uses, and AGENTS.md forbids a hand-rolled parser.
+
+`serde_json` 1 (hord-txn; already a workspace dependency) and tokio's `process` feature (hord-txn): the replay protocol's JSON lines in the canonical protobuf JSON mapping, and the harness process the lander runs and kills at its budget (spec §6.6, ADR 0028).
+
+`hord-replay-ref` (new crate, spec §11): `clap` (feature `env`), `hord-api`, `serde`, `serde_json`, `serde_yaml_ng`, `thiserror`, all already workspace dependencies. `serde_yaml_ng` writes the intent file's front matter for `hord propose`.

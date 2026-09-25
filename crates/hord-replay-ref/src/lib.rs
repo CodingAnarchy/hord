@@ -298,3 +298,67 @@ pub fn replay(request: &ReplayRequest, options: &Options) -> Result<ReplayResult
         ..Default::default()
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> ReplayRequest {
+        let item = |kind: &str, value: &str| proto::IntentItem {
+            kind: kind.into(),
+            value: value.into(),
+        };
+        ReplayRequest {
+            change: "ab".repeat(32),
+            attempt: 2,
+            intent: Some(proto::ChangeIntent {
+                summary: "beta returns 21".into(),
+                body: "Make beta return 21.".into(),
+                refs: vec![item("issue", "7")],
+                acceptance: vec![
+                    item("test", "beta_is_21"),
+                    item("invariant", "alpha is untouched"),
+                ],
+            }),
+            summary: Some(proto::ConflictSummary {
+                text: "Landed (ours) \"beta returns 20\"".into(),
+                ..Default::default()
+            }),
+            note: Some("keep the doc comment".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_prompt_carries_intent_acceptance_summary_and_note() {
+        let text = prompt(&request());
+        for needle in [
+            "attempt 2",
+            "beta returns 21",
+            "Make beta return 21.",
+            "- test: beta_is_21",
+            "beta returns 20",
+            "keep the doc comment",
+        ] {
+            assert!(text.contains(needle), "{needle:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn the_intent_file_keeps_the_intent_and_refs_the_original()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let text = intent_file(&request())?;
+        let yaml = text
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("---\n"))
+            .ok_or("front matter fences")?;
+        let front: Value = serde_yaml_ng::from_str(yaml.0)?;
+        assert_eq!(front["summary"], Value::from("beta returns 21"));
+        assert_eq!(front["refs"][0]["issue"], Value::from("7"));
+        assert_eq!(front["refs"][1]["change"], Value::from("ab".repeat(32)));
+        assert_eq!(front["acceptance"][0]["test"], Value::from("beta_is_21"));
+        assert_eq!(front["acceptance"][1], Value::from("alpha is untouched"));
+        assert_eq!(yaml.1.trim(), "Make beta return 21.");
+        Ok(())
+    }
+}
