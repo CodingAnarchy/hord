@@ -58,6 +58,8 @@ pub struct Config {
     pub wall_time_secs: u64,
     /// `[replay] budget` tokens per attempt.
     pub tokens: u64,
+    /// `[replay] budget` cost per attempt in US dollars; `None`: no limit.
+    pub cost_usd: Option<f64>,
     /// `[land] max_replay_attempts`.
     pub max_attempts: u64,
     /// Where case repositories are built.
@@ -284,8 +286,12 @@ async fn build(cfg: &Config, path: &Path, case: &Case) -> Result<CaseRepo> {
     remove_tree(&dir);
     std::fs::create_dir_all(&dir)?;
     write_files(&dir, &case.base)?;
+    let cost = cfg
+        .cost_usd
+        .map(|usd| format!(", cost_usd = {usd}"))
+        .unwrap_or_default();
     let policy = format!(
-        "[land]\nrequire = [\"check\", \"test:full\"]\nmax_replay_attempts = {}\n\n[replay]\nbudget = {{ wall_time_secs = {}, tokens = {} }}\n",
+        "[land]\nrequire = [\"check\", \"test:full\"]\nmax_replay_attempts = {}\n\n[replay]\nbudget = {{ wall_time_secs = {}, tokens = {}{cost} }}\n",
         cfg.max_attempts, cfg.wall_time_secs, cfg.tokens
     );
     std::fs::write(dir.join(".hord-policy.toml"), policy)?;
@@ -474,6 +480,17 @@ fn budget_violations(cfg: &Config, attempts: &[proto::ReplayAttempt]) -> Vec<Str
             out.push(format!(
                 "attempt {} reported {:?} tokens over the {} budget and was accepted",
                 a.attempt, a.tokens, cfg.tokens
+            ));
+        }
+        let over_cost = cfg.cost_usd.is_some_and(|usd| {
+            a.cost_micros
+                .is_some_and(|c| c as f64 > (usd * 1_000_000.0).round())
+        });
+        if a.outcome() == proto::ReplayOutcome::Proposed && over_cost {
+            out.push(format!(
+                "attempt {} reported a cost of {:?} micro-dollars over the ${:?} budget and was \
+                 accepted",
+                a.attempt, a.cost_micros, cfg.cost_usd
             ));
         }
     }
@@ -850,6 +867,7 @@ mod tests {
             model: None,
             wall_time_secs: 10,
             tokens: 100,
+            cost_usd: None,
             max_attempts: 2,
             work: PathBuf::new(),
             keep: false,

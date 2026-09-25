@@ -55,3 +55,32 @@ each parked case is resolved from its web workbench: the runner posts the
 workbench's "pick ours" form, the UI signs the decision with a key the
 runner provides, and the runner checks that the resolution lands with both
 parents and a signed `Arbitrated` event.
+
+## A real-model pilot
+
+`bench/m5-eval/harness/claude.sh` is a model command for `hord-replay-ref`.
+It runs the Claude Code CLI (`claude -p`) in the replay workspace on the
+prompt from stdin, with only file reading and editing and `cargo
+check/test/build` allowed (`--restricted`, `--permission-mode dontAsk`, no
+permission bypass). It caps spend at the attempt's cost budget
+(`--max-budget-usd`), and writes the tokens (input, output, and cache) and
+`total_cost_usd` it reports to `$HORD_REPLAY_USAGE` for the lander's budget
+check. `HORD_M5_MODEL` picks the model (default `claude-sonnet-5`).
+`HORD_M5_MAX_TURNS` adds `--max-turns`. The CLI's help does not list that
+flag, so it is off unless set.
+
+A 10-case pilot, one or two cases per template, two of them ambiguous:
+
+```
+cargo build --release -p hord-cli -p hord-replay-ref -p hord-eval-m5
+target/release/hord-eval-m5 run \
+  --harness-cmd "$PWD/bench/m5-eval/harness/claude.sh" --model claude-sonnet-5 \
+  --only m5-001 --only m5-014 --only m5-020 --only m5-027 --only m5-039 \
+  --only m5-051 --only m5-064 --only m5-076 --only m5-089 --only m5-090 \
+  --jobs 2 --cost-usd 2 --tokens 50000000 --out /tmp/hord-m5-pilot
+```
+
+- The command's path must be absolute, because it runs inside each case's workspace.
+- `--out` is outside the repository, so Claude Code does not read hord's own `CLAUDE.md` from a parent directory.
+- `--tokens` is high because cache reads count as tokens. `--cost-usd` is the per-attempt budget that matters.
+- The wall-clock budget defaults to 600 s per attempt with `--harness-cmd`.

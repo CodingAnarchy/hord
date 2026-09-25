@@ -91,6 +91,10 @@ struct RunArgs {
     /// `[replay] budget` tokens per attempt.
     #[arg(long, default_value_t = 2_000_000)]
     tokens: u64,
+    /// `[replay] budget` cost per attempt, in US dollars (ADR 0028). Off by
+    /// default: the scripted harness reports no cost.
+    #[arg(long, value_name = "USD")]
+    cost_usd: Option<f64>,
     /// `[land] max_replay_attempts`.
     #[arg(long, default_value_t = 2)]
     max_attempts: u64,
@@ -188,6 +192,7 @@ async fn run(args: RunArgs) -> Result<()> {
             .wall_time_secs
             .unwrap_or(if scripted { 10 } else { 600 }),
         tokens: args.tokens,
+        cost_usd: args.cost_usd,
         max_attempts: args.max_attempts,
         work: out.join("cases"),
         keep: args.keep,

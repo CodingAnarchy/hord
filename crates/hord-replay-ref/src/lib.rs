@@ -18,6 +18,7 @@
 //! | `HORD_REPLAY_ATTEMPT` | the attempt number |
 //! | `HORD_WORKSPACE`, `HORD_WORKSPACE_PATH` | the workspace id and directory |
 //! | `HORD_REPO` | the repository root |
+//! | `HORD_REPLAY_COST_USD`, `HORD_REPLAY_TOKENS` | the attempt's cost and token budget, when it has one |
 //!
 //! Its stdout goes to this process's stderr, so the protocol line stays
 //! alone on stdout. A command that exits non-zero, or leaves nothing to
@@ -227,7 +228,20 @@ pub fn replay(request: &ReplayRequest, options: &Options) -> Result<ReplayResult
     let usage_file = scratch.0.join("usage.json");
     std::fs::write(&prompt_file, &prompt_text).map_err(io("write the prompt"))?;
     let workspace = Path::new(&request.workspace_path);
-    let mut child = shell(&options.cmd)
+    let mut command = shell(&options.cmd);
+    // The attempt's budget, so a model command can stop itself before the
+    // lander rejects the attempt (ADR 0028).
+    let budget = request.budget.unwrap_or_default();
+    if let Some(micros) = budget.cost_micros {
+        command.env(
+            "HORD_REPLAY_COST_USD",
+            format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000),
+        );
+    }
+    if let Some(tokens) = budget.tokens {
+        command.env("HORD_REPLAY_TOKENS", tokens.to_string());
+    }
+    let mut child = command
         .current_dir(workspace)
         .env("HORD_REPLAY_PROMPT_FILE", &prompt_file)
         .env("HORD_REPLAY_USAGE", &usage_file)
