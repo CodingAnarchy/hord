@@ -1,0 +1,118 @@
+id = "m5-071"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: variant-vs-match #8 (State::Busy/load)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum State {
+    Idle,
+}
+
+pub fn label(e: &State) -> &'static str {
+    match e {
+        State::Idle => "idle",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add State::Busy, labelled busy"
+body = 'State needs a Busy case. Its label is "busy".'
+test = "busy_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn busy_is_labelled() {
+    assert_eq!(fixture::label(&fixture::State::Busy), "busy");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum State {
+    Idle,
+    Busy,
+}
+
+pub fn label(e: &State) -> &'static str {
+    match e {
+        State::Idle => "idle",
+        State::Busy => "busy",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add load, a number for each State"
+body = "Add load(e), which is 1 for Idle."
+test = "load_of_idle"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn load_of_idle() {
+    assert_eq!(fixture::load(&fixture::State::Idle), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum State {
+    Idle,
+}
+
+pub fn label(e: &State) -> &'static str {
+    match e {
+        State::Idle => "idle",
+    }
+}
+
+pub fn load(e: &State) -> u32 {
+    match e {
+        State::Idle => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum State {
+    Idle,
+    Busy,
+}
+
+pub fn label(e: &State) -> &'static str {
+    match e {
+        State::Idle => "idle",
+        State::Busy => "busy",
+    }
+}
+
+pub fn load(e: &State) -> u32 {
+    match e {
+        State::Idle => 1,
+        State::Busy => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn load_of_idle() {
+    assert_eq!(fixture::load(&fixture::State::Idle), 1);
+}
+"""

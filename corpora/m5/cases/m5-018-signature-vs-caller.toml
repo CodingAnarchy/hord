@@ -1,0 +1,104 @@
+id = "m5-018"
+kind = "signature-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: signature-vs-caller #5 (resize/resize_margin)"
+script = [
+    "over_budget",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn resize(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn resize_twice(x: u32) -> u32 {
+    resize(resize(x))
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "resize takes its factor as a parameter"
+body = "resize always doubles. Callers need other factors: add a `factor` parameter and keep resize_twice doubling twice."
+test = "resize_takes_a_factor"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn resize_takes_a_factor() {
+    assert_eq!(fixture::resize(3, 7), 21);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn resize(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn resize_twice(x: u32) -> u32 {
+    resize(resize(x, 2), 2)
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add resize_margin: resize plus one"
+body = "Add resize_margin(x), which is resize(x) plus one."
+test = "resize_margin_is_one_more"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn resize_margin_is_one_more() {
+    assert_eq!(fixture::resize_margin(4), 9);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn resize(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn resize_twice(x: u32) -> u32 {
+    resize(resize(x))
+}
+
+pub fn resize_margin(x: u32) -> u32 {
+    resize(x) + 1
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn resize(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn resize_twice(x: u32) -> u32 {
+    resize(resize(x, 2), 2)
+}
+
+pub fn resize_margin(x: u32) -> u32 {
+    resize(x, 2) + 1
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn resize_margin_is_one_more() {
+    assert_eq!(fixture::resize_margin(4), 9);
+}
+"""

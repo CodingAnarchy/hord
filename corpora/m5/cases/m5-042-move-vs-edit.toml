@@ -1,0 +1,87 @@
+id = "m5-042"
+kind = "move-vs-edit"
+conflict = "hard"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: move-vs-edit #4 (parse_age into people)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_age(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "move parse_age into module people"
+body = "Move parse_age into a new public module `people`, re-exported at the crate root."
+test = "parse_age_lives_in_people"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_age_lives_in_people() {
+    assert_eq!(fixture::people::parse_age("7"), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub mod people;
+
+pub use people::parse_age;
+"""
+"src/people.rs" = """
+pub fn parse_age(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "parse_age ignores surrounding whitespace"
+body = "parse_age rejects input with spaces around the number. Trim it first."
+test = "parse_age_trims"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn parse_age_trims() {
+    assert_eq!(fixture::parse_age(" 7 "), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_age(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub mod people;
+
+pub use people::parse_age;
+"""
+"src/people.rs" = """
+pub fn parse_age(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn parse_age_trims() {
+    assert_eq!(fixture::parse_age(" 7 "), Some(7));
+}
+"""

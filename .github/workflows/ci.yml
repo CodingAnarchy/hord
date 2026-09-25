@@ -1,5 +1,5 @@
-# M0–M3 acceptance (spec §12): unit tests and encoding goldens on
-# Linux/macOS/Windows; git round-trip, M1, M2, and M3 corpora on Ubuntu.
+# M0–M5 acceptance (spec §12): unit tests and encoding goldens on
+# Linux/macOS/Windows; git round-trip, M1, M2, M3, and M5 corpora on Ubuntu.
 name: CI
 
 on:
@@ -186,3 +186,43 @@ jobs:
 
       - name: M3 simulation with policy, against the server
         run: cargo run -p hord-eval-m3 --release -- --server --policy --report-throughput
+
+  m5:
+    name: M5 conflict corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The lander's verifier runs each case's tests under coverage
+      # (ADR 0022).
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Build hord, the reference harness, and the runner
+        run: cargo build --release -p hord-cli -p hord-replay-ref -p hord-eval-m5
+
+      # 100 intent-bearing conflict cases through the escalation ladder,
+      # with hord-replay-ref running the deterministic scripted harness.
+      # Gates correctness only: every case collides as designed, no attempt
+      # runs past its budget unkilled and no over-budget result is
+      # accepted, every parked case round-trips through a signed
+      # Arbitrate, and each case is graded as its script predicts. The 60%
+      # resolved-by-replay target needs a model and is reported, not gated.
+      - name: M5 conflict corpus (scripted harness)
+        run: target/release/hord-eval-m5 run --jobs 4 --out target/m5-eval
+
+      - name: Upload the review sheet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m5-review-sheet
+          path: |
+            target/m5-eval/report.json
+            target/m5-eval/review.md
+            target/m5-eval/review.csv

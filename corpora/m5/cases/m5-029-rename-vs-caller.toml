@@ -1,0 +1,85 @@
+id = "m5-029"
+kind = "rename-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: rename-vs-caller #3 (tally->tally_votes/tally_doubled)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn tally(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rename tally to tally_votes"
+body = "tally is a vague name. Rename it to tally_votes; its behavior stays the same."
+test = "tally_votes_sums"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn tally_votes_sums() {
+    assert_eq!(fixture::tally_votes(&[1, 2, 3]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn tally_votes(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add tally_doubled: twice the tally"
+body = "Add tally_doubled(xs), twice the sum that tally computes."
+test = "tally_doubled_doubles"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn tally_doubled_doubles() {
+    assert_eq!(fixture::tally_doubled(&[1, 2]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn tally(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn tally_doubled(xs: &[i32]) -> i32 {
+    tally(xs) * 2
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn tally_votes(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn tally_doubled(xs: &[i32]) -> i32 {
+    tally_votes(xs) * 2
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn tally_doubled_doubles() {
+    assert_eq!(fixture::tally_doubled(&[1, 2]), 6);
+}
+"""

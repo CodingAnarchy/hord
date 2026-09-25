@@ -1,0 +1,87 @@
+id = "m5-049"
+kind = "move-vs-edit"
+conflict = "hard"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: move-vs-edit #11 (parse_limit into limits)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_limit(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "move parse_limit into module limits"
+body = "Move parse_limit into a new public module `limits`, re-exported at the crate root."
+test = "parse_limit_lives_in_limits"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_limit_lives_in_limits() {
+    assert_eq!(fixture::limits::parse_limit("7"), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub mod limits;
+
+pub use limits::parse_limit;
+"""
+"src/limits.rs" = """
+pub fn parse_limit(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "parse_limit ignores surrounding whitespace"
+body = "parse_limit rejects input with spaces around the number. Trim it first."
+test = "parse_limit_trims"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn parse_limit_trims() {
+    assert_eq!(fixture::parse_limit(" 7 "), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_limit(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub mod limits;
+
+pub use limits::parse_limit;
+"""
+"src/limits.rs" = """
+pub fn parse_limit(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn parse_limit_trims() {
+    assert_eq!(fixture::parse_limit(" 7 "), Some(7));
+}
+"""

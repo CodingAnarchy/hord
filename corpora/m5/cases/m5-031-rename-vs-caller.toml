@@ -1,0 +1,85 @@
+id = "m5-031"
+kind = "rename-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: rename-vs-caller #5 (accumulate->sum_up/accumulate_twice)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn accumulate(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rename accumulate to sum_up"
+body = "accumulate is a vague name. Rename it to sum_up; its behavior stays the same."
+test = "sum_up_sums"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn sum_up_sums() {
+    assert_eq!(fixture::sum_up(&[1, 2, 3]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn sum_up(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add accumulate_twice: twice the accumulate"
+body = "Add accumulate_twice(xs), twice the sum that accumulate computes."
+test = "accumulate_twice_doubles"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn accumulate_twice_doubles() {
+    assert_eq!(fixture::accumulate_twice(&[1, 2]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn accumulate(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn accumulate_twice(xs: &[i32]) -> i32 {
+    accumulate(xs) * 2
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn sum_up(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn accumulate_twice(xs: &[i32]) -> i32 {
+    sum_up(xs) * 2
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn accumulate_twice_doubles() {
+    assert_eq!(fixture::accumulate_twice(&[1, 2]), 6);
+}
+"""

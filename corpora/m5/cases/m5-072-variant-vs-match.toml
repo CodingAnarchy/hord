@@ -1,0 +1,121 @@
+id = "m5-072"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: variant-vs-match #9 (Tone::Loud/volume)"
+script = [
+    "sleep",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum Tone {
+    Soft,
+}
+
+pub fn label(e: &Tone) -> &'static str {
+    match e {
+        Tone::Soft => "soft",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add Tone::Loud, labelled loud"
+body = 'Tone needs a Loud case. Its label is "loud".'
+test = "loud_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn loud_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Tone::Loud), "loud");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Tone {
+    Soft,
+    Loud,
+}
+
+pub fn label(e: &Tone) -> &'static str {
+    match e {
+        Tone::Soft => "soft",
+        Tone::Loud => "loud",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add volume, a number for each Tone"
+body = "Add volume(e), which is 1 for Soft."
+test = "volume_of_soft"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn volume_of_soft() {
+    assert_eq!(fixture::volume(&fixture::Tone::Soft), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Tone {
+    Soft,
+}
+
+pub fn label(e: &Tone) -> &'static str {
+    match e {
+        Tone::Soft => "soft",
+    }
+}
+
+pub fn volume(e: &Tone) -> u32 {
+    match e {
+        Tone::Soft => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum Tone {
+    Soft,
+    Loud,
+}
+
+pub fn label(e: &Tone) -> &'static str {
+    match e {
+        Tone::Soft => "soft",
+        Tone::Loud => "loud",
+    }
+}
+
+pub fn volume(e: &Tone) -> u32 {
+    match e {
+        Tone::Soft => 1,
+        Tone::Loud => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn volume_of_soft() {
+    assert_eq!(fixture::volume(&fixture::Tone::Soft), 1);
+}
+"""

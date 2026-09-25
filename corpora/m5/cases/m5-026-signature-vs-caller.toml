@@ -1,0 +1,101 @@
+id = "m5-026"
+kind = "signature-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: signature-vs-caller #13 (dose/dose_extra)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn dose(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn dose_twice(x: u32) -> u32 {
+    dose(dose(x))
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "dose takes its factor as a parameter"
+body = "dose always doubles. Callers need other factors: add a `factor` parameter and keep dose_twice doubling twice."
+test = "dose_takes_a_factor"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn dose_takes_a_factor() {
+    assert_eq!(fixture::dose(3, 15), 45);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn dose(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn dose_twice(x: u32) -> u32 {
+    dose(dose(x, 2), 2)
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add dose_extra: dose plus one"
+body = "Add dose_extra(x), which is dose(x) plus one."
+test = "dose_extra_is_one_more"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn dose_extra_is_one_more() {
+    assert_eq!(fixture::dose_extra(4), 9);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn dose(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn dose_twice(x: u32) -> u32 {
+    dose(dose(x))
+}
+
+pub fn dose_extra(x: u32) -> u32 {
+    dose(x) + 1
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn dose(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn dose_twice(x: u32) -> u32 {
+    dose(dose(x, 2), 2)
+}
+
+pub fn dose_extra(x: u32) -> u32 {
+    dose(x, 2) + 1
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn dose_extra_is_one_more() {
+    assert_eq!(fixture::dose_extra(4), 9);
+}
+"""

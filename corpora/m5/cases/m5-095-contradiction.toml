@@ -1,0 +1,58 @@
+id = "m5-095"
+kind = "contradiction"
+conflict = "hard"
+ambiguous = true
+made_by = "hord-eval-m5 generate v1: contradiction #7 (TIMEOUT_SECS = 26 or 36)"
+script = ["give_up"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub const TIMEOUT_SECS: u32 = 10;
+"""
+
+[[tasks]]
+name = "a"
+summary = "raise TIMEOUT_SECS to 26"
+body = "Production needs TIMEOUT_SECS at 26."
+test = "timeout_secs_is_26"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn timeout_secs_is_26() {
+    assert_eq!(fixture::TIMEOUT_SECS, 26);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub const TIMEOUT_SECS: u32 = 26;
+"""
+
+[[tasks]]
+name = "b"
+summary = "raise TIMEOUT_SECS to 36"
+body = "Load tests need TIMEOUT_SECS at 36."
+test = "timeout_secs_is_36"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn timeout_secs_is_36() {
+    assert_eq!(fixture::TIMEOUT_SECS, 36);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub const TIMEOUT_SECS: u32 = 36;
+"""

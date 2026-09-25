@@ -1,0 +1,101 @@
+id = "m5-017"
+kind = "signature-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: signature-vs-caller #4 (mult/mult_and_bump)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn mult(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn mult_twice(x: u32) -> u32 {
+    mult(mult(x))
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "mult takes its factor as a parameter"
+body = "mult always doubles. Callers need other factors: add a `factor` parameter and keep mult_twice doubling twice."
+test = "mult_takes_a_factor"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn mult_takes_a_factor() {
+    assert_eq!(fixture::mult(3, 6), 18);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn mult(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn mult_twice(x: u32) -> u32 {
+    mult(mult(x, 2), 2)
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add mult_and_bump: mult plus one"
+body = "Add mult_and_bump(x), which is mult(x) plus one."
+test = "mult_and_bump_is_one_more"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn mult_and_bump_is_one_more() {
+    assert_eq!(fixture::mult_and_bump(4), 9);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn mult(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn mult_twice(x: u32) -> u32 {
+    mult(mult(x))
+}
+
+pub fn mult_and_bump(x: u32) -> u32 {
+    mult(x) + 1
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn mult(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn mult_twice(x: u32) -> u32 {
+    mult(mult(x, 2), 2)
+}
+
+pub fn mult_and_bump(x: u32) -> u32 {
+    mult(x, 2) + 1
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn mult_and_bump_is_one_more() {
+    assert_eq!(fixture::mult_and_bump(4), 9);
+}
+"""

@@ -1,0 +1,58 @@
+id = "m5-097"
+kind = "contradiction"
+conflict = "hard"
+ambiguous = true
+made_by = "hord-eval-m5 generate v1: contradiction #9 (BATCH = 28 or 38)"
+script = ["give_up"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub const BATCH: u32 = 10;
+"""
+
+[[tasks]]
+name = "a"
+summary = "raise BATCH to 28"
+body = "Production needs BATCH at 28."
+test = "batch_is_28"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn batch_is_28() {
+    assert_eq!(fixture::BATCH, 28);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub const BATCH: u32 = 28;
+"""
+
+[[tasks]]
+name = "b"
+summary = "raise BATCH to 38"
+body = "Load tests need BATCH at 38."
+test = "batch_is_38"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn batch_is_38() {
+    assert_eq!(fixture::BATCH, 38);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub const BATCH: u32 = 38;
+"""

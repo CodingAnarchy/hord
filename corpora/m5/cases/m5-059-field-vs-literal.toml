@@ -1,0 +1,114 @@
+id = "m5-059"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: field-vs-literal #9 (Sensor.rate/test_sensor)"
+script = [
+    "sleep",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Sensor {
+    pub name: String,
+}
+
+impl Sensor {
+    pub fn new(name: &str) -> Self {
+        Sensor { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Sensor gets a rate field, 45 by default"
+body = "Add `rate: u32` to Sensor. Sensor::new sets it to 45."
+test = "sensor_rate_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn sensor_rate_defaults() {
+    assert_eq!(fixture::Sensor::new("x").rate, 45);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Sensor {
+    pub name: String,
+    pub rate: u32,
+}
+
+impl Sensor {
+    pub fn new(name: &str) -> Self {
+        Sensor { name: name.into(), rate: 45 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add test_sensor, a Sensor named test_sensor"
+body = 'Add test_sensor(), which builds a Sensor named "test_sensor".'
+test = "test_sensor_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn test_sensor_is_named() {
+    assert_eq!(fixture::test_sensor().name, "test_sensor");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Sensor {
+    pub name: String,
+}
+
+impl Sensor {
+    pub fn new(name: &str) -> Self {
+        Sensor { name: name.into() }
+    }
+}
+
+pub fn test_sensor() -> Sensor {
+    Sensor { name: "test_sensor".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Sensor {
+    pub name: String,
+    pub rate: u32,
+}
+
+impl Sensor {
+    pub fn new(name: &str) -> Self {
+        Sensor { name: name.into(), rate: 45 }
+    }
+}
+
+pub fn test_sensor() -> Sensor {
+    Sensor { name: "test_sensor".into(), rate: 45 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn test_sensor_is_named() {
+    assert_eq!(fixture::test_sensor().name, "test_sensor");
+}
+"""

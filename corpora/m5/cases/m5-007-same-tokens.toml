@@ -1,0 +1,80 @@
+id = "m5-007"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: same-tokens #7 (magnify x8)"
+script = [
+    "sleep",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn magnify(x: u32) -> u32 {
+    x * 8
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "magnify adds one after scaling"
+body = "Callers need magnify(x) to be x times 8 plus one, so that zero never maps to zero."
+test = "magnify_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn magnify_adds_one() {
+    assert_eq!(fixture::magnify(3), 25);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn magnify(x: u32) -> u32 {
+    x * 8 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "magnify saturates instead of overflowing"
+body = "magnify panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "magnify_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn magnify_saturates() {
+    assert_eq!(fixture::magnify(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn magnify(x: u32) -> u32 {
+    x.saturating_mul(8)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn magnify(x: u32) -> u32 {
+    x.saturating_mul(8).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn magnify_saturates() {
+    assert_eq!(fixture::magnify(u32::MAX), u32::MAX);
+}
+"""

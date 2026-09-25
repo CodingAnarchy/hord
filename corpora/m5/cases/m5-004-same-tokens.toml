@@ -1,0 +1,80 @@
+id = "m5-004"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: same-tokens #4 (amplify x5)"
+script = [
+    "over_budget",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn amplify(x: u32) -> u32 {
+    x * 5
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "amplify adds one after scaling"
+body = "Callers need amplify(x) to be x times 5 plus one, so that zero never maps to zero."
+test = "amplify_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn amplify_adds_one() {
+    assert_eq!(fixture::amplify(3), 16);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn amplify(x: u32) -> u32 {
+    x * 5 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "amplify saturates instead of overflowing"
+body = "amplify panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "amplify_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn amplify_saturates() {
+    assert_eq!(fixture::amplify(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn amplify(x: u32) -> u32 {
+    x.saturating_mul(5)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn amplify(x: u32) -> u32 {
+    x.saturating_mul(5).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn amplify_saturates() {
+    assert_eq!(fixture::amplify(u32::MAX), u32::MAX);
+}
+"""

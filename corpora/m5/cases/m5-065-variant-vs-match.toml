@@ -1,0 +1,118 @@
+id = "m5-065"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: variant-vs-match #2 (Color::Red/warmth)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum Color {
+    Green,
+}
+
+pub fn label(e: &Color) -> &'static str {
+    match e {
+        Color::Green => "green",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add Color::Red, labelled red"
+body = 'Color needs a Red case. Its label is "red".'
+test = "red_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn red_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Color::Red), "red");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Color {
+    Green,
+    Red,
+}
+
+pub fn label(e: &Color) -> &'static str {
+    match e {
+        Color::Green => "green",
+        Color::Red => "red",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add warmth, a number for each Color"
+body = "Add warmth(e), which is 1 for Green."
+test = "warmth_of_green"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn warmth_of_green() {
+    assert_eq!(fixture::warmth(&fixture::Color::Green), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Color {
+    Green,
+}
+
+pub fn label(e: &Color) -> &'static str {
+    match e {
+        Color::Green => "green",
+    }
+}
+
+pub fn warmth(e: &Color) -> u32 {
+    match e {
+        Color::Green => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum Color {
+    Green,
+    Red,
+}
+
+pub fn label(e: &Color) -> &'static str {
+    match e {
+        Color::Green => "green",
+        Color::Red => "red",
+    }
+}
+
+pub fn warmth(e: &Color) -> u32 {
+    match e {
+        Color::Green => 1,
+        Color::Red => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn warmth_of_green() {
+    assert_eq!(fixture::warmth(&fixture::Color::Green), 1);
+}
+"""

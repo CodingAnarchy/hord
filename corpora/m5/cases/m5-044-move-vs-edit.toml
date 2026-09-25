@@ -1,0 +1,90 @@
+id = "m5-044"
+kind = "move-vs-edit"
+conflict = "hard"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: move-vs-edit #6 (parse_score into scores)"
+script = [
+    "give_up",
+    "give_up",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "move parse_score into module scores"
+body = "Move parse_score into a new public module `scores`, re-exported at the crate root."
+test = "parse_score_lives_in_scores"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_score_lives_in_scores() {
+    assert_eq!(fixture::scores::parse_score("7"), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub mod scores;
+
+pub use scores::parse_score;
+"""
+"src/scores.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "parse_score ignores surrounding whitespace"
+body = "parse_score rejects input with spaces around the number. Trim it first."
+test = "parse_score_trims"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn parse_score_trims() {
+    assert_eq!(fixture::parse_score(" 7 "), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub mod scores;
+
+pub use scores::parse_score;
+"""
+"src/scores.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn parse_score_trims() {
+    assert_eq!(fixture::parse_score(" 7 "), Some(7));
+}
+"""

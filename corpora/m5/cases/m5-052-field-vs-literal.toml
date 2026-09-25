@@ -1,0 +1,111 @@
+id = "m5-052"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: field-vs-literal #2 (Account.level/admin_account)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Account {
+    pub name: String,
+}
+
+impl Account {
+    pub fn new(name: &str) -> Self {
+        Account { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Account gets a level field, 10 by default"
+body = "Add `level: u32` to Account. Account::new sets it to 10."
+test = "account_level_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn account_level_defaults() {
+    assert_eq!(fixture::Account::new("x").level, 10);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Account {
+    pub name: String,
+    pub level: u32,
+}
+
+impl Account {
+    pub fn new(name: &str) -> Self {
+        Account { name: name.into(), level: 10 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add admin_account, a Account named admin_account"
+body = 'Add admin_account(), which builds a Account named "admin_account".'
+test = "admin_account_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn admin_account_is_named() {
+    assert_eq!(fixture::admin_account().name, "admin_account");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Account {
+    pub name: String,
+}
+
+impl Account {
+    pub fn new(name: &str) -> Self {
+        Account { name: name.into() }
+    }
+}
+
+pub fn admin_account() -> Account {
+    Account { name: "admin_account".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Account {
+    pub name: String,
+    pub level: u32,
+}
+
+impl Account {
+    pub fn new(name: &str) -> Self {
+        Account { name: name.into(), level: 10 }
+    }
+}
+
+pub fn admin_account() -> Account {
+    Account { name: "admin_account".into(), level: 10 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn admin_account_is_named() {
+    assert_eq!(fixture::admin_account().name, "admin_account");
+}
+"""

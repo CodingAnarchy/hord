@@ -1,0 +1,77 @@
+id = "m5-013"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: same-tokens #13 (pump x14)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn pump(x: u32) -> u32 {
+    x * 14
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "pump adds one after scaling"
+body = "Callers need pump(x) to be x times 14 plus one, so that zero never maps to zero."
+test = "pump_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn pump_adds_one() {
+    assert_eq!(fixture::pump(3), 43);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn pump(x: u32) -> u32 {
+    x * 14 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "pump saturates instead of overflowing"
+body = "pump panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "pump_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn pump_saturates() {
+    assert_eq!(fixture::pump(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn pump(x: u32) -> u32 {
+    x.saturating_mul(14)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn pump(x: u32) -> u32 {
+    x.saturating_mul(14).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn pump_saturates() {
+    assert_eq!(fixture::pump(u32::MAX), u32::MAX);
+}
+"""

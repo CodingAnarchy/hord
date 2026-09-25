@@ -1,0 +1,111 @@
+id = "m5-057"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: field-vs-literal #7 (Task.retries/chore)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Task {
+    pub name: String,
+}
+
+impl Task {
+    pub fn new(name: &str) -> Self {
+        Task { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Task gets a retries field, 35 by default"
+body = "Add `retries: u32` to Task. Task::new sets it to 35."
+test = "task_retries_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn task_retries_defaults() {
+    assert_eq!(fixture::Task::new("x").retries, 35);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Task {
+    pub name: String,
+    pub retries: u32,
+}
+
+impl Task {
+    pub fn new(name: &str) -> Self {
+        Task { name: name.into(), retries: 35 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add chore, a Task named chore"
+body = 'Add chore(), which builds a Task named "chore".'
+test = "chore_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn chore_is_named() {
+    assert_eq!(fixture::chore().name, "chore");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Task {
+    pub name: String,
+}
+
+impl Task {
+    pub fn new(name: &str) -> Self {
+        Task { name: name.into() }
+    }
+}
+
+pub fn chore() -> Task {
+    Task { name: "chore".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Task {
+    pub name: String,
+    pub retries: u32,
+}
+
+impl Task {
+    pub fn new(name: &str) -> Self {
+        Task { name: name.into(), retries: 35 }
+    }
+}
+
+pub fn chore() -> Task {
+    Task { name: "chore".into(), retries: 35 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn chore_is_named() {
+    assert_eq!(fixture::chore().name, "chore");
+}
+"""

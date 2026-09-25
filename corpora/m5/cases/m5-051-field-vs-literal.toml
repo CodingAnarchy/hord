@@ -1,0 +1,111 @@
+id = "m5-051"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: field-vs-literal #1 (User.age/guest)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct User {
+    pub name: String,
+}
+
+impl User {
+    pub fn new(name: &str) -> Self {
+        User { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "User gets a age field, 5 by default"
+body = "Add `age: u32` to User. User::new sets it to 5."
+test = "user_age_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn user_age_defaults() {
+    assert_eq!(fixture::User::new("x").age, 5);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct User {
+    pub name: String,
+    pub age: u32,
+}
+
+impl User {
+    pub fn new(name: &str) -> Self {
+        User { name: name.into(), age: 5 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add guest, a User named guest"
+body = 'Add guest(), which builds a User named "guest".'
+test = "guest_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn guest_is_named() {
+    assert_eq!(fixture::guest().name, "guest");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct User {
+    pub name: String,
+}
+
+impl User {
+    pub fn new(name: &str) -> Self {
+        User { name: name.into() }
+    }
+}
+
+pub fn guest() -> User {
+    User { name: "guest".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct User {
+    pub name: String,
+    pub age: u32,
+}
+
+impl User {
+    pub fn new(name: &str) -> Self {
+        User { name: name.into(), age: 5 }
+    }
+}
+
+pub fn guest() -> User {
+    User { name: "guest".into(), age: 5 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn guest_is_named() {
+    assert_eq!(fixture::guest().name, "guest");
+}
+"""

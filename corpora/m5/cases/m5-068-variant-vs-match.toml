@@ -1,0 +1,121 @@
+id = "m5-068"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: variant-vs-match #5 (Level::High/rank)"
+script = [
+    "wrong",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum Level {
+    Low,
+}
+
+pub fn label(e: &Level) -> &'static str {
+    match e {
+        Level::Low => "low",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add Level::High, labelled high"
+body = 'Level needs a High case. Its label is "high".'
+test = "high_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn high_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Level::High), "high");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Level {
+    Low,
+    High,
+}
+
+pub fn label(e: &Level) -> &'static str {
+    match e {
+        Level::Low => "low",
+        Level::High => "high",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add rank, a number for each Level"
+body = "Add rank(e), which is 1 for Low."
+test = "rank_of_low"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn rank_of_low() {
+    assert_eq!(fixture::rank(&fixture::Level::Low), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Level {
+    Low,
+}
+
+pub fn label(e: &Level) -> &'static str {
+    match e {
+        Level::Low => "low",
+    }
+}
+
+pub fn rank(e: &Level) -> u32 {
+    match e {
+        Level::Low => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum Level {
+    Low,
+    High,
+}
+
+pub fn label(e: &Level) -> &'static str {
+    match e {
+        Level::Low => "low",
+        Level::High => "high",
+    }
+}
+
+pub fn rank(e: &Level) -> u32 {
+    match e {
+        Level::Low => 1,
+        Level::High => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn rank_of_low() {
+    assert_eq!(fixture::rank(&fixture::Level::Low), 1);
+}
+"""

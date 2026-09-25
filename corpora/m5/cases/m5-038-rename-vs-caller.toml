@@ -1,0 +1,85 @@
+id = "m5-038"
+kind = "rename-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: rename-vs-caller #12 (gather->sum_gathered/gather_twice)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn gather(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rename gather to sum_gathered"
+body = "gather is a vague name. Rename it to sum_gathered; its behavior stays the same."
+test = "sum_gathered_sums"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn sum_gathered_sums() {
+    assert_eq!(fixture::sum_gathered(&[1, 2, 3]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn sum_gathered(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add gather_twice: twice the gather"
+body = "Add gather_twice(xs), twice the sum that gather computes."
+test = "gather_twice_doubles"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn gather_twice_doubles() {
+    assert_eq!(fixture::gather_twice(&[1, 2]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn gather(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn gather_twice(xs: &[i32]) -> i32 {
+    gather(xs) * 2
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn sum_gathered(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn gather_twice(xs: &[i32]) -> i32 {
+    sum_gathered(xs) * 2
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn gather_twice_doubles() {
+    assert_eq!(fixture::gather_twice(&[1, 2]), 6);
+}
+"""

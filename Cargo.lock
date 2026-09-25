@@ -2062,6 +2062,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hord-eval-m5"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hord-api",
+ "hord-core",
+ "hord-encoding",
+ "hord-remote",
+ "hord-txn",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+]
+
+[[package]]
 name = "hord-git"
 version = "0.0.0"
 dependencies = [

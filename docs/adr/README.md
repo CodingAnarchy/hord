@@ -52,3 +52,5 @@ M5 identity and authorization dependencies (spec §10.5.4):
 `serde_json` 1 (hord-txn; already a workspace dependency) and tokio's `process` feature (hord-txn): the replay protocol's JSON lines in the canonical protobuf JSON mapping, and the harness process the lander runs and kills at its budget (spec §6.6, ADR 0028).
 
 `hord-replay-ref` (new crate, spec §11): `clap` (feature `env`), `hord-api`, `serde`, `serde_json`, `serde_yaml_ng`, `thiserror`, all already workspace dependencies. `serde_yaml_ng` writes the intent file's front matter for `hord propose`.
+
+`hord-eval-m5` (bench, the M5 conflict corpus): `anyhow`, `clap`, `hord-api`, `hord-core`, `hord-encoding`, `hord-remote`, `hord-txn`, `serde`, `serde_json`, `tokio` (feature `process`), `tokio-stream`, `toml`, all already workspace dependencies. `hord-remote` drives each case's daemon over the same gRPC API as the CLI and the workbench.

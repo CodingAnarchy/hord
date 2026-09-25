@@ -1,0 +1,58 @@
+id = "m5-091"
+kind = "contradiction"
+conflict = "hard"
+ambiguous = true
+made_by = "hord-eval-m5 generate v1: contradiction #3 (MAX_USERS = 22 or 32)"
+script = ["give_up"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub const MAX_USERS: u32 = 10;
+"""
+
+[[tasks]]
+name = "a"
+summary = "raise MAX_USERS to 22"
+body = "Production needs MAX_USERS at 22."
+test = "max_users_is_22"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn max_users_is_22() {
+    assert_eq!(fixture::MAX_USERS, 22);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub const MAX_USERS: u32 = 22;
+"""
+
+[[tasks]]
+name = "b"
+summary = "raise MAX_USERS to 32"
+body = "Load tests need MAX_USERS at 32."
+test = "max_users_is_32"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn max_users_is_32() {
+    assert_eq!(fixture::MAX_USERS, 32);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub const MAX_USERS: u32 = 32;
+"""

@@ -24,6 +24,7 @@ members = [
     "bench/m2-eval",
     "bench/m3-eval",
     "bench/m4-eval",
+    "bench/m5-eval",
 ]
 
 [workspace.package]

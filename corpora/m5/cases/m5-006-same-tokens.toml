@@ -1,0 +1,77 @@
+id = "m5-006"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: same-tokens #6 (enlarge x7)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn enlarge(x: u32) -> u32 {
+    x * 7
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "enlarge adds one after scaling"
+body = "Callers need enlarge(x) to be x times 7 plus one, so that zero never maps to zero."
+test = "enlarge_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn enlarge_adds_one() {
+    assert_eq!(fixture::enlarge(3), 22);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn enlarge(x: u32) -> u32 {
+    x * 7 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "enlarge saturates instead of overflowing"
+body = "enlarge panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "enlarge_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn enlarge_saturates() {
+    assert_eq!(fixture::enlarge(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn enlarge(x: u32) -> u32 {
+    x.saturating_mul(7)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn enlarge(x: u32) -> u32 {
+    x.saturating_mul(7).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn enlarge_saturates() {
+    assert_eq!(fixture::enlarge(u32::MAX), u32::MAX);
+}
+"""

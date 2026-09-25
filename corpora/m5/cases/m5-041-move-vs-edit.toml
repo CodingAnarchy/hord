@@ -1,0 +1,90 @@
+id = "m5-041"
+kind = "move-vs-edit"
+conflict = "hard"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: move-vs-edit #3 (parse_count into counts)"
+script = [
+    "wrong",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_count(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "move parse_count into module counts"
+body = "Move parse_count into a new public module `counts`, re-exported at the crate root."
+test = "parse_count_lives_in_counts"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_count_lives_in_counts() {
+    assert_eq!(fixture::counts::parse_count("7"), Some(7));
+}
+"""
+
+[tasks.files]
+"src/counts.rs" = """
+pub fn parse_count(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+"src/lib.rs" = """
+pub mod counts;
+
+pub use counts::parse_count;
+"""
+
+[[tasks]]
+name = "b"
+summary = "parse_count ignores surrounding whitespace"
+body = "parse_count rejects input with spaces around the number. Trim it first."
+test = "parse_count_trims"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn parse_count_trims() {
+    assert_eq!(fixture::parse_count(" 7 "), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_count(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+
+[resolution]
+"src/counts.rs" = """
+pub fn parse_count(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+"src/lib.rs" = """
+pub mod counts;
+
+pub use counts::parse_count;
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn parse_count_trims() {
+    assert_eq!(fixture::parse_count(" 7 "), Some(7));
+}
+"""

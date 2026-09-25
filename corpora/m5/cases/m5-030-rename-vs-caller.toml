@@ -1,0 +1,85 @@
+id = "m5-030"
+kind = "rename-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: rename-vs-caller #4 (aggregate->sum_values/aggregate_twice)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn aggregate(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rename aggregate to sum_values"
+body = "aggregate is a vague name. Rename it to sum_values; its behavior stays the same."
+test = "sum_values_sums"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn sum_values_sums() {
+    assert_eq!(fixture::sum_values(&[1, 2, 3]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn sum_values(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add aggregate_twice: twice the aggregate"
+body = "Add aggregate_twice(xs), twice the sum that aggregate computes."
+test = "aggregate_twice_doubles"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn aggregate_twice_doubles() {
+    assert_eq!(fixture::aggregate_twice(&[1, 2]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn aggregate(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn aggregate_twice(xs: &[i32]) -> i32 {
+    aggregate(xs) * 2
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn sum_values(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn aggregate_twice(xs: &[i32]) -> i32 {
+    sum_values(xs) * 2
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn aggregate_twice_doubles() {
+    assert_eq!(fixture::aggregate_twice(&[1, 2]), 6);
+}
+"""

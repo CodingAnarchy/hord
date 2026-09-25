@@ -1,0 +1,118 @@
+id = "m5-073"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: variant-vs-match #10 (Flavor::Sour/strength)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum Flavor {
+    Sweet,
+}
+
+pub fn label(e: &Flavor) -> &'static str {
+    match e {
+        Flavor::Sweet => "sweet",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add Flavor::Sour, labelled sour"
+body = 'Flavor needs a Sour case. Its label is "sour".'
+test = "sour_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn sour_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Flavor::Sour), "sour");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Flavor {
+    Sweet,
+    Sour,
+}
+
+pub fn label(e: &Flavor) -> &'static str {
+    match e {
+        Flavor::Sweet => "sweet",
+        Flavor::Sour => "sour",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add strength, a number for each Flavor"
+body = "Add strength(e), which is 1 for Sweet."
+test = "strength_of_sweet"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn strength_of_sweet() {
+    assert_eq!(fixture::strength(&fixture::Flavor::Sweet), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Flavor {
+    Sweet,
+}
+
+pub fn label(e: &Flavor) -> &'static str {
+    match e {
+        Flavor::Sweet => "sweet",
+    }
+}
+
+pub fn strength(e: &Flavor) -> u32 {
+    match e {
+        Flavor::Sweet => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum Flavor {
+    Sweet,
+    Sour,
+}
+
+pub fn label(e: &Flavor) -> &'static str {
+    match e {
+        Flavor::Sweet => "sweet",
+        Flavor::Sour => "sour",
+    }
+}
+
+pub fn strength(e: &Flavor) -> u32 {
+    match e {
+        Flavor::Sweet => 1,
+        Flavor::Sour => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn strength_of_sweet() {
+    assert_eq!(fixture::strength(&fixture::Flavor::Sweet), 1);
+}
+"""

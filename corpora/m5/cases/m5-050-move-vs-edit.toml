@@ -1,0 +1,90 @@
+id = "m5-050"
+kind = "move-vs-edit"
+conflict = "hard"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: move-vs-edit #12 (parse_seed into seeds)"
+script = [
+    "wrong",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_seed(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "move parse_seed into module seeds"
+body = "Move parse_seed into a new public module `seeds`, re-exported at the crate root."
+test = "parse_seed_lives_in_seeds"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_seed_lives_in_seeds() {
+    assert_eq!(fixture::seeds::parse_seed("7"), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub mod seeds;
+
+pub use seeds::parse_seed;
+"""
+"src/seeds.rs" = """
+pub fn parse_seed(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "parse_seed ignores surrounding whitespace"
+body = "parse_seed rejects input with spaces around the number. Trim it first."
+test = "parse_seed_trims"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn parse_seed_trims() {
+    assert_eq!(fixture::parse_seed(" 7 "), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_seed(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub mod seeds;
+
+pub use seeds::parse_seed;
+"""
+"src/seeds.rs" = """
+pub fn parse_seed(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn parse_seed_trims() {
+    assert_eq!(fixture::parse_seed(" 7 "), Some(7));
+}
+"""

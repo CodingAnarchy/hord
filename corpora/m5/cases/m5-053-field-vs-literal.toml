@@ -1,0 +1,114 @@
+id = "m5-053"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: field-vs-literal #3 (Order.priority/rush_order)"
+script = [
+    "over_budget",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Order {
+    pub name: String,
+}
+
+impl Order {
+    pub fn new(name: &str) -> Self {
+        Order { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Order gets a priority field, 15 by default"
+body = "Add `priority: u32` to Order. Order::new sets it to 15."
+test = "order_priority_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn order_priority_defaults() {
+    assert_eq!(fixture::Order::new("x").priority, 15);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Order {
+    pub name: String,
+    pub priority: u32,
+}
+
+impl Order {
+    pub fn new(name: &str) -> Self {
+        Order { name: name.into(), priority: 15 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add rush_order, a Order named rush_order"
+body = 'Add rush_order(), which builds a Order named "rush_order".'
+test = "rush_order_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn rush_order_is_named() {
+    assert_eq!(fixture::rush_order().name, "rush_order");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Order {
+    pub name: String,
+}
+
+impl Order {
+    pub fn new(name: &str) -> Self {
+        Order { name: name.into() }
+    }
+}
+
+pub fn rush_order() -> Order {
+    Order { name: "rush_order".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Order {
+    pub name: String,
+    pub priority: u32,
+}
+
+impl Order {
+    pub fn new(name: &str) -> Self {
+        Order { name: name.into(), priority: 15 }
+    }
+}
+
+pub fn rush_order() -> Order {
+    Order { name: "rush_order".into(), priority: 15 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn rush_order_is_named() {
+    assert_eq!(fixture::rush_order().name, "rush_order");
+}
+"""

@@ -1,0 +1,77 @@
+id = "m5-009"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: same-tokens #9 (expand x10)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn expand(x: u32) -> u32 {
+    x * 10
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "expand adds one after scaling"
+body = "Callers need expand(x) to be x times 10 plus one, so that zero never maps to zero."
+test = "expand_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn expand_adds_one() {
+    assert_eq!(fixture::expand(3), 31);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn expand(x: u32) -> u32 {
+    x * 10 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "expand saturates instead of overflowing"
+body = "expand panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "expand_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn expand_saturates() {
+    assert_eq!(fixture::expand(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn expand(x: u32) -> u32 {
+    x.saturating_mul(10)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn expand(x: u32) -> u32 {
+    x.saturating_mul(10).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn expand_saturates() {
+    assert_eq!(fixture::expand(u32::MAX), u32::MAX);
+}
+"""

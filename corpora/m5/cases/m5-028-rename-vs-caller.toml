@@ -1,0 +1,85 @@
+id = "m5-028"
+kind = "rename-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: rename-vs-caller #2 (count->count_items/count_twice)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn count(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rename count to count_items"
+body = "count is a vague name. Rename it to count_items; its behavior stays the same."
+test = "count_items_sums"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn count_items_sums() {
+    assert_eq!(fixture::count_items(&[1, 2, 3]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn count_items(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add count_twice: twice the count"
+body = "Add count_twice(xs), twice the sum that count computes."
+test = "count_twice_doubles"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn count_twice_doubles() {
+    assert_eq!(fixture::count_twice(&[1, 2]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn count(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn count_twice(xs: &[i32]) -> i32 {
+    count(xs) * 2
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn count_items(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn count_twice(xs: &[i32]) -> i32 {
+    count_items(xs) * 2
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn count_twice_doubles() {
+    assert_eq!(fixture::count_twice(&[1, 2]), 6);
+}
+"""

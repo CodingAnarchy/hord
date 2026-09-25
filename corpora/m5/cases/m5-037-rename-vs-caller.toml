@@ -1,0 +1,85 @@
+id = "m5-037"
+kind = "rename-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v1: rename-vs-caller #11 (measure->sum_measure/measure_twice)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn measure(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rename measure to sum_measure"
+body = "measure is a vague name. Rename it to sum_measure; its behavior stays the same."
+test = "sum_measure_sums"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn sum_measure_sums() {
+    assert_eq!(fixture::sum_measure(&[1, 2, 3]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn sum_measure(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add measure_twice: twice the measure"
+body = "Add measure_twice(xs), twice the sum that measure computes."
+test = "measure_twice_doubles"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn measure_twice_doubles() {
+    assert_eq!(fixture::measure_twice(&[1, 2]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn measure(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn measure_twice(xs: &[i32]) -> i32 {
+    measure(xs) * 2
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn sum_measure(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn measure_twice(xs: &[i32]) -> i32 {
+    sum_measure(xs) * 2
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn measure_twice_doubles() {
+    assert_eq!(fixture::measure_twice(&[1, 2]), 6);
+}
+"""
