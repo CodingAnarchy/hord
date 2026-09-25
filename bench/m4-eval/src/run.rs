@@ -33,10 +33,62 @@ use crate::fault::{FaultKind, attempts, inject};
 use crate::git::Checkout;
 use crate::prepare::CommitFacts;
 
+/// [`hord_verify_rust::coverage::collect`] with [`corpus_env`]: every
+/// instrumented run of the cargo corpus goes through here.
+pub(crate) fn collect_corpus(
+    checkout: &hord_verify::Checkout,
+    toolchain: &hord_verify::Toolchain,
+    defs: &hord_verify_rust::DefinitionIndex,
+    options: &hord_verify_rust::CoverageOptions,
+) -> Result<hord_verify_rust::CoverageRun> {
+    let started = Instant::now();
+    match hord_verify_rust::coverage::build_suite_with_env(checkout, options, &corpus_env())? {
+        Some(suite) => Ok(hord_verify_rust::coverage::run_suite(
+            &suite, toolchain, defs, options, started,
+        )?),
+        None => Ok(hord_verify_rust::CoverageRun {
+            record: CoverageRecord::new(
+                checkout.snapshot,
+                toolchain.id()?,
+                BTreeSet::new(),
+                Vec::new(),
+            ),
+            elapsed_ms: elapsed(started),
+            command: "cargo llvm-cov (per test): nothing selected".into(),
+            log: String::new(),
+            lines: BTreeMap::new(),
+        }),
+    }
+}
+
+/// Environment for every test run of the cargo corpus: configuration of
+/// cargo's own test suite, not hord logic.
+///
+/// `CFG_DISABLE_CROSS_TESTS=1` is the switch cargo's testsuite reads
+/// (`tests/testsuite/utils/cross_compile.rs`, `disabled()`) to skip its
+/// cross-compilation tests. Without it, the first cross test in each test
+/// process builds a probe project for the alternate target, and on a host
+/// without that target panics once per process to warn. Batched runs see
+/// one such failure (`aaa_trigger_cross_compile_disabled_check`); per-test
+/// processes (instrumented coverage runs) see it in every cross test.
+pub(crate) fn corpus_env() -> BTreeMap<String, String> {
+    [("CFG_DISABLE_CROSS_TESTS".to_owned(), "1".to_owned())]
+        .into_iter()
+        .collect()
+}
+
 /// Where one worker builds and runs.
 pub(crate) struct Worker {
     pub checkout: Checkout,
     pub target_dir: PathBuf,
+}
+
+/// The environment of every cargo command a worker runs: the corpus
+/// configuration, and `LLVM_PROFILE_FILE` inside the worker's directory.
+pub(crate) fn runner_env(worker: &Worker) -> BTreeMap<String, String> {
+    let mut env = corpus_env();
+    env.insert("LLVM_PROFILE_FILE".to_owned(), worker.profraw_pattern());
+    env
 }
 
 impl Worker {
@@ -60,6 +112,9 @@ pub(crate) struct Ctx {
     /// Kill a command that prints nothing this long (a hang, which the
     /// fault can cause; it counts as the run failing).
     pub idle: Duration,
+    /// Faults graded per commit where (b) does not contain (a) (ADR 0023
+    /// amendment); commits where it does get one probe-graded fault.
+    pub faults_per_commit: usize,
 }
 
 /// The selection variants measured side by side (orchestrator request,
@@ -624,9 +679,7 @@ pub(crate) fn evaluate(
         target_dir: Some(worker.target_dir.clone()),
         timeout: Some(ctx.timeout),
         idle_timeout: Some(ctx.idle),
-        env: [("LLVM_PROFILE_FILE".to_owned(), worker.profraw_pattern())]
-            .into_iter()
-            .collect(),
+        env: runner_env(worker),
         ..CargoRunner::default()
     };
     let toolchain = ctx.toolchain.id()?;
@@ -897,9 +950,7 @@ pub(crate) fn full_suite(
     let runner = CargoRunner {
         target_dir: Some(worker.target_dir.clone()),
         timeout: Some(timeout),
-        env: [("LLVM_PROFILE_FILE".to_owned(), worker.profraw_pattern())]
-            .into_iter()
-            .collect(),
+        env: runner_env(worker),
         ..CargoRunner::default()
     };
     let start = Instant::now();

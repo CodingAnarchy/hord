@@ -52,7 +52,7 @@ use clap::Parser;
 use hord_core::{Actor, RepoPath};
 use hord_store::Store;
 use hord_verify::{Checkout as VerifyCheckout, CoverageRecord, TestRef, find_coverage};
-use hord_verify_rust::coverage::{collect, record_evidence};
+use hord_verify_rust::coverage::record_evidence;
 use hord_verify_rust::{CoverageOptions, detect_toolchain};
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +123,43 @@ struct Args {
     /// Kill a cargo command that prints nothing for this many minutes.
     #[arg(long, default_value_t = 5)]
     idle_timeout_mins: u64,
+    /// The first-parent history to take commits from.
+    #[arg(long, default_value = "HEAD")]
+    head: String,
+    /// Grade chain `i` of `n` (ADR 0023 amendment): the era window of
+    /// `--commits-per-chain` first-parent commits ending `i ×
+    /// --chain-stride` commits before `--head`. Chains are independent: each
+    /// starts from its own full instrumented run. Without it, the last
+    /// `--commits` commits.
+    #[arg(long)]
+    chain: Option<String>,
+    /// Commits per chain.
+    #[arg(long, default_value_t = 10)]
+    commits_per_chain: usize,
+    /// First-parent commits between the ends of consecutive chains.
+    #[arg(long, default_value_t = 100)]
+    chain_stride: usize,
+    /// Faults graded per commit where (b) does not contain (a), each on its
+    /// own (ADR 0023 amendment); commits where it does get one probe-graded
+    /// fault.
+    #[arg(long, default_value_t = 1)]
+    faults_per_commit: usize,
+    /// Merge the results of these chain work dirs (and sample dirs) into one
+    /// report and verdict, and exit: no corpus, no runs. Exits nonzero when
+    /// the merged run is complete and a gate fails.
+    #[arg(long, num_args = 1..)]
+    merge: Vec<PathBuf>,
+    /// Run only the literal full-suite sample (ADR 0023, reported, not
+    /// gated) over the commits of every chain window of `--chain _/n`, then
+    /// exit. `--sample-shard k/m` runs the k-th of m slices.
+    #[arg(long)]
+    sample_only: bool,
+    #[arg(long)]
+    sample_shard: Option<String>,
+    /// Test names quarantined up front (one per line; `#` comments), in
+    /// addition to failures of the full-suite sample.
+    #[arg(long)]
+    quarantine: Option<PathBuf>,
     /// Evaluate only commits whose index is `i` modulo `n` (`--shard 0/4`),
     /// so CI machines split one run; the sample and coverage run only where
     /// a shard needs them. Merge by pointing `--work` at the union of the
@@ -276,11 +313,53 @@ fn median(mut v: Vec<f64>) -> Option<f64> {
     })
 }
 
+/// `i/n`, checked.
+fn parse_part(text: &str, flag: &str) -> Result<(usize, usize)> {
+    let (i, n) = text
+        .split_once('/')
+        .with_context(|| format!("{flag} i/n"))?;
+    let (i, n): (usize, usize) = (i.parse()?, n.parse()?);
+    if n == 0 || i >= n {
+        bail!("{flag} {text}: need 0 <= i < n");
+    }
+    Ok((i, n))
+}
+
+/// Test names in a quarantine file (one per line, `#` comments).
+fn read_quarantine(path: Option<&Path>) -> Result<BTreeSet<String>> {
+    let Some(path) = path else {
+        return Ok(BTreeSet::new());
+    };
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or_default().trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let started = Instant::now();
     let started_at = std::time::SystemTime::now();
+    let seed_quarantine = read_quarantine(args.quarantine.as_deref())?;
+    if !args.merge.is_empty() {
+        // Merge: one report and verdict over the chains' work dirs.
+        let report = fresh::report(&args.merge, &seed_quarantine);
+        let md = fresh::print(&report);
+        if let Some(path) = &args.json {
+            write_json(path, &report)?;
+        }
+        if let Some(path) = &args.summary {
+            fs::write(path, md)?;
+        }
+        if report.complete && !(report.safety_gate && report.efficiency_gate) {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let budget = args.budget.as_deref().map(parse_budget).transpose()?;
     let over_budget = || budget.is_some_and(|b| started.elapsed() > b);
     let corpus = corpus_dir(args.cache.clone())?;
@@ -300,8 +379,23 @@ async fn main() -> Result<()> {
     };
     let in_shard = |index: usize| index % shards == shard;
 
+    // The commits: one chain's era window, or the last `--commits`.
+    let chain = args
+        .chain
+        .as_deref()
+        .map(|c| parse_part(c, "--chain"))
+        .transpose()?;
+    let window = |i: usize, n: usize| {
+        git::first_parent_window(&corpus, &args.head, i * args.chain_stride, n)
+    };
+    if args.sample_only {
+        return sample_only(&args, &corpus, &work, chain, &window, timeout, &over_budget);
+    }
     // 1. Prepare.
-    let commits = git::first_parent_commits(&corpus, args.commits)?;
+    let commits = match chain {
+        Some((i, _)) => window(i, args.commits_per_chain)?,
+        None => window(0, args.commits)?,
+    };
     // CBOR: the facts have maps keyed by NodeId and RepoPath.
     let prepared_path = work.join(if args.variants {
         "prepared.cbor"
@@ -380,10 +474,11 @@ async fn main() -> Result<()> {
         .iter()
         .filter_map(|c| read_json(&sample_dir.join(format!("{c}.json"))))
         .collect();
-    let quarantine_names: BTreeSet<String> = sample
+    let mut quarantine_names: BTreeSet<String> = sample
         .iter()
         .flat_map(|s| s.failed.iter().cloned())
         .collect();
+    quarantine_names.extend(seed_quarantine.iter().cloned());
 
     if !args.variants {
         return run_fresh(
@@ -450,7 +545,7 @@ async fn main() -> Result<()> {
                     eprintln!("[coverage] checkpoint {j} at {}", &checkpoint.commit[..10]);
                     let w = &workers[0];
                     w.checkout.checkout(&checkpoint.commit)?;
-                    let run = collect(
+                    let run = run::collect_corpus(
                         &VerifyCheckout {
                             root: w.checkout.root.clone(),
                             snapshot: checkpoint.snapshot,
@@ -545,6 +640,7 @@ async fn main() -> Result<()> {
                 quarantine,
                 timeout,
                 idle: Duration::from_secs(args.idle_timeout_mins * 60),
+                faults_per_commit: args.faults_per_commit,
             };
             for facts in &group {
                 let input = run::CommitInput {
@@ -591,6 +687,7 @@ async fn main() -> Result<()> {
             quarantine,
             timeout,
             idle: Duration::from_secs(args.idle_timeout_mins * 60),
+            faults_per_commit: args.faults_per_commit,
         };
         run_parallel(&workers, todo, &over_budget, |worker, facts| {
             let t = Instant::now();
@@ -677,6 +774,62 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// `--sample-only`: the literal full `cargo test` on a seeded sample of the
+/// commits of every chain window (ADR 0023: reported, not gated; its failures
+/// become the quarantine). Results go to `<work>/sample/`.
+fn sample_only(
+    args: &Args,
+    corpus: &Path,
+    work: &Path,
+    chain: Option<(usize, usize)>,
+    window: &dyn Fn(usize, usize) -> Result<Vec<String>>,
+    timeout: Duration,
+    over_budget: &(dyn Fn() -> bool + Sync),
+) -> Result<()> {
+    let chains = chain.map_or(1, |(_, n)| n);
+    let per = if chain.is_some() {
+        args.commits_per_chain
+    } else {
+        args.commits
+    };
+    let mut candidates = Vec::new();
+    for i in 0..chains {
+        candidates.extend(window(i, per)?);
+    }
+    let mut rng = fault::Rng::new(args.seed, "full-sample");
+    rng.shuffle(&mut candidates);
+    candidates.truncate(args.full_sample);
+    let (k, m) = match &args.sample_shard {
+        Some(s) => parse_part(s, "--sample-shard")?,
+        None => (0, 1),
+    };
+    let sample_dir = work.join("sample");
+    let mine: Vec<String> = candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % m == k)
+        .map(|(_, c)| c)
+        .filter(|c| !sample_dir.join(format!("{c}.json")).exists())
+        .collect();
+    let workers: Vec<run::Worker> = (0..args.jobs.max(1))
+        .map(|i| run::worker(work, corpus, i))
+        .collect::<Result<_>>()?;
+    run_parallel(&workers, mine, over_budget, |worker, commit| {
+        eprintln!("[sample] full cargo test on {}", &commit[..10]);
+        let (failed, elapsed_ms, timed_out) = run::full_suite(worker, &commit, timeout)?;
+        write_json(
+            &sample_dir.join(format!("{commit}.json")),
+            &SampleResult {
+                commit: commit.clone(),
+                failed,
+                elapsed_ms,
+                timed_out,
+            },
+        )
+    });
+    Ok(())
+}
+
 /// The lander-view grading of ADR 0022 as amended ([`fresh`]).
 #[allow(clippy::too_many_arguments)]
 fn run_fresh(
@@ -707,7 +860,7 @@ fn run_fresh(
             );
             let w = &workers[0];
             w.checkout.checkout(&checkpoint.commit)?;
-            let run = collect(
+            let run = run::collect_corpus(
                 &VerifyCheckout {
                     root: w.checkout.root.clone(),
                     snapshot: checkpoint.snapshot,
@@ -739,8 +892,16 @@ fn run_fresh(
             run.record
         }
     };
-    let initial_secs =
-        read_json::<(u64, usize, String)>(&initial_meta).map_or(0.0, |m| m.0 as f64 / 1000.0);
+    write_json(
+        &work.join("chain/meta.json"),
+        &fresh::ChainMeta {
+            chain: args.chain.clone().unwrap_or_default(),
+            head: args.head.clone(),
+            stride: args.chain_stride,
+            commits: prepared.commits.iter().map(|c| c.commit.clone()).collect(),
+            faults_per_commit: args.faults_per_commit,
+        },
+    )?;
     let quarantine: BTreeSet<TestRef> = initial
         .tests
         .iter()
@@ -753,6 +914,7 @@ fn run_fresh(
         quarantine,
         timeout,
         idle: Duration::from_secs(args.idle_timeout_mins * 60),
+        faults_per_commit: args.faults_per_commit,
     };
     anyhow::ensure!(
         workers.len() >= 3,
@@ -772,7 +934,7 @@ fn run_fresh(
         chain_workers,
         graders,
     )?;
-    let mut report = fresh::report(work, prepared, initial_secs);
+    let mut report = fresh::report(&[work.to_path_buf()], quarantine_names);
     report.profraw_in_cwd = profraw_leaks(started_at);
     let md = fresh::print(&report);
     if let Some(path) = &args.json {
@@ -1075,4 +1237,29 @@ fn summary(r: &Report) -> String {
         r.profraw_in_cwd
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_parts_and_quarantine_files() -> Result<()> {
+        assert_eq!(parse_part("2/15", "--chain")?, (2, 15));
+        assert!(parse_part("15/15", "--chain").is_err());
+        assert!(parse_part("1/0", "--chain").is_err());
+        assert!(parse_part("x", "--chain").is_err());
+        let dir = std::env::temp_dir().join(format!("hord-m4-quarantine-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let file = dir.join("q.txt");
+        fs::write(&file, "# known flaky\na::b\n\n  c::d  # env\n")?;
+        let q = read_quarantine(Some(&file))?;
+        fs::remove_dir_all(&dir)?;
+        assert_eq!(
+            q,
+            ["a::b".to_owned(), "c::d".to_owned()].into_iter().collect()
+        );
+        assert!(read_quarantine(None)?.is_empty());
+        Ok(())
+    }
 }

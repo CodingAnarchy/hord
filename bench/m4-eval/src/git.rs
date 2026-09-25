@@ -25,16 +25,29 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 
 /// The last `n` first-parent commits of `HEAD` that have a parent, oldest
 /// first.
+#[allow(dead_code)]
 pub(crate) fn first_parent_commits(dir: &Path, n: usize) -> Result<Vec<String>> {
+    first_parent_window(dir, "HEAD", 0, n)
+}
+
+/// An era window: `n` consecutive first-parent commits of `head` (each with
+/// a parent), after skipping the newest `skip`; oldest first.
+pub(crate) fn first_parent_window(
+    dir: &Path,
+    head: &str,
+    skip: usize,
+    n: usize,
+) -> Result<Vec<String>> {
     let out = git(
         dir,
         &[
             "rev-list",
             "--first-parent",
             "--min-parents=1",
+            &format!("--skip={skip}"),
             "-n",
             &n.to_string(),
-            "HEAD",
+            head,
         ],
     )?;
     let mut commits: Vec<String> = String::from_utf8(out)?.lines().map(str::to_owned).collect();

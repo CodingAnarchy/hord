@@ -1,0 +1,11 @@
+# Cargo-corpus tests quarantined up front for the ADR 0023 gate: skipped in
+# (a) and (b) alike, and listed in the report. The full-suite sample job adds
+# every test that fails on unmutated commits; the merged report lists the
+# union. Corpus configuration, not hord logic.
+#
+# Failed on unmutated commits in the local full-suite samples (2026-09-24,
+# macOS). The cross-compile trigger passes once CFG_DISABLE_CROSS_TESTS=1 is
+# set (see `corpus_env` in src/run.rs); it stays listed until a CI sample
+# confirms it.
+aaa_trigger_cross_compile_disabled_check
+build::cargo_compile_api_exposes_artifact_paths

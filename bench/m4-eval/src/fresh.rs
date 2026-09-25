@@ -29,16 +29,18 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use hord_core::{NodeId, RepoPath};
 use hord_verify::{Checkout as VerifyCheckout, CoverageRecord, DefDelta, Drift};
-use hord_verify_rust::coverage::{BuiltSuite, build_suite, run_suite};
+use hord_verify_rust::coverage::{BuiltSuite, build_suite_with_env, run_suite};
 use hord_verify_rust::{
     CargoRunner, CargoWorkspace, CoverageOptions, DefinitionIndex, Fallback, SelectInput,
     Selection, TestFilter, select,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::fault::{attempts, inject};
+use crate::fault::{FaultKind, attempts, inject};
 use crate::prepare::{CommitFacts, Prepared};
-use crate::run::{Ctx, Fault, Grader, Unit, Worker, cargo, count, elapsed, units};
+use crate::run::{
+    Ctx, Fault, Grader, Unit, Worker, cargo, corpus_env, count, elapsed, runner_env, units,
+};
 
 /// The chain's state after a commit, persisted so a run resumes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,26 +100,39 @@ pub(crate) struct ChainStep {
 }
 
 /// One graded commit.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct FreshResult {
-    pub step: ChainStep,
-    pub fault: Option<Fault>,
-    pub no_fault: Option<String>,
+/// One graded fault on a commit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct FaultGrade {
+    pub fault: Fault,
+    /// Only the probe ran: the selection contains all of (a), so no miss is
+    /// possible (option 2); `detected` is `None` unless the probe caught it.
+    pub probe_only: bool,
     /// Whether (b), the selection, detected the fault.
     pub detected: Option<bool>,
     /// Whether (a) did, when determined.
     pub detected_a: Option<bool>,
-    /// The selection contains every test of (a): no miss is possible.
-    pub covers_a: bool,
-    /// Option 2 (approved): the selection contained all of (a), so only the
-    /// probe ran; `detected` is `None` unless the probe caught the fault.
-    #[serde(default)]
-    pub probe_only: bool,
     pub miss: bool,
+    /// The missed failures pass without the fault.
     pub confirmed_miss: bool,
     pub failed: Vec<String>,
+    /// A command hung or crashed; its units were counted as failing.
     pub unattributed: bool,
     pub build_ms: u64,
+    pub grade_ms: u64,
+}
+
+/// One graded commit: up to `--faults-per-commit` faults where (b) does not
+/// contain (a), one probe-graded fault where it does (ADR 0023 amendment).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct FreshResult {
+    pub step: ChainStep,
+    /// The selection contains every test of (a): no miss is possible.
+    pub covers_a: bool,
+    pub faults: Vec<FaultGrade>,
+    /// Why no fault was graded.
+    pub no_fault: Option<String>,
+    /// Fault attempts that did not type-check.
+    pub rejected: usize,
     pub grade_ms: u64,
     pub error: Option<String>,
 }
@@ -185,20 +200,32 @@ pub(crate) fn run(run: &FreshRun<'_>, chain_workers: &[Worker], graders: &[Worke
                             ..FreshResult::default()
                         },
                     };
+                    let faults: Vec<String> = result
+                        .faults
+                        .iter()
+                        .map(|f| {
+                            format!(
+                                "{:?}:b={:?}/a={:?}{}",
+                                f.fault.kind,
+                                f.detected,
+                                f.detected_a,
+                                if f.miss { " MISS" } else { "" }
+                            )
+                        })
+                        .collect();
                     eprintln!(
-                        "[grade {}] {} ws={} selected {}/{} fault={} b={:?} a={:?}{} ({:.0}s)",
+                        "[grade {}] {} ws={} selected {}/{}{} faults [{}]{} ({:.0}s)",
                         step.index,
                         &step.commit[..10],
                         step.write_set,
                         step.selected,
                         step.suite,
+                        if result.covers_a { " (b covers a)" } else { "" },
+                        faults.join(", "),
                         result
-                            .fault
-                            .as_ref()
-                            .map_or("none".to_owned(), |f| format!("{:?}", f.kind)),
-                        result.detected,
-                        result.detected_a,
-                        if result.miss { " MISS" } else { "" },
+                            .error
+                            .as_deref()
+                            .map_or(String::new(), |e| format!(" error: {e}")),
                         t.elapsed().as_secs_f64()
                     );
                     if let Err(err) = write_json(&out, &result) {
@@ -268,12 +295,13 @@ fn chain(
             let options = build_options(target);
             scope.spawn(move || -> Result<Option<BuiltSuite>> {
                 worker.checkout.checkout(&facts.commit)?;
-                Ok(build_suite(
+                Ok(build_suite_with_env(
                     &VerifyCheckout {
                         root: worker.checkout.root.clone(),
                         snapshot: facts.result_snapshot,
                     },
                     &options,
+                    &corpus_env(),
                 )?)
             })
         };
@@ -495,7 +523,32 @@ fn chain_step(
     Ok(fresh)
 }
 
-/// Grade one commit: fault, (b), (a) if needed, confirm.
+/// Fault attempts in the order they are tried: distinct written functions
+/// first (each target's first kind), then second kinds, and so on, so the
+/// faults of one commit cover as many functions as they can.
+fn fault_order(attempts: Vec<(usize, FaultKind)>) -> Vec<(usize, FaultKind)> {
+    let mut groups: Vec<(usize, Vec<FaultKind>)> = Vec::new();
+    for (target, kind) in attempts {
+        match groups.iter_mut().find(|(t, _)| *t == target) {
+            Some((_, kinds)) => kinds.push(kind),
+            None => groups.push((target, vec![kind])),
+        }
+    }
+    let rounds = groups.iter().map(|(_, k)| k.len()).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for round in 0..rounds {
+        for (target, kinds) in &groups {
+            if let Some(kind) = kinds.get(round) {
+                out.push((*target, *kind));
+            }
+        }
+    }
+    out
+}
+
+/// Grade one commit: up to K faults (ADR 0023 amendment), each injected,
+/// built, and graded on its own: (b), then (a) when needed, then a
+/// confirmation of any miss.
 fn grade(ctx: &Ctx, worker: &Worker, facts: &CommitFacts, step: &ChainStep) -> Result<FreshResult> {
     let started = Instant::now();
     let mut result = FreshResult {
@@ -512,23 +565,26 @@ fn grade(ctx: &Ctx, worker: &Worker, facts: &CommitFacts, step: &ChainStep) -> R
         target_dir: Some(worker.target_dir.clone()),
         timeout: Some(ctx.timeout),
         idle_timeout: Some(ctx.idle),
-        env: [("LLVM_PROFILE_FILE".to_owned(), worker.profraw_pattern())]
-            .into_iter()
-            .collect(),
+        env: runner_env(worker),
         ..CargoRunner::default()
     };
     let set: BTreeSet<Unit> = step.units.iter().cloned().collect();
     let a_set: BTreeSet<Unit> = step.a_units.iter().cloned().collect();
     result.covers_a = a_set.is_subset(&set);
+    let want = if result.covers_a {
+        1
+    } else {
+        ctx.faults_per_commit.max(1)
+    };
     let scope: Vec<String> = step
         .affected
         .iter()
         .flat_map(|p| ["-p".to_owned(), p.clone()])
         .collect();
-
-    let mut injected: Option<(String, NodeId)> = None;
-    let mut rejected = 0;
-    for (target, kind) in attempts(ctx.seed, &facts.commit, &facts.targets) {
+    for (target, kind) in fault_order(attempts(ctx.seed, &facts.commit, &facts.targets)) {
+        if result.faults.len() >= want {
+            break;
+        }
         let t = &facts.targets[target];
         let file = root.join(&t.path);
         let Ok(text) = fs::read_to_string(&file) else {
@@ -544,35 +600,66 @@ fn grade(ctx: &Ctx, worker: &Worker, facts: &CommitFacts, step: &ChainStep) -> R
             &file,
             format!("{}{faulty}{}", &text[..t.span.start], &text[t.span.end..]),
         )?;
-        let b = Instant::now();
+        let fault_started = Instant::now();
         let mut args = vec!["test".to_owned(), "--no-run".to_owned()];
         args.extend(scope.iter().cloned());
         let built = runner.run(root, &cargo(args))?;
-        result.build_ms += elapsed(b);
-        if built.success() {
-            result.fault = Some(Fault {
-                path: t.path.clone(),
-                name: t.name.clone(),
-                kind,
-                rejected,
-                edited_lines: 0,
-            });
-            injected = Some((t.path.clone(), t.node));
-            break;
+        let build_ms = elapsed(fault_started);
+        if !built.success() {
+            worker.checkout.restore(&t.path)?;
+            result.rejected += 1;
+            continue;
         }
+        let fault = Fault {
+            path: t.path.clone(),
+            name: t.name.clone(),
+            kind,
+            rejected: result.rejected,
+            edited_lines: 0,
+        };
+        let graded = grade_fault(
+            &runner,
+            worker,
+            step,
+            &set,
+            &a_set,
+            result.covers_a,
+            &t.path,
+            t.node,
+            fault,
+        );
+        // Always restore, even if grading failed.
         worker.checkout.restore(&t.path)?;
-        rejected += 1;
+        let mut graded = graded?;
+        graded.build_ms = build_ms;
+        graded.grade_ms = elapsed(fault_started);
+        result.faults.push(graded);
     }
-    let Some((fault_path, fault_node)) = injected else {
+    if result.faults.is_empty() {
         result.no_fault = Some(if facts.targets.is_empty() {
             "the commit writes no function".into()
         } else {
-            format!("no fault type-checks ({rejected} tried)")
+            format!("no fault type-checks ({} tried)", result.rejected)
         });
-        result.grade_ms = elapsed(started);
-        return Ok(result);
-    };
+    }
+    result.grade_ms = elapsed(started);
+    Ok(result)
+}
 
+/// Grade one injected fault. The file is restored by the caller.
+#[allow(clippy::too_many_arguments)]
+fn grade_fault(
+    runner: &CargoRunner,
+    worker: &Worker,
+    step: &ChainStep,
+    set: &BTreeSet<Unit>,
+    a_set: &BTreeSet<Unit>,
+    covers_a: bool,
+    fault_path: &str,
+    fault_node: NodeId,
+    fault: Fault,
+) -> Result<FaultGrade> {
+    let root = &worker.checkout.root;
     let probe: BTreeSet<Unit> = step
         .probes
         .iter()
@@ -580,53 +667,62 @@ fn grade(ctx: &Ctx, worker: &Worker, facts: &CommitFacts, step: &ChainStep) -> R
         .map(|(_, u)| u.iter().cloned().collect())
         .unwrap_or_default();
     let mut grader = Grader {
-        runner: &runner,
+        runner,
         root,
         ran: BTreeSet::new(),
         failed: BTreeSet::new(),
         unattributed: false,
         timed_out: false,
     };
-    // Option 2: when (b) contains all of (a), no miss is possible; run only
-    // the probe (the tests that ran the faulted function) to record whether
-    // it caught the fault.
-    if result.covers_a {
-        let batch: Vec<Unit> = probe.intersection(&set).cloned().collect();
+    let mut out = FaultGrade {
+        fault,
+        probe_only: false,
+        detected: None,
+        detected_a: None,
+        miss: false,
+        confirmed_miss: false,
+        failed: Vec::new(),
+        unattributed: false,
+        build_ms: 0,
+        grade_ms: 0,
+    };
+    if covers_a {
+        // Option 2: (b) contains (a), so no miss is possible; run only the
+        // probe to record whether it caught the fault.
+        let batch: Vec<Unit> = probe.intersection(set).cloned().collect();
         grader.run(batch, &|failed| !failed.is_empty())?;
         let caught = !set.is_disjoint(&grader.failed);
-        result.probe_only = true;
-        result.detected = caught.then_some(true);
-        result.detected_a = caught.then_some(true);
-        result.failed = grader.failed.iter().map(Unit::label).collect();
-        result.unattributed = grader.unattributed;
-        worker.checkout.restore(&fault_path)?;
-        result.grade_ms = elapsed(started);
-        return Ok(result);
+        out.probe_only = true;
+        out.detected = caught.then_some(true);
+        out.detected_a = caught.then_some(true);
+        out.failed = grader.failed.iter().map(Unit::label).collect();
+        out.unattributed = grader.unattributed;
+        return Ok(out);
     }
     // (b): the selection, the tests that ran the faulted function first.
     let mut batch: Vec<Unit> = set.iter().cloned().collect();
     batch.sort_by_key(|u| !probe.contains(u));
     grader.run(batch, &|failed| !set.is_disjoint(failed))?;
     let detected = !set.is_disjoint(&grader.failed);
-    // (a): only when (b) did not detect and does not contain all of (a).
-    if !detected && !result.covers_a {
+    if !detected {
         let mut batch: Vec<Unit> = a_set.difference(&grader.ran).cloned().collect();
         batch.sort_by_key(|u| !probe.contains(u));
         grader.run(batch, &|failed| !a_set.is_disjoint(failed))?;
     }
-    result.detected = Some(detected);
-    result.detected_a = if !a_set.is_disjoint(&grader.failed) {
+    out.detected = Some(detected);
+    out.detected_a = if !a_set.is_disjoint(&grader.failed) {
         Some(true)
     } else if a_set.is_subset(&grader.ran) {
         Some(false)
     } else {
         None
     };
-    result.miss = result.detected_a == Some(true) && !detected;
-    result.failed = grader.failed.iter().map(Unit::label).collect();
-    result.unattributed = grader.unattributed;
-    worker.checkout.restore(&fault_path)?;
-    if result.miss {
+    out.miss = out.detected_a == Some(true) && !detected;
+    out.failed = grader.failed.iter().map(Unit::label).collect();
+    out.unattributed = grader.unattributed;
+    if out.miss {
+        // The missed failures must pass without the fault.
+        worker.checkout.restore(fault_path)?;
         let missed: Vec<Unit> = grader
             .failed
             .iter()
@@ -634,7 +730,7 @@ fn grade(ctx: &Ctx, worker: &Worker, facts: &CommitFacts, step: &ChainStep) -> R
             .cloned()
             .collect();
         let mut clean = Grader {
-            runner: &runner,
+            runner,
             root,
             ran: BTreeSet::new(),
             failed: BTreeSet::new(),
@@ -642,61 +738,124 @@ fn grade(ctx: &Ctx, worker: &Worker, facts: &CommitFacts, step: &ChainStep) -> R
             timed_out: false,
         };
         clean.run(missed.clone(), &|_| false)?;
-        result.confirmed_miss =
-            !missed.is_empty() && clean.failed.is_empty() && !grader.unattributed;
+        out.confirmed_miss = !missed.is_empty() && clean.failed.is_empty() && !grader.unattributed;
     }
-    result.grade_ms = elapsed(started);
-    Ok(result)
+    Ok(out)
 }
 
-/// The report of a fresh run.
+/// What a chain was: written to `chain/meta.json` when it starts, so a
+/// merge knows each chain's window and whether it finished.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ChainMeta {
+    /// `i/n`, or empty for a run without `--chain`.
+    pub chain: String,
+    pub head: String,
+    pub stride: usize,
+    pub commits: Vec<String>,
+    pub faults_per_commit: usize,
+}
+
+/// One chain's (or a single run's) results, as read from its work dir.
 #[derive(Debug, Serialize)]
-pub(crate) struct FreshReport {
+pub(crate) struct ChainReport {
+    pub chain: String,
+    pub dir: String,
+    /// Commits in the chain's window, chained, graded, with errors.
     pub commits: usize,
     pub chained: usize,
     pub graded: usize,
     pub errors: usize,
+    pub complete: bool,
     pub small_commits: usize,
     /// Median share of the suite selected, over commits with write set <= 5.
     pub efficiency_median_small: Option<f64>,
     pub efficiency_median_all: Option<f64>,
-    /// The same median with one run per record instead of the union of the
-    /// last three: the union rule's efficiency cost is the difference.
-    pub efficiency_median_small_single_run: Option<f64>,
-    /// Mean instrumented build (overlapped with the previous run) and run
-    /// time per commit, in seconds.
-    pub build_secs_mean: f64,
-    pub run_secs_mean: f64,
-    pub median_selected_small: Option<f64>,
-    pub faults_injected: usize,
-    pub detected_b: usize,
-    pub detected_a: usize,
-    pub covers_a: usize,
-    /// Faults graded by the probe only (option 2).
-    pub probe_only: usize,
-    pub misses: Vec<String>,
-    pub confirmed_misses: usize,
+    pub counts: Counts,
     /// Commits each fallback kind fired on.
     pub fallbacks: BTreeMap<String, usize>,
-    /// Commits where drift selected extra tests, and their median count.
-    pub drift_commits: usize,
-    pub drift_median_extra: Option<f64>,
     /// The lander's wall time per commit (selection + instrumented build
     /// and run + merge), in seconds.
     pub lander_secs_mean: f64,
     pub lander_secs_median: Option<f64>,
     pub lander_secs_p90: Option<f64>,
     pub lander_secs_total: f64,
-    /// The initial full instrumented run, in seconds.
+    /// The chain's initial full instrumented run, in seconds.
     pub initial_secs: f64,
-    /// Projected lander time for 500 commits: initial + 500 × mean.
-    pub projected_500_hours: f64,
-    /// Grading (fault, (b), (a)) is the harness's cost, not the lander's.
+    /// Grading (faults, (b), (a)) per commit, in seconds: the harness's cost,
+    /// not the lander's.
     pub grade_secs_mean: f64,
+    pub misses: Vec<String>,
+}
+
+/// Per-fault and per-commit counts (ADR 0023 amendment: faults within one
+/// commit are correlated, so both are reported).
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct Counts {
+    /// Faults graded, and those where a miss was possible ((b) does not
+    /// contain (a)).
+    pub faults: usize,
+    pub informative_faults: usize,
+    pub faults_detected_b: usize,
+    pub faults_detected_a: usize,
+    pub fault_misses: usize,
+    pub fault_confirmed_misses: usize,
+    /// Commits with at least one graded fault; informative ones; ones with a
+    /// miss.
+    pub commits_with_faults: usize,
+    pub informative_commits: usize,
+    pub commits_with_miss: usize,
+}
+
+impl Counts {
+    fn add(&mut self, r: &FreshResult) {
+        if r.error.is_some() || r.faults.is_empty() {
+            return;
+        }
+        self.commits_with_faults += 1;
+        if !r.covers_a {
+            self.informative_commits += 1;
+        }
+        if r.faults.iter().any(|f| f.miss) {
+            self.commits_with_miss += 1;
+        }
+        for f in &r.faults {
+            self.faults += 1;
+            if !f.probe_only {
+                self.informative_faults += 1;
+            }
+            self.faults_detected_b += usize::from(f.detected == Some(true));
+            self.faults_detected_a += usize::from(f.detected_a == Some(true));
+            self.fault_misses += usize::from(f.miss);
+            self.fault_confirmed_misses += usize::from(f.confirmed_miss);
+        }
+    }
+}
+
+/// The report of one run, or of several chains merged (`--merge`).
+#[derive(Debug, Serialize)]
+pub(crate) struct FreshReport {
+    pub chains: Vec<ChainReport>,
+    /// Pooled over every chain.
+    pub commits: usize,
+    pub chained: usize,
+    pub graded: usize,
+    pub errors: usize,
+    pub complete: bool,
+    pub small_commits: usize,
+    pub efficiency_median_small: Option<f64>,
+    pub efficiency_median_all: Option<f64>,
+    pub counts: Counts,
+    pub fallbacks: BTreeMap<String, usize>,
+    pub lander_secs_mean: f64,
+    pub misses: Vec<String>,
+    pub quarantine: Vec<String>,
+    pub sample: Vec<crate::SampleResult>,
     pub profraw_in_cwd: Vec<String>,
+    /// ADR 0023 gate: zero misses, and a median ≤ 20% for write sets ≤ 5.
     pub safety_gate: bool,
     pub efficiency_gate: bool,
-    pub results: Vec<FreshResult>,
+    /// Every graded commit, with its chain.
+    pub results: Vec<(String, FreshResult)>,
 }
 
 fn median(mut v: Vec<f64>) -> Option<f64> {
@@ -712,7 +871,7 @@ fn median(mut v: Vec<f64>) -> Option<f64> {
     })
 }
 
-fn mean(v: Vec<f64>) -> f64 {
+fn mean(v: &[f64]) -> f64 {
     if v.is_empty() {
         0.0
     } else {
@@ -729,102 +888,157 @@ fn percentile(mut v: Vec<f64>, p: f64) -> Option<f64> {
     v.get(i).copied()
 }
 
-/// Collect the chain steps and grades under `work` into a report.
-pub(crate) fn report(work: &Path, prepared: &Prepared, initial_secs: f64) -> FreshReport {
-    let steps: Vec<ChainStep> = prepared
-        .commits
-        .iter()
-        .filter_map(|c| read_json(&work.join(format!("chain/{}.json", c.index))))
-        .collect();
-    let results: Vec<FreshResult> = prepared
-        .commits
-        .iter()
-        .filter_map(|c| read_json(&work.join(format!("fresh-results/{}.json", c.index))))
-        .collect();
-    let ok_steps: Vec<&ChainStep> = steps.iter().filter(|s| s.error.is_none()).collect();
-    let share = |s: &ChainStep| s.selected as f64 / s.suite.max(1) as f64;
-    let small: Vec<&&ChainStep> = ok_steps.iter().filter(|s| s.write_set <= 5).collect();
-    let mut fallbacks: BTreeMap<String, usize> = BTreeMap::new();
-    for s in &ok_steps {
+fn share(s: &ChainStep) -> f64 {
+    s.selected as f64 / s.suite.max(1) as f64
+}
+
+fn fallback_counts<'a>(steps: impl Iterator<Item = &'a ChainStep>) -> BTreeMap<String, usize> {
+    let mut out: BTreeMap<String, usize> = BTreeMap::new();
+    for s in steps {
         if s.fallbacks.is_empty() {
-            *fallbacks.entry("(none)".into()).or_default() += 1;
+            *out.entry("(none)".into()).or_default() += 1;
         }
         for k in &s.fallbacks {
-            *fallbacks.entry(k.clone()).or_default() += 1;
+            *out.entry(k.clone()).or_default() += 1;
         }
     }
+    out
+}
+
+fn numbered<T: for<'de> Deserialize<'de>>(dir: &Path) -> Vec<(usize, T)> {
+    let mut out: Vec<(usize, T)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let index: usize = name.strip_suffix(".json")?.parse().ok()?;
+            Some((index, read_json(&e.path())?))
+        })
+        .collect();
+    out.sort_by_key(|(i, _)| *i);
+    out
+}
+
+/// Read one chain's results from its work dir.
+fn chain_report(work: &Path) -> (ChainReport, Vec<ChainStep>, Vec<FreshResult>) {
+    let meta: ChainMeta = read_json(&work.join("chain/meta.json")).unwrap_or_default();
+    let steps: Vec<ChainStep> = numbered(&work.join("chain"))
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    let results: Vec<FreshResult> = numbered(&work.join("fresh-results"))
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    let ok: Vec<&ChainStep> = steps.iter().filter(|s| s.error.is_none()).collect();
+    let small: Vec<&&ChainStep> = ok.iter().filter(|s| s.write_set <= 5).collect();
     let lander: Vec<f64> = steps.iter().map(|s| s.chain_ms as f64 / 1000.0).collect();
-    let lander_mean = if lander.is_empty() {
-        0.0
+    let mut counts = Counts::default();
+    for r in &results {
+        counts.add(r);
+    }
+    let initial_secs = read_json::<(u64, usize, String)>(&work.join("chain/initial.json"))
+        .map_or(0.0, |m| m.0 as f64 / 1000.0);
+    let commits = if meta.commits.is_empty() {
+        steps.len()
     } else {
-        lander.iter().sum::<f64>() / lander.len() as f64
+        meta.commits.len()
     };
-    let graded: Vec<&FreshResult> = results.iter().filter(|r| r.error.is_none()).collect();
-    let faulted: Vec<&&FreshResult> = graded.iter().filter(|r| r.fault.is_some()).collect();
-    let misses: Vec<String> = faulted
+    let misses = results
         .iter()
-        .filter(|r| r.miss)
-        .map(|r| format!("{} {}", r.step.index, &r.step.commit[..10]))
+        .filter(|r| r.faults.iter().any(|f| f.miss))
+        .map(|r| {
+            format!(
+                "{} {} {}",
+                meta.chain,
+                r.step.index,
+                &r.step.commit[..10.min(r.step.commit.len())]
+            )
+        })
         .collect();
-    let drift: Vec<f64> = ok_steps
-        .iter()
-        .filter(|s| s.drift_selected > 0)
-        .map(|s| s.drift_selected as f64)
-        .collect();
-    let efficiency_median_small = median(small.iter().map(|s| share(s)).collect());
-    FreshReport {
-        commits: prepared.commits.len(),
+    let graded_secs: Vec<f64> = results.iter().map(|r| r.grade_ms as f64 / 1000.0).collect();
+    let report = ChainReport {
+        chain: meta.chain.clone(),
+        dir: work.display().to_string(),
+        commits,
         chained: steps.len(),
         graded: results.len(),
-        errors: steps.len() - ok_steps.len() + results.iter().filter(|r| r.error.is_some()).count(),
+        errors: steps.len() - ok.len() + results.iter().filter(|r| r.error.is_some()).count(),
+        complete: steps.len() >= commits && results.len() >= commits,
         small_commits: small.len(),
-        efficiency_median_small,
-        efficiency_median_all: median(ok_steps.iter().map(|s| share(s)).collect()),
-        efficiency_median_small_single_run: median(
-            small
-                .iter()
-                .map(|s| s.selected_single as f64 / s.suite.max(1) as f64)
-                .collect(),
-        ),
-        build_secs_mean: mean(
-            ok_steps
-                .iter()
-                .map(|s| s.build_ms as f64 / 1000.0)
-                .collect(),
-        ),
-        run_secs_mean: mean(ok_steps.iter().map(|s| s.run_ms as f64 / 1000.0).collect()),
-        median_selected_small: median(small.iter().map(|s| s.selected as f64).collect()),
-        faults_injected: faulted.len(),
-        detected_b: faulted.iter().filter(|r| r.detected == Some(true)).count(),
-        detected_a: faulted
-            .iter()
-            .filter(|r| r.detected_a == Some(true))
-            .count(),
-        covers_a: faulted.iter().filter(|r| r.covers_a).count(),
-        probe_only: faulted.iter().filter(|r| r.probe_only).count(),
-        confirmed_misses: faulted.iter().filter(|r| r.confirmed_miss).count(),
-        safety_gate: misses.is_empty(),
-        misses,
-        fallbacks,
-        drift_commits: drift.len(),
-        drift_median_extra: median(drift),
-        lander_secs_mean: lander_mean,
+        efficiency_median_small: median(small.iter().map(|s| share(s)).collect()),
+        efficiency_median_all: median(ok.iter().map(|s| share(s)).collect()),
+        counts,
+        fallbacks: fallback_counts(ok.iter().copied()),
+        lander_secs_mean: mean(&lander),
         lander_secs_median: median(lander.clone()),
         lander_secs_p90: percentile(lander.clone(), 0.9),
         lander_secs_total: lander.iter().sum(),
         initial_secs,
-        projected_500_hours: (initial_secs + 500.0 * lander_mean) / 3600.0,
-        grade_secs_mean: if graded.is_empty() {
-            0.0
-        } else {
-            graded
-                .iter()
-                .map(|r| r.grade_ms as f64 / 1000.0)
-                .sum::<f64>()
-                / graded.len() as f64
-        },
-        profraw_in_cwd: Vec::new(),
+        grade_secs_mean: mean(&graded_secs),
+        misses,
+    };
+    (report, steps, results)
+}
+
+/// The report over the work dirs of one or more chains (`--merge`, or a
+/// single run's own dir), with the sample results found in any of them.
+pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshReport {
+    let mut chains = Vec::new();
+    let mut steps = Vec::new();
+    let mut results = Vec::new();
+    let mut sample: Vec<crate::SampleResult> = Vec::new();
+    for dir in dirs {
+        if dir.join("chain").is_dir() {
+            let (c, s, r) = chain_report(dir);
+            steps.extend(s);
+            results.extend(r.into_iter().map(|r| (c.chain.clone(), r)));
+            chains.push(c);
+        }
+        if let Ok(entries) = fs::read_dir(dir.join("sample")) {
+            for e in entries.flatten() {
+                if let Some(r) = read_json::<crate::SampleResult>(&e.path()) {
+                    sample.push(r);
+                }
+            }
+        }
+    }
+    sample.sort_by(|a, b| a.commit.cmp(&b.commit));
+    sample.dedup_by(|a, b| a.commit == b.commit);
+    let mut quarantine: BTreeSet<String> = quarantine.clone();
+    quarantine.extend(sample.iter().flat_map(|s| s.failed.iter().cloned()));
+    let ok: Vec<&ChainStep> = steps.iter().filter(|s| s.error.is_none()).collect();
+    let small: Vec<&&ChainStep> = ok.iter().filter(|s| s.write_set <= 5).collect();
+    let mut counts = Counts::default();
+    for (_, r) in &results {
+        counts.add(r);
+    }
+    let misses: Vec<String> = chains
+        .iter()
+        .flat_map(|c| c.misses.iter().cloned())
+        .collect();
+    let efficiency_median_small = median(small.iter().map(|s| share(s)).collect());
+    let lander: Vec<f64> = steps.iter().map(|s| s.chain_ms as f64 / 1000.0).collect();
+    FreshReport {
+        commits: chains.iter().map(|c| c.commits).sum(),
+        chained: steps.len(),
+        graded: results.len(),
+        errors: chains.iter().map(|c| c.errors).sum(),
+        complete: !chains.is_empty() && chains.iter().all(|c| c.complete),
+        small_commits: small.len(),
+        efficiency_median_small,
+        efficiency_median_all: median(ok.iter().map(|s| share(s)).collect()),
+        fallbacks: fallback_counts(ok.iter().copied()),
+        lander_secs_mean: mean(&lander),
+        safety_gate: counts.fault_misses == 0,
         efficiency_gate: efficiency_median_small.is_some_and(|m| m <= 0.20),
+        counts,
+        misses,
+        quarantine: quarantine.into_iter().collect(),
+        sample,
+        profraw_in_cwd: Vec::new(),
+        chains,
         results,
     }
 }
@@ -835,108 +1049,120 @@ fn pct(m: Option<f64>) -> String {
 
 /// Print the report, and return its Markdown summary.
 pub(crate) fn print(r: &FreshReport) -> String {
-    let secs = |v: Option<f64>| v.map_or("n/a".to_owned(), |v| format!("{v:.0} s"));
+    let c = &r.counts;
     let mut md = String::new();
     md.push_str(&format!(
-        "# M4 fresh per-test coverage (lander view): {} commits\n\n",
-        r.chained
+        "# M4 selection gate (ADR 0023): {} chain(s), {} of {} commits chained{}\n\n",
+        r.chains.len(),
+        r.chained,
+        r.commits,
+        if r.complete { "" } else { " (incomplete)" }
     ));
-    md.push_str("| Measure | Value |\n|---|---|\n");
     let rows = [
         (
-            "Commits chained / graded / errors",
-            format!("{} / {} / {}", r.chained, r.graded, r.errors),
+            "Verdict",
+            format!(
+                "safety {} (zero misses), efficiency {} (median <= 20% for write sets <= 5){}",
+                if r.safety_gate { "PASS" } else { "FAIL" },
+                if r.efficiency_gate { "PASS" } else { "FAIL" },
+                if r.complete {
+                    ""
+                } else {
+                    "; not gated: incomplete"
+                }
+            ),
         ),
         (
             "Efficiency, median share (write set <= 5)",
-            format!(
-                "{} (n={}, median {} tests)",
-                pct(r.efficiency_median_small),
-                r.small_commits,
-                r.median_selected_small
-                    .map_or("n/a".into(), |m| format!("{m:.0}"))
-            ),
+            format!("{} (n={})", pct(r.efficiency_median_small), r.small_commits),
         ),
         (
             "Efficiency, median share (all)",
             pct(r.efficiency_median_all),
         ),
         (
-            "Union rule's cost: median share (ws <= 5) with one run per record",
-            pct(r.efficiency_median_small_single_run),
-        ),
-        (
-            "Instrumented build (overlapped) / run, mean per commit",
-            format!("{:.0} s / {:.0} s", r.build_secs_mean, r.run_secs_mean),
-        ),
-        (
-            "Faults injected / (b) detected / (a) detected / (b) covers (a) / probe only",
+            "Faults: graded / informative / (b) detected / (a) detected",
             format!(
-                "{} / {} / {} / {} / {}",
-                r.faults_injected, r.detected_b, r.detected_a, r.covers_a, r.probe_only
+                "{} / {} / {} / {}",
+                c.faults, c.informative_faults, c.faults_detected_b, c.faults_detected_a
             ),
         ),
         (
-            "Misses (confirmed)",
-            format!("{} ({}) {:?}", r.misses.len(), r.confirmed_misses, r.misses),
+            "Misses per fault (confirmed)",
+            format!("{} ({})", c.fault_misses, c.fault_confirmed_misses),
         ),
         (
-            "Commits where drift added tests (median extra)",
+            "Commits: with faults / informative / with a miss",
             format!(
-                "{} ({})",
-                r.drift_commits,
-                r.drift_median_extra
-                    .map_or("n/a".into(), |m| format!("{m:.0}"))
+                "{} / {} / {}",
+                c.commits_with_faults, c.informative_commits, c.commits_with_miss
             ),
         ),
+        ("Misses", format!("{:?}", r.misses)),
         (
-            "Lander wall time per commit: mean / median / p90",
-            format!(
-                "{:.0} s / {} / {}",
-                r.lander_secs_mean,
-                secs(r.lander_secs_median),
-                secs(r.lander_secs_p90)
-            ),
+            "Lander wall time per commit (mean)",
+            format!("{:.0} s", r.lander_secs_mean),
         ),
-        (
-            "Initial full instrumented run",
-            format!("{:.1} min", r.initial_secs / 60.0),
-        ),
-        (
-            "Projected 500 commits (initial + 500 × mean)",
-            format!("{:.1} h", r.projected_500_hours),
-        ),
-        (
-            "Grading per commit (harness, not lander)",
-            format!("{:.0} s", r.grade_secs_mean),
-        ),
+        ("Quarantine", format!("{:?}", r.quarantine)),
         (
             "profraw in the working directory",
             format!("{:?}", r.profraw_in_cwd),
         ),
-        (
-            "Gates",
-            format!(
-                "safety {}, efficiency {}",
-                if r.safety_gate { "PASS" } else { "FAIL" },
-                if r.efficiency_gate { "PASS" } else { "FAIL" }
-            ),
-        ),
     ];
+    md.push_str("| Measure | Value |\n|---|---|\n");
     for (k, v) in rows {
         println!("  {k}: {v}");
         md.push_str(&format!("| {k} | {v} |\n"));
     }
     println!("  fallbacks (commits): {:?}", r.fallbacks);
+    md.push_str("\n## Chains\n\n| Chain | Commits | Median share (ws <= 5) | Faults (informative) | Misses | Lander s/commit (mean, p90) | Initial run | Grading s/commit |\n|---|---|---|---|---|---|---|---|\n");
+    for ch in &r.chains {
+        let line = format!(
+            "| {} | {}/{}{} | {} | {} ({}) | {} | {:.0}, {} | {:.1} min | {:.0} |",
+            if ch.chain.is_empty() { "-" } else { &ch.chain },
+            ch.chained,
+            ch.commits,
+            if ch.complete { "" } else { " (incomplete)" },
+            pct(ch.efficiency_median_small),
+            ch.counts.faults,
+            ch.counts.informative_faults,
+            ch.counts.fault_misses,
+            ch.lander_secs_mean,
+            ch.lander_secs_p90
+                .map_or("n/a".into(), |v| format!("{v:.0}")),
+            ch.initial_secs / 60.0,
+            ch.grade_secs_mean,
+        );
+        println!("  chain {line}");
+        md.push_str(&line);
+        md.push('\n');
+    }
     md.push_str("\n## Fallback kinds (commits fired)\n\n| Kind | Commits |\n|---|---|\n");
     for (k, n) in &r.fallbacks {
         md.push_str(&format!("| {k} | {n} |\n"));
     }
-    md.push_str("\n## Commits\n\n| # | Commit | ws | Selected | Fallbacks | Drift + | Lander s | Fault | (b) | (a) |\n|---|---|---|---|---|---|---|---|---|---|\n");
-    for x in &r.results {
+    md.push_str("\n## Commits\n\n| Chain | # | Commit | ws | Selected | Fallbacks | Drift + | Lander s | Faults |\n|---|---|---|---|---|---|---|---|---|\n");
+    for (chain, x) in &r.results {
         let s = &x.step;
+        let faults: Vec<String> = x
+            .faults
+            .iter()
+            .map(|f| {
+                let d = if f.miss {
+                    "MISS"
+                } else if f.probe_only {
+                    "probe"
+                } else if f.detected == Some(true) {
+                    "caught"
+                } else {
+                    "not caught by (a)"
+                };
+                format!("{:?} `{}`: {d}", f.fault.kind, f.fault.name)
+            })
+            .collect();
         md.push_str(&format!(
-            "| {} | {} | {} | {}/{} | {} | {} | {:.0} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {}/{} | {} | {} | {:.0} | {} |\n",
+            if chain.is_empty() { "-" } else { chain },
             s.index,
             &s.commit[..10.min(s.commit.len())],
             s.write_set,
@@ -945,16 +1171,14 @@ pub(crate) fn print(r: &FreshReport) -> String {
             s.fallbacks.join(", "),
             s.drift_selected,
             s.chain_ms as f64 / 1000.0,
-            x.fault.as_ref().map_or_else(
-                || x.error.clone().unwrap_or_else(|| "none".into()),
-                |f| format!("{:?} `{}`", f.kind, f.name)
-            ),
-            x.detected.map_or("-".into(), |d| if x.miss {
-                "MISS".into()
+            if faults.is_empty() {
+                x.no_fault
+                    .clone()
+                    .or_else(|| x.error.clone())
+                    .unwrap_or_default()
             } else {
-                d.to_string()
-            }),
-            x.detected_a.map_or("-".into(), |d| d.to_string()),
+                faults.join("; ")
+            },
         ));
     }
     md
@@ -963,4 +1187,64 @@ pub(crate) fn print(r: &FreshReport) -> String {
 /// Where the fresh run keeps its initial record.
 pub(crate) fn initial_path(work: &Path) -> PathBuf {
     work.join("chain/initial.cbor")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faults_cover_distinct_functions_before_second_kinds() {
+        use FaultKind::{Default as D, Flip as F, Panic as P};
+        let order = fault_order(vec![(2, P), (2, D), (2, F), (0, F), (0, P), (1, D)]);
+        assert_eq!(order, vec![(2, P), (0, F), (1, D), (2, D), (0, P), (2, F)]);
+        assert!(fault_order(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn counts_are_per_fault_and_per_commit() {
+        let grade = |probe_only: bool, detected: Option<bool>, miss: bool| FaultGrade {
+            fault: Fault {
+                path: "src/lib.rs".into(),
+                name: "f".into(),
+                kind: FaultKind::Panic,
+                rejected: 0,
+                edited_lines: 0,
+            },
+            probe_only,
+            detected,
+            detected_a: detected.or(Some(miss)),
+            miss,
+            confirmed_miss: miss,
+            failed: Vec::new(),
+            unattributed: false,
+            build_ms: 0,
+            grade_ms: 0,
+        };
+        let mut c = Counts::default();
+        c.add(&FreshResult {
+            covers_a: false,
+            faults: vec![
+                grade(false, Some(true), false),
+                grade(false, Some(false), true),
+            ],
+            ..FreshResult::default()
+        });
+        c.add(&FreshResult {
+            covers_a: true,
+            faults: vec![grade(true, None, false)],
+            ..FreshResult::default()
+        });
+        c.add(&FreshResult::default());
+        assert_eq!((c.faults, c.informative_faults, c.fault_misses), (3, 2, 1));
+        assert_eq!(
+            (
+                c.commits_with_faults,
+                c.informative_commits,
+                c.commits_with_miss
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(c.faults_detected_b, 1);
+    }
 }
