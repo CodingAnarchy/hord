@@ -191,8 +191,24 @@ fn wait_for(dir: &Path, home: &Path, change: &str, status: &str) -> TestResult<s
     }
 }
 
-#[test]
-fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
+/// A server requiring tokens over an origin whose policy needs
+/// `review:human` for function edits; a clone of it; users `root`
+/// (admin), `ada` (review:human), and `eve` (no review); and agent `bot-1`
+/// logged in with a minted token. Each identity has its own `~/.hord`.
+struct World {
+    homes: TempDir,
+    _origin: TempDir,
+    clone: TempDir,
+    _server: Serve,
+    _op: PathBuf,
+    ada: PathBuf,
+    eve: PathBuf,
+    bot: PathBuf,
+    nobody: PathBuf,
+    bot_key: String,
+}
+
+fn world() -> TestResult<World> {
     let homes = TempDir::new("hord-auth-homes")?;
     let home = |who: &str| -> TestResult<PathBuf> {
         let dir = homes.0.join(who);
@@ -211,6 +227,8 @@ fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
     let origin = TempDir::new("hord-auth-origin")?;
     fs::create_dir_all(origin.0.join("src"))?;
     fs::write(origin.0.join("src/lib.rs"), LIB)?;
+    fs::create_dir_all(origin.0.join("docs"))?;
+    fs::write(origin.0.join("docs/notes.txt"), "notes\n")?;
     fs::write(
         origin.0.join("Cargo.toml"),
         "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
@@ -293,22 +311,75 @@ fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
         &["login", "origin", "--token", &token, "--key-file", key_arg],
     )?;
 
+    Ok(World {
+        homes,
+        _origin: origin,
+        clone,
+        _server: server,
+        _op: op,
+        ada,
+        eve,
+        bot,
+        nobody,
+        bot_key,
+    })
+}
+
+impl World {
+    /// Log `user` in with the user table, from their own home; their key id.
+    fn login(&self, home: &Path, user: &str) -> TestResult<String> {
+        let login = json_in(
+            &self.clone.0,
+            home,
+            &["login", "origin", "--user", user, "--password-stdin"],
+            &format!("{user}-pw\n"),
+        )?;
+        Ok(str_field(&login, "keyId")?.to_owned())
+    }
+
+    /// As `home`: a workspace at head, `from` replaced by `to` in `file`,
+    /// proposed and submitted. The change id.
+    fn submit(
+        &self,
+        home: &Path,
+        file: &str,
+        from: &str,
+        to: &str,
+        summary: &str,
+    ) -> TestResult<String> {
+        let dir = &self.clone.0;
+        let ws = json(dir, home, &["ws", "new"])?;
+        let id = str_field(&ws, "id")?.to_owned();
+        let path = PathBuf::from(str_field(&ws, "materialization")?).join(file);
+        let text = fs::read_to_string(&path)?;
+        assert!(text.contains(from), "{file}: {text}");
+        fs::write(&path, text.replacen(from, to, 1))?;
+        let intent = self
+            .homes
+            .0
+            .join(format!("{}.md", summary.replace(' ', "-")));
+        fs::write(&intent, format!("---\nsummary: {summary}\n---\nWhy.\n"))?;
+        let intent = intent.to_str().ok_or("intent path is UTF-8")?;
+        let proposed = json(dir, home, &["propose", "-w", &id, "--intent", intent])?;
+        let change = str_field(&proposed, "change")?.to_owned();
+        json(dir, home, &["submit", &change])?;
+        Ok(change)
+    }
+}
+
+#[test]
+fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
+    let w = world()?;
+    let (dir, ada, eve, bot) = (&w.clone.0, &w.ada, &w.eve, &w.bot);
+    let bot_key = &w.bot_key;
+
+    // No token: refused.
+    let refused = fails(dir, &w.nobody, &["queue"])?;
+    assert!(refused.contains("requires a bearer token"), "{refused}");
+
     // The agent edits a function, proposes, and submits: parked for review.
-    let ws = json(dir, &bot, &["ws", "new"])?;
-    let id = str_field(&ws, "id")?.to_owned();
-    let checkout = PathBuf::from(str_field(&ws, "materialization")?);
-    let lib = checkout.join("src/lib.rs");
-    fs::write(
-        &lib,
-        fs::read_to_string(&lib)?.replacen("    1\n", "    10\n", 1),
-    )?;
-    let intent = dir.join("intent.md");
-    fs::write(&intent, "---\nsummary: alpha ten\n---\nWhy.\n")?;
-    let intent = intent.to_str().ok_or("intent path is UTF-8")?;
-    let proposed = json(dir, &bot, &["propose", "-w", &id, "--intent", intent])?;
-    let change = str_field(&proposed, "change")?.to_owned();
-    json(dir, &bot, &["submit", &change])?;
-    let parked = wait_for(dir, &bot, &change, PARKED)?;
+    let change = w.submit(bot, "src/lib.rs", "    1\n", "    10\n", "alpha ten")?;
+    let parked = wait_for(dir, bot, &change, PARKED)?;
     assert_eq!(parked["actor"]["agent"]["id"], "bot-1", "{parked:#}");
     assert!(
         parked["reason"]
@@ -317,20 +388,15 @@ fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
         "{parked:#}"
     );
     // The agent signed it, and provenance is the token's actor.
-    let signed = json(dir, &bot, &["key", "verify", &change, "--key", &bot_key])?;
+    let signed = json(dir, bot, &["key", "verify", &change, "--key", bot_key])?;
     assert_eq!(signed["verified"], true, "{signed:#}");
     assert_eq!(signed["actor"]["agent"]["id"], "bot-1", "{signed:#}");
 
     // A human without `review:human` cannot sign that review.
-    json_in(
-        dir,
-        &eve,
-        &["login", "origin", "--user", "eve", "--password-stdin"],
-        "eve-pw\n",
-    )?;
+    w.login(eve, "eve")?;
     let denied = fails(
         dir,
-        &eve,
+        eve,
         &[
             "review",
             &change,
@@ -345,16 +411,10 @@ fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
     assert!(denied.contains("permission denied"), "{denied}");
 
     // Ada can: the change lands.
-    let login = json_in(
-        dir,
-        &ada,
-        &["login", "origin", "--user", "ada", "--password-stdin"],
-        "ada-pw\n",
-    )?;
-    let ada_key = str_field(&login, "keyId")?.to_owned();
+    let ada_key = w.login(ada, "ada")?;
     let review = json(
         dir,
-        &ada,
+        ada,
         &[
             "review",
             &change,
@@ -367,8 +427,8 @@ fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
     )?;
     assert_eq!(review["keyId"], ada_key.as_str(), "{review:#}");
     let evidence = str_field(&review, "evidence")?.to_owned();
-    let landed = wait_for(dir, &bot, &change, LANDED)?;
-    let log = json(dir, &ada, &["log"])?;
+    let landed = wait_for(dir, bot, &change, LANDED)?;
+    let log = json(dir, ada, &["log"])?;
     let last = log["changes"]
         .as_array()
         .and_then(|c| c.last())
@@ -376,19 +436,71 @@ fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
     assert_eq!(last["change"], landed["landed"], "{log:#}");
 
     // The review verifies with Ada's key, and not with another.
-    let ok = json(dir, &ada, &["key", "verify", &evidence, "--key", &ada_key])?;
+    let ok = json(dir, ada, &["key", "verify", &evidence, "--key", &ada_key])?;
     assert_eq!(ok["verified"], true, "{ok:#}");
     assert_eq!(ok["kind"], "evidence");
     assert_eq!(ok["actor"]["human"]["id"], "ada", "{ok:#}");
     let out = run(
         dir,
-        &ada,
-        &["key", "verify", &evidence, "--key", &bot_key, "--json"],
+        ada,
+        &["key", "verify", &evidence, "--key", bot_key, "--json"],
         "",
     )?;
     assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
     let wrong: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     assert_eq!(wrong["verified"], false, "{wrong:#}");
-    drop(server);
+    drop(w);
+    Ok(())
+}
+
+/// ADR 0031: head moves between the agent's proposal and the human's
+/// review. The review is signed against the change's own result; the lander
+/// rebases the change cleanly onto the new head (a different file), counts
+/// the review, and lands it.
+#[test]
+#[ignore = "needs ladder's ADR 0031 change"]
+fn a_review_carries_across_a_clean_rebase() -> TestResult {
+    let w = world()?;
+    let (dir, ada, eve, bot) = (&w.clone.0, &w.ada, &w.eve, &w.bot);
+    let change = w.submit(bot, "src/lib.rs", "    1\n", "    10\n", "alpha ten")?;
+    let parked = wait_for(dir, bot, &change, PARKED)?;
+    let base = parked["report"]["head"].clone();
+
+    // Head moves: Eve's edit touches no function, so it needs no review.
+    w.login(eve, "eve")?;
+    let notes = w.submit(eve, "docs/notes.txt", "notes\n", "more notes\n", "notes")?;
+    wait_for(dir, eve, &notes, LANDED)?;
+    let head = json(dir, eve, &["log"])?;
+    let head = head["changes"]
+        .as_array()
+        .and_then(|c| c.last())
+        .map(|c| c["change"].clone())
+        .ok_or("the log has changes")?;
+    assert_eq!(head, notes.as_str());
+    assert_ne!(base, head);
+
+    // Ada reviews the change as the agent proposed it; it lands rebased.
+    let ada_key = w.login(ada, "ada")?;
+    let review = json(
+        dir,
+        ada,
+        &[
+            "review",
+            &change,
+            "--as",
+            "human",
+            "--approve",
+            "-m",
+            "alpha is ten now",
+        ],
+    )?;
+    let landed = wait_for(dir, bot, &change, LANDED)?;
+    assert_ne!(landed["landed"], change.as_str(), "rebased: {landed:#}");
+    let report = &landed["report"];
+    assert_eq!(report["merge"], serde_json::json!([]), "{landed:#}");
+    assert_eq!(report["adapterMerged"], serde_json::json!([]), "{landed:#}");
+    let evidence = str_field(&review, "evidence")?;
+    let ok = json(dir, ada, &["key", "verify", evidence, "--key", &ada_key])?;
+    assert_eq!(ok["verified"], true, "{ok:#}");
     Ok(())
 }
