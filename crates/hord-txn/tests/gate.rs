@@ -19,6 +19,7 @@ use hord_verify::{
     Check, Checkout, CoverageRecord, Drift, EvidenceFields, EvidenceIndex, ImpactSet, Toolchain,
     VerifyPlan, VerifyPolicy,
 };
+use hord_verify_rust::Cancel;
 
 /// Plans one `true <requirement>` check per requirement it can produce
 /// (everything but `review:*`) and counts what it runs.
@@ -121,6 +122,7 @@ impl VerifierFactory for FakeFactory {
         _checkout: &Checkout,
         _coverage: Option<Arc<CoverageRecord>>,
         _drift: Option<Arc<Drift>>,
+        _cancel: &Cancel,
     ) -> hord_verify::Result<Built> {
         Ok(Built {
             verifier: Box::new(FakeRunner {

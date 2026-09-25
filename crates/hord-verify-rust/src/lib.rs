@@ -19,6 +19,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+mod cancel;
 mod cargo;
 pub mod coverage;
 mod facts;
@@ -28,6 +29,7 @@ mod runner;
 mod select;
 mod verifier;
 
+pub use cancel::Cancel;
 pub use cargo::{CargoWorkspace, Package, Target};
 pub use coverage::{CoverageOptions, CoverageRun, DefinitionIndex, TestFilter};
 pub use facts::{diff_rust_file, rust_traits};

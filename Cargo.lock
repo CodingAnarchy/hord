@@ -2297,6 +2297,8 @@ dependencies = [
  "hord-store",
  "hord-txn",
  "hord-ui",
+ "hord-verify",
+ "hord-verify-rust",
  "http",
  "http-body-util",
  "hyper-util",

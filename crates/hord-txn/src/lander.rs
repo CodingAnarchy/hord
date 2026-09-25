@@ -400,6 +400,11 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
     let ahead = check_ahead();
     let mut window: VecDeque<Slot> = VecDeque::new();
     loop {
+        // Closing the repository: stop here, recording nothing more.
+        if repo.inner.closing.is_cancelled() {
+            abandon(&mut window, &mut state);
+            break;
+        }
         // Fill the window.
         while window.len() < SPECULATIVE_WINDOW {
             let from = match window.back() {
@@ -468,7 +473,10 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
             }
             // Replays are running (spec §6.4 rung 2): what they propose is
             // submitted, which wakes this loop, as does a replay finishing.
-            repo.inner.wake.notified().await;
+            tokio::select! {
+                () = repo.inner.wake.notified() => {}
+                () = repo.inner.closing.cancelled() => {}
+            }
             continue;
         };
         state.cursor = Some(front.seq());
@@ -477,9 +485,25 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                 let entry = blocking(&repo.inner, move |inner| inner.settle(*entry)).await?;
                 (entry, false)
             }
-            Slot::Verifying { candidate, verdict } => {
+            Slot::Verifying {
+                candidate,
+                mut verdict,
+            } => {
                 let predicted = candidate.predicted;
-                let verdict = verdict.await.unwrap_or_else(|err| Verdict::Fail {
+                // Shutdown must not wait out a verification run: cancel it
+                // (its commands are killed) and record nothing. The change
+                // stays queued, and the next start verifies it again.
+                let verdict = tokio::select! {
+                    verdict = &mut verdict => verdict,
+                    () = repo.inner.closing.cancelled() => {
+                        verdict.abort();
+                        let seq = candidate.entry.seq;
+                        abandon(&mut window, &mut state);
+                        state.cursor = Some(seq);
+                        break;
+                    }
+                };
+                let verdict = verdict.unwrap_or_else(|err| Verdict::Fail {
                     evidence: Vec::new(),
                     reason: format!("verification task failed: {err}"),
                 });
@@ -512,6 +536,19 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
         blocking(&repo.inner, |inner| inner.sync_events()).await?;
     }
     Ok(processed)
+}
+
+/// Drop the window without recording anything: abort its verification
+/// and point the cursor at its first entry, which is still queued.
+fn abandon(window: &mut VecDeque<Slot>, state: &mut LanderState) {
+    if let Some(front) = window.front() {
+        state.cursor = Some(front.seq());
+    }
+    for slot in window.drain(..) {
+        if let Slot::Verifying { verdict, .. } = slot {
+            verdict.abort();
+        }
+    }
 }
 
 /// Start verifying `candidate` on the runtime.

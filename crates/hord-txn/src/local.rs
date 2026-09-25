@@ -74,6 +74,9 @@ impl LocalRepo {
     /// close the repository ([`Repo::close`]): afterwards no task it spawned
     /// holds it.
     pub async fn shutdown(&self) {
+        // Stop replays and verification first: the lander may be waiting
+        // for either, and must not wait them out.
+        self.repo.inner.stop_background();
         self.cancel.cancel();
         let task = crate::repo::lock(&self.lander).take();
         if let Some(task) = task {
