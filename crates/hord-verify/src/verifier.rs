@@ -252,12 +252,12 @@ mod tests {
         };
         let policy = VerifyPolicy::default().requiring(["check", "test:selected"]);
         let impact = ImpactSet::default();
-        let first = verify(&verifier, &index, &checkout, &impact, &policy).unwrap();
+        let first = verify(&verifier, &index, &checkout, &impact, &policy).expect("verify");
         assert!(first.passed());
         assert_eq!(first.evidence().len(), 2);
         assert_eq!(verifier.runs.load(Ordering::Relaxed), 2);
         // Resubmitting the unchanged change on the unchanged head runs nothing.
-        let second = verify(&verifier, &index, &checkout, &impact, &policy).unwrap();
+        let second = verify(&verifier, &index, &checkout, &impact, &policy).expect("verify");
         assert_eq!(verifier.runs.load(Ordering::Relaxed), 2);
         let mut a = first.evidence().to_vec();
         let mut b = second.evidence().to_vec();
@@ -265,18 +265,22 @@ mod tests {
         b.sort();
         assert_eq!(a, b);
         // The toolchain object is resolvable.
-        assert!(index.get_raw(verifier.toolchain.id().unwrap()).is_ok());
+        assert!(
+            index
+                .get_raw(verifier.toolchain.id().expect("compute toolchain id"))
+                .is_ok()
+        );
         // Another snapshot is another key.
         let other = Checkout {
             snapshot: ObjectId::from_bytes([5; 32]),
             ..checkout
         };
-        verify(&verifier, &index, &other, &impact, &policy).unwrap();
+        verify(&verifier, &index, &other, &impact, &policy).expect("verify");
         assert_eq!(verifier.runs.load(Ordering::Relaxed), 4);
     }
 
     #[test]
-    fn failures_fail_the_verdict_and_are_reused_as_failures() {
+    fn failures_fail_the_verdict_and_are_reused_as_failures() -> std::result::Result<(), String> {
         let index = MemoryIndex::new();
         let verifier = fake("lint");
         let checkout = Checkout {
@@ -284,14 +288,17 @@ mod tests {
             snapshot: ObjectId::from_bytes([4; 32]),
         };
         let policy = VerifyPolicy::default().requiring(["check", "lint"]);
-        let verdict = verify(&verifier, &index, &checkout, &ImpactSet::default(), &policy).unwrap();
+        let verdict =
+            verify(&verifier, &index, &checkout, &ImpactSet::default(), &policy).expect("verify");
         let Verdict::Fail { evidence, reason } = verdict else {
-            panic!("expected failure");
+            return Err(format!("expected a failing verdict, got {verdict:?}"));
         };
         assert_eq!(evidence.len(), 2);
         assert!(reason.contains("true lint: boom"), "{reason}");
-        let again = verify(&verifier, &index, &checkout, &ImpactSet::default(), &policy).unwrap();
+        let again =
+            verify(&verifier, &index, &checkout, &ImpactSet::default(), &policy).expect("verify");
         assert!(!again.passed());
         assert_eq!(verifier.runs.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 }

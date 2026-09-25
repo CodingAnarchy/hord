@@ -345,19 +345,28 @@ mod tests {
         let tc = ObjectId::from_bytes([2; 32]);
 
         let ok = sh("echo 'test result: ok. 2 passed; 0 failed; 0 ignored;'");
-        let out = runner.run(&root, &ok).unwrap();
+        let out = runner.run(&root, &ok).expect("run the shell check");
         assert!(out.success() && out.report.passed == 2);
-        let ev = runner.evidence(snap, tc, &ok, &out, &index).unwrap();
+        let ev = runner
+            .evidence(snap, tc, &ok, &out, &index)
+            .expect("record the evidence");
         assert_eq!(ev.result, EvidenceResult::Pass);
         assert_eq!(ev.command, ok.command());
-        let log = hord_verify::get_log(&index, ev.log.unwrap()).unwrap();
-        assert!(String::from_utf8(log).unwrap().contains("2 passed"));
+        let log =
+            hord_verify::get_log(&index, ev.log.expect("evidence carries a log")).expect("get log");
+        assert!(
+            String::from_utf8(log)
+                .expect("output is UTF-8")
+                .contains("2 passed")
+        );
 
         let bad = sh(
             "echo 'test x::y ... FAILED'; echo 'test result: FAILED. 0 passed; 1 failed;'; exit 101",
         );
-        let out = runner.run(&root, &bad).unwrap();
-        let ev = runner.evidence(snap, tc, &bad, &out, &index).unwrap();
+        let out = runner.run(&root, &bad).expect("run the shell check");
+        let ev = runner
+            .evidence(snap, tc, &bad, &out, &index)
+            .expect("record the evidence");
         assert_eq!(
             ev.result,
             EvidenceResult::Fail {
@@ -368,11 +377,11 @@ mod tests {
         let build = sh(
             "echo 'error[E0308]: mismatched types' >&2; echo 'error: could not compile `x`' >&2; exit 101",
         );
-        let out = runner.run(&root, &build).unwrap();
+        let out = runner.run(&root, &build).expect("run the shell check");
         assert!(out.build_failed);
         assert!(
             out.failure_summary()
-                .unwrap()
+                .expect("failure summary")
                 .starts_with("build failed: error[E0308]")
         );
 
@@ -381,22 +390,26 @@ mod tests {
             ..CargoRunner::default()
         };
         let chatty = sh("for i in 1 2 3 4 5 6; do echo $i; sleep 0.1; done");
-        assert!(idle.run(&root, &chatty).unwrap().success());
+        assert!(
+            idle.run(&root, &chatty)
+                .expect("run the shell check")
+                .success()
+        );
         // A quiet grandchild holding the pipes is killed with its group.
         let hung = sh("echo start; sh -c 'sleep 30' ; echo never");
         let started = Instant::now();
-        let out = idle.run(&root, &hung).unwrap();
+        let out = idle.run(&root, &hung).expect("run the shell check");
         assert!(out.timed_out && started.elapsed() < Duration::from_secs(10));
 
         let slow = sh("sleep 5");
-        let out = runner.run(&root, &slow).unwrap();
+        let out = runner.run(&root, &slow).expect("run the shell check");
         assert!(out.timed_out && !out.success());
         assert_eq!(out.failure_summary().as_deref(), Some("timed out"));
     }
 
     #[test]
     fn detects_this_toolchain() {
-        let tc = detect_toolchain(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let tc = detect_toolchain(Path::new(env!("CARGO_MANIFEST_DIR"))).expect("detect toolchain");
         assert!(tc.components["rustc"].starts_with("rustc "));
         assert!(tc.components["cargo"].starts_with("cargo "));
     }

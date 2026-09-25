@@ -97,7 +97,7 @@ mod tests {
     fn def(kind: &str, text: &str) -> DefTraits {
         let d = Definition {
             node: NodeId::from_u128(1),
-            path: RepoPath::from_str("src/lib.rs").unwrap(),
+            path: RepoPath::from_str("src/lib.rs").expect("parse test path"),
             kind: NodeKind::new(kind),
             name: None,
             span: 0..text.len(),

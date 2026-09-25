@@ -219,7 +219,7 @@ mod tests {
         let mut c = check(&["test", "--", "a b", ""]);
         c.env.insert("B".into(), "2".into());
         c.env.insert("A".into(), "x y".into());
-        c.dir = RepoPath::from_str("crates/x").unwrap();
+        c.dir = RepoPath::from_str("crates/x").expect("parse test path");
         assert_eq!(
             c.command(),
             "A=\"x y\" B=2 cargo test -- \"a b\" \"\" (in crates/x)"
@@ -251,7 +251,7 @@ mod tests {
         let (a, b, c) = (check(&["a"]), check(&["b"]), check(&["c"]));
         index
             .put_evidence(&evidence(&a, EvidenceResult::Pass, 1))
-            .unwrap();
+            .expect("put evidence");
         let newest = index
             .put_evidence(&evidence(
                 &a,
@@ -260,17 +260,17 @@ mod tests {
                 },
                 2,
             ))
-            .unwrap();
+            .expect("put evidence");
         index
             .put_evidence(&evidence(
                 &b,
                 EvidenceResult::Skipped { reason: "r".into() },
                 1,
             ))
-            .unwrap();
+            .expect("put evidence");
         let mut plan = VerifyPlan::new(snapshot, toolchain);
         plan.checks = vec![a.clone(), b.clone(), c.clone()];
-        let plan = plan.apply_reuse(&index).unwrap();
+        let plan = plan.apply_reuse(&index).expect("apply reuse");
         assert_eq!(plan.checks, vec![b, c]);
         assert_eq!(plan.reused.len(), 1);
         assert_eq!(plan.reused[0].evidence, newest);

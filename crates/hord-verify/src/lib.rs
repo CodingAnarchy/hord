@@ -27,6 +27,7 @@
 
 mod change;
 mod coverage;
+mod drift;
 mod error;
 mod evidence;
 mod impact;
@@ -39,11 +40,13 @@ pub use change::{
     ChangeFacts, DefDelta, DefTraits, Definition, FileVersion, TouchedDef, line_range,
 };
 pub use coverage::{
-    COVERAGE_KIND, CoverageRecord, TestCoverage, TestRef, TestTarget, find_coverage,
+    COVERAGE_KIND, CoverageRecord, RUNS_PER_RECORD, TestCoverage, TestRef, TestRun, TestTarget,
+    find_coverage,
 };
+pub use drift::Drift;
 pub use error::{Error, Result};
 pub use evidence::EvidenceFields;
-pub use impact::{ImpactBound, ImpactSet, ReferenceGraph, impact_set};
+pub use impact::{ImpactBound, ImpactSet, ReferenceGraph, impact_set, impact_set_attributable};
 pub use index::{EvidenceIndex, MemoryIndex, get_evidence, get_log, put_log};
 pub use plan::{Check, Reused, VerifyPlan, VerifyPolicy};
 pub use toolchain::Toolchain;

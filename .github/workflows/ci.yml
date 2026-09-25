@@ -1,5 +1,5 @@
-# M0 + M1 acceptance (spec §12): unit tests and encoding goldens on
-# Linux/macOS/Windows; git round-trip and M1 corpora on Ubuntu.
+# M0–M3 acceptance (spec §12): unit tests and encoding goldens on
+# Linux/macOS/Windows; git round-trip, M1, M2, and M3 corpora on Ubuntu.
 name: CI
 
 on:
@@ -106,3 +106,81 @@ jobs:
 
       - name: M1 consecutive apply(diff)
         run: cargo run -p hord-eval-m1 --release -- --pairs-only --skip-merges
+
+  m2:
+    name: M2 corpora
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache git corpora
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hord/corpora
+          key: hord-corpora-v1
+
+      - name: Fetch cargo corpus
+        # hord-eval bare-clones cargo into the corpus cache when it is missing
+        # (and re-checks its round trip); the M2 harness only reads the cache.
+        run: cargo run -p hord-eval --release -- --only cargo
+
+      - name: M2 identity, references, blame
+        # Identity stability and rename precision over cargo history, syntactic
+        # reference recall (ADR 0011), and warm blame latency. rust-analyzer's
+        # find-references is informational (ADR 0011) and needs the binary plus
+        # network for cargo metadata, so CI skips it.
+        run: cargo run -p hord-eval-m2 --release -- --skip-rust-analyzer
+
+  m3:
+    name: M3 concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache git corpora
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hord/corpora
+          key: hord-corpora-v1
+
+      - name: Fetch cargo corpus
+        run: cargo run -p hord-eval --release -- --only cargo
+
+      # Shared runners vary 2-3x in speed between runs (24.5/s, then 10.0/s, on
+      # the same code), so CI gates every correctness check and only reports
+      # throughput. The 20/s throughput gate is checked on the reference
+      # machine before a milestone merges.
+      - name: M3 simulation (seed 42)
+        # 100 agents on cargo: zero false negatives, false-positive rate,
+        # disjoint changes landed without replay, workspaces, and concurrent
+        # Cargo.lock additions.
+        run: cargo run -p hord-eval-m3 --release -- --seed 42 --report-throughput
+
+      - name: M3 simulation (completion-order submits)
+        run: cargo run -p hord-eval-m3 --release -- --racy-submit --report-throughput
+
+      - name: M3 simulation (changes proposed in another process)
+        run: cargo run -p hord-eval-m3 --release -- --remote-submit --report-throughput
+
+      - name: M3 simulation against a spawned server (100 clients, flight recording)
+        run: cargo run -p hord-eval-m3 --release -- --server --report-throughput
+
+      - name: M3 simulation with section 7.2 policy enforced
+        run: cargo run -p hord-eval-m3 --release -- --policy --report-throughput
+
+      - name: M3 simulation with policy, against the server
+        run: cargo run -p hord-eval-m3 --release -- --server --policy --report-throughput

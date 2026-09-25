@@ -1,5 +1,12 @@
 //! Test selection for cargo (ADR 0022).
 //!
+//! ADR 0022 as amended after the 50-commit measurement: coverage is fresh
+//! per test ([`SelectInput::drift`]), selection keys on the functions the
+//! change wrote plus dependents of writes coverage cannot attribute
+//! ([`hord_verify::impact_set_attributable`] builds that impact set), and a
+//! file with no adapter falls back only if its package can read it
+//! ([`crate::narrow::package_reads`]).
+//!
 //! Tests are selected by the coverage record's `Tests(t, def)` edges and by
 //! static edges (a test that is itself in the impact set references an
 //! impacted definition within the bound), plus every test the change adds
@@ -160,8 +167,8 @@ impl Selection {
 /// Inputs to [`select`].
 #[derive(Clone, Copy, Debug)]
 pub struct SelectInput<'a> {
-    /// The coverage record, if any. Its snapshot must be the older side of
-    /// `impact.facts` (drift since coverage ran is part of the change).
+    /// The coverage record, if any: per-test fresh entries with [`Self::drift`],
+    /// or one snapshot's record whose drift is part of `impact.facts`.
     pub coverage: Option<&'a CoverageRecord>,
     /// Toolchain the selected tests will run with.
     pub toolchain: ObjectId,
@@ -171,6 +178,14 @@ pub struct SelectInput<'a> {
     pub impact: &'a ImpactSet,
     /// Run everything above this many impacted nodes.
     pub max_impact: Option<usize>,
+    /// Per-test freshness (ADR 0022, amendments after the 50-commit
+    /// measurement): the chain of landed changes up to the snapshot being
+    /// verified. With it, `impact.facts` is the change's own (base to
+    /// result), and each test is also selected when a definition it
+    /// executed changed since its own coverage snapshot. `None`: `impact`
+    /// covers the drift since [`CoverageRecord::snapshot`] as facts (the
+    /// earlier rule; still sound, less efficient).
+    pub drift: Option<&'a hord_verify::Drift>,
 }
 
 /// Select the tests that can observe the change (ADR 0022).
@@ -217,11 +232,26 @@ pub fn select_ignoring(input: SelectInput<'_>, ignore: &BTreeSet<&str>) -> Selec
             }
         };
 
+    let mut literals = BTreeMap::new();
     for path in &facts.paths {
-        if let Some(p) = ws.package_of(path) {
+        let name = path.components().last().map_or("", String::as_str);
+        let pkg = ws.package_of(path);
+        let non_rust = !name.ends_with(".rs")
+            && name != "Cargo.toml"
+            && name != "Cargo.lock"
+            && !ws.is_workspace_wide(path)
+            && !ws.is_build_script(path);
+        // ADR 0022 (after the 50-commit measurement): a file with no adapter
+        // that its package cannot read selects no tests.
+        if non_rust
+            && let Some(p) = pkg
+            && !crate::narrow::package_reads(ws, &p.name, path, &mut literals)
+        {
+            continue;
+        }
+        if let Some(p) = pkg {
             touched_pkgs.insert(p.name.clone());
         }
-        let name = path.components().last().map_or("", String::as_str);
         if ws.is_workspace_wide(path) {
             if ignore.contains("workspace-file") {
                 continue;
@@ -330,6 +360,19 @@ pub fn select_ignoring(input: SelectInput<'_>, ignore: &BTreeSet<&str>) -> Selec
             .or_default()
             .insert(test.name.clone());
     }
+    // Coverage is fresh per test, and staleness is checked run by run: a test
+    // is selected when one of its last runs executed code that changed since
+    // that run's own snapshot (or a snapshot the chain does not know).
+    if let Some(drift) = input.drift {
+        for t in &coverage.tests {
+            if coverage.is_stale(t, drift) {
+                sel.exact
+                    .entry((t.test.package.clone(), t.test.target.clone()))
+                    .or_default()
+                    .insert(t.test.name.clone());
+            }
+        }
+    }
     // A test that failed during the coverage run has partial edges: it is
     // always selected (it cannot be ruled out).
     for t in coverage.tests.iter().filter(|t| t.failed) {
@@ -374,7 +417,7 @@ mod tests {
     }
 
     fn p(s: &str) -> RepoPath {
-        RepoPath::from_str(s).unwrap()
+        RepoPath::from_str(s).expect("parse test path")
     }
 
     fn tc() -> ObjectId {
@@ -466,11 +509,205 @@ mod tests {
             workspace: &ws,
             impact,
             max_impact: Some(50),
+            drift: None,
         })
     }
 
     fn exact(sel: &Selection) -> BTreeSet<String> {
         sel.exact.values().flatten().cloned().collect()
+    }
+
+    #[test]
+    fn drift_selects_each_test_whose_executed_code_changed_since_its_own_snapshot() {
+        use hord_verify::Drift;
+        let (s0, s1, s2) = (
+            ObjectId::from_bytes([1; 32]),
+            ObjectId::from_bytes([2; 32]),
+            ObjectId::from_bytes([3; 32]),
+        );
+        // t1 ran f(1) at s0; t2 ran g(2) and was refreshed at s1.
+        let old = CoverageRecord::new(
+            s0,
+            tc(),
+            BTreeSet::new(),
+            vec![
+                (
+                    t("a", "testsuite", "m::t1"),
+                    None,
+                    [n(1)].into_iter().collect(),
+                    false,
+                ),
+                (
+                    t("a", "testsuite", "m::t2"),
+                    None,
+                    [n(2)].into_iter().collect(),
+                    false,
+                ),
+            ],
+        );
+        let run = CoverageRecord::new(
+            s1,
+            tc(),
+            BTreeSet::new(),
+            vec![(
+                t("a", "testsuite", "m::t2"),
+                None,
+                [n(2)].into_iter().collect(),
+                false,
+            )],
+        );
+        // One run per record here; the three-run union is tested below.
+        let ledger = old.merge_keeping(&run, 1);
+        let ws = sample();
+        let pick = |drift: &Drift| {
+            let i = impact(&[9], &[], vec![]);
+            exact(&select(SelectInput {
+                coverage: Some(&ledger),
+                toolchain: tc(),
+                workspace: &ws,
+                impact: &i,
+                max_impact: None,
+                drift: Some(drift),
+            }))
+        };
+        // s0 -> s1 wrote g(2); s1 -> s2 wrote nothing either test ran.
+        let mut drift = Drift::new(s0);
+        drift.push(s1, [n(2)].into_iter().collect());
+        drift.push(s2, [n(7)].into_iter().collect());
+        // t2 was refreshed after g changed, t1 never ran g: nothing selected.
+        assert!(pick(&drift).is_empty());
+        // Had f changed at s1, t1 (snapshot s0) is stale; t2 is not.
+        let mut drift = Drift::new(s0);
+        drift.push(s1, [n(1), n(2)].into_iter().collect());
+        drift.push(s2, BTreeSet::new());
+        assert_eq!(pick(&drift), ["m::t1".to_owned()].into_iter().collect());
+        // A snapshot the chain does not know is stale.
+        let drift = Drift::new(s2);
+        assert_eq!(pick(&drift).len(), 2);
+    }
+
+    #[test]
+    fn a_path_seen_in_an_earlier_run_still_selects_the_test() {
+        use hord_verify::Drift;
+        let (s0, s1, s2) = (
+            ObjectId::from_bytes([1; 32]),
+            ObjectId::from_bytes([2; 32]),
+            ObjectId::from_bytes([3; 32]),
+        );
+        let run = |s, covers: &[u128]| {
+            CoverageRecord::new(
+                s,
+                tc(),
+                BTreeSet::new(),
+                vec![(
+                    t("a", "testsuite", "m::flaky"),
+                    None,
+                    covers.iter().copied().map(n).collect(),
+                    false,
+                )],
+            )
+        };
+        // Run 1 (at s0) entered f(1) through a retry; run 2 (at s1) did not.
+        let ledger = run(s0, &[1, 2]).merge(&run(s1, &[2]));
+        let ws = sample();
+        let mut drift = Drift::new(s0);
+        drift.push(s1, BTreeSet::new());
+        drift.push(s2, [n(1)].into_iter().collect());
+        // The change edits f: the test is still selected, by its coverage
+        // and by drift since its oldest run.
+        let i = impact(
+            &[1],
+            &[],
+            vec![touched(1, "src/f.rs", "function_item", DefDelta::Edited)],
+        );
+        let sel = select(SelectInput {
+            coverage: Some(&ledger),
+            toolchain: tc(),
+            workspace: &ws,
+            impact: &i,
+            max_impact: None,
+            drift: Some(&drift),
+        });
+        assert_eq!(exact(&sel), ["m::flaky".to_owned()].into_iter().collect());
+        // With one run per record the retry path is forgotten and f's edit
+        // selects nothing: the hole the union closes.
+        let single = run(s0, &[1, 2]).merge_keeping(&run(s1, &[2]), 1);
+        let sel = select(SelectInput {
+            coverage: Some(&single),
+            toolchain: tc(),
+            workspace: &ws,
+            impact: &i,
+            max_impact: None,
+            drift: Some(&drift),
+        });
+        assert!(exact(&sel).is_empty());
+    }
+
+    #[test]
+    fn a_change_that_predates_the_run_that_executed_it_does_not_select() {
+        use hord_verify::Drift;
+        let (s0, s1, s2) = (
+            ObjectId::from_bytes([1; 32]),
+            ObjectId::from_bytes([2; 32]),
+            ObjectId::from_bytes([3; 32]),
+        );
+        let run = |s, covers: &[u128]| {
+            CoverageRecord::new(
+                s,
+                tc(),
+                BTreeSet::new(),
+                vec![(
+                    t("a", "testsuite", "m::t"),
+                    None,
+                    covers.iter().copied().map(n).collect(),
+                    false,
+                )],
+            )
+        };
+        // g(2) changed at s1; run 2, taken at s1, executed the new g. Run 1
+        // (at s0) never ran g.
+        let ledger = run(s0, &[1]).merge(&run(s1, &[1, 2]));
+        let mut drift = Drift::new(s0);
+        drift.push(s1, [n(2)].into_iter().collect());
+        drift.push(s2, [n(7)].into_iter().collect());
+        let ws = sample();
+        let i = impact(&[7], &[], vec![]);
+        let sel = select(SelectInput {
+            coverage: Some(&ledger),
+            toolchain: tc(),
+            workspace: &ws,
+            impact: &i,
+            max_impact: None,
+            drift: Some(&drift),
+        });
+        assert!(exact(&sel).is_empty(), "{:?}", sel.exact);
+    }
+
+    #[test]
+    fn unread_non_rust_files_select_nothing() {
+        let root = std::env::temp_dir().join(format!("hord-select-narrow-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).expect("create dir all");
+        std::fs::write(root.join("src/lib.rs"), "fn f() {}\n").expect("write a fixture file");
+        let mut ws = sample();
+        ws.root = Some(root.clone());
+        let mut i = impact(&[], &[], vec![]);
+        i.facts.paths = ["triagebot.toml", "src/doc/x.md"]
+            .iter()
+            .map(|s| p(s))
+            .collect();
+        let r = record();
+        let sel = select(SelectInput {
+            coverage: Some(&r),
+            toolchain: tc(),
+            workspace: &ws,
+            impact: &i,
+            max_impact: None,
+            drift: None,
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        // `triagebot.toml` is read by nothing; `src/doc/x.md` is inside the
+        // library's source directory, so it still falls back.
+        assert_eq!(sel.fallbacks, vec![Fallback::NonRust(p("src/doc/x.md"))]);
     }
 
     #[test]
@@ -705,6 +942,7 @@ mod tests {
             workspace: &ws,
             impact: &i,
             max_impact: None,
+            drift: None,
         };
         let with = select(input);
         assert_eq!(with.fallbacks[0].kind(), "non-rust");

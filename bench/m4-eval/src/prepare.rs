@@ -16,7 +16,7 @@ use hord_core::{Actor, ChangeId, Intent, NodeId, RepoPath, SnapshotId};
 use hord_txn::{BeginOptions, QueueStatus, Repo, RepoOptions, StubVerifier};
 use hord_verify::{
     ChangeFacts, DefDelta, Definition, FileVersion, ImpactBound, ImpactSet, ReferenceGraph,
-    impact_set,
+    impact_set, impact_set_attributable,
 };
 use hord_verify_rust::{DefinitionIndex, diff_rust_file};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,17 @@ pub(crate) struct CommitFacts {
     /// `path: qualified name` of every impacted and touched node, for
     /// `--explain`.
     pub names: BTreeMap<NodeId, String>,
+    /// Per edited function (checkpoint to commit), its edited lines in the
+    /// checkpoint's file: variant B's region filter.
+    pub edited_lines: BTreeMap<NodeId, (RepoPath, BTreeSet<u32>)>,
+    /// The commit's own facts (base to commit) and the impact set ADR 0022
+    /// selects with after the 50-commit measurement: dependents only of
+    /// writes coverage cannot attribute (the lander's view, `--fresh`).
+    pub own_impact: ImpactSet,
+    /// Definitions of the `.rs` files the commit rewrote, at the commit.
+    pub defs_delta: DefinitionIndex,
+    /// `.rs` files the commit deleted (or that no longer parse).
+    pub defs_removed: Vec<RepoPath>,
 }
 
 /// A coverage checkpoint: the base of its first commit.
@@ -63,6 +74,9 @@ pub(crate) struct Checkpoint {
     pub commit: String,
     pub snapshot: SnapshotId,
     pub defs: DefinitionIndex,
+    /// Union of its commits' edited function lines (variant B's region
+    /// data is collected for these).
+    pub interest: BTreeMap<RepoPath, BTreeSet<u32>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,6 +178,58 @@ fn private_scope(
         dir.push(stem.to_owned());
     }
     Some(dir)
+}
+
+/// The lines of `node` in `old`'s file that the edit to `new` changes: each
+/// deleted or replaced line, and for a pure insertion the lines on both
+/// sides of it. `None` when the definition is missing from either side.
+fn edited_lines_of(node: NodeId, old: &Entry, new: &Entry) -> Option<BTreeSet<u32>> {
+    let before = old.defs.iter().find(|d| d.node == node)?;
+    let after = new.defs.iter().find(|d| d.node == node)?;
+    let first = hord_verify::line_range(&old.bytes, &before.span).start;
+    let old_text = String::from_utf8_lossy(old.bytes.get(before.span.clone())?).into_owned();
+    let new_text = String::from_utf8_lossy(new.bytes.get(after.span.clone())?).into_owned();
+    Some(
+        changed_old_lines(&old_text, &new_text)
+            .into_iter()
+            .map(|l| first + l)
+            .collect(),
+    )
+}
+
+/// 0-based lines of `old` that differ in `new` (see [`edited_lines_of`]).
+fn changed_old_lines(old: &str, new: &str) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    let patch = diffy::create_patch(old, new);
+    for hunk in patch.hunks() {
+        // `old_range().start()` is 1-based.
+        let mut at = u32::try_from(hunk.old_range().start())
+            .unwrap_or(1)
+            .saturating_sub(1);
+        // Inserts right after deletes replace those lines; only a pure
+        // insertion marks its neighbours.
+        let mut replacing = false;
+        for line in hunk.lines() {
+            match line {
+                diffy::Line::Context(_) => {
+                    at += 1;
+                    replacing = false;
+                }
+                diffy::Line::Delete(_) => {
+                    out.insert(at);
+                    at += 1;
+                    replacing = true;
+                }
+                diffy::Line::Insert(_) if replacing => {}
+                diffy::Line::Insert(_) => {
+                    out.insert(at.saturating_sub(1));
+                    out.insert(at);
+                }
+            }
+        }
+    }
+    let last = u32::try_from(old.lines().count().max(1) - 1).unwrap_or(0);
+    out.into_iter().map(|l| l.min(last)).collect()
 }
 
 /// A definition's text without its child definitions.
@@ -401,6 +467,7 @@ pub(crate) async fn prepare(
                 commit: base.clone(),
                 snapshot,
                 defs: files.definition_index(),
+                interest: BTreeMap::new(),
             });
             stash.clear();
         }
@@ -451,6 +518,8 @@ pub(crate) async fn prepare(
                 None => files.remove(p),
             }
         }
+        let mut defs_delta = DefinitionIndex::new();
+        let mut defs_removed = Vec::new();
         for p in &paths {
             if p.to_string().ends_with(".rs") {
                 diff_rust_file(
@@ -459,6 +528,12 @@ pub(crate) async fn prepare(
                     version(old[p].as_ref()),
                     version(files.entries.get(p)),
                 );
+                match files.entries.get(p) {
+                    Some(e) if !e.defs.is_empty() => defs_delta.add_file(p, &e.bytes, &e.defs),
+                    _ => defs_removed.push(p.clone()),
+                }
+            } else {
+                own.paths.insert(p.clone());
             }
         }
         let mut targets = Vec::new();
@@ -498,7 +573,33 @@ pub(crate) async fn prepare(
                 facts.paths.insert(p.clone());
             }
         }
+        let mut edited_lines = BTreeMap::new();
+        for t in &facts.touched {
+            if t.kind.as_str() != "function_item" || t.delta != DefDelta::Edited {
+                continue;
+            }
+            let (Some(Some(old)), Some(new)) = (stash.get(&t.path), files.entries.get(&t.path))
+            else {
+                continue;
+            };
+            if let Some(lines) = edited_lines_of(t.node, old, new) {
+                let cp = checkpoints
+                    .last_mut()
+                    .expect("commit 0 opens a checkpoint (0 % every == 0)");
+                cp.interest
+                    .entry(t.path.clone())
+                    .or_default()
+                    .extend(lines.iter().copied());
+                edited_lines.insert(t.node, (t.path.clone(), lines));
+            }
+        }
         let impact = impact_set(&files, &record.write_set, ImpactBound::default(), facts)?;
+        let own_impact = impact_set_attributable(
+            &files,
+            &record.write_set,
+            ImpactBound::default(),
+            own.clone(),
+        )?;
         let names = impact
             .nodes
             .keys()
@@ -518,6 +619,10 @@ pub(crate) async fn prepare(
             impact,
             targets,
             names,
+            edited_lines,
+            own_impact,
+            defs_delta,
+            defs_removed,
         });
         if (index + 1) % 25 == 0 || index + 1 == commits.len() {
             eprintln!(
@@ -552,7 +657,7 @@ mod tests {
     ) -> Definition {
         Definition {
             node: NodeId::from_u128(node),
-            path: RepoPath::from_str("crates/a/src/lib.rs").unwrap(),
+            path: RepoPath::from_str("crates/a/src/lib.rs").expect("parse test path"),
             kind: NodeKind::new("function_item"),
             name: Some(QualifiedName::new(name)),
             span,
@@ -561,10 +666,24 @@ mod tests {
     }
 
     #[test]
+    fn edited_lines_are_replaced_lines_and_insertion_neighbours() {
+        let old = "fn f() {\n    a();\n    b();\n    c();\n}\n";
+        let replaced = old.replace("b();", "bb();");
+        assert_eq!(changed_old_lines(old, &replaced), [2].into_iter().collect());
+        let inserted = old.replace("    b();\n", "    b();\n    x();\n");
+        assert_eq!(
+            changed_old_lines(old, &inserted),
+            [2, 3].into_iter().collect()
+        );
+        let deleted = old.replace("    a();\n", "");
+        assert_eq!(changed_old_lines(old, &deleted), [1].into_iter().collect());
+    }
+
+    #[test]
     fn textual_graph_finds_callers_not_namesakes() {
         let src = "fn new() {}\nfn build() { new(); }\nfn other() { let x = 1; }\nimpl T { fn new() { Self::new(); } }\n";
         let spans = |needle: &str| {
-            let s = src.find(needle).unwrap();
+            let s = src.find(needle).expect("the needle is in the test source");
             s..s + needle.len()
         };
         let defs = vec![
@@ -581,16 +700,16 @@ mod tests {
         ];
         let mut files = Files::default();
         files.set(
-            RepoPath::from_str("crates/a/Cargo.toml").unwrap(),
+            RepoPath::from_str("crates/a/Cargo.toml").expect("parse test path"),
             Vec::new(),
             Vec::new(),
         );
         files.set(
-            RepoPath::from_str("crates/a/src/lib.rs").unwrap(),
+            RepoPath::from_str("crates/a/src/lib.rs").expect("parse test path"),
             src.as_bytes().to_vec(),
             defs,
         );
-        let mut deps = files.dependents(NodeId::from_u128(1)).unwrap();
+        let mut deps = files.dependents(NodeId::from_u128(1)).expect("dependents");
         deps.sort();
         // `build` calls it; `T::new` calls `new` besides declaring it; the
         // impl's own text (without its method) does not.
@@ -608,14 +727,14 @@ mod tests {
         let one = |path: &str, node: u128, name: &str, text: &str| {
             let d = Definition {
                 node: NodeId::from_u128(node),
-                path: RepoPath::from_str(path).unwrap(),
+                path: RepoPath::from_str(path).expect("parse test path"),
                 kind: NodeKind::new("function_item"),
                 name: Some(QualifiedName::new(name)),
                 span: 0..text.len(),
                 parent: None,
             };
             (
-                RepoPath::from_str(path).unwrap(),
+                RepoPath::from_str(path).expect("parse test path"),
                 text.as_bytes().to_vec(),
                 vec![d],
             )
@@ -647,11 +766,11 @@ mod tests {
         // `simple` is private to `cache`: `other::y` naming a `simple` is
         // another item.
         assert_eq!(
-            files.dependents(NodeId::from_u128(1)).unwrap(),
+            files.dependents(NodeId::from_u128(1)).expect("dependents"),
             vec![NodeId::from_u128(2)]
         );
         assert_eq!(
-            files.dependents(NodeId::from_u128(4)).unwrap(),
+            files.dependents(NodeId::from_u128(4)).expect("dependents"),
             vec![NodeId::from_u128(5)]
         );
     }

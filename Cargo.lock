@@ -1897,6 +1897,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "diffy",
  "hord-core",
  "hord-encoding",
  "hord-lang",

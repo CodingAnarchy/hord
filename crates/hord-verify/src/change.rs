@@ -275,7 +275,7 @@ mod tests {
     use super::*;
 
     fn path() -> RepoPath {
-        RepoPath::from_str("src/lib.rs").unwrap()
+        RepoPath::from_str("src/lib.rs").expect("parse test path")
     }
 
     fn def(node: u128, kind: &str, span: Range<usize>, parent: Option<u128>) -> Definition {

@@ -54,7 +54,7 @@ use std::sync::Arc;
 use hord_api::EventStream;
 use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IdentityDelta,
-    ObjectId, SnapshotId, Timestamp,
+    NodeId, ObjectId, SnapshotId, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -397,7 +397,16 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
             window.push_back(match step {
                 Step::Done(entry) => Slot::Done(entry),
                 Step::Candidate(candidate) => {
-                    let verdict = spawn_verify(repo, &candidate);
+                    let pending: Vec<_> = window
+                        .iter()
+                        .filter_map(|slot| match slot {
+                            Slot::Verifying { candidate, .. } if candidate.predicted => {
+                                Some((candidate.landed.result, candidate.landed.write_set.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let verdict = spawn_verify(repo, &candidate, pending);
                     Slot::Verifying { candidate, verdict }
                 }
             });
@@ -443,11 +452,18 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
 }
 
 /// Start verifying `candidate` on the runtime.
-fn spawn_verify(repo: &Repo, candidate: &Candidate) -> tokio::task::JoinHandle<Verdict> {
+///
+/// `pending` are the candidates ahead in the window it is stacked on.
+fn spawn_verify(
+    repo: &Repo,
+    candidate: &Candidate,
+    pending: Vec<(SnapshotId, BTreeSet<NodeId>)>,
+) -> tokio::task::JoinHandle<Verdict> {
     let context: Arc<dyn VerifyContext> = Arc::new(CandidateContext::new(
         Arc::clone(&repo.inner),
         candidate.landed_id,
         Arc::clone(&candidate.landed),
+        pending,
         true,
     ));
     let request = VerifyRequest {

@@ -107,6 +107,11 @@ struct Args {
     /// Internal: serve the repository at this path (the `--server` child).
     #[arg(long, hide = true, value_name = "DIR")]
     internal_serve: Option<PathBuf>,
+    /// Print throughput without gating on it. Every correctness gate still
+    /// applies. For shared CI runners, whose speed varies run to run;
+    /// throughput is gated on the reference machine instead.
+    #[arg(long)]
+    report_throughput: bool,
     /// Also write the full report as JSON to this path.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -230,10 +235,11 @@ async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> 
         report.landed,
         report.conflicted,
         report.rejected,
-        pass_fail(report.pass)
+        throughput_status(report.throughput, args.report_throughput)
     );
     write_json(args, &report)?;
-    Ok(report.pass)
+    // Remote mode gates only throughput, which --report-throughput reports.
+    Ok(report.pass || args.report_throughput)
 }
 
 async fn server_run(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<bool> {
@@ -244,12 +250,12 @@ async fn server_run(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Res
         &args.sim_config(),
     )
     .await?;
-    let gates = sim_gates(&report.sim);
+    let gates = sim_gates(&report.sim, args.report_throughput);
     println!(
         "[server] {} over {} client connections; pushed {} objects ({:.2}s summed over agents)",
         report.url, report.client_connections, report.objects_pushed, report.push_secs
     );
-    print_sim(&report.sim, &gates);
+    print_sim(&report.sim, &gates, args.report_throughput);
     println!(
         "[server] flight recording {} ({} events) replays {}",
         report.recording,
@@ -271,9 +277,9 @@ struct SimGates {
     all: bool,
 }
 
-fn sim_gates(sim: &sim::SimReport) -> SimGates {
+fn sim_gates(sim: &sim::SimReport, report_throughput: bool) -> SimGates {
     let policy = sim.policy.as_ref().is_none_or(|p| p.pass);
-    let throughput = sim.throughput >= 20.0;
+    let throughput = sim.throughput >= 20.0 || report_throughput;
     let false_negatives = sim.false_negatives.is_empty();
     let false_positive_rate = sim.false_positive_rate <= 0.10;
     let disjoint_landed = sim.disjoint_not_landed.is_empty() && sim.disjoint > 0;
@@ -319,7 +325,7 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
     let cargo_lock = lock::run(scratch, manifest, lockfile).await?;
 
     let gates = {
-        let sim_gates = sim_gates(&sim);
+        let sim_gates = sim_gates(&sim, args.report_throughput);
         let workspaces = workspaces::ok(&workspaces, args.workspaces);
         let cargo_lock = cargo_lock.iter().all(|c| c.pass);
         Gates {
@@ -355,11 +361,20 @@ fn write_json(args: &Args, report: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// PASS/FAIL against the 20 changes/s gate, or REPORTED when it is not gated.
+fn throughput_status(changes_per_sec: f64, report_only: bool) -> &'static str {
+    match (changes_per_sec >= 20.0, report_only) {
+        (true, _) => "PASS",
+        (false, true) => "REPORTED (not gated)",
+        (false, false) => "FAIL",
+    }
+}
+
 fn pass_fail(ok: bool) -> &'static str {
     if ok { "PASS" } else { "FAIL" }
 }
 
-fn print_sim(sim: &sim::SimReport, gates: &SimGates) {
+fn print_sim(sim: &sim::SimReport, gates: &SimGates, report_throughput: bool) {
     let kinds = |kind: sim::PairKind| sim.pairs.iter().filter(|p| p.2 == kind).count();
     println!(
         "[sim] seed {} agents {} (disjoint {}, overlapping {}: pairs write-write {} read-write {} name {}) target pool {} strict_reads {} racy_submit {}",
@@ -388,7 +403,7 @@ fn print_sim(sim: &sim::SimReport, gates: &SimGates) {
         sim.throughput,
         sim.agents,
         sim.land_secs,
-        pass_fail(gates.throughput)
+        throughput_status(sim.throughput, report_throughput)
     );
     for f in &sim.false_negatives {
         println!(
@@ -475,7 +490,11 @@ fn print_sim(sim: &sim::SimReport, gates: &SimGates) {
 }
 
 fn print(report: &Report, args: &Args) {
-    print_sim(&report.sim, &sim_gates(&report.sim));
+    print_sim(
+        &report.sim,
+        &sim_gates(&report.sim, args.report_throughput),
+        args.report_throughput,
+    );
     let gates = &report.gates;
     let ws = &report.workspaces;
     println!(

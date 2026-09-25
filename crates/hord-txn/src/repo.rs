@@ -204,6 +204,11 @@ pub(crate) struct Inner {
     pub fetching: [Mutex<()>; FETCH_SHARDS],
     /// Parsed policies by blob (ADR 0026).
     pub policies: Mutex<HashMap<ObjectId, Arc<hord_policy::CompiledPolicy>>>,
+    /// Write sets of the latest landings, for coverage drift ([`crate::gate`]).
+    pub landed_chain: Mutex<crate::gate::LandedChain>,
+    /// Definitions of the last snapshot verified under coverage, updated by
+    /// difference to the next ([`crate::gate`]).
+    pub definition_index: Mutex<Option<(SnapshotId, Arc<hord_verify_rust::DefinitionIndex>)>>,
 }
 
 impl Drop for Inner {
@@ -396,6 +401,8 @@ impl Inner {
             slots: crate::gate::Slots::default(),
             fetching: std::array::from_fn(|_| Mutex::new(())),
             policies: Mutex::new(HashMap::new()),
+            landed_chain: Mutex::new(crate::gate::LandedChain::default()),
+            definition_index: Mutex::new(None),
         })
     }
 

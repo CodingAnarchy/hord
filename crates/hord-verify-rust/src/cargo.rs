@@ -3,7 +3,7 @@
 //! graph that package-level fallbacks follow.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
@@ -52,6 +52,11 @@ impl Package {
 pub struct CargoWorkspace {
     /// Members by name.
     pub packages: BTreeMap<String, Package>,
+    /// The checkout it was loaded from ([`Self::load`]); selection reads
+    /// package sources there for the non-Rust file rule. `None` when parsed
+    /// from JSON alone.
+    #[serde(skip)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +116,9 @@ impl CargoWorkspace {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
-        Self::from_metadata_json(&output.stdout)
+        let mut ws = Self::from_metadata_json(&output.stdout)?;
+        ws.root = Some(root.to_path_buf());
+        Ok(ws)
     }
 
     /// Parse `cargo metadata --format-version 1` output.
@@ -165,7 +172,10 @@ impl CargoWorkspace {
                 },
             );
         }
-        Ok(Self { packages })
+        Ok(Self {
+            packages,
+            root: None,
+        })
     }
 
     /// The package whose directory is the deepest one containing `path`.
@@ -254,11 +264,11 @@ pub(crate) mod tests {
              "targets": [], "dependencies": []}
           ]
         }"#;
-        CargoWorkspace::from_metadata_json(json.as_bytes()).unwrap()
+        CargoWorkspace::from_metadata_json(json.as_bytes()).expect("from metadata json")
     }
 
     fn p(s: &str) -> RepoPath {
-        RepoPath::from_str(s).unwrap()
+        RepoPath::from_str(s).expect("parse test path")
     }
 
     #[test]
@@ -269,9 +279,22 @@ pub(crate) mod tests {
             ws.packages["a"].deps,
             ["b".to_owned()].into_iter().collect()
         );
-        assert_eq!(ws.package_of(&p("crates/b/src/x.rs")).unwrap().name, "b");
-        assert_eq!(ws.package_of(&p("src/lib.rs")).unwrap().name, "a");
-        assert_eq!(ws.package_of(&p("crates/bb/x.rs")).unwrap().name, "a");
+        assert_eq!(
+            ws.package_of(&p("crates/b/src/x.rs"))
+                .expect("package of")
+                .name,
+            "b"
+        );
+        assert_eq!(
+            ws.package_of(&p("src/lib.rs")).expect("package of").name,
+            "a"
+        );
+        assert_eq!(
+            ws.package_of(&p("crates/bb/x.rs"))
+                .expect("package of")
+                .name,
+            "a"
+        );
         let c: BTreeSet<String> = ["c".to_owned()].into_iter().collect();
         assert_eq!(ws.with_reverse_deps(&c).len(), 3);
         assert!(ws.packages["a"].has_doctests() && !ws.packages["c"].has_doctests());

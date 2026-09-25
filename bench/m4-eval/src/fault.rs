@@ -184,21 +184,21 @@ mod tests {
     #[test]
     fn each_kind_rewrites_the_body() {
         assert_eq!(
-            inject(FaultKind::Panic, FUNC).unwrap(),
+            inject(FaultKind::Panic, FUNC).expect("inject"),
             "/// Doc.\n#[inline]\npub fn is_small(x: u32) -> bool { panic!(\"hord-m4 injected fault\") }"
         );
         assert_eq!(
-            inject(FaultKind::Default, FUNC).unwrap(),
+            inject(FaultKind::Default, FUNC).expect("inject"),
             "/// Doc.\n#[inline]\npub fn is_small(x: u32) -> bool { ::core::default::Default::default() }"
         );
         assert_eq!(
-            inject(FaultKind::Flip, FUNC).unwrap(),
+            inject(FaultKind::Flip, FUNC).expect("inject"),
             "/// Doc.\n#[inline]\npub fn is_small(x: u32) -> bool {\n    x >= 10\n}"
         );
         // Signature operators are not flipped; body ones are.
         let generic = "fn f<T: Fn() -> bool>(t: T) -> bool {\n    t() == true\n}";
         assert_eq!(
-            inject(FaultKind::Flip, generic).unwrap(),
+            inject(FaultKind::Flip, generic).expect("inject"),
             "fn f<T: Fn() -> bool>(t: T) -> bool {\n    t() != true\n}"
         );
         assert_eq!(inject(FaultKind::Flip, "fn f() { g(); }"), None);
@@ -233,23 +233,24 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src")).expect("create dir all");
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"faulty\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
         )
-        .unwrap();
+        .expect("write a fixture file");
         let test = "\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn small() {\n        assert!(super::is_small(3));\n        assert!(!super::is_small(30));\n    }\n}\n";
         let run = |src: &str| {
-            fs::write(root.join("src/lib.rs"), format!("{src}{test}")).unwrap();
+            fs::write(root.join("src/lib.rs"), format!("{src}{test}"))
+                .expect("write a fixture file");
             Command::new("cargo")
                 .args(["test", "--offline"])
                 .current_dir(&root)
                 .output()
-                .unwrap()
+                .expect("run cargo test on the fault crate")
         };
         assert!(run(FUNC).status.success(), "the unfaulted test passes");
-        let faulted = inject(kind, FUNC).unwrap();
+        let faulted = inject(kind, FUNC).expect("inject");
         let out = run(&faulted);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let _ = fs::remove_dir_all(&root);

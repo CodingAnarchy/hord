@@ -32,3 +32,13 @@ Option 2. Selection safety is graded on 500 real cargo commits with one seeded f
 - **The literal "full `cargo test`" run is reported for a sample of commits (default 20), not gated.** It is also where flaky tests are found and quarantined; a quarantined test is listed in the report.
 - **Faults are deterministic** (seeded per commit), so a miss reproduces.
 - Changing the fault kinds, the budget, or the (a) superset rule needs a new ADR.
+
+## Amendments (2026-09-24, from implementation)
+
+- **150 commits, several faults per informative commit.** A single commit's grading costs minutes of instrumented cargo tests, and in the 50-commit baseline only 10 of 32 single faults landed where a miss was possible, because selection (b) did not contain all of (a).
+  - The gate grades 150 real cargo commits, as independent chains of consecutive first-parent commits taken from different periods of history. Each chain starts from its own full instrumented run and is graded exactly as the lander sees it.
+  - On each commit where (b) does not contain (a), up to 5 separate seeded faults are graded: different written functions, or different fault kinds, each built and graded on its own. That is about 300 informative faults, against about 150 from 500 × 1.
+  - Commits where (b) contains (a) keep one probe-graded fault.
+  - The report gives per-fault and per-commit counts, because faults within one commit are correlated. The gate stays zero misses.
+- **It runs on CI, not on a developer machine.** It uses standard GitHub runners, split into enough chains (about 15 chains of 10 commits) that each job stays well under the 6-hour job limit. It runs nightly or on demand, and a merge job combines the chains into one report and verdict.
+- Efficiency is unchanged: the median selected share for write sets ≤ 5, from the chains' selections.

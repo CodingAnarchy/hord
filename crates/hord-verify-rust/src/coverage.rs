@@ -63,6 +63,24 @@ impl DefinitionIndex {
         }
     }
 
+    /// Replace the definitions of one file (after a change rewrote it).
+    pub fn set_file(&mut self, path: &RepoPath, bytes: &[u8], defs: &[Definition]) {
+        self.files.remove(path);
+        self.add_file(path, bytes, defs);
+    }
+
+    /// Forget a file (deleted, or no longer parsed).
+    pub fn remove_file(&mut self, path: &RepoPath) {
+        self.files.remove(path);
+    }
+
+    /// Replace every file `other` indexes with its entries.
+    pub fn update(&mut self, other: &DefinitionIndex) {
+        for (path, entries) in &other.files {
+            self.files.insert(path.clone(), entries.clone());
+        }
+    }
+
     /// The smallest definition of `path` whose lines contain `lines`.
     #[must_use]
     pub fn innermost(&self, path: &RepoPath, lines: &Range<u32>) -> Option<NodeId> {
@@ -101,6 +119,98 @@ pub struct CoverageOptions {
     pub test_timeout: Duration,
     /// Tests not to run (quarantined).
     pub skip: BTreeSet<TestRef>,
+    /// Run only these tests (an instrumented verification run of a
+    /// selection, ADR 0022); `None` runs every test in scope.
+    pub only: Option<TestFilter>,
+    /// Source lines (1-based, per file) whose per-test execution to report
+    /// in [`CoverageRun::lines`]: region-level data for chosen lines, such
+    /// as the lines a change edits. Empty: none (the default; cheaper).
+    pub lines_of_interest: BTreeMap<RepoPath, BTreeSet<u32>>,
+}
+
+impl Default for CoverageOptions {
+    /// Whole workspace, `target/hord-coverage`, one job per available CPU,
+    /// a 10-minute test timeout, nothing skipped or filtered.
+    fn default() -> Self {
+        Self {
+            packages: None,
+            target_dir: PathBuf::from("target/hord-coverage"),
+            jobs: std::thread::available_parallelism().map_or(1, usize::from),
+            test_timeout: Duration::from_secs(600),
+            skip: BTreeSet::new(),
+            only: None,
+            lines_of_interest: BTreeMap::new(),
+        }
+    }
+}
+
+/// Which tests an instrumented run runs: a selection, as
+/// [`TestFilter::from_selection`] maps it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestFilter {
+    /// These tests.
+    pub tests: BTreeSet<TestRef>,
+    /// Every test of these packages.
+    pub packages: BTreeSet<String>,
+    /// Tests of a package whose names contain a filter (tests the record
+    /// does not know yet).
+    pub names: BTreeMap<String, BTreeSet<String>>,
+    /// Every test.
+    pub all: bool,
+}
+
+impl TestFilter {
+    /// The tests `selection` runs (its doctests are not instrumented and
+    /// run separately).
+    #[must_use]
+    pub fn from_selection(selection: &crate::Selection) -> Self {
+        let mut tests = BTreeSet::new();
+        for ((package, target), names) in &selection.exact {
+            for name in names {
+                tests.insert(TestRef {
+                    package: package.clone(),
+                    target: target.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
+        Self {
+            tests,
+            packages: selection.packages.clone(),
+            names: selection.filters.clone(),
+            all: selection.full,
+        }
+    }
+
+    /// Whether it selects `test`.
+    #[must_use]
+    pub fn contains(&self, test: &TestRef) -> bool {
+        self.all
+            || self.packages.contains(&test.package)
+            || self.tests.contains(test)
+            || self
+                .names
+                .get(&test.package)
+                .is_some_and(|fs| fs.iter().any(|f| test.name.contains(f.as_str())))
+    }
+
+    /// Whether it selects nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.all && self.tests.is_empty() && self.packages.is_empty() && self.names.is_empty()
+    }
+
+    /// The packages whose test binaries must be built.
+    #[must_use]
+    pub fn packages(&self) -> Option<BTreeSet<String>> {
+        if self.all {
+            return None;
+        }
+        let mut out = self.packages.clone();
+        out.extend(self.tests.iter().map(|t| t.package.clone()));
+        out.extend(self.names.keys().cloned());
+        Some(out)
+    }
 }
 
 /// A finished coverage run.
@@ -114,6 +224,23 @@ pub struct CoverageRun {
     pub command: String,
     /// Progress notes and failures, for the evidence log.
     pub log: String,
+    /// Per test, the [`CoverageOptions::lines_of_interest`] it executed
+    /// (a line counts when `llvm-cov` gives it a nonzero count). Tests
+    /// that executed none are absent.
+    pub lines: BTreeMap<TestRef, BTreeMap<RepoPath, BTreeSet<u32>>>,
+}
+
+/// Executed lines of one test, restricted to the lines of interest.
+type TestLines = BTreeMap<RepoPath, BTreeSet<u32>>;
+
+/// What [`run_one`] needs to report lines of interest.
+struct LineQuery {
+    /// Every instrumented executable, for `llvm-cov export`.
+    objects: Vec<PathBuf>,
+    /// Absolute source path, its repository path, and the lines wanted.
+    files: Vec<(PathBuf, RepoPath, BTreeSet<u32>)>,
+    /// Some test already kept an indexed profile for the export mapping.
+    have_export: std::sync::atomic::AtomicBool,
 }
 
 /// One test binary from the instrumented build.
@@ -242,6 +369,78 @@ pub fn collect(
     options: &CoverageOptions,
 ) -> Result<CoverageRun> {
     let start = Instant::now();
+    match build_suite(checkout, options)? {
+        Some(suite) => run_suite(&suite, toolchain, defs, options, start),
+        None => Ok(CoverageRun {
+            record: CoverageRecord::new(
+                checkout.snapshot,
+                toolchain.id()?,
+                BTreeSet::new(),
+                Vec::new(),
+            ),
+            elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            command: "cargo llvm-cov (per test): nothing selected".into(),
+            log: String::new(),
+            lines: BTreeMap::new(),
+        }),
+    }
+}
+
+/// An instrumented build of a checkout's test binaries, with every test
+/// listed and its run environment captured: steps 1 and 2 of [`collect`].
+/// Building does not depend on which tests will run, so a caller can build
+/// the next snapshot while [`run_suite`] runs the current one (they need
+/// separate [`CoverageOptions::target_dir`]s).
+#[derive(Debug)]
+pub struct BuiltSuite {
+    snapshot: hord_core::SnapshotId,
+    /// The checkout root as given, and canonicalized.
+    checkout_root: PathBuf,
+    root: PathBuf,
+    bin: PathBuf,
+    work: PathBuf,
+    objects: Vec<PathBuf>,
+    binaries: usize,
+    /// Every non-ignored test: its ref, environment, and binary.
+    tests: Vec<(TestRef, BTreeMap<String, String>, PathBuf)>,
+    crate_of: HashMap<TestRef, String>,
+    scope: Vec<String>,
+    log: String,
+    /// Milliseconds the build and listing took.
+    pub build_ms: u64,
+}
+
+impl BuiltSuite {
+    /// Number of tests listed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tests.len()
+    }
+
+    /// Whether no test was listed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tests.is_empty()
+    }
+}
+
+/// Steps 1 and 2 of [`collect`] for `checkout`: build the test binaries of
+/// [`CoverageOptions::packages`] (narrowed to what `options.only` needs)
+/// instrumented, list their tests, and capture the environment each runs
+/// in. `None` when nothing is selected, so nothing is built.
+pub fn build_suite(checkout: &Checkout, options: &CoverageOptions) -> Result<Option<BuiltSuite>> {
+    build_suite_with_env(checkout, options, &BTreeMap::new())
+}
+
+/// [`build_suite`] with `extra_env` set for the build and for every test
+/// process the suite later runs: configuration of the repository's own test
+/// suite (a switch its tests read), not hord's.
+pub fn build_suite_with_env(
+    checkout: &Checkout,
+    options: &CoverageOptions,
+    extra_env: &BTreeMap<String, String>,
+) -> Result<Option<BuiltSuite>> {
+    let start = Instant::now();
     let root = checkout.root.canonicalize()?;
     let workspace = CargoWorkspace::load(&root)?;
     let bin = llvm_bin(&root)?;
@@ -266,7 +465,28 @@ pub fn collect(
     let mut log = String::new();
 
     // 1. Build.
-    let scope = scope_args(&options.packages);
+    let packages = match &options.only {
+        Some(filter) if filter.is_empty() => {
+            // Nothing selected: nothing to build or run.
+            return Ok(None);
+        }
+        Some(filter) => match (filter.packages(), &options.packages) {
+            (Some(needed), Some(limit)) => Some(needed.intersection(limit).cloned().collect()),
+            (Some(needed), None) => Some(needed),
+            (None, limit) => limit.clone(),
+        },
+        None => options.packages.clone(),
+    };
+    // Tests of packages the workspace no longer has cannot run.
+    let packages = packages.map(|ps| {
+        ps.into_iter()
+            .filter(|p| workspace.packages.contains_key(p))
+            .collect::<BTreeSet<_>>()
+    });
+    if packages.as_ref().is_some_and(BTreeSet::is_empty) {
+        return Ok(None);
+    }
+    let scope = scope_args(&packages);
     let mut build = Command::new("cargo");
     build
         .arg("test")
@@ -278,6 +498,7 @@ pub fn collect(
         ])
         .current_dir(&root)
         .envs(&env)
+        .envs(extra_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -352,6 +573,7 @@ pub fn collect(
         ))
         .current_dir(&root)
         .envs(&env)
+        .envs(extra_env)
         .env("HORD_CAPTURE_DIR", work.join("capture"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -360,7 +582,7 @@ pub fn collect(
     if !listed.success() {
         return Err(Error::tool("cargo test --list", listed.stderr));
     }
-    let mut jobs: Vec<(usize, TestRef, BTreeMap<String, String>, PathBuf)> = Vec::new();
+    let mut tests_out: Vec<(TestRef, BTreeMap<String, String>, PathBuf)> = Vec::new();
     let mut crate_of: HashMap<TestRef, String> = HashMap::new();
     for exe in &exes {
         let name = exe
@@ -433,22 +655,74 @@ pub fn collect(
                 target: exe.target.clone(),
                 name: test,
             };
-            if options.skip.contains(&test_ref) {
-                continue;
-            }
             crate_of.insert(test_ref.clone(), exe.krate.clone());
             let mut env = run_env.clone();
             env.insert("__HORD_CWD".into(), cwd.display().to_string());
-            jobs.push((jobs.len(), test_ref, env, exe.path.clone()));
+            tests_out.push((test_ref, env, exe.path.clone()));
         }
+    }
+    Ok(Some(BuiltSuite {
+        snapshot: checkout.snapshot,
+        checkout_root: checkout.root.clone(),
+        root,
+        bin,
+        work,
+        objects,
+        binaries: exes.len(),
+        tests: tests_out,
+        crate_of,
+        scope,
+        log,
+        build_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }))
+}
+
+/// Steps 3 and 4 of [`collect`]: run the tests of `suite` that `options`
+/// selects (`only`, `skip`), each alone under coverage, and map what they
+/// ran to `defs` (the definitions of the suite's snapshot). `start` is when
+/// the caller's run began, for [`CoverageRun::elapsed_ms`].
+pub fn run_suite(
+    suite: &BuiltSuite,
+    toolchain: &Toolchain,
+    defs: &DefinitionIndex,
+    options: &CoverageOptions,
+    start: Instant,
+) -> Result<CoverageRun> {
+    let (root, bin, work, objects, scope) = (
+        &suite.root,
+        &suite.bin,
+        &suite.work,
+        &suite.objects,
+        &suite.scope,
+    );
+    let mut log = suite.log.clone();
+    let crate_of = &suite.crate_of;
+    let mut jobs: Vec<(usize, TestRef, BTreeMap<String, String>, PathBuf)> = Vec::new();
+    for (test_ref, env, exe) in &suite.tests {
+        if options.skip.contains(test_ref)
+            || options.only.as_ref().is_some_and(|f| !f.contains(test_ref))
+        {
+            continue;
+        }
+        jobs.push((jobs.len(), test_ref.clone(), env.clone(), exe.clone()));
     }
     log.push_str(&format!(
         "{} test binaries, {} tests\n",
-        exes.len(),
+        suite.binaries,
         jobs.len()
     ));
 
     // 3. Run each test alone.
+    let query = Arc::new(LineQuery {
+        objects: objects.clone(),
+        files: options
+            .lines_of_interest
+            .iter()
+            .map(|(p, l)| (root.join(p.to_string()), p.clone(), l.clone()))
+            .collect(),
+        have_export: std::sync::atomic::AtomicBool::new(false),
+    });
+    let lines: Arc<Mutex<Vec<Option<TestLines>>>> = Arc::new(Mutex::new(vec![None; jobs.len()]));
     let names = Arc::new(Mutex::new(Interner::default()));
     let results: Arc<Mutex<Vec<Option<TestOutcome>>>> =
         Arc::new(Mutex::new(vec![None; jobs.len()]));
@@ -466,6 +740,7 @@ pub fn collect(
             Arc::clone(&failures),
         );
         let export_profile = Arc::clone(&export_profile);
+        let (query, lines) = (Arc::clone(&query), Arc::clone(&lines));
         let (work, bin, timeout) = (work.clone(), bin.clone(), options.test_timeout);
         handles.push(thread::spawn(move || {
             loop {
@@ -473,13 +748,17 @@ pub fn collect(
                 let Some((id, test, env, exe)) = jobs.get(i) else {
                     break;
                 };
-                let outcome = run_one(&work, &bin, *id, test, env, exe, timeout, &names);
+                let outcome = run_one(&work, &bin, *id, test, env, exe, timeout, &names, &query);
                 match outcome {
-                    Ok((covered, passed, profile)) => {
+                    Ok((covered, passed, profile, hit)) => {
+                        if !hit.is_empty() {
+                            lock(&lines)[*id] = Some(hit);
+                        }
                         if let Some(profile) = profile {
                             let mut slot = lock(&export_profile);
                             if slot.is_none() {
                                 *slot = Some(profile);
+                                query.have_export.store(true, Ordering::Relaxed);
                             } else {
                                 let _ = fs::remove_file(profile);
                             }
@@ -506,10 +785,13 @@ pub fn collect(
     }
 
     // 4. Map functions to definitions.
-    let profile = lock(&export_profile)
-        .clone()
-        .ok_or_else(|| Error::tool("llvm-profdata", "no test produced a profile"))?;
-    let functions = export_functions(&bin, &profile, &objects)?;
+    // No test ran (an empty selection) or none left a profile: no function
+    // mapping, and every test's coverage is empty.
+    let functions = match lock(&export_profile).clone() {
+        Some(profile) => export_functions(bin, &profile, objects)?,
+        None if jobs.is_empty() => Vec::new(),
+        None => return Err(Error::tool("llvm-profdata", "no test produced a profile")),
+    };
     let mut node_of_name: HashMap<String, NodeId> = HashMap::new();
     let mut node_of_path: HashMap<String, NodeId> = HashMap::new();
     let mut instrumented = BTreeSet::new();
@@ -524,7 +806,7 @@ pub fn collect(
         let Some(file) = usize::try_from(*file).ok().and_then(|i| f.filenames.get(i)) else {
             continue;
         };
-        let Some(path) = repo_path(&root, &checkout.root, file) else {
+        let Some(path) = repo_path(root, &suite.checkout_root, file) else {
             continue;
         };
         let lines = u32::try_from(*start).unwrap_or(0)..u32::try_from(*end).unwrap_or(0) + 1;
@@ -539,6 +821,11 @@ pub fn collect(
     }
     let names = lock(&names);
     let results = lock(&results);
+    let lines = lock(&lines);
+    let per_test_lines: BTreeMap<TestRef, TestLines> = jobs
+        .iter()
+        .filter_map(|(id, test, _, _)| lines[*id].clone().map(|l| (test.clone(), l)))
+        .collect();
     let mut tests = Vec::new();
     for (id, test, _, _) in jobs.iter() {
         let (covered, failed) = results[*id].clone().unwrap_or_default();
@@ -552,8 +839,8 @@ pub fn collect(
             .and_then(|k| node_of_path.get(&format!("{k}::{}", test.name)).copied());
         tests.push((test.clone(), own, covers, failed));
     }
-    let _ = fs::remove_dir_all(&work);
-    let record = CoverageRecord::new(checkout.snapshot, toolchain.id()?, instrumented, tests);
+    let _ = fs::remove_dir_all(work);
+    let record = CoverageRecord::new(suite.snapshot, toolchain.id()?, instrumented, tests);
     Ok(CoverageRun {
         command: format!(
             "cargo llvm-cov (per test) cargo test {} --tests -- --exact",
@@ -562,6 +849,7 @@ pub fn collect(
         record,
         elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         log,
+        lines: per_test_lines,
     })
 }
 
@@ -628,7 +916,8 @@ fn run_one(
     exe: &Path,
     timeout: Duration,
     names: &Mutex<Interner>,
-) -> Result<(BTreeSet<u32>, bool, Option<PathBuf>)> {
+    query: &LineQuery,
+) -> Result<(BTreeSet<u32>, bool, Option<PathBuf>, TestLines)> {
     let dir = work.join(format!("t{id}"));
     fs::create_dir_all(&dir)?;
     let mut env = env.clone();
@@ -652,7 +941,34 @@ fn run_one(
         .collect();
     if raws.is_empty() {
         let _ = fs::remove_dir_all(&dir);
-        return Ok((BTreeSet::new(), out.success(), None));
+        return Ok((BTreeSet::new(), out.success(), None, TestLines::new()));
+    }
+    // Usually one `llvm-profdata merge --text` gives the entered functions
+    // (one process per test instead of merge + show). An indexed profile is
+    // made only when `llvm-cov` needs one: the export mapping (until a test
+    // has provided it) and lines of interest.
+    if query.files.is_empty() && query.have_export.load(Ordering::Relaxed) {
+        let text = Command::new(bin.join("llvm-profdata"))
+            .args(["merge", "-sparse", "--text", "-o", "-"])
+            .args(&raws)
+            .stderr(Stdio::null())
+            .output()?;
+        let _ = fs::remove_dir_all(&dir);
+        if !text.status.success() {
+            return Err(Error::tool(
+                "llvm-profdata merge --text",
+                format!("failed for {}", test.name),
+            ));
+        }
+        let mut covered = BTreeSet::new();
+        {
+            let text = String::from_utf8_lossy(&text.stdout);
+            let mut names = lock(names);
+            for name in entered_functions_text(&text) {
+                covered.insert(names.intern(name));
+            }
+        }
+        return Ok((covered, out.success(), None, TestLines::new()));
     }
     let merged = work.join(format!("t{id}.profdata"));
     let status = Command::new(bin.join("llvm-profdata"))
@@ -682,7 +998,105 @@ fn run_one(
             covered.insert(names.intern(name));
         }
     }
-    Ok((covered, out.success(), Some(merged)))
+    let hit = if query.files.is_empty() {
+        TestLines::new()
+    } else {
+        executed_lines(bin, &merged, query)?
+    };
+    Ok((covered, out.success(), Some(merged), hit))
+}
+
+/// The lines of interest a profile executed (`llvm-cov export
+/// -format=lcov`, restricted to the files of interest).
+fn executed_lines(bin: &Path, profile: &Path, query: &LineQuery) -> Result<TestLines> {
+    let Some((first, rest)) = query.objects.split_first() else {
+        return Ok(TestLines::new());
+    };
+    let mut cmd = Command::new(bin.join("llvm-cov"));
+    cmd.args([
+        "export",
+        "-format=lcov",
+        "-skip-expansions",
+        "-instr-profile",
+    ])
+    .arg(profile)
+    .arg(first);
+    for o in rest {
+        cmd.arg("-object").arg(o);
+    }
+    for (abs, _, _) in &query.files {
+        cmd.arg(abs);
+    }
+    let out = cmd.stderr(Stdio::null()).output()?;
+    if !out.status.success() {
+        return Err(Error::tool("llvm-cov export -format=lcov", "failed"));
+    }
+    Ok(parse_lcov(
+        &String::from_utf8_lossy(&out.stdout),
+        &query.files,
+    ))
+}
+
+/// `DA:line,count` records with a nonzero count, per `SF:` file, kept when
+/// the line is of interest.
+fn parse_lcov(lcov: &str, files: &[(PathBuf, RepoPath, BTreeSet<u32>)]) -> TestLines {
+    let mut out = TestLines::new();
+    let mut current: Option<&(PathBuf, RepoPath, BTreeSet<u32>)> = None;
+    for line in lcov.lines() {
+        if let Some(path) = line.strip_prefix("SF:") {
+            let path = Path::new(path);
+            current = files.iter().find(|(abs, _, _)| {
+                abs == path || abs.canonicalize().ok().as_deref() == Some(path)
+            });
+        } else if let Some(rest) = line.strip_prefix("DA:")
+            && let Some((file, rel, wanted)) = current
+        {
+            let _ = file;
+            let mut parts = rest.split(',');
+            let (Some(n), Some(count)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let (Ok(n), Ok(count)) = (n.parse::<u32>(), count.parse::<u64>()) else {
+                continue;
+            };
+            if count > 0 && wanted.contains(&n) {
+                out.entry(rel.clone()).or_default().insert(n);
+            }
+        } else if line == "end_of_record" {
+            current = None;
+        }
+    }
+    out
+}
+
+/// Functions with a nonzero entry count (first counter) in the text profile
+/// format `llvm-profdata merge --text` prints: blocks of a name line, then
+/// `# Func Hash:`, `# Num Counters:`, `# Counter Values:` sections.
+fn entered_functions_text(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut name: Option<&str> = None;
+    let mut want_count = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            name = None;
+            want_count = false;
+        } else if line == "# Counter Values:" {
+            want_count = true;
+        } else if line.starts_with('#') || line.starts_with(':') {
+            want_count = false;
+        } else if want_count {
+            if let Some(n) = name.take()
+                && line.parse::<u64>().is_ok_and(|c| c > 0)
+            {
+                out.push(n);
+            }
+            want_count = false;
+        } else if name.is_none() && line.parse::<u64>().is_err() {
+            name = Some(line);
+        }
+    }
+    out
 }
 
 /// Functions with a nonzero entry count in `llvm-profdata show
@@ -794,10 +1208,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_executed_lines_of_interest_from_lcov() {
+        let rel = RepoPath::from_str("src/lib.rs").expect("parse test path");
+        let files = vec![(
+            PathBuf::from("/w/src/lib.rs"),
+            rel.clone(),
+            [2, 3, 9].into_iter().collect(),
+        )];
+        let lcov = "SF:/w/src/lib.rs\nDA:2,5\nDA:3,0\nDA:4,1\nDA:9,1\nend_of_record\n\
+                    SF:/w/src/other.rs\nDA:2,7\nend_of_record\n";
+        let got = parse_lcov(lcov, &files);
+        assert_eq!(got[&rel], [2, 9].into_iter().collect());
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
     fn unquotes_shell_values() {
         assert_eq!(unquote("'a b'"), "a b");
         assert_eq!(unquote("'a'\\''b'"), "a'b");
         assert_eq!(unquote("plain"), "plain");
+    }
+
+    #[test]
+    fn reads_entered_functions_from_the_text_profile() {
+        let text = "_RNvA\n# Func Hash:\n12\n# Num Counters:\n2\n# Counter Values:\n5\n0\n\n\
+                    src/x.rs;_RNvB\n# Func Hash:\n7\n# Num Counters:\n1\n# Counter Values:\n0\n\n\
+                    _RNvC\n# Func Hash:\n9\n# Num Counters:\n3\n# Counter Values:\n1\n0\n4\n";
+        assert_eq!(entered_functions_text(text), vec!["_RNvA", "_RNvC"]);
     }
 
     #[test]
@@ -811,7 +1248,7 @@ mod tests {
 
     #[test]
     fn innermost_definition_by_lines() {
-        let path = RepoPath::from_str("src/lib.rs").unwrap();
+        let path = RepoPath::from_str("src/lib.rs").expect("parse test path");
         let src = b"mod m {\n    fn f() {\n        1;\n    }\n}\n";
         let def = |node: u128, span: Range<usize>| Definition {
             node: NodeId::from_u128(node),
@@ -836,7 +1273,10 @@ mod tests {
             Path::new("/tmp/x"),
             "/tmp/x/src/a.rs",
         );
-        assert_eq!(p, Some(RepoPath::from_str("src/a.rs").unwrap()));
+        assert_eq!(
+            p,
+            Some(RepoPath::from_str("src/a.rs").expect("parse test path"))
+        );
         assert_eq!(repo_path(Path::new("/a"), Path::new("/a"), "/b/c.rs"), None);
     }
 }
