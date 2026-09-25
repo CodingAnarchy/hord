@@ -36,6 +36,17 @@ pub struct Signer {
     pub key: Arc<SigningKey>,
 }
 
+/// This process's actor ([`txn::actor`]) and their key in
+/// `~/.hord/keys/<id>.pem` (`HORD_HOME` honored), created on first use.
+pub fn local_signer() -> Result<Signer> {
+    let actor = txn::actor();
+    let key = identity::load_or_create_key(&identity::key_path(actor.id())?)?;
+    Ok(Signer {
+        actor,
+        key: Arc::new(key),
+    })
+}
+
 /// Connect to the remote `name` at `url`, with the token `hord login`
 /// stored for it, if any.
 pub fn connect(name: &str, url: &str) -> Result<(RemoteRepo, Option<Credential>)> {
@@ -171,12 +182,7 @@ impl Session {
                 key: Arc::new(credential.key()?),
             });
         }
-        let actor = txn::actor();
-        let key = identity::load_or_create_key(&identity::key_path(actor.id())?)?;
-        Ok(Signer {
-            actor,
-            key: Arc::new(key),
-        })
+        local_signer()
     }
 
     /// The repository backend.
