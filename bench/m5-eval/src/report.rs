@@ -170,7 +170,7 @@ pub fn text(summary: &Summary, gated_share: bool) -> String {
     if summary.failures.is_empty() {
         let _ = writeln!(
             out,
-            "correctness: budget enforced, every parked case arbitrated, grading as expected"
+            "correctness: budget enforced, every parked case resolved from the workbench, grading as expected"
         );
     } else {
         let _ = writeln!(out, "FAILURES ({}):", summary.failures.len());

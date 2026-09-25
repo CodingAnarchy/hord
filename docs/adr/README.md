@@ -59,4 +59,4 @@ M5 identity and authorization dependencies (spec §10.5.4):
 
 `cookie` 0.18 (hord-ui, hord-server): builds and parses the web UI's HttpOnly, SameSite=Strict sign-in cookie that carries a bearer token (spec §10.5.4, ADR 0030). AGENTS.md forbids a hand-rolled `Cookie` header parser.
 
-`hord-eval-m5` (bench, the M5 conflict corpus): `anyhow`, `clap`, `hord-api`, `hord-core`, `hord-encoding`, `hord-remote`, `hord-txn`, `serde`, `serde_json`, `tokio` (feature `process`), `tokio-stream`, `toml`, all already workspace dependencies. `hord-remote` drives each case's daemon over the same gRPC API as the CLI and the workbench.
+`hord-eval-m5` (bench, the M5 conflict corpus): `anyhow`, `clap`, `hord-api`, `hord-core`, `hord-encoding`, `hord-remote`, `hord-txn`, `serde`, `serde_json`, `tokio` (feature `process`), `tokio-stream`, `toml`, all already workspace dependencies. `hord-remote` drives each case's `hord serve` over the same gRPC API as the CLI. `http`, `http-body-util`, `hyper-util`, and `bytes` (already in the tree) post the web workbench's arbitration form, as a browser would.

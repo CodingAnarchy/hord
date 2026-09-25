@@ -211,8 +211,9 @@ jobs:
       # with hord-replay-ref running the deterministic scripted harness.
       # Gates correctness only: every case collides as designed, no attempt
       # runs past its budget unkilled and no over-budget result is
-      # accepted, every parked case round-trips through a signed
-      # Arbitrate, and each case is graded as its script predicts. The 60%
+      # accepted, every parked case is resolved from the web workbench (a
+      # signed Arbitrate the UI sends), and each case is graded as its
+      # script predicts. The 60%
       # resolved-by-replay target needs a model and is reported, not gated.
       - name: M5 conflict corpus (scripted harness)
         run: target/release/hord-eval-m5 run --jobs 4 --out target/m5-eval

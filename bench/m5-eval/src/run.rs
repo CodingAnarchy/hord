@@ -1,8 +1,11 @@
-//! Running one case end to end, through the same API the CLI and the web
-//! workbench use: the case's repository gets its own daemon (`hord serve
-//! --daemon`), whose lander runs the replay harness from
-//! `.hord/replay.toml`; tasks are proposed through its `Workspaces`
-//! service, and parked cases are resolved with a signed `Arbitrate`.
+//! Running one case end to end, as agents and an arbiter would: the case's
+//! repository runs under its own `hord serve`, whose lander runs the replay
+//! harness from `.hord/replay.toml`. Tasks are proposed through its
+//! `Workspaces` service on the repository's local endpoint, and a parked
+//! case is resolved from the web workbench (spec §12 M5): the runner posts
+//! the workbench's form, and the UI signs the decision with the server's
+//! key. The direct `Arbitrate` API is only a fallback, reported as a
+//! failure.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -61,6 +64,23 @@ pub struct Config {
     pub work: PathBuf,
     /// Keep each case's repository.
     pub keep: bool,
+    /// `HORD_HOME` for each case's `hord serve`: its `keys/` holds the key
+    /// the web UI signs arbitration decisions with.
+    pub home: PathBuf,
+    /// The actor that key belongs to (`HORD_ACTOR`), the UI's arbiter.
+    pub arbiter: String,
+    /// That key's public half, to verify `Arbitrated` signatures.
+    pub arbiter_key: hord_core::sign::PublicKey,
+}
+
+/// Write a fresh signing key for `actor` under `home/keys/` (the file
+/// `hord serve` gives the web UI) and return its public half.
+pub fn ui_key(home: &Path, actor: &str) -> Result<hord_core::sign::PublicKey> {
+    let key = SigningKey::generate()?;
+    let dir = home.join("keys");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(format!("{actor}.pem")), key.to_pem()?)?;
+    Ok(key.public())
 }
 
 /// How a case ended.
@@ -215,25 +235,32 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
-/// A case's repository with its daemon; the daemon stops when dropped.
+/// A case's repository under its own `hord serve`, which serves the gRPC
+/// API on the repository's local endpoint and the web UI on a loopback
+/// port; the server stops when dropped.
 struct CaseRepo {
     dir: PathBuf,
     remote: RemoteRepo,
-    daemon: tokio::process::Child,
+    /// The web UI's address, `http://127.0.0.1:<port>`.
+    ui: String,
+    server: tokio::process::Child,
 }
 
 impl CaseRepo {
     async fn stop(mut self) {
-        let _ = self
-            .remote
-            .workspaces()
-            .shutdown(proto::ShutdownRequest {})
-            .await;
-        if tokio::time::timeout(Duration::from_secs(10), self.daemon.wait())
+        // `hord serve` stops on Ctrl-C; SIGINT lets it close its store.
+        #[cfg(unix)]
+        if let Some(pid) = self.server.id() {
+            let _ = Command::new("kill")
+                .args(["-INT", &pid.to_string()])
+                .status()
+                .await;
+        }
+        if tokio::time::timeout(Duration::from_secs(10), self.server.wait())
             .await
             .is_err()
         {
-            let _ = self.daemon.kill().await;
+            let _ = self.server.kill().await;
         }
     }
 }
@@ -251,7 +278,7 @@ fn caller(id: &str) -> proto::Caller {
 }
 
 /// Build the case's repository, import it, configure the harness, and
-/// start its daemon.
+/// start its `hord serve`.
 async fn build(cfg: &Config, path: &Path, case: &Case) -> Result<CaseRepo> {
     let dir = cfg.work.join(&case.id);
     remove_tree(&dir);
@@ -303,35 +330,50 @@ async fn build(cfg: &Config, path: &Path, case: &Case) -> Result<CaseRepo> {
         )?;
     }
 
-    let log = std::fs::File::create(cfg.work.join(format!("{}.daemon.log", case.id)))?;
-    let daemon = Command::new(&cfg.hord)
-        .args(["serve", "--repo", dir_text, "--daemon"])
+    let log_path = cfg.work.join(format!("{}.serve.log", case.id));
+    let log = std::fs::File::create(&log_path)?;
+    let server = Command::new(&cfg.hord)
+        .args(["serve", "--repo", dir_text, "--bind", "127.0.0.1:0"])
         .current_dir(&dir)
-        .env("HORD_DAEMON_IDLE_SECS", "3600")
-        .env("HORD_ACTOR", "m5-eval")
+        .env("HORD_HOME", &cfg.home)
+        .env("HORD_ACTOR", &cfg.arbiter)
+        .env_remove("HORD_AGENT_MODEL")
         .env_remove("HORD_NO_DAEMON")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .kill_on_drop(true)
         .spawn()
-        .context("start the case's daemon")?;
+        .context("start the case's hord serve")?;
     let deadline = Instant::now() + Duration::from_secs(30);
-    let remote = loop {
-        if let Ok(remote) = RemoteRepo::connect_local(&dir).await
+    let (remote, ui) = loop {
+        // Its first line names the address: `hord serve: http://<addr> (...)`.
+        let ui = std::fs::read_to_string(&log_path).ok().and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("hord serve: "))
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_owned)
+        });
+        if let Some(ui) = ui
+            && let Ok(remote) = RemoteRepo::connect_local(&dir).await
             && remote.head(proto::HeadRequest {}).await.is_ok()
         {
-            break remote;
+            break (remote, ui);
         }
         if Instant::now() > deadline {
-            bail!("the daemon for {} did not answer", case.id);
+            bail!(
+                "hord serve for {} did not start (see {})",
+                case.id,
+                log_path.display()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     Ok(CaseRepo {
         dir,
         remote,
-        daemon,
+        ui,
+        server,
     })
 }
 
@@ -479,26 +521,32 @@ async fn acceptance(remote: &RemoteRepo, case: &Case) -> Result<Option<String>> 
 /// (keep ours, which always lands), then check that the resolution landed
 /// with both colliding changes as parents and that the `Arbitrated` event
 /// carries a signature that verifies.
-async fn round_trip(remote: &RemoteRepo, change: &str, first_landed: &str) -> Result<String> {
+async fn round_trip(
+    cfg: &Config,
+    remote: &RemoteRepo,
+    ui: &str,
+    change: &str,
+    first_landed: &str,
+) -> Result<String> {
     let id: ChangeId = wire::object_id("change", change)?;
-    let key = SigningKey::generate()?;
     let decision = Arbitration::PickOurs;
-    let signature = hord_txn::sign_arbitration(id, &decision, &key)?;
-    let arbiter = Actor::Human {
-        id: "m5-arbiter".into(),
+    // The workbench's own form, as its "pick ours" button posts it; the UI
+    // signs the decision with the server's key for `cfg.arbiter`.
+    let (arbiter, key, fallback) = match workbench_pick_ours(ui, change).await {
+        Ok(()) => (
+            Actor::Human {
+                id: cfg.arbiter.clone(),
+            },
+            cfg.arbiter_key,
+            None,
+        ),
+        Err(err) => {
+            // Resolve it anyway, so the case's result is complete, but
+            // report the missing workbench as a failure.
+            let (arbiter, key) = direct_pick_ours(remote, id, change).await?;
+            (arbiter, key, Some(err))
+        }
     };
-    let reply = remote
-        .arbitrate(proto::ArbitrateRequest {
-            change: change.into(),
-            action: Some(proto::Arbitration {
-                action: Some(proto::arbitration::Action::PickOurs(true)),
-            }),
-            arbiter: Some(wire::actor(&arbiter)),
-            note: None,
-            key_id: Some(signature.key_id.clone()),
-            signature: Some(signature.bytes.as_slice().to_vec()),
-        })
-        .await?;
     // Until it is arbitrated, or back in the arbitration queue with no
     // resolution pending (the resolution did not land).
     let entry = wait_for(remote, change, Duration::from_secs(300), |e| {
@@ -510,8 +558,7 @@ async fn round_trip(remote: &RemoteRepo, change: &str, first_landed: &str) -> Re
     .await?;
     if entry.status() != proto::QueueStatus::Arbitrated {
         bail!(
-            "the resolution {} did not land: {:?}",
-            reply.change,
+            "the resolution did not land: {:?}",
             entry.escalation.and_then(|e| e.note)
         );
     }
@@ -562,9 +609,80 @@ async fn round_trip(remote: &RemoteRepo, change: &str, first_landed: &str) -> Re
                 .ok_or_else(|| anyhow!("Arbitrated has no signature"))?,
         ),
     };
-    hord_txn::verify_arbitration(id, &decision, &stored, &key.public())
+    hord_txn::verify_arbitration(id, &decision, &stored, &key)
         .context("the Arbitrated signature does not verify")?;
-    Ok(format!("landed {landed} with parents {parents:?}"))
+    if let Some(err) = fallback {
+        bail!(
+            "the workbench route is unavailable ({err:#}); resolved through the direct \
+             Arbitrate API instead, which does not count"
+        );
+    }
+    Ok(format!(
+        "resolved from the workbench; landed {landed} with parents {parents:?}"
+    ))
+}
+
+/// Post the workbench's "pick ours" form for `change` to the web UI at
+/// `ui`, and check the page it returns says the resolution was submitted.
+async fn workbench_pick_ours(ui: &str, change: &str) -> Result<()> {
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<bytes::Bytes>>();
+    let request = http::Request::post(format!("{ui}/arbitrate/{change}"))
+        .header(
+            http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(Full::new(bytes::Bytes::from_static(
+            b"action=pick_ours&note=&resolved=",
+        )))?;
+    let response = client
+        .request(request)
+        .await
+        .context("post the workbench form")?;
+    let status = response.status();
+    let page = response.into_body().collect().await?.to_bytes();
+    let page = String::from_utf8_lossy(&page);
+    if !status.is_success() {
+        bail!("the workbench answered {status}");
+    }
+    if !page.contains("submitted; it lands with both as parents") {
+        let flash = page
+            .find("Arbitration failed")
+            .or_else(|| page.find("Could not sign"))
+            .map(|i| page[i..].split('<').next().unwrap_or_default().to_owned())
+            .unwrap_or_else(|| "no confirmation on the page".into());
+        bail!("the workbench did not submit a resolution: {flash}");
+    }
+    Ok(())
+}
+
+/// The direct `Arbitrate` call (keep ours), signed with a fresh key: the
+/// fallback when the workbench is unavailable.
+async fn direct_pick_ours(
+    remote: &RemoteRepo,
+    id: ChangeId,
+    change: &str,
+) -> Result<(Actor, hord_core::sign::PublicKey)> {
+    let key = SigningKey::generate()?;
+    let signature = hord_txn::sign_arbitration(id, &Arbitration::PickOurs, &key)?;
+    let arbiter = Actor::Human {
+        id: "m5-arbiter-direct".into(),
+    };
+    remote
+        .arbitrate(proto::ArbitrateRequest {
+            change: change.into(),
+            action: Some(proto::Arbitration {
+                action: Some(proto::arbitration::Action::PickOurs(true)),
+            }),
+            arbiter: Some(wire::actor(&arbiter)),
+            note: None,
+            key_id: Some(signature.key_id.clone()),
+            signature: Some(signature.bytes.as_slice().to_vec()),
+        })
+        .await?;
+    Ok((arbiter, key.public()))
 }
 
 /// Run `case` end to end.
@@ -598,7 +716,7 @@ pub async fn run_case(cfg: &Config, path: &Path, case: &Case) -> CaseResult {
             return result;
         }
     };
-    if let Err(err) = drive(cfg, case, &repo.remote, &mut result).await {
+    if let Err(err) = drive(cfg, case, &repo.remote, &repo.ui, &mut result).await {
         result.outcome = Outcome::Error {
             why: format!("{err:#}"),
         };
@@ -616,6 +734,7 @@ async fn drive(
     cfg: &Config,
     case: &Case,
     remote: &RemoteRepo,
+    ui: &str,
     result: &mut CaseResult,
 ) -> Result<()> {
     let ws_a = workspace(remote, "agent-a").await?;
@@ -701,7 +820,7 @@ async fn drive(
         proto::QueueStatus::NeedsArbitration | proto::QueueStatus::Conflicted => {
             result.outcome = Outcome::Parked;
             result.summary = escalation.summary.map(|s| s.text);
-            result.arbitration = Some(match round_trip(remote, &b, &first_landed).await {
+            result.arbitration = Some(match round_trip(cfg, remote, ui, &b, &first_landed).await {
                 Ok(detail) => RoundTrip { ok: true, detail },
                 Err(err) => RoundTrip {
                     ok: false,
@@ -734,6 +853,11 @@ mod tests {
             max_attempts: 2,
             work: PathBuf::new(),
             keep: false,
+            home: PathBuf::new(),
+            arbiter: "m5-arbiter".into(),
+            arbiter_key: SigningKey::generate()
+                .expect("generate a test key")
+                .public(),
         }
     }
 
@@ -749,6 +873,21 @@ mod tests {
             tokens: Some(tokens),
             ..Default::default()
         }
+    }
+
+    /// A workbench that does not answer is an error, so the runner reports
+    /// the case as failed even though the direct API resolves it.
+    #[tokio::test]
+    async fn an_unreachable_workbench_is_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let addr = listener.local_addr().expect("its address");
+        drop(listener);
+        let change = "ab".repeat(32);
+        assert!(
+            workbench_pick_ours(&format!("http://{addr}"), &change)
+                .await
+                .is_err()
+        );
     }
 
     /// An attempt past its wall-clock budget must have been killed, and an

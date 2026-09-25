@@ -2175,12 +2175,16 @@ name = "hord-eval-m5"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "hord-api",
  "hord-core",
  "hord-encoding",
  "hord-remote",
  "hord-txn",
+ "http",
+ "http-body-util",
+ "hyper-util",
  "serde",
  "serde_json",
  "tokio",

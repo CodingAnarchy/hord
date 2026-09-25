@@ -6,12 +6,13 @@
 //! hord-eval-m5 scripted --case FILE      (run by hord-replay-ref)
 //! ```
 //!
-//! `run` builds each case's repository with its own daemon, lands the
+//! `run` builds each case's repository under its own `hord serve`, lands the
 //! first task, submits the second with the replay harness configured, and
 //! lets the escalation ladder run. It grades a case resolved by replay when
 //! a replay lands and both tasks' acceptance tests pass on the landed head;
 //! otherwise the case must be parked with a conflict summary, and it is
-//! then resolved with a signed `Arbitrate` (the round-trip). It reports the
+//! then resolved from the web workbench, whose form post the UI turns into
+//! a signed `Arbitrate` (the round-trip, spec §12 M5). It reports the
 //! share resolved by replay (target 60% with a model), attempts, and budget
 //! outcomes, and writes `report.json`, `review.md`, and `review.csv` (the
 //! human "sufficient to resolve" rating).
@@ -113,6 +114,9 @@ struct RunArgs {
     replay_ref: Option<PathBuf>,
 }
 
+/// The web UI's arbiter: `HORD_ACTOR` of each case's `hord serve`.
+const ARBITER: &str = "m5-arbiter";
+
 fn beside_me(name: &str) -> Result<PathBuf> {
     let me = std::env::current_exe()?;
     let path = me
@@ -187,6 +191,9 @@ async fn run(args: RunArgs) -> Result<()> {
         max_attempts: args.max_attempts,
         work: out.join("cases"),
         keep: args.keep,
+        arbiter_key: run::ui_key(&out.join("home"), ARBITER)?,
+        home: out.join("home"),
+        arbiter: ARBITER.into(),
     });
     std::fs::create_dir_all(&cfg.work)?;
     let mut cases = corpus::load(&corpus_dir(args.corpus))?;

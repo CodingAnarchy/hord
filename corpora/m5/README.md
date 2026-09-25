@@ -50,4 +50,8 @@ target/release/hord-eval-m5 run --harness-cmd 'claude -p "$(cat "$HORD_REPLAY_PR
 The runner needs git and cargo with cargo-llvm-cov (the lander's verifier
 runs each case's tests). It writes `report.json`, and `review.md` and
 `review.csv` for the human "sufficient to resolve" rating of every parked
-case's conflict summary.
+case's conflict summary. Each case runs under its own `hord serve`, and
+each parked case is resolved from its web workbench: the runner posts the
+workbench's "pick ours" form, the UI signs the decision with a key the
+runner provides, and the runner checks that the resolution lands with both
+parents and a signed `Arbitrated` event.
