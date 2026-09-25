@@ -17,6 +17,15 @@ pub enum Error {
         /// to trip `clippy::result_large_err` on every function returning this type.
         source: Box<hord_txn::Error>,
     },
+    /// A hosted repository's options could not be built (for example its
+    /// `.hord/replay.toml` is invalid).
+    #[error("repository {path}: {reason}")]
+    Options {
+        /// Its root.
+        path: PathBuf,
+        /// Why.
+        reason: String,
+    },
     /// `--root` found no repository.
     #[error("no repository (.hord/) under {0}")]
     NoRepos(PathBuf),

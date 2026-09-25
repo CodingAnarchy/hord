@@ -157,12 +157,12 @@ fn new_workspace(hord: &Hord) -> TestResult<(String, PathBuf)> {
     ))
 }
 
-#[test]
-fn the_reference_harness_resolves_a_conflict_through_the_daemon() -> TestResult {
-    let bin = hord_bin()?;
-    let repo = TempDir::new("hord-replay-ref")?;
-    let notes = TempDir::new("hord-replay-ref-notes")?;
-    let dir = repo.0.clone();
+/// A git repository with `src/lib.rs` at `dir`, imported into hord, with
+/// `.hord/replay.toml` running `hord-replay-ref` whose "model" saves its
+/// prompt to `prompt_copy`, makes beta return 21 on the new base, and
+/// reports its usage.
+fn setup(hord: &Hord, prompt_copy: &Path) -> TestResult {
+    let dir = &hord.dir;
     fs::create_dir_all(dir.join("src"))?;
     fs::write(dir.join("src/lib.rs"), LIB)?;
     fs::write(
@@ -170,19 +170,11 @@ fn the_reference_harness_resolves_a_conflict_through_the_daemon() -> TestResult 
         "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )?;
     fs::write(dir.join(".gitignore"), "target/\n")?;
-    git(&dir, &["init", "-q", "-b", "main"])?;
-    git(&dir, &["add", "."])?;
-    git(&dir, &["commit", "-q", "-m", "fixture"])?;
-    let hord = Hord {
-        bin: bin.clone(),
-        dir: dir.clone(),
-    };
+    git(dir, &["init", "-q", "-b", "main"])?;
+    git(dir, &["add", "."])?;
+    git(dir, &["commit", "-q", "-m", "fixture"])?;
     let git_path = dir.to_str().ok_or("temp path is UTF-8")?;
     hord.run(&["init", "--from-git", git_path])?;
-
-    // The "model": saves its prompt, makes beta return 21 on the new base,
-    // and reports its usage.
-    let prompt_copy = notes.0.join("prompt.txt");
     let cmd = format!(
         "cat > '{}' && printf 'pub fn alpha() -> u32 {{\\n    1\\n}}\\n\\npub fn beta() -> u32 {{\\n    21\\n}}\\n' > src/lib.rs && printf '{{\"tokens\": 42, \"cost_usd\": 0.01}}' > \"$HORD_REPLAY_USAGE\"",
         prompt_copy.display()
@@ -192,18 +184,22 @@ fn the_reference_harness_resolves_a_conflict_through_the_daemon() -> TestResult 
         "harness = [{:?}, \"--cmd\", {:?}, \"--hord\", {:?}, \"--model\", \"scripted\"]\n",
         harness,
         cmd,
-        bin.display().to_string()
+        hord.bin.display().to_string()
     );
     fs::write(dir.join(".hord").join("replay.toml"), config)?;
+    Ok(())
+}
 
-    let (ws_a, checkout_a) = new_workspace(&hord)?;
-    let (ws_b, checkout_b) = new_workspace(&hord)?;
-    let a = propose_beta(&hord, &notes.0, &ws_a, &checkout_a, 20)?;
-    let b = propose_beta(&hord, &notes.0, &ws_b, &checkout_b, 21)?;
+/// a makes beta 20 and lands; b makes beta 21 on the same base and
+/// conflicts; the harness replays b, and the replay lands.
+fn conflict_is_replayed(hord: &Hord, notes: &Path, prompt_copy: &Path) -> TestResult {
+    let (ws_a, checkout_a) = new_workspace(hord)?;
+    let (ws_b, checkout_b) = new_workspace(hord)?;
+    let a = propose_beta(hord, notes, &ws_a, &checkout_a, 20)?;
+    let b = propose_beta(hord, notes, &ws_b, &checkout_b, 21)?;
     hord.run(&["land", "--local", &a])?;
     hord.run(&["submit", &b])?;
 
-    // b conflicts with a; the harness replays it on a's result.
     let deadline = Instant::now() + Duration::from_secs(90);
     let entry = loop {
         let queue = hord.json(&["queue"])?;
@@ -243,12 +239,85 @@ fn the_reference_harness_resolves_a_conflict_through_the_daemon() -> TestResult 
         "{conflicts:#}"
     );
 
-    let prompt = fs::read_to_string(&prompt_copy)?;
+    let prompt = fs::read_to_string(prompt_copy)?;
     assert!(prompt.contains("beta returns 21"), "{prompt}");
     assert!(prompt.contains("beta_is_21"), "{prompt}");
     assert!(
         prompt.contains("beta returns 20"),
         "the landed side: {prompt}"
     );
+    Ok(())
+}
+
+#[test]
+fn the_reference_harness_resolves_a_conflict_through_the_daemon() -> TestResult {
+    let repo = TempDir::new("hord-replay-ref")?;
+    let notes = TempDir::new("hord-replay-ref-notes")?;
+    let hord = Hord {
+        bin: hord_bin()?,
+        dir: repo.0.clone(),
+    };
+    let prompt_copy = notes.0.join("prompt.txt");
+    setup(&hord, &prompt_copy)?;
+    conflict_is_replayed(&hord, &notes.0, &prompt_copy)
+}
+
+/// Kills the server when the test ends.
+struct Serving(std::process::Child);
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spec §10.5.1: under `hord serve --root`, each hosted repository's lander
+/// runs its own `.hord/replay.toml` harness, and `hord` commands in the
+/// repository (the harness's `hord propose` too) reach the server on the
+/// repository's local endpoint.
+#[test]
+fn serve_root_runs_each_repositorys_replay_harness() -> TestResult {
+    let root = TempDir::new("hord-replay-ref-root")?;
+    let notes = TempDir::new("hord-replay-ref-notes")?;
+    let bin = hord_bin()?;
+    let hord = Hord {
+        bin: bin.clone(),
+        dir: root.0.join("alpha"),
+    };
+    let prompt_copy = notes.0.join("prompt.txt");
+    setup(&hord, &prompt_copy)?;
+    // A second hosted repository with no harness.
+    let other = Hord {
+        bin: bin.clone(),
+        dir: root.0.join("beta"),
+    };
+    setup(&other, &notes.0.join("unused.txt"))?;
+    fs::remove_file(other.dir.join(".hord").join("replay.toml"))?;
+
+    let mut child = Command::new(&bin)
+        .args(["serve", "--root"])
+        .arg(&root.0)
+        .args(["--bind", "127.0.0.1:0"])
+        .env_remove("HORD_NO_DAEMON")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let stderr = child.stderr.take().ok_or("the server's stderr")?;
+    let serving = Serving(child);
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(stderr), &mut first)?;
+    assert!(first.starts_with("hord serve: http://"), "{first}");
+    assert!(first.contains("alpha") && first.contains("beta"), "{first}");
+    let endpoint = PathBuf::from(hord_api::local::endpoint(&hord.dir.canonicalize()?)?);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !endpoint.exists() {
+        if Instant::now() > deadline {
+            return Err(format!("{} never appeared", endpoint.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    conflict_is_replayed(&hord, &notes.0, &prompt_copy)?;
+    drop(serving);
     Ok(())
 }

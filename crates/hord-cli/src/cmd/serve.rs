@@ -6,9 +6,13 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use hord_api::WorkspacesBackend;
 use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig};
+
+use crate::workspaces::LocalWorkspaces;
 
 use crate::repo;
 
@@ -52,13 +56,20 @@ pub async fn run(
         (Some(path), _) => {
             Hosts::open_repo(path, crate::cmd::replay::lander_options(path)?).await?
         }
-        (None, Some(dir)) => Hosts::open_root(dir, hord_txn::RepoOptions::default).await?,
+        // Each hosted repository's lander runs its own replay harness.
+        (None, Some(dir)) => {
+            Hosts::open_root(dir, |path| {
+                crate::cmd::replay::lander_options(path).map_err(|err| format!("{err:#}"))
+            })
+            .await?
+        }
         (None, None) => unreachable!("one of --repo or --root"),
     };
     let names: Vec<String> = hosts.names().map(str::to_owned).collect();
     let listener = Server::bind(addr, &ServeOptions { insecure_bind }).await?;
     let local = listener.local_addr()?;
     let auth = auth.or_else(|| config.auth.as_ref().map(|a| a.file.clone()));
+    let (stop_local, local_endpoints) = serve_local_endpoints(&hosts);
     let mut server = Server::new(hosts, config);
     let mut note = String::new();
     if let Some(path) = auth {
@@ -74,5 +85,52 @@ pub async fn run(
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    let _ = stop_local.send(true);
+    for task in local_endpoints {
+        let _ = task.await;
+    }
     Ok(())
+}
+
+/// Serve each hosted repository on its local endpoint too, with its
+/// workspace commands, as its daemon would (ADR 0021): this process holds
+/// the store, so `hord` commands in the repository, including a replay
+/// harness's `hord propose`, reach it there. They share the lander. The
+/// endpoint takes no tokens, like the daemon's; it is the local user's.
+fn serve_local_endpoints(
+    hosts: &Hosts,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut tasks = Vec::new();
+    for (name, local) in hosts.locals() {
+        let root = local.repo().store().repo_root().to_path_buf();
+        let endpoint = match hord_api::local::endpoint(&root) {
+            Ok(endpoint) => endpoint,
+            Err(err) => {
+                eprintln!("hord serve: no local endpoint for {name}: {err}");
+                continue;
+            }
+        };
+        let workspaces: Arc<dyn WorkspacesBackend> =
+            Arc::new(LocalWorkspaces::local(local.repo().clone(), None));
+        let server = Server::new(
+            Hosts::from_local(name.to_owned(), Arc::clone(local)),
+            ServerConfig::default(),
+        )
+        .with_workspaces(workspaces);
+        let mut stopped = stopped.clone();
+        let name = name.to_owned();
+        tasks.push(tokio::spawn(async move {
+            let shutdown = async move {
+                let _ = stopped.wait_for(|stop| *stop).await;
+            };
+            if let Err(err) = server.serve_local(&endpoint, shutdown).await {
+                eprintln!("hord serve: local endpoint of {name}: {err}");
+            }
+        }));
+    }
+    (stop, tasks)
 }
