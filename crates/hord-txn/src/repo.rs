@@ -11,6 +11,8 @@ use hord_core::{
 };
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::gate::Verifier;
 use crate::lander::QueueEntry;
@@ -204,6 +206,11 @@ pub(crate) struct Inner {
     pub wake: tokio::sync::Notify,
     /// The persisted event log (spec §10.5.3), opened on first use.
     pub events: Mutex<Option<Arc<crate::events::EventLog>>>,
+    /// Every task this repository spawns that holds it: blocking store
+    /// work, verification, and replays. [`Repo::close`] waits for them.
+    pub tasks: TaskTracker,
+    /// Cancelled by [`Repo::close`]: replays stop at once.
+    pub closing: CancellationToken,
     /// Reference indexes for impact sets ([`crate::graph`]).
     pub refs: Mutex<crate::graph::RefCache>,
     /// Checkout slots for verification ([`crate::gate`]).
@@ -411,6 +418,8 @@ impl Inner {
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
             wake: tokio::sync::Notify::new(),
             events: Mutex::new(None),
+            tasks: TaskTracker::new(),
+            closing: CancellationToken::new(),
             refs: Mutex::new(crate::graph::RefCache::default()),
             slots: crate::gate::Slots::default(),
             fetching: std::array::from_fn(|_| Mutex::new(())),
@@ -658,8 +667,12 @@ where
     T: Send + 'static,
     F: FnOnce(&Inner) -> Result<T> + Send + 'static,
 {
+    let tasks = inner.tasks.clone();
     let inner = Arc::clone(inner);
-    spawn_blocking(move || f(&inner)).await
+    tasks
+        .spawn_blocking(move || f(&inner))
+        .await
+        .map_err(|err| Error::Task(err.to_string()))?
 }
 
 /// Run `f` on tokio's blocking pool.
@@ -925,6 +938,26 @@ impl Repo {
     ) -> Result<hord_api::EventStream> {
         let log = blocking(&self.inner, Inner::event_log).await?;
         Ok(log.subscribe(from))
+    }
+
+    /// End every event stream and wait for the tasks behind them (see
+    /// [`Self::events`]); later streams end at once. Lets a server's live
+    /// streams, and so its connections, finish before it stops.
+    pub async fn close_events(&self) {
+        self.inner.close_events().await;
+    }
+
+    /// Stop what this repository runs in the background and wait until none
+    /// of it holds the repository: replays are stopped (a dropped attempt
+    /// kills its harness, and the next start resumes it), event streams
+    /// end, and every blocking, verification, and replay task it spawned is
+    /// awaited. The handle stays usable for reads and writes; it runs no
+    /// more replays or event streams.
+    pub async fn close(&self) {
+        self.inner.closing.cancel();
+        self.inner.close_events().await;
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
     }
 
     /// Up to `limit` recorded events with a cursor greater than `after`, in

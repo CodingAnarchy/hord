@@ -14,6 +14,13 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use hord_api::proto::event::Kind;
+use hord_api::{ChangesBackend, proto, wire};
+use hord_core::sign::{PublicKey, SigningKey};
+use hord_core::{Bytes, ObjectId, Signature};
+use hord_remote::RemoteRepo;
+use hord_txn::{Arbitration, verify_arbitration};
+
 const LIB: &str = "pub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n";
 /// Editing a function needs a human's review, and nothing else.
 const POLICY: &str = "[[rule]]\nname = \"functions need a human\"\n\
@@ -199,12 +206,13 @@ struct World {
     homes: TempDir,
     _origin: TempDir,
     clone: TempDir,
-    _server: Serve,
+    server: Serve,
     _op: PathBuf,
     ada: PathBuf,
     eve: PathBuf,
     bot: PathBuf,
     nobody: PathBuf,
+    judge: PathBuf,
     bot_key: String,
 }
 
@@ -222,6 +230,7 @@ fn world() -> TestResult<World> {
         home("bot")?,
         home("nobody")?,
     );
+    let judge = home("judge")?;
 
     // The origin: a function-editing policy at head, and a user table.
     let origin = TempDir::new("hord-auth-origin")?;
@@ -246,6 +255,7 @@ fn world() -> TestResult<World> {
         ("root", &["admin"][..]),
         ("ada", &["read", "propose", "review:human"][..]),
         ("eve", &["read", "propose"][..]),
+        ("judge", &["read", "arbitrate"][..]),
     ] {
         let mut args = vec![
             "user",
@@ -315,12 +325,13 @@ fn world() -> TestResult<World> {
         homes,
         _origin: origin,
         clone,
-        _server: server,
+        server,
         _op: op,
         ada,
         eve,
         bot,
         nobody,
+        judge,
         bot_key,
     })
 }
@@ -504,6 +515,108 @@ fn a_review_carries_across_a_clean_rebase() -> TestResult {
     Ok(())
 }
 
+/// `hord arbitrate` against `hord serve --auth` (spec §6.4 rung 3,
+/// §10.5.4): a token without `arbitrate` is refused; the judge's
+/// `--pick theirs` lands a resolution with both parents, and the
+/// `Arbitrated` event's signature verifies with the judge's key only.
+#[test]
+fn hord_arbitrate_resolves_a_parked_change_with_a_signed_decision() -> TestResult {
+    let w = world()?;
+    let (dir, bot, eve, judge) = (&w.clone.0, &w.bot, &w.eve, &w.judge);
+
+    // Two agent edits to the same line of a file no rule covers, from the
+    // same head: the first lands, the second conflicts.
+    let mut changes = Vec::new();
+    let workspaces = [
+        json(dir, bot, &["ws", "new"])?,
+        json(dir, bot, &["ws", "new"])?,
+    ];
+    for (ws, (text, summary)) in workspaces.iter().zip([
+        ("alpha notes\n", "alpha notes"),
+        ("beta notes\n", "beta notes"),
+    ]) {
+        let id = str_field(ws, "id")?.to_owned();
+        let notes = PathBuf::from(str_field(ws, "materialization")?).join("docs/notes.txt");
+        fs::write(&notes, text)?;
+        let intent = w.homes.0.join(format!("{}.md", summary.replace(' ', "-")));
+        fs::write(&intent, format!("---\nsummary: {summary}\n---\nWhy.\n"))?;
+        let intent = intent.to_str().ok_or("intent path is UTF-8")?;
+        let proposed = json(dir, bot, &["propose", "-w", &id, "--intent", intent])?;
+        changes.push(str_field(&proposed, "change")?.to_owned());
+    }
+    let (first, second) = (&changes[0], &changes[1]);
+    json(dir, bot, &["submit", first])?;
+    wait_for(dir, bot, first, LANDED)?;
+    json(dir, bot, &["submit", second])?;
+    wait_for(dir, bot, second, "QUEUE_STATUS_CONFLICTED")?;
+
+    // Eve may not arbitrate.
+    w.login(eve, "eve")?;
+    let denied = fails(dir, eve, &["arbitrate", second, "--pick", "theirs"])?;
+    assert!(denied.contains("requires scope arbitrate"), "{denied}");
+
+    // The judge takes the parked change.
+    let judge_key = w.login(judge, "judge")?;
+    let reply = json(dir, judge, &["arbitrate", second, "--pick", "theirs"])?;
+    let resolution = str_field(&reply, "change")?.to_owned();
+    let entry = wait_for(dir, judge, second, "QUEUE_STATUS_ARBITRATED")?;
+    assert_eq!(entry["landed"], resolution.as_str(), "{entry:#}");
+    let log = json(dir, judge, &["log"])?;
+    let landed = log["changes"]
+        .as_array()
+        .and_then(|c| c.last())
+        .ok_or("the log has changes")?;
+    assert_eq!(landed["change"], resolution.as_str(), "{log:#}");
+    let parents = landed["parents"].as_array().ok_or("parents")?;
+    for parent in [first, second] {
+        assert!(parents.iter().any(|p| p == parent.as_str()), "{landed:#}");
+    }
+
+    // The signed Arbitrated event, read with the judge's token.
+    let credentials: toml::Value =
+        toml::from_str(&fs::read_to_string(judge.join("credentials.toml"))?)?;
+    let token = credentials["remotes"][w.server.url.as_str()]["token"]
+        .as_str()
+        .ok_or("the judge's token")?
+        .to_owned();
+    let url = w.server.url.clone();
+    let parked = second.clone();
+    let event = tokio::runtime::Runtime::new()?.block_on(async move {
+        let remote = RemoteRepo::connect_with_token(&url, &token).await?;
+        for _ in 0..300 {
+            let view = ChangesBackend::get_change(
+                &remote.changes(),
+                proto::GetChangeRequest {
+                    change: parked.clone(),
+                },
+            )
+            .await?;
+            let found = view.history.iter().find_map(|e| {
+                match e.event.as_ref().and_then(|e| e.kind.as_ref()) {
+                    Some(Kind::Arbitrated(a)) => Some(a.clone()),
+                    _ => None,
+                }
+            });
+            if let Some(found) = found {
+                return Ok::<_, Box<dyn std::error::Error>>(found);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err("no Arbitrated event".into())
+    })?;
+    assert_eq!(event.by.as_ref().map(wire::actor_id), Some("judge"));
+    let signature = Signature {
+        key_id: event.key_id.clone().ok_or("the event names its key")?,
+        bytes: Bytes::new(event.signature.clone().ok_or("the event is signed")?),
+    };
+    let parked: ObjectId = second.parse()?;
+    let judge_key: PublicKey = judge_key.parse()?;
+    verify_arbitration(parked, &Arbitration::PickTheirs, &signature, &judge_key)?;
+    let other = SigningKey::generate()?.public();
+    assert!(verify_arbitration(parked, &Arbitration::PickTheirs, &signature, &other).is_err());
+    Ok(())
+}
+
 /// `hord` through the repository's per-repo daemon (ADR 0021), started on
 /// demand, as the identity whose `~/.hord` is `home`.
 fn daemon_json(dir: &Path, home: &Path, args: &[&str]) -> TestResult<serde_json::Value> {
@@ -580,7 +693,7 @@ fn daemon_proposals_are_signed_with_the_users_key() -> TestResult {
     let verified = daemon_json(dir, &home.0, &["key", "verify", &change, "--key", &key])?;
     assert_eq!(verified["verified"], true, "{verified:#}");
     assert_eq!(verified["kind"], "change");
-    let other = hord_core::sign::SigningKey::generate()?.public().key_id();
+    let other = SigningKey::generate()?.public().key_id();
     let out = hord(
         dir,
         &home.0,

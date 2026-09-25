@@ -10,9 +10,7 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::error::Error;
 use std::fs;
-use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -121,40 +119,19 @@ async fn serve_with(root: &Path, setup: impl FnOnce(Server) -> Server) -> TestRe
     serve_harness(root, None, setup).await
 }
 
-/// Open a repository a server just released. A stopped server's event log
-/// can stay locked for a moment while its last stream tasks wind down, so
-/// "already open" is retried for a few seconds.
-async fn reopen<T, E, F>(open: impl Fn() -> F) -> TestResult<T>
-where
-    F: Future<Output = Result<T, E>>,
-    E: Error + 'static,
-{
-    for _ in 0..100 {
-        match open().await {
-            Err(err) if err.to_string().contains("already open") => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            other => return Ok(other?),
-        }
-    }
-    Ok(open().await?)
-}
-
 async fn serve_harness(
     root: &Path,
     harness: Option<Arc<dyn ReplayHarness>>,
     setup: impl FnOnce(Server) -> Server,
 ) -> TestResult<Running> {
-    let hosts = reopen(|| {
-        Hosts::open_repo(
-            root,
-            RepoOptions {
-                verifier: Some(Arc::new(hord_txn::StubVerifier)),
-                harness: harness.clone(),
-                ..RepoOptions::default()
-            },
-        )
-    })
+    let hosts = Hosts::open_repo(
+        root,
+        RepoOptions {
+            verifier: Some(Arc::new(hord_txn::StubVerifier)),
+            harness,
+            ..RepoOptions::default()
+        },
+    )
     .await?;
     let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
     let addr = listener.local_addr()?;
@@ -255,7 +232,7 @@ async fn scenario() -> TestResult<Scenario> {
 
     // Store the recording in the repository, then serve it again.
     let recording = {
-        let repo = reopen(|| Repo::open(&dir.0)).await?;
+        let repo = Repo::open(&dir.0).await?;
         save_recording(&repo, recorder.finish()?)?
     };
     let running = serve(&dir.0).await?;

@@ -28,6 +28,9 @@ use crate::{Error, Result};
 /// How long shutdown waits for open calls (such as event streams) to end.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How often shutdown checks that the served routes released the hosts.
+const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Options for [`Server::bind`].
 #[derive(Clone, Debug, Default)]
 pub struct ServeOptions {
@@ -158,6 +161,11 @@ impl Server {
 
     /// Serve on `listener` until `shutdown` resolves, then stop the
     /// landers. Webhooks run meanwhile.
+    ///
+    /// Returns only once nothing the server started holds a repository:
+    /// event streams, connections, webhooks, landers, and the tasks the
+    /// repositories spawned have all ended. Dropping the [`Server`] then
+    /// closes every repository, which may be reopened at once.
     pub async fn serve(
         &self,
         listener: TcpListener,
@@ -217,32 +225,51 @@ impl Server {
             })
             .collect();
         let (stop, mut stopped) = tokio::sync::watch::channel(());
-        let serving = tonic::transport::Server::builder()
-            .accept_http1(true)
-            .layer(crate::activity::ActivityLayer(Arc::clone(&self.activity)))
-            .layer(RepoPrefixLayer::new(self.hosts.names().map(str::to_owned)))
-            .layer(AuthLayer(self.auth.clone()))
-            .add_routes(self.routes())
-            .serve_with_incoming_shutdown(incoming, async move {
-                let _ = stopped.changed().await;
-            });
-        tokio::pin!(serving);
-        // Graceful shutdown waits for every connection to close, and a live
-        // event stream never does: after the grace period, stop anyway.
-        let served = tokio::select! {
-            served = &mut serving => served,
-            () = shutdown => {
-                let _ = stop.send(());
-                tokio::time::timeout(SHUTDOWN_GRACE, &mut serving)
-                    .await
-                    .unwrap_or(Ok(()))
+        let served = {
+            let serving = tonic::transport::Server::builder()
+                .accept_http1(true)
+                .layer(crate::activity::ActivityLayer(Arc::clone(&self.activity)))
+                .layer(RepoPrefixLayer::new(self.hosts.names().map(str::to_owned)))
+                .layer(AuthLayer(self.auth.clone()))
+                .add_routes(self.routes())
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = stopped.changed().await;
+                });
+            tokio::pin!(serving);
+            tokio::select! {
+                served = &mut serving => served,
+                () = shutdown => {
+                    let _ = stop.send(());
+                    // Graceful shutdown waits for every connection to close. A
+                    // live event stream (gRPC `Events`, the UI's SSE relay)
+                    // never ends by itself: end them all first, so the drain
+                    // finishes. The grace period only bounds a client that keeps
+                    // a request open.
+                    self.hosts.close_events().await;
+                    tokio::time::timeout(SHUTDOWN_GRACE, &mut serving)
+                        .await
+                        .unwrap_or(Ok(()))
+                }
             }
         };
+        // Nothing may hold a repository once this returns, so a caller can
+        // reopen it at once: the webhook tasks, the landers and every task
+        // the repositories spawned, and then the services' own handles.
         for hook in hooks {
             hook.abort();
+            let _ = hook.await;
         }
         self.hosts.shutdown().await;
+        self.released().await;
         Ok(served?)
+    }
+
+    /// Wait until the served routes (each service holds the hosts) are
+    /// gone, which happens once every connection task has ended.
+    async fn released(&self) {
+        while Arc::strong_count(&self.hosts) > 1 {
+            tokio::time::sleep(RELEASE_POLL).await;
+        }
     }
 }
 

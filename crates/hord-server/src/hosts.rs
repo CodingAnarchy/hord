@@ -194,7 +194,16 @@ impl Hosts {
         }
     }
 
-    /// Stop every lander this server started.
+    /// End the event streams of every repository this server opened, so
+    /// its connections can drain.
+    pub async fn close_events(&self) {
+        for local in &self.locals {
+            local.close_events().await;
+        }
+    }
+
+    /// Stop every lander this server started and close its repository:
+    /// afterwards no task they spawned holds it.
     pub async fn shutdown(&self) {
         for (_, local) in &self.locals {
             local.shutdown().await;
