@@ -786,7 +786,7 @@ Accept:
 
 ### M6 — Self-hosting
 
-Deliver: hord's own repository is a hord repository, served by `hord serve` on a team host. The git mirror (`hord git sync`) is what GitHub sees. All contributions — human and agent — go through the lander. Web UI views 4–6 (lineage, provenance trace, repository browser).
+Deliver: hord's own repository is a hord repository, served by `hord serve` on a team host. The git mirror (`hord git sync`) is what GitHub sees. All contributions — human and agent — go through the lander. Web UI views 4–6 (lineage, provenance trace, repository browser). TLS for `hord serve` (in-process `rustls` or a documented terminating proxy; ADR 0032).
 
 Accept:
 - Thirty consecutive days of development with zero manual git operations by the core team.
@@ -796,7 +796,7 @@ Accept:
 
 ### M7 — Scale and breadth (OPEN, sequenced by need)
 
-Candidates: FUSE VFS; partitioned landers; second Tier 2 adapter (TypeScript or Python) to validate the adapter abstraction; WASM adapters; rust-analyzer-precision references; coverage-refined test edges; mirrored landers.
+Candidates: FUSE VFS; partitioned landers; second Tier 2 adapter (TypeScript or Python) to validate the adapter abstraction; WASM adapters; rust-analyzer-precision references; coverage-refined test edges; mirrored landers; OIDC login (§10.5.4, ADR 0032).
 
 ---
 
