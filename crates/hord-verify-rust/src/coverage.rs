@@ -128,6 +128,22 @@ pub struct CoverageOptions {
     pub lines_of_interest: BTreeMap<RepoPath, BTreeSet<u32>>,
 }
 
+impl Default for CoverageOptions {
+    /// Whole workspace, `target/hord-coverage`, one job per available CPU,
+    /// a 10-minute test timeout, nothing skipped or filtered.
+    fn default() -> Self {
+        Self {
+            packages: None,
+            target_dir: PathBuf::from("target/hord-coverage"),
+            jobs: std::thread::available_parallelism().map_or(1, usize::from),
+            test_timeout: Duration::from_secs(600),
+            skip: BTreeSet::new(),
+            only: None,
+            lines_of_interest: BTreeMap::new(),
+        }
+    }
+}
+
 /// Which tests an instrumented run runs: a selection, as
 /// [`TestFilter::from_selection`] maps it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -413,6 +429,17 @@ impl BuiltSuite {
 /// instrumented, list their tests, and capture the environment each runs
 /// in. `None` when nothing is selected, so nothing is built.
 pub fn build_suite(checkout: &Checkout, options: &CoverageOptions) -> Result<Option<BuiltSuite>> {
+    build_suite_with_env(checkout, options, &BTreeMap::new())
+}
+
+/// [`build_suite`] with `extra_env` set for the build and for every test
+/// process the suite later runs: configuration of the repository's own test
+/// suite (a switch its tests read), not hord's.
+pub fn build_suite_with_env(
+    checkout: &Checkout,
+    options: &CoverageOptions,
+    extra_env: &BTreeMap<String, String>,
+) -> Result<Option<BuiltSuite>> {
     let start = Instant::now();
     let root = checkout.root.canonicalize()?;
     let workspace = CargoWorkspace::load(&root)?;
@@ -471,6 +498,7 @@ pub fn build_suite(checkout: &Checkout, options: &CoverageOptions) -> Result<Opt
         ])
         .current_dir(&root)
         .envs(&env)
+        .envs(extra_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -545,6 +573,7 @@ pub fn build_suite(checkout: &Checkout, options: &CoverageOptions) -> Result<Opt
         ))
         .current_dir(&root)
         .envs(&env)
+        .envs(extra_env)
         .env("HORD_CAPTURE_DIR", work.join("capture"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

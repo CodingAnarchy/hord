@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn failures_fail_the_verdict_and_are_reused_as_failures() {
+    fn failures_fail_the_verdict_and_are_reused_as_failures() -> std::result::Result<(), String> {
         let index = MemoryIndex::new();
         let verifier = fake("lint");
         let checkout = Checkout {
@@ -291,7 +291,7 @@ mod tests {
         let verdict =
             verify(&verifier, &index, &checkout, &ImpactSet::default(), &policy).expect("verify");
         let Verdict::Fail { evidence, reason } = verdict else {
-            panic!("expected failure");
+            return Err(format!("expected a failing verdict, got {verdict:?}"));
         };
         assert_eq!(evidence.len(), 2);
         assert!(reason.contains("true lint: boom"), "{reason}");
@@ -299,5 +299,6 @@ mod tests {
             verify(&verifier, &index, &checkout, &ImpactSet::default(), &policy).expect("verify");
         assert!(!again.passed());
         assert_eq!(verifier.runs.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 }

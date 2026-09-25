@@ -113,10 +113,10 @@ fn llvm_cov_installed() -> bool {
 }
 
 #[test]
-fn coverage_follows_subprocesses_and_drives_selection() {
+fn coverage_follows_subprocesses_and_drives_selection() -> Result<(), String> {
     if !llvm_cov_installed() {
         eprintln!("skipping: cargo-llvm-cov is not installed");
-        return;
+        return Ok(());
     }
     let dir = fixture();
     let root = dir.0.clone();
@@ -161,10 +161,10 @@ fn coverage_follows_subprocesses_and_drives_selection() {
             .tests
             .iter()
             .find(|t| t.test.name == name)
-            .unwrap_or_else(|| panic!("no test {name}: {:?}", record.tests))
+            .ok_or_else(|| format!("no test {name} in the record: {:?}", record.tests))
     };
     // The unit test ran `double` in-process.
-    let unit = by_name("tests::doubles");
+    let unit = by_name("tests::doubles")?;
     let unit_covers: BTreeSet<NodeId> = record.covered_by(unit).collect();
     assert!(unit_covers.contains(&node("double")), "{unit_covers:?}");
     assert!(!unit_covers.contains(&node("triple")));
@@ -172,7 +172,7 @@ fn coverage_follows_subprocesses_and_drives_selection() {
     assert_eq!(unit.test.target.kind, "lib");
     // The integration test ran the binary as a subprocess: `main`, `shout`,
     // and the library's `triple` are attributed to it.
-    let cli = by_name("runs_the_binary");
+    let cli = by_name("runs_the_binary")?;
     let cli_covers: BTreeSet<NodeId> = record.covered_by(cli).collect();
     for f in ["runs_the_binary", "main", "shout", "triple"] {
         assert!(
@@ -385,4 +385,5 @@ fn coverage_follows_subprocesses_and_drives_selection() {
         index.evidence_at(snapshot).expect("evidence at").len(),
         before
     );
+    Ok(())
 }

@@ -360,21 +360,12 @@ pub fn select_ignoring(input: SelectInput<'_>, ignore: &BTreeSet<&str>) -> Selec
             .or_default()
             .insert(test.name.clone());
     }
-    // Coverage is fresh per test: a test whose executed code changed between
-    // its record's snapshot and the verified one is selected; one whose
-    // snapshot the drift chain does not know is selected too.
+    // Coverage is fresh per test, and staleness is checked run by run: a test
+    // is selected when one of its last runs executed code that changed since
+    // that run's own snapshot (or a snapshot the chain does not know).
     if let Some(drift) = input.drift {
-        let mut since: BTreeMap<hord_core::SnapshotId, Option<BTreeSet<NodeId>>> = BTreeMap::new();
         for t in &coverage.tests {
-            let snapshot = coverage.test_snapshot(t);
-            let changed = since
-                .entry(snapshot)
-                .or_insert_with(|| drift.changed_since(snapshot));
-            let stale = match changed {
-                None => true,
-                Some(changed) => coverage.covered_by(t).any(|n| changed.contains(&n)),
-            };
-            if stale {
+            if coverage.is_stale(t, drift) {
                 sel.exact
                     .entry((t.test.package.clone(), t.test.target.clone()))
                     .or_default()
@@ -650,6 +641,46 @@ mod tests {
             drift: Some(&drift),
         });
         assert!(exact(&sel).is_empty());
+    }
+
+    #[test]
+    fn a_change_that_predates_the_run_that_executed_it_does_not_select() {
+        use hord_verify::Drift;
+        let (s0, s1, s2) = (
+            ObjectId::from_bytes([1; 32]),
+            ObjectId::from_bytes([2; 32]),
+            ObjectId::from_bytes([3; 32]),
+        );
+        let run = |s, covers: &[u128]| {
+            CoverageRecord::new(
+                s,
+                tc(),
+                BTreeSet::new(),
+                vec![(
+                    t("a", "testsuite", "m::t"),
+                    None,
+                    covers.iter().copied().map(n).collect(),
+                    false,
+                )],
+            )
+        };
+        // g(2) changed at s1; run 2, taken at s1, executed the new g. Run 1
+        // (at s0) never ran g.
+        let ledger = run(s0, &[1]).merge(&run(s1, &[1, 2]));
+        let mut drift = Drift::new(s0);
+        drift.push(s1, [n(2)].into_iter().collect());
+        drift.push(s2, [n(7)].into_iter().collect());
+        let ws = sample();
+        let i = impact(&[7], &[], vec![]);
+        let sel = select(SelectInput {
+            coverage: Some(&ledger),
+            toolchain: tc(),
+            workspace: &ws,
+            impact: &i,
+            max_impact: None,
+            drift: Some(&drift),
+        });
+        assert!(exact(&sel).is_empty(), "{:?}", sel.exact);
     }
 
     #[test]

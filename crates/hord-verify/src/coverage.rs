@@ -138,6 +138,42 @@ impl CoverageRecord {
         }
     }
 
+    /// `test`'s runs, oldest first, each with its snapshot and the
+    /// definitions it executed. An entry without [`TestCoverage::runs`] is
+    /// one run: its snapshot and coverage.
+    #[must_use]
+    pub fn runs(&self, test: &TestCoverage) -> Vec<(SnapshotId, BTreeSet<NodeId>)> {
+        if test.runs.is_empty() {
+            return vec![(self.test_snapshot(test), self.covered_by(test).collect())];
+        }
+        test.runs
+            .iter()
+            .map(|r| {
+                let nodes = r
+                    .covers
+                    .iter()
+                    .filter_map(|i| self.defs.get(*i as usize).copied())
+                    .collect();
+                (r.snapshot, nodes)
+            })
+            .collect()
+    }
+
+    /// Whether `test` is stale under `drift` (ADR 0022, staleness checked
+    /// run by run): for some run r among its runs, a definition r executed
+    /// changed since r's own snapshot. A run whose snapshot the chain does
+    /// not know counts as stale. Coverage selection, by contrast, uses the
+    /// union of the runs ([`Self::tests_covering`]).
+    #[must_use]
+    pub fn is_stale(&self, test: &TestCoverage, drift: &crate::Drift) -> bool {
+        self.runs(test).iter().any(
+            |(snapshot, executed)| match drift.changed_since(*snapshot) {
+                None => true,
+                Some(changed) => !executed.is_disjoint(&changed),
+            },
+        )
+    }
+
     /// The snapshot `test`'s coverage was taken on.
     #[must_use]
     pub fn test_snapshot(&self, test: &TestCoverage) -> SnapshotId {
@@ -167,23 +203,7 @@ impl CoverageRecord {
         defs.extend(newer.defs.iter().copied());
         // Every test's runs as node sets, oldest first.
         type Runs = Vec<(SnapshotId, BTreeSet<NodeId>)>;
-        let runs_of = |record: &CoverageRecord, t: &TestCoverage| -> Runs {
-            if t.runs.is_empty() {
-                vec![(record.test_snapshot(t), record.covered_by(t).collect())]
-            } else {
-                t.runs
-                    .iter()
-                    .map(|r| {
-                        let nodes = r
-                            .covers
-                            .iter()
-                            .filter_map(|i| record.defs.get(*i as usize).copied())
-                            .collect();
-                        (r.snapshot, nodes)
-                    })
-                    .collect()
-            }
-        };
+        let runs_of = |record: &CoverageRecord, t: &TestCoverage| -> Runs { record.runs(t) };
         let mut entries: BTreeMap<TestRef, (TestCoverage, Runs)> = BTreeMap::new();
         for t in &self.tests {
             entries.insert(t.test.clone(), (t.clone(), runs_of(self, t)));
@@ -417,6 +437,49 @@ mod tests {
             hord_encoding::decode::<CoverageRecord>(&bytes).expect("decode"),
             ledger
         );
+    }
+
+    #[test]
+    fn staleness_is_checked_run_by_run() {
+        use crate::Drift;
+        let tc = ObjectId::from_bytes([2; 32]);
+        let snap = |n: u8| ObjectId::from_bytes([n; 32]);
+        let run = |s: u8, covers: &[u128]| {
+            CoverageRecord::new(
+                snap(s),
+                tc,
+                BTreeSet::new(),
+                vec![(t("x"), None, covers.iter().copied().map(n).collect(), false)],
+            )
+        };
+        // Run 1 (at s10) entered f(1) on a nondeterministic path; run 2 (at
+        // s11) entered only g(2).
+        let ledger = run(10, &[1, 2]).merge(&run(11, &[2]));
+        let x = &ledger.tests[0];
+        // h(3) changes at s11. Only run 2, taken at s11 (after the change),
+        // executed it.
+        let mut drift = Drift::new(snap(10));
+        drift.push(snap(11), [n(3)].into_iter().collect());
+        let later = run(10, &[1]).merge(&run(11, &[1, 3]));
+        let y = &later.tests[0];
+        // A change that predates the run that executed it: not stale.
+        assert!(!later.is_stale(y, &drift));
+        // The union-from-oldest reading would have selected it.
+        let changed = drift
+            .changed_since(later.test_snapshot(y))
+            .expect("known snapshot");
+        assert!(later.covered_by(y).any(|n| changed.contains(&n)));
+        // The nondeterministic path still selects: f(1), seen only in run 1,
+        // changes after run 1's snapshot.
+        drift.push(snap(12), [n(1)].into_iter().collect());
+        assert!(ledger.is_stale(x, &drift));
+        // Nothing either run executed changed: not stale.
+        let mut quiet = Drift::new(snap(10));
+        quiet.push(snap(11), BTreeSet::new());
+        quiet.push(snap(12), [n(9)].into_iter().collect());
+        assert!(!ledger.is_stale(x, &quiet));
+        // A run on a snapshot the chain does not know is stale.
+        assert!(ledger.is_stale(x, &Drift::new(snap(99))));
     }
 
     #[test]
