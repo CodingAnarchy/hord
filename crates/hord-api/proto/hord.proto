@@ -92,6 +92,20 @@ service Schema {
   rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
 }
 
+// Identity and authorization (spec §10.5.4): bearer tokens, scopes, and
+// the public signing keys the server has bound to actors.
+service Auth {
+  // Exchange a local user's name and password for a bearer token, and bind
+  // the user's public signing key to them. Needs no token.
+  rpc Login(LoginRequest) returns (LoginResponse);
+  // Mint a token bound to an agent actor, with a new signing key (`admin`).
+  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
+  // The caller's actor and scopes (any token).
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+  // A bound public key and whose it is (`read`).
+  rpc GetKey(GetKeyRequest) returns (GetKeyResponse);
+}
+
 // ---------------------------------------------------------------- common
 
 // Who did something (spec §3.5 `Actor`).
@@ -1154,4 +1168,137 @@ message GetSchemaResponse {
   bytes descriptor_set = 1;
   // JSON Schema (draft 2020-12) of the JSON mapping, generated from it.
   string json_schema = 2;
+}
+
+// ---------------------------------------------------------------- auth
+
+// Arguments to Login.
+message LoginRequest {
+  // User name in the server's user table.
+  string user = 1;
+  // The user's password.
+  string password = 2;
+  // Key id (`ed25519:<hex>`) of the user's signing key, bound to them.
+  string key_id = 3;
+}
+
+// A token for the user.
+message LoginResponse {
+  // Bearer token: send as `authorization: Bearer <token>`.
+  string token = 1;
+  // The actor the token is bound to.
+  Actor actor = 2;
+  // Its scopes (`read`, `propose`, `review:<kind>`, `arbitrate`, `admin`).
+  repeated string scopes = 3;
+}
+
+// Arguments to MintToken.
+message MintTokenRequest {
+  // Agent id.
+  string agent_id = 1;
+  // Model the agent runs.
+  string model = 2;
+  // Harness that runs it.
+  string harness = 3;
+  // Scopes to grant.
+  repeated string scopes = 4;
+}
+
+// A new agent token and its signing key.
+message MintTokenResponse {
+  // Bearer token.
+  string token = 1;
+  // The agent actor the token is bound to.
+  Actor actor = 2;
+  // Its scopes.
+  repeated string scopes = 3;
+  // Key id of the agent's new signing key, bound to the actor.
+  string key_id = 4;
+  // The private key, PKCS#8 PEM. The server does not keep it.
+  string private_key_pem = 5;
+}
+
+// Arguments to WhoAmI.
+message WhoAmIRequest {}
+
+// Who the caller is.
+message WhoAmIResponse {
+  // The token's actor; unset when the server does not require auth.
+  Actor actor = 1;
+  // The token's scopes.
+  repeated string scopes = 2;
+  // Whether the server requires a token.
+  bool auth_required = 3;
+}
+
+// Arguments to GetKey.
+message GetKeyRequest {
+  // Key id (`ed25519:<hex>`).
+  string key_id = 1;
+}
+
+// A bound public key.
+message GetKeyResponse {
+  // Key id.
+  string key_id = 1;
+  // The actor it is bound to.
+  Actor actor = 2;
+}
+
+// `hord login`.
+message LoginResult {
+  // Remote name.
+  string remote = 1;
+  // Its address.
+  string url = 2;
+  // The actor the token is bound to.
+  Actor actor = 3;
+  // Its scopes.
+  repeated string scopes = 4;
+  // Key id of the signing key bound to the actor.
+  string key_id = 5;
+  // Where the key file is.
+  string key_file = 6;
+}
+
+// `hord user add`.
+message UserAddResult {
+  // User name.
+  string user = 1;
+  // Scopes a login grants.
+  repeated string scopes = 2;
+  // The auth file written.
+  string auth_file = 3;
+}
+
+// `hord review`.
+message ReviewResult {
+  // The change reviewed.
+  string change = 1;
+  // The snapshot the review is about: the change's result.
+  string snapshot = 2;
+  // ObjectId of the signed Evidence.
+  string evidence = 3;
+  // Reviewer kind (`--as`).
+  string qualifier = 4;
+  // Whether it approves.
+  bool approved = 5;
+  // Key id that signed it.
+  string key_id = 6;
+}
+
+// `hord key verify`.
+message KeyVerifyResult {
+  // ObjectId of the signed object.
+  string object = 1;
+  // `change` or `evidence`.
+  string kind = 2;
+  // Key id it was checked against.
+  string key_id = 3;
+  // Whether the signature verifies with that key.
+  bool verified = 4;
+  // Why not, when it does not.
+  optional string reason = 5;
+  // The key's actor, when the server knows it.
+  Actor actor = 6;
 }

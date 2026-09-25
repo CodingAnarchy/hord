@@ -9,10 +9,16 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+argon2.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+blake3.workspace = true
 bytes.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 hord-api.workspace = true
+hord-core.workspace = true
+hord-encoding.workspace = true
 hord-store.workspace = true
 hord-txn.workspace = true
 http.workspace = true

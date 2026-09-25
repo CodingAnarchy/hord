@@ -21,6 +21,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod auth;
 mod backend;
 #[cfg(feature = "conformance")]
 pub mod conformance;
