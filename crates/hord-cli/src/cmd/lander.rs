@@ -19,6 +19,10 @@ fn status_name(entry: &proto::QueueEntry) -> &'static str {
         proto::QueueStatus::Conflicted => "conflicted",
         proto::QueueStatus::Rejected => "rejected",
         proto::QueueStatus::Parked => "parked",
+        proto::QueueStatus::Replaying => "replaying",
+        proto::QueueStatus::NeedsArbitration => "arbitration",
+        proto::QueueStatus::Replayed => "replayed",
+        proto::QueueStatus::Arbitrated => "arbitrated",
         proto::QueueStatus::Unspecified => "unknown",
     }
 }

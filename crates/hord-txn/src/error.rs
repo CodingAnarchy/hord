@@ -140,6 +140,18 @@ pub enum Error {
     /// Verification could not run.
     #[error("verification: {0}")]
     Verify(String),
+    /// The change is not waiting for an arbiter (spec §6.4 rung 3).
+    #[error("change {change} cannot be arbitrated: it is {status}")]
+    NotArbitrable {
+        /// The change.
+        change: ChangeId,
+        /// Where it is instead, in words.
+        status: String,
+    },
+    /// A replay was asked for, but the repository has no replay harness
+    /// ([`crate::RepoOptions::harness`]).
+    #[error("no replay harness is configured for this repository")]
+    NoHarness,
 }
 
 fn list(nodes: &[NodeId]) -> String {

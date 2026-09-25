@@ -88,8 +88,12 @@ pub trait RepoBackend: Send + Sync {
     /// Lander queue entries in submission order, filtered by the query.
     async fn queue(&self, request: proto::QueueQuery) -> ApiResult<proto::QueueResponse>;
 
-    /// Resolve a parked change (spec §6.4 rung 3). Returns
-    /// [`crate::ApiError::Unimplemented`] until M5 ships arbitration.
+    /// Resolve a parked change (spec §6.4 rung 3): keep what landed, take
+    /// the parked change, replay it again, or land a given change, as a
+    /// change whose parents include both colliding changes. An unknown
+    /// change is [`crate::ApiError::NotFound`]; one that is not conflicted
+    /// or waiting for arbitration is
+    /// [`crate::ApiError::FailedPrecondition`].
     async fn arbitrate(
         &self,
         request: proto::ArbitrateRequest,

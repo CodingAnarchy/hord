@@ -72,6 +72,13 @@ pub struct RepoOptions {
     /// a source that fetches on demand (spec §8.3); what it fetches is kept
     /// in the store, and writes go to the store.
     pub objects: Option<Arc<dyn ObjectSource>>,
+    /// The replay harness the lander runs on a conflicted change (spec
+    /// §6.4 rung 2, §6.6). `None`: conflicted changes wait as
+    /// [`crate::QueueStatus::Conflicted`] for an arbiter. A
+    /// [`crate::CommandHarness`] that proposes through `hord` needs the
+    /// lander to run in the process that serves the repository (its daemon
+    /// or `hord serve`).
+    pub harness: Option<Arc<dyn crate::ReplayHarness>>,
 }
 
 impl std::fmt::Debug for RepoOptions {
@@ -84,6 +91,7 @@ impl std::fmt::Debug for RepoOptions {
             )
             .field("verifier", &self.verifier.is_some())
             .field("objects", &self.objects.is_some())
+            .field("harness", &self.harness.as_ref().map(|h| h.name()))
             .finish()
     }
 }
@@ -209,6 +217,12 @@ pub(crate) struct Inner {
     /// Definitions of the last snapshot verified under coverage, updated by
     /// difference to the next ([`crate::gate`]).
     pub definition_index: Mutex<Option<(SnapshotId, Arc<hord_verify_rust::DefinitionIndex>)>>,
+    /// The replay harness ([`RepoOptions::harness`]).
+    pub harness: Option<Arc<dyn crate::ReplayHarness>>,
+    /// Serializes updates to escalation state on queue entries.
+    pub ladder: Mutex<()>,
+    /// Replays running in this process.
+    pub replays: crate::escalation::Replays,
 }
 
 impl Drop for Inner {
@@ -403,6 +417,9 @@ impl Inner {
             policies: Mutex::new(HashMap::new()),
             landed_chain: Mutex::new(crate::gate::LandedChain::default()),
             definition_index: Mutex::new(None),
+            harness: options.harness,
+            ladder: Mutex::new(()),
+            replays: crate::escalation::Replays::default(),
         })
     }
 

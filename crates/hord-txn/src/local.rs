@@ -8,12 +8,14 @@ use hord_api::{
     ApiError, ApiResult, DEFAULT_LOG_LIMIT, EventStream, MAX_BATCH_BYTES, MAX_BATCH_IDS,
     RepoBackend, proto, wire,
 };
-use hord_core::{ChangeId, ChangeRecord, Evidence, NodeId, ObjectId};
+use hord_core::{Actor, Bytes, ChangeId, ChangeRecord, Evidence, NodeId, ObjectId};
 use hord_store::EdgeKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::conflict::{ConflictKind, ConflictReport, MergeSeverity};
+use crate::escalation::{Arbiter, Arbitration, Escalation, ReplayOutcome};
 use crate::lander::{Lander, QueueEntry, QueueStatus};
+use crate::replay::summary_message;
 use crate::repo::{Inner, Repo};
 use crate::source::ObjectSource;
 use crate::{Error, Result};
@@ -112,9 +114,11 @@ impl From<Error> for ApiError {
             Error::InvalidPath(_) | Error::Encoding(_) | Error::Corrupt { .. } => {
                 Self::InvalidArgument(message)
             }
-            Error::AmbiguousName { .. } | Error::NotEmpty(_) | Error::NothingToPropose => {
-                Self::FailedPrecondition(message)
-            }
+            Error::AmbiguousName { .. }
+            | Error::NotEmpty(_)
+            | Error::NothingToPropose
+            | Error::NotArbitrable { .. }
+            | Error::NoHarness => Self::FailedPrecondition(message),
             _ => Self::Internal(message),
         }
     }
@@ -264,6 +268,20 @@ pub fn queue_entry_message(entry: &QueueEntry, record: Option<&ChangeRecord>) ->
             (proto::QueueStatus::Rejected, None, Some(reason.clone()))
         }
         QueueStatus::Parked { reason } => (proto::QueueStatus::Parked, None, Some(reason.clone())),
+        QueueStatus::Replaying { .. } => (proto::QueueStatus::Replaying, None, None),
+        QueueStatus::NeedsArbitration => (
+            proto::QueueStatus::NeedsArbitration,
+            None,
+            entry.escalation.as_ref().and_then(|e| e.note.clone()),
+        ),
+        QueueStatus::Replayed { landed } => {
+            (proto::QueueStatus::Replayed, Some(wire::id(*landed)), None)
+        }
+        QueueStatus::Arbitrated { landed } => (
+            proto::QueueStatus::Arbitrated,
+            Some(wire::id(*landed)),
+            None,
+        ),
     };
     let conflicts = entry
         .report
@@ -282,6 +300,53 @@ pub fn queue_entry_message(entry: &QueueEntry, record: Option<&ChangeRecord>) ->
         conflicts: u32::try_from(conflicts).unwrap_or(u32::MAX),
         hard: entry.report.as_ref().is_some_and(ConflictReport::has_hard),
         report: entry.report.as_ref().map(conflict_report_message),
+        escalation: entry.escalation.as_ref().map(escalation_message),
+    }
+}
+
+/// Wire form of an [`Escalation`].
+#[must_use]
+pub fn escalation_message(escalation: &Escalation) -> proto::Escalation {
+    proto::Escalation {
+        attempts: escalation
+            .attempts
+            .iter()
+            .map(|a| proto::ReplayAttempt {
+                attempt: a.attempt,
+                harness: a.harness.clone(),
+                outcome: match a.outcome {
+                    ReplayOutcome::Running => proto::ReplayOutcome::Running,
+                    ReplayOutcome::Proposed => proto::ReplayOutcome::Proposed,
+                    ReplayOutcome::GaveUp => proto::ReplayOutcome::GaveUp,
+                    ReplayOutcome::Killed => proto::ReplayOutcome::Killed,
+                    ReplayOutcome::OverBudget => proto::ReplayOutcome::OverBudget,
+                    ReplayOutcome::Failed => proto::ReplayOutcome::Failed,
+                }
+                .into(),
+                change: a.change.map(wire::id),
+                detail: a.detail.clone(),
+                elapsed_ms: a.elapsed_ms,
+                tokens: a.tokens,
+                cost_micros: a.cost_micros,
+                model: a.model.clone(),
+                note: a.note.clone(),
+            })
+            .collect(),
+        candidates: escalation
+            .candidates
+            .iter()
+            .map(|c| proto::ArbitrationCandidate {
+                change: wire::id(c.change),
+                attempts: c.attempts.clone(),
+                base: wire::id(c.base),
+                result: wire::id(c.result),
+                ops: c.ops,
+                settled: c.settled.clone(),
+            })
+            .collect(),
+        summary: escalation.summary.as_ref().map(summary_message),
+        resolution: escalation.resolution.as_ref().map(|r| wire::id(r.change)),
+        note: escalation.note.clone(),
     }
 }
 
@@ -412,6 +477,20 @@ impl Inner {
                 continue;
             }
             let mut view = queue_entry_message(&entry, record.as_ref());
+            // Asked about one conflicted change that has no summary yet (no
+            // harness replayed it): summarize it for the arbiter.
+            if change.is_some()
+                && entry.status == QueueStatus::Conflicted
+                && entry
+                    .escalation
+                    .as_ref()
+                    .is_none_or(|e| e.summary.is_none())
+                && let Some(report) = &entry.report
+                && let Ok(summary) = self.conflict_summary(entry.change, report)
+            {
+                view.escalation.get_or_insert_with(Default::default).summary =
+                    Some(summary_message(&summary));
+            }
             // Asked about one change: name the report's nodes (`hord
             // conflicts`).
             if change.is_some()
@@ -439,32 +518,7 @@ impl Inner {
                 records.push(record);
             }
         }
-        let mut known: std::collections::HashMap<NodeId, (Option<String>, String)> =
-            std::collections::HashMap::new();
-        for record in &records {
-            let paths: Vec<_> = self
-                .changed_paths(record.base, record.result)?
-                .into_iter()
-                .map(|d| d.path)
-                .collect();
-            for path in &paths {
-                known
-                    .entry(NodeId::file_root(path))
-                    .or_insert_with(|| (Some("(file)".into()), path.to_string()));
-            }
-            for snapshot in [record.base, record.result] {
-                for path in &paths {
-                    for def in self.definitions_at(snapshot, path)? {
-                        known.entry(def.node).or_insert_with(|| {
-                            (
-                                def.name.map(|n| n.as_str().to_owned()),
-                                def.path.to_string(),
-                            )
-                        });
-                    }
-                }
-            }
-        }
+        let known = self.node_names(&records.iter().collect::<Vec<_>>())?;
         let name = |node: &mut proto::NodeRef| {
             if let Ok(id) = node.id.parse::<NodeId>()
                 && let Some((name, path)) = known.get(&id)
@@ -617,11 +671,41 @@ impl RepoBackend for LocalRepo {
 
     async fn arbitrate(
         &self,
-        _request: proto::ArbitrateRequest,
+        request: proto::ArbitrateRequest,
     ) -> ApiResult<proto::ArbitrateResponse> {
-        Err(ApiError::Unimplemented(
-            "arbitration ships in M5 (spec §6.4 rung 3)".into(),
-        ))
+        use proto::arbitration::Action;
+        let change = wire::object_id("change", &request.change)?;
+        let action = match request.action.and_then(|a| a.action) {
+            Some(Action::PickOurs(true)) => Arbitration::PickOurs,
+            Some(Action::PickTheirs(true)) => Arbitration::PickTheirs,
+            Some(Action::Replay(true)) => Arbitration::Replay { note: request.note },
+            Some(Action::Resolved(id)) => {
+                Arbitration::Resolved(wire::object_id("action.resolved", &id)?)
+            }
+            Some(Action::PickOurs(false) | Action::PickTheirs(false) | Action::Replay(false))
+            | None => {
+                return Err(ApiError::InvalidArgument(
+                    "action: pick_ours, pick_theirs, replay, or resolved".into(),
+                ));
+            }
+        };
+        let actor = match &request.arbiter {
+            Some(actor) => wire::actor_from("arbiter", actor)?,
+            None => Actor::Human {
+                id: "anonymous".into(),
+            },
+        };
+        let arbiter = Arbiter {
+            actor,
+            key_id: request.key_id,
+            signature: request.signature.map(Bytes::new),
+        };
+        let (resolution, entry) = self.repo.arbitrate(change, action, arbiter).await?;
+        let entry = api(&self.repo, move |inner| Ok(inner.entry_with_record(&entry))).await?;
+        Ok(proto::ArbitrateResponse {
+            change: wire::id(resolution),
+            entry: Some(entry),
+        })
     }
 
     async fn node_history(
