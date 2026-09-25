@@ -7,10 +7,11 @@
 //! - head did not change it since the change's base: the change's version;
 //! - both changed it and it parses on all three sides: the structural 3-way
 //!   merge (spec §5.2, the lander's mode). While it reports a hard conflict,
-//!   the contested definitions in head's version are replaced by the parked
-//!   change's text (removed, when the change deleted them; appended, when
-//!   head deleted them), the result is identified against head, and the
-//!   merge runs again. Every definition not in contention stays as the
+//!   each contested definition gets the parked change's text at the place
+//!   head has that [`NodeId`] now (so a move head made within the file is
+//!   followed); it is removed when the change deleted it, and re-added at
+//!   its old place when head deleted it. The result is identified against
+//!   head, and the merge runs again. Every definition not in contention stays as the
 //!   merge produces it, so a non-conflicting edit head gained in the same
 //!   file (a third agent's landed change) is kept;
 //! - otherwise (a blob-tier file, one that does not parse, a conflict on
@@ -19,6 +20,7 @@
 //!   These files are reported ([`TheirsMerge::whole_file`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use hord_core::{Bytes, ChangeRecord, NodeId, RepoPath, SnapshotId};
@@ -120,6 +122,7 @@ impl Inner {
         };
         let root = NodeId::file_root(path);
         let theirs_defs = by_node(definitions(adapter, path, &theirs.tree));
+        let base_defs = by_node(definitions(adapter, path, &base.tree));
         let theirs_text = adapter.project(&theirs.tree.tree);
         let mut ours: Arc<IdentifiedTree> = Arc::clone(&head_view.tree);
         for _ in 0..MAX_ROUNDS {
@@ -145,6 +148,7 @@ impl Inner {
                 &ours_defs,
                 theirs_text.as_slice(),
                 &theirs_defs,
+                &base_defs,
                 &contested,
             ) else {
                 return Ok(None);
@@ -185,15 +189,49 @@ fn by_node(defs: Vec<DefinitionInfo>) -> BTreeMap<NodeId, DefinitionInfo> {
     defs.into_iter().map(|d| (d.node, d)).collect()
 }
 
-/// `ours` with each contested definition replaced by `theirs`' text of it:
-/// removed when `theirs` has no such definition, appended when `ours` has
-/// none. A contested definition inside another contested one goes with its
-/// parent. `None` when a contested id is in neither.
+/// Where to re-add `node`, a definition `ours` no longer has, and how to
+/// pad it: after its nearest earlier sibling in `base` that `ours` still
+/// has, else before its nearest later one, else at the end of the file.
+fn old_place(
+    node: NodeId,
+    ours: &[u8],
+    ours_defs: &BTreeMap<NodeId, DefinitionInfo>,
+    base_defs: &BTreeMap<NodeId, DefinitionInfo>,
+) -> (usize, bool) {
+    let Some(was) = base_defs.get(&node) else {
+        return (ours.len(), true);
+    };
+    let siblings = base_defs
+        .values()
+        .filter(|d| d.parent == was.parent && d.node != node && ours_defs.contains_key(&d.node));
+    let before = siblings
+        .clone()
+        .filter(|d| d.span.end <= was.span.start)
+        .max_by_key(|d| d.span.end);
+    if let Some(prev) = before.and_then(|d| ours_defs.get(&d.node)) {
+        return (prev.span.end, true);
+    }
+    let after = siblings
+        .filter(|d| d.span.start >= was.span.end)
+        .min_by_key(|d| d.span.start);
+    match after.and_then(|d| ours_defs.get(&d.node)) {
+        Some(next) => (next.span.start, false),
+        None => (ours.len(), true),
+    }
+}
+
+/// `ours` with each contested definition given `theirs`' text of it, at
+/// the place `ours` has that [`NodeId`] now (which follows a move head made
+/// within the file): removed when `theirs` has no such definition, and
+/// re-added at its old place ([`old_place`]) when `ours` has none (head
+/// deleted it). A contested definition inside another contested one goes
+/// with its parent. `None` when a contested id is in neither.
 fn take_theirs(
     ours: &[u8],
     ours_defs: &BTreeMap<NodeId, DefinitionInfo>,
     theirs: &[u8],
     theirs_defs: &BTreeMap<NodeId, DefinitionInfo>,
+    base_defs: &BTreeMap<NodeId, DefinitionInfo>,
     contested: &BTreeSet<NodeId>,
 ) -> Option<Vec<u8>> {
     let inside = |node: &NodeId, defs: &BTreeMap<NodeId, DefinitionInfo>| {
@@ -206,25 +244,34 @@ fn take_theirs(
         }
         false
     };
-    // (span in ours, replacement), applied back to front.
-    let mut splices: Vec<(std::ops::Range<usize>, Vec<u8>)> = Vec::new();
-    let mut appended: Vec<u8> = Vec::new();
+    // (span in ours, replacement), applied back to front. An insertion is
+    // an empty span.
+    let mut splices: Vec<(Range<usize>, Vec<u8>)> = Vec::new();
     for node in contested {
         if inside(node, ours_defs) || inside(node, theirs_defs) {
             continue;
         }
-        let text = |d: &DefinitionInfo, bytes: &[u8]| bytes.get(d.span.clone()).map(<[u8]>::to_vec);
+        let text = |d: &DefinitionInfo| theirs.get(d.span.clone()).map(<[u8]>::to_vec);
         match (ours_defs.get(node), theirs_defs.get(node)) {
-            (Some(o), Some(t)) => splices.push((o.span.clone(), text(t, theirs)?)),
+            (Some(o), Some(t)) => splices.push((o.span.clone(), text(t)?)),
             (Some(o), None) => splices.push((o.span.clone(), Vec::new())),
             (None, Some(t)) => {
-                appended.extend_from_slice(b"\n");
-                appended.extend(text(t, theirs)?);
+                let (at, after) = old_place(*node, ours, ours_defs, base_defs);
+                let body = text(t)?;
+                let mut insert = Vec::new();
+                if after {
+                    insert.extend_from_slice(b"\n\n");
+                    insert.extend(body.strip_suffix(b"\n").unwrap_or(&body));
+                } else {
+                    insert.extend(&body);
+                    insert.extend_from_slice(b"\n\n");
+                }
+                splices.push((at..at, insert));
             }
             (None, None) => return None,
         }
     }
-    splices.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+    splices.sort_by_key(|(span, _)| std::cmp::Reverse((span.start, span.end)));
     let mut out = ours.to_vec();
     let mut floor = usize::MAX;
     for (span, replacement) in splices {
@@ -235,11 +282,100 @@ fn take_theirs(
         floor = span.start;
         out.splice(span, replacement);
     }
-    if !appended.is_empty() {
-        if !out.ends_with(b"\n") {
-            out.push(b'\n');
-        }
-        out.extend(appended);
-    }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use hord_core::NodeKind;
+
+    use super::*;
+
+    const A: NodeId = NodeId::from_u128(1);
+    const D: NodeId = NodeId::from_u128(2);
+    const M: NodeId = NodeId::from_u128(3);
+    const Z: NodeId = NodeId::from_u128(4);
+
+    /// `node`'s definition: `snippet`'s place in `text`.
+    fn def(node: NodeId, text: &str, snippet: &str, parent: Option<NodeId>) -> DefinitionInfo {
+        let start = text.find(snippet).expect("the snippet is in the test text");
+        DefinitionInfo {
+            node,
+            path: "src/lib.rs".parse().expect("parse a literal path"),
+            kind: NodeKind::new("function_item"),
+            name: None,
+            span: start..start + snippet.len(),
+            parent,
+        }
+    }
+
+    fn defs(items: Vec<DefinitionInfo>) -> BTreeMap<NodeId, DefinitionInfo> {
+        by_node(items)
+    }
+
+    /// Head moved `d` into `mod m` (same NodeId): the parked edit of `d`
+    /// goes where head has it now, and nothing is left at the old place.
+    #[test]
+    fn a_move_within_the_file_is_followed() {
+        let base = "fn a() {}\n\nfn d() { 4 }\n";
+        let ours = "fn a() {}\n\nmod m {\n    fn d() { 4 }\n}\n";
+        let theirs = "fn a() {}\n\nfn d() { 44 }\n";
+        let ours_defs = defs(vec![
+            def(A, ours, "fn a() {}", None),
+            def(M, ours, "mod m {\n    fn d() { 4 }\n}", None),
+            def(D, ours, "fn d() { 4 }", Some(M)),
+        ]);
+        let theirs_defs = defs(vec![
+            def(A, theirs, "fn a() {}", None),
+            def(D, theirs, "fn d() { 44 }", None),
+        ]);
+        let base_defs = defs(vec![
+            def(A, base, "fn a() {}", None),
+            def(D, base, "fn d() { 4 }", None),
+        ]);
+        let out = take_theirs(
+            ours.as_bytes(),
+            &ours_defs,
+            theirs.as_bytes(),
+            &theirs_defs,
+            &base_defs,
+            &BTreeSet::from([D]),
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some("fn a() {}\n\nmod m {\n    fn d() { 44 }\n}\n".as_bytes())
+        );
+    }
+
+    /// Head deleted `d`: the parked side's `d` comes back at its old place,
+    /// between its old neighbors, not at the end of the file.
+    #[test]
+    fn a_deleted_definition_returns_at_its_old_place() {
+        let base = "fn a() {}\n\nfn d() { 4 }\n\nfn z() {}\n";
+        let ours = "fn a() {}\n\nfn z() {}\n";
+        let theirs = "fn a() {}\n\nfn d() { 44 }\n\nfn z() {}\n";
+        let ours_defs = defs(vec![
+            def(A, ours, "fn a() {}", None),
+            def(Z, ours, "fn z() {}", None),
+        ]);
+        let theirs_defs = defs(vec![
+            def(A, theirs, "fn a() {}", None),
+            def(D, theirs, "fn d() { 44 }", None),
+            def(Z, theirs, "fn z() {}", None),
+        ]);
+        let base_defs = defs(vec![
+            def(A, base, "fn a() {}", None),
+            def(D, base, "fn d() { 4 }", None),
+            def(Z, base, "fn z() {}", None),
+        ]);
+        let out = take_theirs(
+            ours.as_bytes(),
+            &ours_defs,
+            theirs.as_bytes(),
+            &theirs_defs,
+            &base_defs,
+            &BTreeSet::from([D]),
+        );
+        assert_eq!(out.as_deref(), Some(theirs.as_bytes()));
+    }
 }
