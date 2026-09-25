@@ -31,6 +31,10 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// How often shutdown checks that the served routes released the hosts.
 const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// How long shutdown waits for request tasks to release the repositories
+/// before it returns anyway (the store's lock timeout keeps a reopen safe).
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Options for [`Server::bind`].
 #[derive(Clone, Debug, Default)]
 pub struct ServeOptions {
@@ -162,10 +166,13 @@ impl Server {
     /// Serve on `listener` until `shutdown` resolves, then stop the
     /// landers. Webhooks run meanwhile.
     ///
-    /// Returns only once nothing the server started holds a repository:
-    /// event streams, connections, webhooks, landers, and the tasks the
-    /// repositories spawned have all ended. Dropping the [`Server`] then
-    /// closes every repository, which may be reopened at once.
+    /// Returns once nothing the server started holds a repository: event
+    /// streams, webhooks, and landers have ended, replays and verification
+    /// in progress are cancelled (nothing is recorded for them; the next
+    /// start resumes), and the tasks the repositories spawned are done.
+    /// Requests still open are waited for up to 10 s, then named on stderr.
+    /// Dropping the [`Server`] then closes every repository, which may be
+    /// reopened at once.
     pub async fn serve(
         &self,
         listener: TcpListener,
@@ -265,9 +272,21 @@ impl Server {
     }
 
     /// Wait until the served routes (each service holds the hosts) are
-    /// gone, which happens once every connection task has ended.
+    /// gone, which happens once every connection task has ended. After
+    /// [`RELEASE_WAIT`], say which repositories requests still hold, and
+    /// return.
     async fn released(&self) {
+        let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
         while Arc::strong_count(&self.hosts) > 1 {
+            if tokio::time::Instant::now() >= deadline {
+                let held: Vec<&str> = self.hosts.names().collect();
+                eprintln!(
+                    "hord serve: stopped with requests still holding {} after {}s",
+                    held.join(", "),
+                    RELEASE_WAIT.as_secs()
+                );
+                return;
+            }
             tokio::time::sleep(RELEASE_POLL).await;
         }
     }

@@ -11,6 +11,7 @@ use hord_core::{
 };
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
+use hord_verify_rust::Cancel;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -209,8 +210,11 @@ pub(crate) struct Inner {
     /// Every task this repository spawns that holds it: blocking store
     /// work, verification, and replays. [`Repo::close`] waits for them.
     pub tasks: TaskTracker,
-    /// Cancelled by [`Repo::close`]: replays stop at once.
+    /// Cancelled by [`Repo::close`]: replays and the lander stop at once.
     pub closing: CancellationToken,
+    /// Set with [`Self::closing`]: running verification commands are
+    /// killed (their process groups) and record nothing.
+    pub verify_cancel: Cancel,
     /// Reference indexes for impact sets ([`crate::graph`]).
     pub refs: Mutex<crate::graph::RefCache>,
     /// Checkout slots for verification ([`crate::gate`]).
@@ -420,6 +424,7 @@ impl Inner {
             events: Mutex::new(None),
             tasks: TaskTracker::new(),
             closing: CancellationToken::new(),
+            verify_cancel: Cancel::new(),
             refs: Mutex::new(crate::graph::RefCache::default()),
             slots: crate::gate::Slots::default(),
             fetching: std::array::from_fn(|_| Mutex::new(())),
@@ -658,6 +663,15 @@ impl Inner {
                 Ok((snapshot, parent))
             }
         }
+    }
+}
+
+impl Inner {
+    /// Stop replays, the lander's waits, and running verification (see
+    /// [`Repo::close`]); does not wait.
+    pub(crate) fn stop_background(&self) {
+        self.closing.cancel();
+        self.verify_cancel.cancel();
     }
 }
 
@@ -949,12 +963,13 @@ impl Repo {
 
     /// Stop what this repository runs in the background and wait until none
     /// of it holds the repository: replays are stopped (a dropped attempt
-    /// kills its harness, and the next start resumes it), event streams
-    /// end, and every blocking, verification, and replay task it spawned is
-    /// awaited. The handle stays usable for reads and writes; it runs no
+    /// kills its harness, and the next start resumes it), verification is
+    /// cancelled (its commands are killed and it records nothing; the next
+    /// start verifies again), event streams end, and every blocking,
+    /// verification, and replay task it spawned is awaited. The handle stays usable for reads and writes; it runs no
     /// more replays or event streams.
     pub async fn close(&self) {
-        self.inner.closing.cancel();
+        self.inner.stop_background();
         self.inner.close_events().await;
         self.inner.tasks.close();
         self.inner.tasks.wait().await;

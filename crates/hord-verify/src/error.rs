@@ -45,6 +45,10 @@ pub enum Error {
         /// What went wrong.
         message: String,
     },
+    /// Verification was cancelled (the repository is shutting down). It
+    /// says nothing about the change, so no evidence is recorded for it.
+    #[error("verification was cancelled")]
+    Cancelled,
 }
 
 impl Error {

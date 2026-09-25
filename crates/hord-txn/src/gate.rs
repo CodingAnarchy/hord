@@ -32,7 +32,8 @@ use hord_verify::{
     Checkout, CoverageRecord, Drift, EvidenceIndex, ImpactBound, ImpactSet, Toolchain, VerifyPlan,
     VerifyPolicy,
 };
-use hord_verify_rust::{DefinitionIndex, InstrumentedRun};
+use hord_verify_rust::{Cancel, DefinitionIndex, InstrumentedRun};
+use tokio_util::task::TaskTracker;
 
 use crate::conflict::ConflictReport;
 use crate::repo::{Inner, fs_path, lock};
@@ -74,6 +75,19 @@ pub trait VerifyContext: Send + Sync {
     /// The verifier planned `plan` (the `Verifying` event; `hord verify
     /// --plan-only`).
     fn planned(&self, plan: &VerifyPlan);
+
+    /// Set when verification must stop (the repository is shutting down):
+    /// running commands are killed and nothing is recorded. Never set by
+    /// default.
+    fn cancel(&self) -> Cancel {
+        Cancel::default()
+    }
+
+    /// Where to run blocking verification work so that closing the
+    /// repository waits for it; `None` runs it untracked.
+    fn tasks(&self) -> Option<TaskTracker> {
+        None
+    }
 }
 
 /// What the lander asks a [`Verifier`] to check.
@@ -191,6 +205,7 @@ pub trait VerifierFactory: Send + Sync {
         checkout: &Checkout,
         coverage: Option<Arc<CoverageRecord>>,
         drift: Option<Arc<Drift>>,
+        cancel: &Cancel,
     ) -> hord_verify::Result<Built>;
 }
 
@@ -280,6 +295,7 @@ impl VerifierFactory for RustFactory {
         checkout: &Checkout,
         coverage: Option<Arc<CoverageRecord>>,
         drift: Option<Arc<Drift>>,
+        cancel: &Cancel,
     ) -> hord_verify::Result<Built> {
         let toolchain = self.toolchain().ok_or_else(|| hord_verify::Error::Tool {
             tool: "rustc".into(),
@@ -290,6 +306,7 @@ impl VerifierFactory for RustFactory {
             .with_coverage(coverage)
             .with_drift(drift);
         verifier.runner = self.runner.clone();
+        verifier.runner.cancel = cancel.clone();
         verifier.quarantine = self.quarantine.clone();
         // Instrumented builds use other flags: their own target directory,
         // kept in the slot (`target/` survives a slot reset) or beside the
@@ -308,6 +325,7 @@ impl VerifierFactory for RustFactory {
                 skip: BTreeSet::new(),
                 only: None,
                 lines_of_interest: BTreeMap::new(),
+                cancel: cancel.clone(),
             },
         };
         Ok(Built {
@@ -401,12 +419,18 @@ impl Verifier for EngineVerifier {
     fn verify(&self, request: VerifyRequest) -> VerifyFuture<'_> {
         let factory = Arc::clone(&self.factory);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || engine_verify(factory.as_ref(), &request))
-                .await
-                .unwrap_or_else(|err| Verdict::Fail {
-                    evidence: Vec::new(),
-                    reason: format!("verification task failed: {err}"),
-                })
+            // Tracked, so closing the repository waits for it: a cancel
+            // kills its commands, and it returns at once.
+            let tasks = request.context.tasks();
+            let run = move || engine_verify(factory.as_ref(), &request);
+            let task = match tasks {
+                Some(tasks) => tasks.spawn_blocking(run),
+                None => tokio::task::spawn_blocking(run),
+            };
+            task.await.unwrap_or_else(|err| Verdict::Fail {
+                evidence: Vec::new(),
+                reason: format!("verification task failed: {err}"),
+            })
         })
     }
 }
@@ -455,6 +479,7 @@ fn engine_run(
         &checkout,
         coverage.map(|(_, record)| Arc::new(record)),
         drift,
+        &context.cancel(),
     )?;
     let verifier = built.verifier.as_ref();
     let tests_required = TEST_REQUIREMENTS.iter().any(|r| request.policy.requires(r));
@@ -1210,6 +1235,14 @@ fn verify_err(err: Error) -> hord_verify::Error {
 }
 
 impl VerifyContext for CandidateContext {
+    fn cancel(&self) -> Cancel {
+        self.inner.verify_cancel.clone()
+    }
+
+    fn tasks(&self) -> Option<TaskTracker> {
+        Some(self.inner.tasks.clone())
+    }
+
     fn impact(&self, bound: ImpactBound) -> hord_verify::Result<ImpactSet> {
         self.inner
             .impact_set(&self.record, bound, true)

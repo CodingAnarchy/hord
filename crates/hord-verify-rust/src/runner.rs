@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hord_core::{Actor, Evidence, EvidenceResult, ObjectId, SnapshotId, Timestamp};
 use hord_verify::{Check, EvidenceFields, EvidenceIndex, Result, Toolchain, put_log};
 
+use crate::cancel::Cancel;
 use crate::libtest::TestReport;
 
 /// Detect the Rust toolchain a checkout builds with (its
@@ -64,13 +65,15 @@ pub struct RunOutput {
     pub build_failed: bool,
     /// The timeout killed it.
     pub timed_out: bool,
+    /// A [`crate::Cancel`] killed it: it says nothing about the change.
+    pub cancelled: bool,
 }
 
 impl RunOutput {
     /// Whether the command succeeded.
     #[must_use]
     pub fn success(&self) -> bool {
-        self.code == Some(0) && !self.timed_out
+        self.code == Some(0) && !self.timed_out && !self.cancelled
     }
 
     /// One-line failure summary, `None` on success.
@@ -78,6 +81,9 @@ impl RunOutput {
     pub fn failure_summary(&self) -> Option<String> {
         if self.success() {
             return None;
+        }
+        if self.cancelled {
+            return Some("cancelled: verification was stopped".to_owned());
         }
         if self.timed_out {
             // Name what the command was doing when it was killed (for
@@ -152,6 +158,9 @@ pub struct CargoRunner {
     pub idle_timeout: Option<Duration>,
     /// Who produces the evidence.
     pub actor: Actor,
+    /// Kills the running command when set (the repository is shutting
+    /// down).
+    pub cancel: Cancel,
 }
 
 /// Default limit on one verification command: a stuck command must fail
@@ -174,6 +183,7 @@ impl Default for CargoRunner {
                 model_hash: hord_core::Bytes::default(),
                 harness: "hord".into(),
             },
+            cancel: Cancel::default(),
         }
     }
 }
@@ -191,7 +201,7 @@ impl CargoRunner {
             cmd.env("CARGO_TARGET_DIR", dir);
         }
         cmd.envs(&self.env).envs(&check.env);
-        run_captured(cmd, self.timeout, self.idle_timeout)
+        run_captured(cmd, self.timeout, self.idle_timeout, &self.cancel)
     }
 
     /// The evidence for `check`'s `output`, with its log stored in `logs`.
@@ -203,6 +213,10 @@ impl CargoRunner {
         output: &RunOutput,
         logs: &dyn EvidenceIndex,
     ) -> Result<Evidence> {
+        // A killed command says nothing about the change: no evidence.
+        if output.cancelled {
+            return Err(hord_verify::Error::Cancelled);
+        }
         let log = put_log(logs, output.log().as_bytes())?;
         Ok(EvidenceFields {
             kind: check.kind.clone(),
@@ -306,6 +320,7 @@ pub(crate) fn run_captured(
     mut cmd: Command,
     timeout: Option<Duration>,
     idle: Option<Duration>,
+    cancel: &Cancel,
 ) -> Result<RunOutput> {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -349,9 +364,15 @@ pub(crate) fn run_captured(
         Arc::clone(&last_output),
     );
     let mut timed_out = false;
+    let mut cancelled = false;
     let status: ExitStatus = loop {
         if let Some(status) = child.try_wait()? {
             break status;
+        }
+        if cancel.is_cancelled() {
+            cancelled = true;
+            kill_group(&mut child);
+            break child.wait()?;
         }
         let quiet = millis(start.elapsed()).saturating_sub(last_output.load(Ordering::Relaxed));
         if timeout.is_some_and(|t| start.elapsed() > t)
@@ -365,7 +386,7 @@ pub(crate) fn run_captured(
     };
     // The group leader exited: stop anything it left behind that still
     // holds the pipes.
-    if !timed_out {
+    if !timed_out && !cancelled {
         #[cfg(unix)]
         signal_group(child.id());
     }
@@ -373,7 +394,11 @@ pub(crate) fn run_captured(
     let stdout = out_reader.collect(drained);
     let stderr = err_reader.collect(drained);
     let report = TestReport::parse(&stdout);
-    let code = if timed_out { None } else { status.code() };
+    let code = if timed_out || cancelled {
+        None
+    } else {
+        status.code()
+    };
     let build_failed = code != Some(0)
         && report.binaries == 0
         && (stderr.contains("error: could not compile") || stderr.contains("error[E"));
@@ -385,6 +410,7 @@ pub(crate) fn run_captured(
         report,
         build_failed,
         timed_out,
+        cancelled,
     })
 }
 
@@ -406,6 +432,45 @@ mod tests {
             dir: RepoPath::default(),
             scope: None,
         }
+    }
+
+    #[test]
+    fn a_cancel_kills_the_running_command_and_records_nothing() {
+        let runner = CargoRunner {
+            timeout: None,
+            idle_timeout: None,
+            ..CargoRunner::default()
+        };
+        let cancel = runner.cancel.clone();
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        // A quiet grandchild (the backgrounded sleep) goes with its group.
+        let check = sh("sleep 60 & wait");
+        let out = runner
+            .run(&std::env::temp_dir(), &check)
+            .expect("run the shell check");
+        stopper.join().expect("the stopper thread ends");
+        assert!(out.cancelled && !out.success(), "{out:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let index = MemoryIndex::new();
+        let err = runner
+            .evidence(
+                ObjectId::from_bytes([1; 32]),
+                ObjectId::from_bytes([2; 32]),
+                &check,
+                &out,
+                &index,
+            )
+            .expect_err("a cancelled command is no evidence");
+        assert!(matches!(err, hord_verify::Error::Cancelled), "{err}");
+        // A command started after the cancel is killed at once.
+        let again = runner
+            .run(&std::env::temp_dir(), &sh("sleep 60"))
+            .expect("run");
+        assert!(again.cancelled);
     }
 
     #[test]

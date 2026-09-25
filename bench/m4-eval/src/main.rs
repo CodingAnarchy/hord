@@ -560,6 +560,7 @@ async fn main() -> Result<()> {
                             skip: BTreeSet::new(),
                             only: None,
                             lines_of_interest: checkpoint.interest.clone(),
+                            cancel: Default::default(),
                         },
                     )?;
                     record_evidence(
@@ -875,6 +876,7 @@ fn run_fresh(
                     skip: BTreeSet::new(),
                     only: None,
                     lines_of_interest: BTreeMap::new(),
+                    cancel: Default::default(),
                 },
             )?;
             fs::create_dir_all(work.join("chain"))?;
