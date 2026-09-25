@@ -488,8 +488,10 @@ message ArbitrateRequest {
   optional string note = 4;
   // Id of the key that made `signature` (spec §10.5.4).
   optional string key_id = 5;
-  // The arbiter's signature over the decision, stored on the `Arbitrated`
-  // event. Verified by the server's auth layer, not by the lander.
+  // The arbiter's Ed25519 signature over the decision (domain
+  // `hord.arbitration`: the parked change, the action, the resolving change,
+  // and the note), stored on the `Arbitrated` event. It must verify; with
+  // tokens, the key must be bound to the arbiter, who is the token's actor.
   optional bytes signature = 6;
 }
 

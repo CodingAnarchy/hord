@@ -66,8 +66,9 @@ pub use conflict::{
 };
 pub use error::{Error, Result};
 pub use escalation::{
-    Arbiter, Arbitration, ArbitrationCandidate, Escalation, Origin, PendingResolution,
-    ReplayAttempt, ReplayOutcome, as_replay,
+    ARBITRATION_DOMAIN, Arbiter, Arbitration, ArbitrationCandidate, Escalation, Origin,
+    PendingResolution, ReplayAttempt, ReplayOutcome, arbitration_message, as_replay,
+    sign_arbitration, verify_arbitration,
 };
 pub use gate::{
     Built, EngineVerifier, FailClosedVerifier, InstrumentedTests, PolicySource, RustFactory,
@@ -76,7 +77,9 @@ pub use gate::{
 };
 pub use hord_store::{EdgeKind, WorkspaceId};
 pub use lander::{Lander, QueueEntry, QueueStatus, SPECULATIVE_WINDOW};
-pub use local::{LocalRepo, conflict_report_message, queue_entry_message};
+pub use local::{
+    LocalRepo, arbitrate_request, conflict_report_message, escalation_message, queue_entry_message,
+};
 pub use materialize::MaterializeMode;
 pub use propose::ReadDeclaration;
 pub use query::{Query, line_start};

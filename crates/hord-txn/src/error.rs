@@ -152,6 +152,9 @@ pub enum Error {
     /// ([`crate::RepoOptions::harness`]).
     #[error("no replay harness is configured for this repository")]
     NoHarness,
+    /// An arbiter's signature does not verify (spec §10.5.4).
+    #[error("bad arbitration signature: {0}")]
+    BadSignature(String),
 }
 
 fn list(nodes: &[NodeId]) -> String {

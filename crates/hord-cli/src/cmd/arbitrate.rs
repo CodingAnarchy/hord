@@ -5,6 +5,7 @@
 use anyhow::Result;
 use hord_api::proto::arbitration::Action;
 use hord_api::{proto, wire};
+use hord_txn::Arbitration;
 
 use crate::output;
 use crate::session::{Session, Target};
@@ -20,27 +21,40 @@ pub fn run(
     replay: bool,
     note: Option<String>,
 ) -> Result<()> {
-    txn::parse_change(&change)?;
+    let id = txn::parse_change(&change)?;
     let session = Session::open(target)?;
     if edit {
         return open_workspace(json, &session, &change);
     }
-    let action = match pick.as_deref() {
-        Some("ours") => Action::PickOurs(true),
-        Some("theirs") => Action::PickTheirs(true),
-        Some(other) => Action::Resolved(wire::id(txn::parse_change(other)?)),
-        None if replay => Action::Replay(true),
+    let (action, decision) = match pick.as_deref() {
+        Some("ours") => (Action::PickOurs(true), Arbitration::PickOurs),
+        Some("theirs") => (Action::PickTheirs(true), Arbitration::PickTheirs),
+        Some(other) => {
+            let resolved = txn::parse_change(other)?;
+            (
+                Action::Resolved(wire::id(resolved)),
+                Arbitration::Resolved(resolved),
+            )
+        }
+        None if replay => (
+            Action::Replay(true),
+            Arbitration::Replay { note: note.clone() },
+        ),
         None => unreachable!("clap requires --pick, --edit, or --replay"),
     };
+    // Signed like a review (spec §10.5.4): the logged-in actor's key
+    // against a remote, else this user's key in `~/.hord/keys/`.
+    let signer = session.signer()?;
+    let signature = hord_txn::sign_arbitration(id, &decision, &signer.key)?;
     let reply = block_on(session.backend().arbitrate(proto::ArbitrateRequest {
         change: change.clone(),
         action: Some(proto::Arbitration {
             action: Some(action.clone()),
         }),
-        arbiter: Some(wire::actor(&txn::actor())),
+        arbiter: Some(wire::actor(&signer.actor)),
         note,
-        key_id: None,
-        signature: None,
+        key_id: Some(signature.key_id),
+        signature: Some(signature.bytes.as_slice().to_vec()),
     }))?;
     if json {
         output::print_json(&reply)?;

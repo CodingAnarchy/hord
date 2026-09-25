@@ -390,8 +390,11 @@ pub(crate) fn arbitrated(change: ChangeId, arbiter: &Arbiter, result: ChangeId) 
         change: wire::id(change),
         by: Some(wire::actor(&arbiter.actor)),
         result: wire::id(result),
-        key_id: arbiter.key_id.clone(),
-        signature: arbiter.signature.as_ref().map(|s| s.as_slice().to_vec()),
+        key_id: arbiter.signature.as_ref().map(|s| s.key_id.clone()),
+        signature: arbiter
+            .signature
+            .as_ref()
+            .map(|s| s.bytes.as_slice().to_vec()),
     })
 }
 

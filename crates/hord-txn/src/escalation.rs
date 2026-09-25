@@ -28,8 +28,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 
+use hord_core::sign::{self, PublicKey, SigningKey};
 use hord_core::{
-    Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, ObjectId, Provenance, SnapshotId,
+    Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, ObjectId, Provenance, Signature,
+    SnapshotId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -123,10 +125,9 @@ pub struct PendingResolution {
     pub change: ChangeId,
     /// Who decided.
     pub by: Actor,
-    /// Id of the key that made `signature`.
-    pub key_id: Option<String>,
-    /// The arbiter's signature, stored on the `Arbitrated` event.
-    pub signature: Option<Bytes>,
+    /// The arbiter's signature over the decision
+    /// ([`arbitration_message`]), stored on the `Arbitrated` event.
+    pub signature: Option<Signature>,
 }
 
 /// A conflicted change's way up the ladder.
@@ -163,17 +164,68 @@ pub enum Arbitration {
 
 /// Who arbitrates, and their signature over the decision.
 ///
-/// The signature is accepted as given and stored on the `Arbitrated` event;
-/// verifying it against the arbiter's key is the server's auth layer's job
-/// (spec §10.5.4), not the lander's.
+/// [`Repo::arbitrate`] checks that a signature verifies with the key it
+/// names ([`verify_arbitration`]); that the key belongs to `actor` is the
+/// server's auth layer's check (spec §10.5.4), which knows the keys.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Arbiter {
     /// The arbiter; the resolution's author.
     pub actor: Actor,
-    /// Id of the key that made `signature`.
-    pub key_id: Option<String>,
-    /// The signature.
-    pub signature: Option<Bytes>,
+    /// Their signature over [`arbitration_message`] under
+    /// [`ARBITRATION_DOMAIN`].
+    pub signature: Option<Signature>,
+}
+
+/// Signature domain of an arbiter's decision (`hord_core::sign`).
+pub const ARBITRATION_DOMAIN: &str = "hord.arbitration";
+
+/// What an arbiter signs: the decision, canonically encoded.
+#[derive(Serialize)]
+struct Decision<'a> {
+    change: ChangeId,
+    action: &'a str,
+    resolved: Option<ChangeId>,
+    note: Option<&'a str>,
+}
+
+/// The message an arbiter signs for `action` on the parked `change`: the
+/// [`ObjectId`] bytes of the decision's canonical encoding (the parked
+/// change, the action, the resolving change, and the note).
+pub fn arbitration_message(change: ChangeId, action: &Arbitration) -> Result<ObjectId> {
+    let (name, resolved, note) = match action {
+        Arbitration::PickOurs => ("pick_ours", None, None),
+        Arbitration::PickTheirs => ("pick_theirs", None, None),
+        Arbitration::Replay { note } => ("replay", None, note.as_deref()),
+        Arbitration::Resolved(id) => ("resolved", Some(*id), None),
+    };
+    Ok(ObjectId::of(&Decision {
+        change,
+        action: name,
+        resolved,
+        note,
+    })?)
+}
+
+/// Sign `action` on `change` with `key`.
+pub fn sign_arbitration(
+    change: ChangeId,
+    action: &Arbitration,
+    key: &SigningKey,
+) -> Result<Signature> {
+    let message = arbitration_message(change, action)?;
+    Ok(key.sign(ARBITRATION_DOMAIN, message.as_bytes()))
+}
+
+/// Check `signature` over `action` on `change` with `key`.
+pub fn verify_arbitration(
+    change: ChangeId,
+    action: &Arbitration,
+    signature: &Signature,
+    key: &PublicKey,
+) -> Result<()> {
+    let message = arbitration_message(change, action)?;
+    key.verify(ARBITRATION_DOMAIN, message.as_bytes(), signature)
+        .map_err(|err| Error::BadSignature(err.to_string()))
 }
 
 /// One replay attempt to run.
@@ -506,12 +558,10 @@ impl Inner {
             let arbiter = pending.map_or_else(
                 || Arbiter {
                     actor: lander_actor(),
-                    key_id: None,
                     signature: None,
                 },
                 |p| Arbiter {
                     actor: p.by,
-                    key_id: p.key_id,
                     signature: p.signature,
                 },
             );
@@ -766,6 +816,11 @@ impl Repo {
         action: Arbitration,
         arbiter: Arbiter,
     ) -> Result<(ChangeId, QueueEntry)> {
+        if let Some(signature) = &arbiter.signature {
+            let key =
+                sign::signer(signature).map_err(|err| Error::BadSignature(err.to_string()))?;
+            verify_arbitration(change, &action, signature, &key)?;
+        }
         let entry = blocking(&self.inner, move |inner| {
             let entry = inner.submitted_entry(change)?;
             if !entry.status.is_arbitrable() {
@@ -920,7 +975,6 @@ impl Repo {
             escalation.resolution = Some(PendingResolution {
                 change: id,
                 by: arbiter.actor,
-                key_id: arbiter.key_id,
                 signature: arbiter.signature,
             });
             escalation.note = None;

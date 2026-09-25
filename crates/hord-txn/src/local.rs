@@ -8,7 +8,7 @@ use hord_api::{
     ApiError, ApiResult, DEFAULT_LOG_LIMIT, EventStream, MAX_BATCH_BYTES, MAX_BATCH_IDS,
     RepoBackend, proto, wire,
 };
-use hord_core::{Actor, Bytes, ChangeId, ChangeRecord, Evidence, NodeId, ObjectId};
+use hord_core::{Actor, Bytes, ChangeId, ChangeRecord, Evidence, NodeId, ObjectId, Signature};
 use hord_store::EdgeKind;
 use tokio_util::sync::CancellationToken;
 
@@ -119,6 +119,7 @@ impl From<Error> for ApiError {
             | Error::NothingToPropose
             | Error::NotArbitrable { .. }
             | Error::NoHarness => Self::FailedPrecondition(message),
+            Error::BadSignature(_) => Self::InvalidArgument(message),
             _ => Self::Internal(message),
         }
     }
@@ -302,6 +303,51 @@ pub fn queue_entry_message(entry: &QueueEntry, record: Option<&ChangeRecord>) ->
         report: entry.report.as_ref().map(conflict_report_message),
         escalation: entry.escalation.as_ref().map(escalation_message),
     }
+}
+
+/// The parked change, the decision, and the arbiter an Arbitrate request
+/// names. An unset arbiter is `anonymous`; `key_id` and `signature` come
+/// together or not at all.
+pub fn arbitrate_request(
+    request: &proto::ArbitrateRequest,
+) -> ApiResult<(ChangeId, Arbitration, Arbiter)> {
+    use proto::arbitration::Action;
+    let change = wire::object_id("change", &request.change)?;
+    let action = match request.action.as_ref().and_then(|a| a.action.as_ref()) {
+        Some(Action::PickOurs(true)) => Arbitration::PickOurs,
+        Some(Action::PickTheirs(true)) => Arbitration::PickTheirs,
+        Some(Action::Replay(true)) => Arbitration::Replay {
+            note: request.note.clone(),
+        },
+        Some(Action::Resolved(id)) => {
+            Arbitration::Resolved(wire::object_id("action.resolved", id)?)
+        }
+        Some(Action::PickOurs(false) | Action::PickTheirs(false) | Action::Replay(false))
+        | None => {
+            return Err(ApiError::InvalidArgument(
+                "action: pick_ours, pick_theirs, replay, or resolved".into(),
+            ));
+        }
+    };
+    let actor = match &request.arbiter {
+        Some(actor) => wire::actor_from("arbiter", actor)?,
+        None => Actor::Human {
+            id: "anonymous".into(),
+        },
+    };
+    let signature = match (&request.key_id, &request.signature) {
+        (Some(key_id), Some(bytes)) => Some(Signature {
+            key_id: key_id.clone(),
+            bytes: Bytes::new(bytes.clone()),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::InvalidArgument(
+                "key_id and signature come together".into(),
+            ));
+        }
+    };
+    Ok((change, action, Arbiter { actor, signature }))
 }
 
 /// Wire form of an [`Escalation`].
@@ -673,33 +719,7 @@ impl RepoBackend for LocalRepo {
         &self,
         request: proto::ArbitrateRequest,
     ) -> ApiResult<proto::ArbitrateResponse> {
-        use proto::arbitration::Action;
-        let change = wire::object_id("change", &request.change)?;
-        let action = match request.action.and_then(|a| a.action) {
-            Some(Action::PickOurs(true)) => Arbitration::PickOurs,
-            Some(Action::PickTheirs(true)) => Arbitration::PickTheirs,
-            Some(Action::Replay(true)) => Arbitration::Replay { note: request.note },
-            Some(Action::Resolved(id)) => {
-                Arbitration::Resolved(wire::object_id("action.resolved", &id)?)
-            }
-            Some(Action::PickOurs(false) | Action::PickTheirs(false) | Action::Replay(false))
-            | None => {
-                return Err(ApiError::InvalidArgument(
-                    "action: pick_ours, pick_theirs, replay, or resolved".into(),
-                ));
-            }
-        };
-        let actor = match &request.arbiter {
-            Some(actor) => wire::actor_from("arbiter", actor)?,
-            None => Actor::Human {
-                id: "anonymous".into(),
-            },
-        };
-        let arbiter = Arbiter {
-            actor,
-            key_id: request.key_id,
-            signature: request.signature.map(Bytes::new),
-        };
+        let (change, action, arbiter) = arbitrate_request(&request)?;
         let (resolution, entry) = self.repo.arbitrate(change, action, arbiter).await?;
         let entry = api(&self.repo, move |inner| Ok(inner.entry_with_record(&entry))).await?;
         Ok(proto::ArbitrateResponse {

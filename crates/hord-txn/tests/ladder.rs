@@ -12,10 +12,12 @@ use std::time::Duration;
 use common::*;
 use hord_api::proto;
 use hord_api::proto::event::Kind;
+use hord_core::sign::SigningKey;
 use hord_core::{Bytes, ChangeId};
 use hord_txn::{
     Arbiter, Arbitration, CommandHarness, QueueEntry, QueueStatus, ReplayFuture, ReplayHarness,
     ReplayOutcome, Repo, RepoOptions, StubVerifier, Verdict, Verifier, VerifyFuture, VerifyRequest,
+    sign_arbitration, verify_arbitration,
 };
 use tokio_stream::StreamExt;
 
@@ -418,7 +420,6 @@ async fn attempts_run_out_into_arbitration_with_deduplicated_candidates() -> Tes
             Arbitration::Resolved(pick),
             Arbiter {
                 actor: actor("arbiter"),
-                key_id: None,
                 signature: None,
             },
         )
@@ -445,10 +446,21 @@ async fn arbitration_lands_a_change_with_both_parents() -> TestResult {
     t.repo.land_local().await?;
     assert_eq!(t.repo.status(cb).await?.status, QueueStatus::Conflicted);
 
+    let key = SigningKey::generate()?;
+    let ann = hord_core::Actor::Human { id: "ann".into() };
+    // A signature over another decision is refused.
+    let wrong = Arbiter {
+        actor: ann.clone(),
+        signature: Some(sign_arbitration(cb, &Arbitration::PickOurs, &key)?),
+    };
+    assert!(matches!(
+        t.repo.arbitrate(cb, Arbitration::PickTheirs, wrong).await,
+        Err(hord_txn::Error::BadSignature(_))
+    ));
+    let signature = sign_arbitration(cb, &Arbitration::PickTheirs, &key)?;
     let arbiter = Arbiter {
-        actor: hord_core::Actor::Human { id: "ann".into() },
-        key_id: Some("ann-key".into()),
-        signature: Some(Bytes::new(vec![7; 64])),
+        actor: ann,
+        signature: Some(signature.clone()),
     };
     let (resolution, pending) = t
         .repo
@@ -496,8 +508,13 @@ async fn arbitration_lands_a_change_with_both_parents() -> TestResult {
         arbitrated.by.as_ref().map(hord_api::wire::actor_id),
         Some("ann")
     );
-    assert_eq!(arbitrated.key_id.as_deref(), Some("ann-key"));
-    assert_eq!(arbitrated.signature, Some(vec![7; 64]));
+    assert_eq!(arbitrated.key_id, Some(key.public().key_id()));
+    let stored = hord_core::Signature {
+        key_id: arbitrated.key_id.clone().ok_or("key id")?,
+        bytes: Bytes::new(arbitrated.signature.clone().ok_or("signature")?),
+    };
+    assert_eq!(stored, signature);
+    verify_arbitration(cb, &Arbitration::PickTheirs, &stored, &key.public())?;
 
     // Arbitrated is final.
     assert!(
@@ -524,7 +541,6 @@ async fn keeping_ours_lands_an_empty_change_with_both_parents() -> TestResult {
             Arbitration::PickOurs,
             Arbiter {
                 actor: actor("arbiter"),
-                key_id: None,
                 signature: None,
             },
         )
@@ -568,7 +584,6 @@ async fn an_arbiter_can_ask_for_one_more_replay_with_a_note() -> TestResult {
             },
             Arbiter {
                 actor: actor("arbiter"),
-                key_id: None,
                 signature: None,
             },
         )
