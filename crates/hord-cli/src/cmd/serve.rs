@@ -6,11 +6,12 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig};
+use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig, UiSigner};
 
-use crate::repo;
+use crate::{identity, repo, txn};
 
 /// The address when neither `--bind` nor `server.toml` gives one.
 const DEFAULT_BIND: &str = "127.0.0.1:7878";
@@ -65,6 +66,12 @@ pub async fn run(
         note = format!(", tokens from {}", path.display());
         server = server.with_auth(store);
     }
+    // Reviews signed in the web UI use this user's existing key (ADR 0030);
+    // without one, the UI says to use `hord review`.
+    if let Some(signer) = ui_signer() {
+        note.push_str(&format!(", UI reviews signed as {}", signer.actor.id()));
+        server = server.with_ui_signer(signer);
+    }
     // The first line: tests read the address from it.
     eprintln!("hord serve: http://{local} ({}{note})", names.join(", "));
     server
@@ -73,4 +80,19 @@ pub async fn run(
         })
         .await?;
     Ok(())
+}
+
+/// This user's key in `~/.hord/keys/`, if it exists. `hord serve` never
+/// creates one.
+fn ui_signer() -> Option<UiSigner> {
+    let actor = txn::actor();
+    let path = identity::key_path(actor.id()).ok()?;
+    if !path.exists() {
+        return None;
+    }
+    let key = identity::read_key(&path).ok()?;
+    Some(UiSigner {
+        actor,
+        key: Arc::new(key),
+    })
 }

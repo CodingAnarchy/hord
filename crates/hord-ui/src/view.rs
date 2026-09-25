@@ -440,6 +440,18 @@ pub struct ErrorPage {
     pub base: String,
     /// What went wrong.
     pub message: String,
+    /// Whether signing in would help (the call needed a token).
+    pub sign_in: bool,
+}
+
+/// The sign-in page: a bearer token kept in a cookie.
+#[derive(Template, Debug)]
+#[template(path = "login.html")]
+pub struct LoginPage {
+    /// Page title.
+    pub title: String,
+    /// URL prefix of this repository's pages.
+    pub base: String,
 }
 
 #[cfg(test)]

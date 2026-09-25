@@ -22,7 +22,7 @@ use crate::config::ServerConfig;
 use crate::hosts::Hosts;
 use crate::route::RepoPrefixLayer;
 use crate::service::{GrpcRepoBackend, GrpcSchema};
-use crate::ui::HostedUi;
+use crate::ui::{HostedUi, UiSigner};
 use crate::{Error, Result};
 
 /// How long shutdown waits for open calls (such as event streams) to end.
@@ -52,6 +52,7 @@ pub struct Server {
     workspaces: Option<Arc<dyn hord_api::WorkspacesBackend>>,
     activity: Arc<crate::activity::Activity>,
     auth: Option<Arc<AuthStore>>,
+    ui_signer: Option<UiSigner>,
 }
 
 impl std::fmt::Debug for Server {
@@ -61,6 +62,7 @@ impl std::fmt::Debug for Server {
             .field("config", &self.config)
             .field("workspaces", &self.workspaces.is_some())
             .field("auth", &self.auth.as_ref().map(|a| a.path()))
+            .field("ui_signer", &self.ui_signer)
             .finish()
     }
 }
@@ -75,7 +77,17 @@ impl Server {
             workspaces: None,
             activity: Arc::default(),
             auth: None,
+            ui_signer: None,
         }
+    }
+
+    /// Sign reviews made in the web UI with `signer` (ADR 0030): the key of
+    /// whoever runs the server. With auth, ingest accepts such a review
+    /// only from a signed-in actor who is `signer`'s actor.
+    #[must_use]
+    pub fn with_ui_signer(mut self, signer: UiSigner) -> Self {
+        self.ui_signer = Some(signer);
+        self
     }
 
     /// Require a bearer token on every call but the public ones, checked
@@ -136,9 +148,11 @@ impl Server {
             .into_axum_router()
             .layer(tonic_web::GrpcWebLayer::new())
             .route("/schema.json", get(schema_json))
-            .merge(hord_ui::router(Arc::new(HostedUi::new(Arc::clone(
-                &self.hosts,
-            )))));
+            .merge(hord_ui::router(Arc::new(HostedUi::new(
+                Arc::clone(&self.hosts),
+                self.auth.clone(),
+                self.ui_signer.clone(),
+            ))));
         Routes::from(router)
     }
 

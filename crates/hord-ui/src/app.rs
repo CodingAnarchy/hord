@@ -13,6 +13,7 @@
 //! | `GET /recordings` | `ListRecordings` | |
 //! | `GET /recordings/{id}` and `…/frames` | `GetRecording`, `Queue` | |
 //! | `GET /static/{name}` | embedded assets | |
+//! | `GET`/`POST /login`, `POST /logout` | | the sign-in cookie |
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -25,8 +26,9 @@ use axum::extract::{Form, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use cookie::{Cookie, SameSite};
 use hord_api::proto::event::Kind;
 use hord_api::{ApiError, ApiResult, ChangesBackend, RepoBackend, proto};
 use serde::Deserialize;
@@ -38,9 +40,13 @@ use crate::playback::Playback;
 use crate::present;
 use crate::strip::Strip;
 use crate::view::{
-    self, ArbitrationPage, ChangePage, ErrorPage, PlaybackPage, RecordingRow, RecordingsPage,
-    RowView, StripPage, StripRow, StripRows,
+    self, ArbitrationPage, ChangePage, ErrorPage, LoginPage, PlaybackPage, RecordingRow,
+    RecordingsPage, RowView, StripPage, StripRow, StripRows,
 };
+
+/// The cookie the sign-in page keeps the bearer token in (spec §10.5.4).
+/// The server reads it on UI paths only, never for a gRPC call.
+pub const UI_TOKEN_COOKIE: &str = "hord_token";
 
 /// Most rows the strip renders: the latest submissions.
 pub const MAX_ROWS: usize = 500;
@@ -137,6 +143,8 @@ pub fn router(hosts: Arc<dyn UiHosts>) -> Router {
         .route("/recordings/{id}", get(playback_page))
         .route("/recordings/{id}/frames", get(frames))
         .route("/static/{name}", get(asset))
+        .route("/login", get(login_page).post(login))
+        .route("/logout", post(logout))
         .with_state(app)
 }
 
@@ -180,6 +188,8 @@ fn status_of(err: &ApiError) -> StatusCode {
         ApiError::FailedPrecondition(_) => StatusCode::CONFLICT,
         ApiError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
         ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ApiError::Unauthenticated(_) => StatusCode::UNAUTHORIZED,
+        ApiError::PermissionDenied(_) => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -192,6 +202,10 @@ fn error_page(base: &str, err: &ApiError) -> Response {
             .to_owned(),
         base: base.to_owned(),
         message: err.to_string(),
+        sign_in: matches!(
+            err,
+            ApiError::Unauthenticated(_) | ApiError::PermissionDenied(_)
+        ),
     };
     (status_of(err), html(&page)).into_response()
 }
@@ -649,6 +663,52 @@ async fn frames(
         response.headers_mut().insert("hord-next-delay", value);
     }
     Ok(response)
+}
+
+// ------------------------------------------------------------ sign-in
+
+async fn login_page(Ctx(repo): Ctx) -> Response {
+    html(&LoginPage {
+        title: "Sign in".into(),
+        base: repo.base,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginForm {
+    token: String,
+}
+
+/// Keep the token in an HttpOnly, SameSite=Strict cookie: other sites'
+/// pages cannot send it, and scripts cannot read it. The server reads it on
+/// UI paths only.
+async fn login(Ctx(repo): Ctx, Form(form): Form<LoginForm>) -> Response {
+    let cookie = Cookie::build((UI_TOKEN_COOKIE, form.token.trim().to_owned()))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .build();
+    signed(&repo.base, &cookie)
+}
+
+async fn logout(Ctx(repo): Ctx) -> Response {
+    let mut cookie = Cookie::build((UI_TOKEN_COOKIE, ""))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .build();
+    cookie.make_removal();
+    signed(&repo.base, &cookie)
+}
+
+/// Set `cookie` and go back to the landing strip.
+fn signed(base: &str, cookie: &Cookie<'_>) -> Response {
+    let home = if base.is_empty() { "/" } else { base };
+    let mut response = Redirect::to(home).into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie.to_string()) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
 }
 
 // ------------------------------------------------------------ assets

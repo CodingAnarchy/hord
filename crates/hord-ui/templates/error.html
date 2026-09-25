@@ -2,4 +2,5 @@
 {% block content %}
 <h1>{{ title }}</h1>
 <p>{{ message }}</p>
+{% if sign_in %}<p><a href="{{ base }}/login">Sign in</a></p>{% endif %}
 {% endblock %}

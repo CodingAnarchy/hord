@@ -31,7 +31,7 @@ pub mod present;
 pub mod strip;
 pub mod view;
 
-pub use app::{MAX_ROWS, ReviewBackend, SingleRepo, UiHosts, UiRepo, router};
+pub use app::{MAX_ROWS, ReviewBackend, SingleRepo, UI_TOKEN_COOKIE, UiHosts, UiRepo, router};
 
 use hord_api::ApiError;
 

@@ -3,6 +3,10 @@
 //! enforces the scope [`hord_api::auth::requirement`] names for the RPC.
 //!
 //! It runs after the `/r/<name>/` prefix is stripped, so it sees gRPC paths.
+//! Any other path is the web UI's (ADR 0030): the layer only identifies the
+//! caller there, from the bearer header or the UI's sign-in cookie, and the
+//! UI checks each RPC it makes in process against the same requirements
+//! (`crate::ui`).
 //! The caller's [`Principal`] goes into the request's extensions, where
 //! the services read it (provenance and evidence checks). A server without
 //! an auth file passes everything through, with no principal.
@@ -13,7 +17,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use cookie::Cookie;
 use hord_api::auth::{AUTHORIZATION, Requirement, bearer, requirement};
+use hord_ui::UI_TOKEN_COOKIE;
 use tonic::Status;
 use tower::{Layer, Service};
 
@@ -72,7 +78,12 @@ where
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(bearer)
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .or_else(|| {
+                ui_path(&path)
+                    .then(|| ui_cookie(request.headers()))
+                    .flatten()
+            });
         Box::pin(async move {
             match authorize(store, &path, token).await {
                 Ok(principal) => {
@@ -87,6 +98,25 @@ where
     }
 }
 
+/// Whether `path` is a web UI route, not a gRPC method (`/hord.v1.…`).
+fn ui_path(path: &str) -> bool {
+    !path.starts_with("/hord.")
+}
+
+/// The token in the UI's sign-in cookie, if any. Read on UI paths only, so
+/// a cookie never authorizes a gRPC call.
+fn ui_cookie(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(Cookie::split_parse)
+        .filter_map(Result::ok)
+        .find(|c| c.name() == UI_TOKEN_COOKIE)
+        .map(|c| c.value().to_owned())
+        .filter(|t| !t.is_empty())
+}
+
 /// The caller's principal, if the request may proceed. A public call
 /// with a valid token still carries its principal.
 async fn authorize(
@@ -94,7 +124,13 @@ async fn authorize(
     path: &str,
     token: Option<String>,
 ) -> Result<Option<Principal>, Status> {
-    let Some(required) = requirement(path) else {
+    let required = match requirement(path) {
+        Some(required) => Some(required),
+        // The UI identifies its caller and checks every RPC it makes.
+        None if ui_path(path) => Some(Requirement::Public),
+        None => None,
+    };
+    let Some(required) = required else {
         return Err(Status::permission_denied(format!(
             "{path}: not an RPC of hord.proto"
         )));

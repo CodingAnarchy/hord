@@ -52,3 +52,5 @@ M5 identity and authorization dependencies (spec §10.5.4):
 `askama` 0.16 (hord-ui only): compiled, HTML-escaping templates for the server-rendered web UI. Spec §10.4 names it (DECIDED stack), so the views need no frontend build pipeline and no hand-rolled HTML escaping.
 
 `axum` 0.8 with `form` and `query`, `serde`, `serde_json`, `tokio`, `tokio-stream`, `async-trait` (hord-ui; all already in the tree) and `diffy` (hord-server; already a workspace dependency, AGENTS.md prefers it): the web UI's routes, form and query decoding, the SSE relay, and the `Changes` service's text diff (ADR 0030).
+
+`cookie` 0.18 (hord-ui, hord-server): builds and parses the web UI's HttpOnly, SameSite=Strict sign-in cookie that carries a bearer token (spec §10.5.4, ADR 0030). AGENTS.md forbids a hand-rolled `Cookie` header parser.

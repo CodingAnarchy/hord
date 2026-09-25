@@ -19,16 +19,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::{self, Body};
+use hord_api::auth::Scope;
 use hord_api::proto::event::Kind;
 use hord_api::recording::Recorder;
 use hord_api::{ChangesBackend, RepoBackend, proto, wire};
+use hord_core::Evidence;
+use hord_core::sign::{self, SigningKey};
 use hord_core::{Actor, Bytes, ChangeId, Intent, RepoPath};
 use hord_remote::RemoteRepo;
-use hord_server::{Hosts, ServeOptions, Server, ServerConfig, save_recording};
+use hord_server::{
+    AuthStore, Hosts, ServeOptions, Server, ServerConfig, UI_REVIEW_KIND, UiSigner, save_recording,
+};
 use hord_txn::{BeginOptions, Repo, RepoOptions};
+use hord_ui::UI_TOKEN_COOKIE;
 use hord_ui::audit::{AuditLog, Audited, unlisted};
 use hord_ui::{SingleRepo, UiRepo};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::handshake;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
@@ -104,6 +110,10 @@ impl Running {
 }
 
 async fn serve(root: &Path) -> TestResult<Running> {
+    serve_with(root, |server| server).await
+}
+
+async fn serve_with(root: &Path, setup: impl FnOnce(Server) -> Server) -> TestResult<Running> {
     let hosts = Hosts::open_repo(
         root,
         RepoOptions {
@@ -115,7 +125,7 @@ async fn serve(root: &Path) -> TestResult<Running> {
     let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
     let addr = listener.local_addr()?;
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = Server::new(hosts, ServerConfig::default());
+    let server = setup(Server::new(hosts, ServerConfig::default()));
     let task = tokio::spawn(async move {
         server
             .serve(listener, async {
@@ -384,14 +394,43 @@ async fn every_view_renders_over_the_wire_and_calls_only_listed_rpcs() -> TestRe
 /// A plain HTTP/1.1 GET on the server; with `first_frame`, returns only the
 /// first body frame (for an SSE stream that never ends).
 async fn http1(addr: SocketAddr, uri: &str, first_frame: bool) -> TestResult<(u16, String)> {
+    let request = http::Request::get(uri)
+        .header("host", addr.to_string())
+        .body(Full::new(body::Bytes::new()))?;
+    send(addr, request, first_frame)
+        .await
+        .map(|(status, _, text)| (status, text))
+}
+
+/// An HTTP/1.1 request with a cookie (and a form body, for a POST).
+async fn with_cookie(
+    addr: SocketAddr,
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    form: &str,
+) -> TestResult<(u16, http::HeaderMap, String)> {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", addr.to_string())
+        .header("cookie", cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Full::new(body::Bytes::from(form.to_owned())))?;
+    send(addr, request, false).await
+}
+
+async fn send(
+    addr: SocketAddr,
+    request: http::Request<Full<body::Bytes>>,
+    first_frame: bool,
+) -> TestResult<(u16, http::HeaderMap, String)> {
     let stream = TcpStream::connect(addr).await?;
     let (mut sender, conn) = handshake(TokioIo::new(stream)).await?;
     tokio::spawn(conn);
-    let request = http::Request::get(uri)
-        .header("host", addr.to_string())
-        .body(Empty::<body::Bytes>::new())?;
     let response = sender.send_request(request).await?;
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     let mut body = response.into_body();
     let text = if first_frame {
         let frame = timeout(Duration::from_secs(10), body.frame())
@@ -402,7 +441,7 @@ async fn http1(addr: SocketAddr, uri: &str, first_frame: bool) -> TestResult<(u1
     } else {
         String::from_utf8(body.collect().await?.to_bytes().to_vec())?
     };
-    Ok((status, text))
+    Ok((status, headers, text))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -464,5 +503,114 @@ async fn hord_serve_mounts_the_ui_beside_the_grpc_services() -> TestResult {
         Some(Kind::Parked(_))
     )));
     sc.running.stop().await;
+    Ok(())
+}
+
+/// With an auth file, the UI identifies the browser by its sign-in cookie
+/// and holds every call it makes to the scope the RPC needs; a review from
+/// the UI is signed with the server's key and verifies with it, and only
+/// that key's actor may make one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_auth_the_ui_checks_scopes_and_signs_reviews() -> TestResult {
+    let sc = scenario().await?;
+    sc.running.stop().await;
+    let auth_file = sc.dir.0.join("auth.toml");
+    let reviewer = [Scope::Read, Scope::Review(UI_REVIEW_KIND.into())];
+    AuthStore::add_user(&auth_file, "ada", "pw-ada", &reviewer)?;
+    AuthStore::add_user(&auth_file, "bob", "pw-bob", &reviewer)?;
+    let ada_key = Arc::new(SigningKey::generate()?);
+    let bob_key = SigningKey::generate()?;
+    let store = AuthStore::open(&auth_file)?;
+    let ada = store.login("ada", "pw-ada", &ada_key.public().key_id())?;
+    let bob = store.login("bob", "pw-bob", &bob_key.public().key_id())?;
+    let signer = UiSigner {
+        actor: ada.principal.actor.clone(),
+        key: Arc::clone(&ada_key),
+    };
+    let running = serve_with(&sc.dir.0, |server| {
+        server.with_auth(store).with_ui_signer(signer)
+    })
+    .await?;
+    let addr = running.addr;
+    let ada_cookie = format!("{UI_TOKEN_COOKIE}={}", ada.token);
+    let bob_cookie = format!("{UI_TOKEN_COOKIE}={}", bob.token);
+
+    // Signed out, the pages ask for a token; signing in sets the cookie.
+    let (status, page) = http1(addr, "/", false).await?;
+    assert_eq!(status, 401, "{page}");
+    has(&page, "/login")?;
+    let (status, headers, _) =
+        with_cookie(addr, "POST", "/login", "", &format!("token={}", ada.token)).await?;
+    assert_eq!(status, 303);
+    let set = headers
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("set-cookie")?;
+    assert!(
+        set.contains("HttpOnly") && set.contains("SameSite=Strict"),
+        "{set}"
+    );
+    let (status, _, page) = with_cookie(addr, "GET", "/", &ada_cookie, "").await?;
+    assert_eq!(status, 200, "{page}");
+
+    // A cookie never authorizes a gRPC call.
+    let bare = RemoteRepo::connect(&running.url()).await?;
+    assert!(bare.head(proto::HeadRequest {}).await.is_err());
+
+    // Ada may read and review, not arbitrate.
+    let (status, _, acted) = with_cookie(
+        addr,
+        "POST",
+        &format!("/arbitrate/{}", sc.parked),
+        &ada_cookie,
+        "action=pick_theirs",
+    )
+    .await?;
+    assert_eq!(status, 200, "{acted}");
+    has(&acted, "permission denied")?;
+
+    // Bob may review, but the server's key is Ada's: ingest refuses.
+    let (_, _, refused) = with_cookie(
+        addr,
+        "POST",
+        &format!("/changes/{}/review", sc.parked),
+        &bob_cookie,
+        "verdict=approve&message=lgtm",
+    )
+    .await?;
+    has(&refused, "Review failed")?;
+
+    // Ada's review is signed with her key and attached to the change.
+    let (status, _, reviewed) = with_cookie(
+        addr,
+        "POST",
+        &format!("/changes/{}/review", sc.parked),
+        &ada_cookie,
+        "verdict=approve&message=lgtm",
+    )
+    .await?;
+    assert_eq!(status, 200, "{reviewed}");
+    has(&reviewed, "Approval recorded as evidence")?;
+    has(&reviewed, "review:human")?;
+    let remote = RemoteRepo::connect_with_token(&running.url(), &ada.token).await?;
+    let view = remote
+        .changes()
+        .get_change(proto::GetChangeRequest {
+            change: sc.parked.clone(),
+        })
+        .await?;
+    let review = view
+        .evidence
+        .iter()
+        .find(|e| e.qualifier.as_deref() == Some(UI_REVIEW_KIND))
+        .ok_or("the review is listed")?;
+    let object = remote
+        .get_objects(proto::GetObjectsRequest {
+            ids: vec![review.id.clone()],
+        })
+        .await?;
+    let evidence: Evidence = hord_encoding::decode(&object.objects.first().ok_or("object")?.cbor)?;
+    sign::verify_evidence(&evidence, &ada_key.public())?;
+    running.stop().await;
     Ok(())
 }

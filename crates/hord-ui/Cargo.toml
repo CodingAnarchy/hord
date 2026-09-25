@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 askama.workspace = true
 async-trait.workspace = true
+cookie.workspace = true
 axum = { workspace = true, features = ["form", "query"] }
 hord-api.workspace = true
 serde.workspace = true
