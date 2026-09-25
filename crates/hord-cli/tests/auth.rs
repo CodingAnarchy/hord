@@ -458,7 +458,6 @@ fn a_human_review_unblocks_a_parked_agent_change() -> TestResult {
 /// rebases the change cleanly onto the new head (a different file), counts
 /// the review, and lands it.
 #[test]
-#[ignore = "needs ladder's ADR 0031 change"]
 fn a_review_carries_across_a_clean_rebase() -> TestResult {
     let w = world()?;
     let (dir, ada, eve, bot) = (&w.clone.0, &w.ada, &w.eve, &w.bot);
