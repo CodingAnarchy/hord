@@ -105,7 +105,11 @@ fn chains_faults_sample_and_merge() -> TestResult {
     let bin = env!("CARGO_BIN_EXE_hord-eval-m4");
     let common = |work: &Path| {
         let mut cmd = Command::new(bin);
-        cmd.arg("--cache")
+        // The eval refuses these (cargo's UI tests strip them); a developer
+        // shell may set them.
+        cmd.env_remove("CARGO_TERM_COLOR")
+            .env_remove("CARGO_TERM_HYPERLINKS")
+            .arg("--cache")
             .arg(&corpora)
             .arg("--work")
             .arg(work)

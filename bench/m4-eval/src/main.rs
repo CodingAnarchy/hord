@@ -239,10 +239,35 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SampleResult {
-    commit: String,
-    failed: Vec<String>,
-    elapsed_ms: u64,
-    timed_out: bool,
+    pub(crate) commit: String,
+    pub(crate) failed: Vec<String>,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) timed_out: bool,
+    /// A few failing tests' output, to diagnose environment failures.
+    #[serde(default)]
+    pub(crate) failure_output: Vec<(String, String)>,
+}
+
+impl SampleResult {
+    /// Record one sample run, and log its failure excerpts.
+    fn from_run(commit: &str, run: run::FullSuite) -> Self {
+        eprintln!(
+            "[sample] {}: {} failed{}",
+            &commit[..10.min(commit.len())],
+            run.failed.len(),
+            if run.timed_out { " (timed out)" } else { "" }
+        );
+        for (test, output) in &run.excerpts {
+            eprintln!("[sample] ---- {test} ----\n{output}");
+        }
+        Self {
+            commit: commit.to_owned(),
+            failed: run.failed,
+            elapsed_ms: run.elapsed_ms,
+            timed_out: run.timed_out,
+            failure_output: run.excerpts,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -361,6 +386,7 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    run::check_corpus_env(std::env::vars())?;
     let budget = args.budget.as_deref().map(parse_budget).transpose()?;
     let over_budget = || budget.is_some_and(|b| started.elapsed() > b);
     let corpus = corpus_dir(args.cache.clone())?;
@@ -460,16 +486,8 @@ async fn main() -> Result<()> {
         .collect();
     run_parallel(&workers, pending, &over_budget, |worker, commit| {
         eprintln!("[sample] full cargo test on {}", &commit[..10]);
-        let (failed, elapsed_ms, timed_out) = run::full_suite(worker, &commit, timeout)?;
-        write_json(
-            &sample_dir.join(format!("{commit}.json")),
-            &SampleResult {
-                commit: commit.clone(),
-                failed,
-                elapsed_ms,
-                timed_out,
-            },
-        )
+        let sample = SampleResult::from_run(&commit, run::full_suite(worker, &commit, timeout)?);
+        write_json(&sample_dir.join(format!("{commit}.json")), &sample)
     });
     let sample: Vec<SampleResult> = sample_commits
         .iter()
@@ -820,16 +838,8 @@ fn sample_only(
     run_parallel(&workers, mine, over_budget, |worker, commit| {
         eprintln!("[sample] full cargo test on {}", &commit[..10]);
         let since = std::time::SystemTime::now();
-        let (failed, elapsed_ms, timed_out) = run::full_suite(worker, &commit, timeout)?;
-        let written = write_json(
-            &sample_dir.join(format!("{commit}.json")),
-            &SampleResult {
-                commit: commit.clone(),
-                failed,
-                elapsed_ms,
-                timed_out,
-            },
-        );
+        let sample = SampleResult::from_run(&commit, run::full_suite(worker, &commit, timeout)?);
+        let written = write_json(&sample_dir.join(format!("{commit}.json")), &sample);
         let label = format!("sample {}", &commit[..10]);
         disk::prune_and_log(&label, &worker.target_dir, since);
         disk::clear_dir(&worker.profraw_dir());
@@ -891,6 +901,13 @@ fn run_fresh(
                 },
             )?;
             disk::prune_and_log("initial", &target_dir, since);
+            let names: BTreeSet<&str> = run
+                .record
+                .tests
+                .iter()
+                .map(|t| t.test.name.as_str())
+                .collect();
+            write_json(&fresh::suite_path(work), &names)?;
             monitor.sample("initial");
             fs::create_dir_all(work.join("chain"))?;
             fs::write(&initial_path, hord_encoding::encode(&run.record)?)?;

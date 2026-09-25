@@ -79,7 +79,11 @@ permissions:
   contents: read
 
 env:
-  CARGO_TERM_COLOR: always
+  # No CARGO_TERM_COLOR here (unlike ci.yml): cargo's UI tests set
+  # CARGO_TERM_COLOR=always and then strip every CARGO_* variable present in
+  # the parent environment, so an inherited one uncolors their output and
+  # every `.term.svg` snapshot fails (about 335 tests in run 36145004665,
+  # reproduced locally). The eval refuses to start with it set.
   CORPUS_HEAD: ${{ inputs.corpus_head || '8814ead110e36ed8fdcf1fdd4009baf82bd78523' }}
   FAULTS_PER_COMMIT: ${{ inputs.faults_per_commit || '5' }}
   CHAINS: "15"
@@ -100,6 +104,8 @@ jobs:
   build:
     name: build hord-eval-m4
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
