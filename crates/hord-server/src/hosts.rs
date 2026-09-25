@@ -48,7 +48,10 @@ impl Hosts {
     /// Host an open repository under `name`, with a lander task.
     pub fn from_repo(name: String, repo: Repo) -> Result<Self> {
         let path = repo.store().repo_root().to_path_buf();
-        let local = LocalRepo::new(repo).map_err(|source| Error::Repo { path, source })?;
+        let local = LocalRepo::new(repo).map_err(|source| Error::Repo {
+            path,
+            source: Box::new(source),
+        })?;
         let mut hosts = Self::empty();
         hosts.insert_local(name.clone(), Arc::new(local));
         hosts.single = Some(name);
@@ -138,7 +141,7 @@ impl Hosts {
 async fn open_local(root: &Path, options: RepoOptions) -> Result<Arc<LocalRepo>> {
     let repo_err = |source| Error::Repo {
         path: root.to_path_buf(),
-        source,
+        source: Box::new(source),
     };
     let repo = Repo::open_with(root, options).await.map_err(repo_err)?;
     Ok(Arc::new(LocalRepo::new(repo).map_err(repo_err)?))

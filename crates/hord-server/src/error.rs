@@ -13,8 +13,9 @@ pub enum Error {
     Repo {
         /// Its root.
         path: PathBuf,
-        /// Why.
-        source: hord_txn::Error,
+        /// Why. Boxed: `hord_txn::Error` is large enough (notably on Windows)
+        /// to trip `clippy::result_large_err` on every function returning this type.
+        source: Box<hord_txn::Error>,
     },
     /// `--root` found no repository.
     #[error("no repository (.hord/) under {0}")]
