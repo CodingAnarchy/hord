@@ -763,7 +763,7 @@ impl Inner {
                 let footprint = Arc::new(self.footprint_of(landed_id, &landed)?);
                 let predicted = match (&policy, &facts) {
                     (Ok((policy, _)), Some(facts)) => {
-                        self.predict(policy, facts, &require, &landed)?
+                        self.predict(policy, facts, &require, &landed, &report)?
                     }
                     (Ok(_), None) => true,
                     (Err(_), _) => false,
@@ -806,8 +806,9 @@ impl Inner {
         facts: &hord_policy::Facts,
         require: &BTreeSet<String>,
         landed: &ChangeRecord,
+        report: &ConflictReport,
     ) -> Result<bool> {
-        let mut evidence = self.evidence_facts(landed.result)?;
+        let mut evidence = self.candidate_evidence_facts(landed, report)?;
         for requirement in require {
             let Ok(tag) = requirement.parse::<hord_policy::EvidenceTag>() else {
                 continue;
@@ -1037,7 +1038,7 @@ impl Inner {
             Verdict::Pass { evidence } => evidence,
         };
         if let (Ok((policy, _)), Some(mut facts)) = (&policy, facts) {
-            facts.evidence = self.evidence_facts(landed.result)?;
+            facts.evidence = self.candidate_evidence_facts(&landed, &report)?;
             if let hord_policy::Decision::Deny { reasons } = policy.evaluate(&facts) {
                 let summary = reasons
                     .iter()

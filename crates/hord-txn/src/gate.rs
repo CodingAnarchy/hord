@@ -731,6 +731,33 @@ impl Inner {
         Ok(out)
     }
 
+    /// Evidence facts for judging the candidate `landed` with its rebase
+    /// `report`: everything indexed for its result, plus, for a rebased
+    /// record whose rebase merged nothing (no `merge`, no `adapter_merged`),
+    /// the `review:*` evidence indexed for the submitted record's result
+    /// (ADR 0031). Machine evidence counts only for the exact snapshot.
+    pub(crate) fn candidate_evidence_facts(
+        &self,
+        landed: &ChangeRecord,
+        report: &ConflictReport,
+    ) -> Result<Vec<EvidenceFact>> {
+        let mut out = self.evidence_facts(landed.result)?;
+        if let Some(submitted) = landed.rebased_from
+            && report.merge.is_empty()
+            && report.adapter_merged.is_empty()
+        {
+            let submitted = self.change_record(submitted)?;
+            if submitted.result != landed.result {
+                out.extend(
+                    self.evidence_facts(submitted.result)?
+                        .into_iter()
+                        .filter(|fact| fact.tag.kind() == "review"),
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// Policy facts for `record` (ADR 0026): its actor and write-set size,
     /// the files it changes, the write-set definitions in them (read from
     /// the result, or the base when deleted) with the adapter's kinds and
