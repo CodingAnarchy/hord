@@ -20,11 +20,11 @@ pub enum Error {
     /// `--root` found no repository.
     #[error("no repository (.hord/) under {0}")]
     NoRepos(PathBuf),
-    /// A non-loopback bind address without `--insecure-bind` (ADR 0024:
-    /// there is no authentication until M5).
+    /// A non-loopback bind address without `--insecure-bind` (ADR 0024;
+    /// there is no TLS, so tokens would travel in the clear).
     #[error(
-        "refusing to bind {0}: not a loopback address, and there is no authentication \
-         until M5; pass --insecure-bind to bind it anyway"
+        "refusing to bind {0}: not a loopback address, and there is no TLS (bearer \
+         tokens would travel in the clear); pass --insecure-bind to bind it anyway"
     )]
     InsecureBind(std::net::SocketAddr),
     /// `server.toml` is invalid.

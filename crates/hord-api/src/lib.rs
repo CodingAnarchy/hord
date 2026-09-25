@@ -11,6 +11,7 @@
 //! - [`RepoBackend`]: spec §10.5.2's trait, method for method, expressed in
 //!   the generated request and response messages, implemented by
 //!   `hord_txn::LocalRepo` and (later) `hord-remote`'s `RemoteRepo`;
+//! - [`auth`]: scopes, and the one each RPC needs (spec §10.5.4);
 //! - [`schema`]: the descriptor set and a JSON Schema generated from it;
 //! - [`wire`]: conversions between wire strings and [`hord_core`] ids and
 //!   values;

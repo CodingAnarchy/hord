@@ -7,6 +7,9 @@
 //! - An agent stores the token and key an operator minted for it (`hord
 //!   token mint`): `--token <t> --key-file <pem>`. The server says whose
 //!   token it is, and the key must be bound to that actor.
+//!
+//! OIDC against a configured provider (spec §10.5.4) is future work; the
+//! user table serves single-team deployments.
 
 use std::path::{self, PathBuf};
 
