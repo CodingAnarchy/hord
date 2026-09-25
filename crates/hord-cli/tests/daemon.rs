@@ -136,10 +136,15 @@ fn store_held(dir: &Path) -> bool {
 fn the_daemon_serves_workspaces_and_lands_on_submit() -> TestResult {
     let repo = setup()?;
     let dir = &repo.0;
-    let ws = json(dir, &["ws", "new"])?;
+    let started = hord(dir, &["ws", "new", "--json"]).output()?;
+    if !started.status.success() {
+        return Err(format!("ws new: {}", describe(&started)).into());
+    }
+    let ws: serde_json::Value = serde_json::from_slice(&started.stdout)?;
     assert!(
         store_held(dir),
-        "ws new started a daemon that owns the store; daemon.log:\n{}",
+        "ws new started a daemon that owns the store\nws new stderr:\n{}\ndaemon.log:\n{}",
+        String::from_utf8_lossy(&started.stderr),
         fs::read_to_string(dir.join(".hord").join("daemon.log")).unwrap_or_default()
     );
     let id = str_field(&ws, "id")?.to_owned();
