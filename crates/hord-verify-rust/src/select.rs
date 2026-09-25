@@ -7,6 +7,11 @@
 //! file with no adapter falls back only if its package can read it
 //! ([`crate::narrow::package_reads`]).
 //!
+//! ADR 0022 as amended after the first CI gate run: a test is stale only
+//! until it re-ran on the change ([`CoverageRecord::is_stale`]), and a
+//! non-function edit in an integration-test module selects that module's
+//! tests rather than the package ([`crate::test_module`]).
+//!
 //! Tests are selected by the coverage record's `Tests(t, def)` edges and by
 //! static edges (a test that is itself in the impact set references an
 //! impacted definition within the bound), plus every test the change adds
@@ -64,6 +69,9 @@ pub enum Fallback {
     Uncovered(NodeId),
     /// A test changed whose package is unknown.
     UnknownPackage(RepoPath),
+    /// A non-function edit in an integration-test module: that module's
+    /// tests, not the package (ADR 0022, R2).
+    TestModule(RepoPath),
 }
 
 impl Fallback {
@@ -86,6 +94,7 @@ impl Fallback {
             Self::DispatchImpl(_) => "dispatch-impl",
             Self::Uncovered(_) => "uncovered",
             Self::UnknownPackage(_) => "unknown-package",
+            Self::TestModule(_) => "test-module",
         }
     }
 
@@ -120,6 +129,7 @@ impl fmt::Display for Fallback {
             Self::DispatchImpl(n) => write!(f, "trait impl born or died {n}"),
             Self::Uncovered(n) => write!(f, "no coverage record for {n}"),
             Self::UnknownPackage(p) => write!(f, "no package for {p}"),
+            Self::TestModule(p) => write!(f, "non-function edit in test module {p}"),
         }
     }
 }
@@ -186,6 +196,56 @@ pub struct SelectInput<'a> {
     /// covers the drift since [`CoverageRecord::snapshot`] as facts (the
     /// earlier rule; still sound, less efficient).
     pub drift: Option<&'a hord_verify::Drift>,
+}
+
+/// The integration-test module a non-function edit in `path` is confined to
+/// (ADR 0022, R2): `path` is a module of a test target (not its root file
+/// or a shared helper module), and every dependent the impact set found
+/// for the change's non-function writes is in that module's files. A
+/// dependent whose file is unknown keeps the package fallback.
+fn scoped_test_module(
+    ws: &CargoWorkspace,
+    path: &RepoPath,
+    impact: &ImpactSet,
+) -> Option<crate::test_module::TestModule> {
+    let module = crate::test_module::test_module(ws, path)?;
+    let confined = impact
+        .nodes
+        .iter()
+        .filter(|(_, hops)| **hops > 0)
+        .all(|(node, _)| {
+            impact
+                .paths
+                .get(node)
+                .is_some_and(|p| module.contains_file(p))
+        });
+    confined.then_some(module)
+}
+
+/// Select every test of `module`: those the record names, and a name
+/// filter for any it does not.
+fn select_test_module(
+    sel: &mut Selection,
+    coverage: &CoverageRecord,
+    module: &crate::test_module::TestModule,
+    path: &RepoPath,
+) {
+    for t in &coverage.tests {
+        if t.test.package == module.package
+            && t.test.target.name == module.target
+            && module.contains_test(&t.test.name)
+        {
+            sel.exact
+                .entry((t.test.package.clone(), t.test.target.clone()))
+                .or_default()
+                .insert(t.test.name.clone());
+        }
+    }
+    sel.filters
+        .entry(module.package.clone())
+        .or_default()
+        .insert(module.filter());
+    sel.fallbacks.push(Fallback::TestModule(path.clone()));
 }
 
 /// Select the tests that can observe the change (ADR 0022).
@@ -318,7 +378,19 @@ pub fn select_ignoring(input: SelectInput<'_>, ignore: &BTreeSet<&str>) -> Selec
         };
         let rule = rule.filter(|r| !ignore.contains(r.kind()));
         if let Some(rule) = rule {
-            widen(&mut sel, &mut fallback_pkgs, &t.path, rule);
+            let scoped = matches!(
+                rule,
+                Fallback::Glue(_)
+                    | Fallback::Declaration(_)
+                    | Fallback::Initializer(_)
+                    | Fallback::Attributes(_)
+            )
+            .then(|| scoped_test_module(ws, &t.path, input.impact))
+            .flatten();
+            match scoped {
+                Some(m) => select_test_module(&mut sel, coverage, &m, &t.path),
+                None => widen(&mut sel, &mut fallback_pkgs, &t.path, rule),
+            }
             continue;
         }
         if t.test {
@@ -499,6 +571,7 @@ mod tests {
                 .chain(extra.iter().map(|e| (n(*e), 1)))
                 .collect(),
             facts,
+            paths: BTreeMap::new(),
         }
     }
 
@@ -729,6 +802,108 @@ mod tests {
         assert_eq!(
             exact(&select(input(&later))),
             ["m::t".to_owned()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn non_function_edits_in_a_test_module_select_that_module() {
+        // testsuite has m::t1, m::t2 (tests/testsuite/m.rs) and other::t4
+        // (tests/testsuite/other.rs); t4 covers nothing that changes.
+        let rec = CoverageRecord::new(
+            ObjectId::from_bytes([1; 32]),
+            tc(),
+            [n(1), n(100), n(101), n(104)].into_iter().collect(),
+            vec![
+                (
+                    t("a", "testsuite", "m::t1"),
+                    Some(n(100)),
+                    [n(1), n(100)].into_iter().collect(),
+                    false,
+                ),
+                (
+                    t("a", "testsuite", "m::t2"),
+                    Some(n(101)),
+                    [n(101)].into_iter().collect(),
+                    false,
+                ),
+                (
+                    t("a", "testsuite", "other::t4"),
+                    Some(n(104)),
+                    [n(104)].into_iter().collect(),
+                    false,
+                ),
+            ],
+        );
+        let ws = sample();
+        let glue = |path: &str| TouchedDef {
+            node: NodeId::file_root(&p(path)),
+            ..touched(0, path, "source_file", DefDelta::Edited)
+        };
+        let run = |i: &ImpactSet| {
+            select(SelectInput {
+                coverage: Some(&rec),
+                toolchain: tc(),
+                workspace: &ws,
+                impact: i,
+                max_impact: None,
+                drift: None,
+            })
+        };
+        let module_tests: BTreeSet<String> = ["m::t1".to_owned(), "m::t2".to_owned()]
+            .into_iter()
+            .collect();
+        let scoped = |sel: &Selection| {
+            sel.packages.is_empty()
+                && exact(sel) == module_tests
+                && sel.filters.get("a").is_some_and(|f| f.contains("m::"))
+                && sel.fallbacks.iter().any(|f| f.kind() == "test-module")
+        };
+
+        // Glue in the module's file: its tests, not the package.
+        let sel = run(&impact(&[], &[], vec![glue("tests/testsuite/m.rs")]));
+        assert!(scoped(&sel), "{sel:?}");
+        // A const whose dependent is in the same module: still the module.
+        let mut i = impact(
+            &[9],
+            &[10],
+            vec![touched(
+                9,
+                "tests/testsuite/m.rs",
+                "const_item",
+                DefDelta::Edited,
+            )],
+        );
+        i.paths.insert(n(10), p("tests/testsuite/m/inner.rs"));
+        assert!(scoped(&run(&i)), "{:?}", run(&i));
+
+        // Kept (shared-helper guard, References): the const is used from
+        // another test module.
+        i.paths.insert(n(10), p("tests/testsuite/other.rs"));
+        let sel = run(&i);
+        assert!(sel.packages.contains("a"), "{sel:?}");
+        assert!(
+            sel.fallbacks
+                .iter()
+                .any(|f| matches!(f, Fallback::Initializer(_)))
+        );
+        // Kept: a dependent whose file the graph does not know.
+        i.paths.clear();
+        assert!(run(&i).packages.contains("a"));
+        // Kept (shared-helper guard, by path): glue in a helper module, and
+        // in the target's root file.
+        for path in ["tests/testsuite/utils/mod.rs", "tests/testsuite/main.rs"] {
+            let sel = run(&impact(&[], &[], vec![glue(path)]));
+            assert!(sel.packages.contains("a"), "{path}: {sel:?}");
+            assert!(
+                sel.fallbacks.iter().any(|f| matches!(f, Fallback::Glue(_))),
+                "{path}"
+            );
+        }
+        // Kept: the same edit in the library is still the package fallback.
+        assert!(
+            run(&impact(&[], &[], vec![glue("src/lib.rs")]))
+                .packages
+                .contains("a")
         );
     }
 

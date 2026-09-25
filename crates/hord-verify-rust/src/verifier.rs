@@ -507,6 +507,7 @@ mod tests {
             write_set: [NodeId::from_u128(node)].into_iter().collect(),
             nodes: [(NodeId::from_u128(node), 0)].into_iter().collect(),
             facts,
+            paths: BTreeMap::new(),
         }
     }
 
