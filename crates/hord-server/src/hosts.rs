@@ -197,7 +197,7 @@ impl Hosts {
     /// End the event streams of every repository this server opened, so
     /// its connections can drain.
     pub async fn close_events(&self) {
-        for local in &self.locals {
+        for (_, local) in &self.locals {
             local.close_events().await;
         }
     }
