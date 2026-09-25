@@ -10,8 +10,10 @@
 //!   each contested definition gets the parked change's text at the place
 //!   head has that [`NodeId`] now (so a move head made within the file is
 //!   followed); it is removed when the change deleted it, and re-added at
-//!   its old place when head deleted it. The result is identified against
-//!   head, and the merge runs again. Every definition not in contention stays as the
+//!   its old place when head deleted it. A definition head moved to another
+//!   file keeps its [`NodeId`] (ADR 0033): its parked text goes to that
+//!   file, at head's place of it, and it leaves this file's parked side.
+//!   The result is identified against head, and the merge runs again. Every definition not in contention stays as the
 //!   merge produces it, so a non-conflicting edit head gained in the same
 //!   file (a third agent's landed change) is kept;
 //! - otherwise (a blob-tier file, one that does not parse, a conflict on
@@ -52,6 +54,7 @@ impl Inner {
         head: SnapshotId,
     ) -> Result<TheirsMerge> {
         let mut out = TheirsMerge::default();
+        let mut moves = Moves::default();
         for delta in self.changed_paths(record.base, record.result)? {
             let path = delta.path;
             let ours = self.blob_id(head, &path)?;
@@ -73,7 +76,7 @@ impl Inner {
                 out.files.push((path, theirs_bytes));
                 continue;
             };
-            let merged = match self.merge_definitions(record, head, &path)? {
+            let merged = match self.merge_definitions(record, head, &path, &mut moves)? {
                 Some(bytes) => Some(bytes),
                 None => {
                     let (base, ours, theirs) = (
@@ -98,7 +101,79 @@ impl Inner {
                 }
             }
         }
+        self.place_moved(head, moves.relocated, &mut out)?;
         Ok(out)
+    }
+
+    /// Give each definition head moved to another file its parked text,
+    /// at head's place of it in that file (as merged, if the change also
+    /// touched that file).
+    fn place_moved(
+        &self,
+        head: SnapshotId,
+        relocated: Vec<Relocated>,
+        out: &mut TheirsMerge,
+    ) -> Result<()> {
+        for moved in relocated {
+            let (Some(head_view), slot) = (
+                self.parsed_at(head, &moved.to)?,
+                out.files.iter().position(|(p, _)| *p == moved.to),
+            ) else {
+                continue;
+            };
+            let current = match slot.and_then(|i| out.files[i].1.clone()) {
+                Some(bytes) => bytes,
+                None => match self.blob_id(head, &moved.to)? {
+                    Some(blob) => self.blob_bytes(blob)?,
+                    None => continue,
+                },
+            };
+            let Some(adapter) = self.adapter_for(&moved.to, head_view.lang) else {
+                continue;
+            };
+            let Some(tree) = self.identify_on_head(
+                adapter,
+                &moved.to,
+                head,
+                &head_view.tree,
+                current.as_slice().to_vec(),
+            )?
+            else {
+                continue;
+            };
+            let Some(def) = definitions(adapter, &moved.to, &tree)
+                .into_iter()
+                .find(|d| d.node == moved.node)
+            else {
+                continue;
+            };
+            let mut bytes = current.as_slice().to_vec();
+            bytes.splice(def.span, moved.text);
+            let bytes = Some(Bytes::new(bytes));
+            match slot {
+                Some(i) => out.files[i].1 = bytes,
+                None => out.files.push((moved.to, bytes)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Where each definition is in head, by [`NodeId`] (built on first use).
+    fn head_index<'m>(
+        &self,
+        head: SnapshotId,
+        moves: &'m mut Moves,
+    ) -> Result<&'m BTreeMap<NodeId, RepoPath>> {
+        if moves.index.is_none() {
+            let mut index = BTreeMap::new();
+            for (path, _) in self.list_files(head)? {
+                for def in self.definitions_at(head, &path)? {
+                    index.insert(def.node, path.clone());
+                }
+            }
+            moves.index = Some(index);
+        }
+        Ok(moves.index.get_or_insert_default())
     }
 
     /// The structural merge of `path` with the parked change winning hard
@@ -109,6 +184,7 @@ impl Inner {
         record: &ChangeRecord,
         head: SnapshotId,
         path: &RepoPath,
+        moves: &mut Moves,
     ) -> Result<Option<Bytes>> {
         let (Some(base), Some(head_view), Some(theirs)) = (
             self.parsed_at(record.base, path)?,
@@ -121,9 +197,8 @@ impl Inner {
             return Ok(None);
         };
         let root = NodeId::file_root(path);
-        let theirs_defs = by_node(definitions(adapter, path, &theirs.tree));
         let base_defs = by_node(definitions(adapter, path, &base.tree));
-        let theirs_text = adapter.project(&theirs.tree.tree);
+        let mut theirs_tree: Arc<IdentifiedTree> = Arc::clone(&theirs.tree);
         let mut ours: Arc<IdentifiedTree> = Arc::clone(&head_view.tree);
         for _ in 0..MAX_ROUNDS {
             let conflict = match hord_diff::merge(
@@ -131,18 +206,61 @@ impl Inner {
                 path,
                 &base.tree,
                 &ours,
-                &theirs.tree,
+                &theirs_tree,
                 hord_diff::MergeMode::Lander,
             ) {
                 Ok(merged) => return Ok(Some(adapter.project(&merged.tree.tree))),
                 Err(conflict) => conflict,
             };
-            let contested: BTreeSet<NodeId> = conflict.nodes.iter().copied().collect();
+            let mut contested: BTreeSet<NodeId> = conflict.nodes.iter().copied().collect();
             if contested.is_empty() || contested.contains(&root) {
                 return Ok(None);
             }
+            let theirs_defs = by_node(definitions(adapter, path, &theirs_tree));
+            let theirs_text = adapter.project(&theirs_tree.tree);
             let ours_text = adapter.project(&ours.tree);
             let ours_defs = by_node(definitions(adapter, path, &ours));
+            // ADR 0033: gone from head's file but kept elsewhere in head
+            // under the same id: the parked text follows it there, and it
+            // leaves this file's parked side.
+            let index = self.head_index(head, moves)?;
+            let away: Vec<(NodeId, RepoPath)> = contested
+                .iter()
+                .filter(|n| !ours_defs.contains_key(n) && theirs_defs.contains_key(n))
+                .filter_map(|n| index.get(n).filter(|p| *p != path).map(|p| (*n, p.clone())))
+                .collect();
+            if !away.is_empty() {
+                let mut text = theirs_text.as_slice().to_vec();
+                let mut spans: Vec<Range<usize>> = Vec::new();
+                for (node, to) in &away {
+                    let Some(def) = theirs_defs.get(node) else {
+                        continue;
+                    };
+                    let Some(body) = text.get(def.span.clone()) else {
+                        return Ok(None);
+                    };
+                    moves.relocated.push(Relocated {
+                        node: *node,
+                        to: to.clone(),
+                        text: body.to_vec(),
+                    });
+                    spans.push(def.span.clone());
+                    contested.remove(node);
+                }
+                spans.sort_by_key(|s| std::cmp::Reverse(s.start));
+                for span in spans {
+                    text.splice(span, Vec::new());
+                }
+                match self.identify_on(adapter, path, record.result, &theirs.tree, text)? {
+                    Some(tree) => theirs_tree = tree,
+                    None => return Ok(None),
+                }
+                if contested.is_empty() {
+                    continue;
+                }
+            }
+            let theirs_defs = by_node(definitions(adapter, path, &theirs_tree));
+            let theirs_text = adapter.project(&theirs_tree.tree);
             let Some(next) = take_theirs(
                 ours_text.as_slice(),
                 &ours_defs,
@@ -173,16 +291,44 @@ impl Inner {
         head_tree: &IdentifiedTree,
         bytes: Vec<u8>,
     ) -> Result<Option<Arc<IdentifiedTree>>> {
+        self.identify_on(adapter, path, head, head_tree, bytes)
+    }
+
+    /// `bytes` parsed, with ids carried from `from_tree`, `path` in
+    /// `snapshot`.
+    fn identify_on(
+        &self,
+        adapter: &dyn LangAdapter,
+        path: &RepoPath,
+        snapshot: SnapshotId,
+        from_tree: &IdentifiedTree,
+        bytes: Vec<u8>,
+    ) -> Result<Option<Arc<IdentifiedTree>>> {
         let blob = self.put_blob(&bytes)?;
         let Some(tree) = self.parse(adapter, blob, &bytes) else {
             return Ok(None);
         };
-        let mapping = carry(adapter, path, head, head_tree, &tree)?;
+        let mapping = carry(adapter, path, snapshot, from_tree, &tree)?;
         Ok(Some(Arc::new(IdentifiedTree::new(
             (*tree).clone(),
             mapping.nodes,
         ))))
     }
+}
+
+/// Definitions head moved to other files (ADR 0033), and where head's
+/// definitions are.
+#[derive(Default)]
+struct Moves {
+    index: Option<BTreeMap<NodeId, RepoPath>>,
+    relocated: Vec<Relocated>,
+}
+
+/// A definition's parked text, for the file head moved it to.
+struct Relocated {
+    node: NodeId,
+    to: RepoPath,
+    text: Vec<u8>,
 }
 
 fn by_node(defs: Vec<DefinitionInfo>) -> BTreeMap<NodeId, DefinitionInfo> {

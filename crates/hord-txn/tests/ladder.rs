@@ -702,3 +702,84 @@ async fn taking_theirs_reports_files_taken_whole() -> TestResult {
     assert!(String::from_utf8(readme.as_slice().to_vec())?.contains("line uno"));
     Ok(())
 }
+
+const DELTA: &str = "pub fn delta() -> u32 {\n    4\n}\n";
+
+async fn file_at_head(repo: &Repo, file: &str) -> TestResult<Option<String>> {
+    let mut ws = begin(repo, "reader").await?;
+    Ok(match ws.read_file(&path(file)).await? {
+        Some(bytes) => Some(String::from_utf8(bytes.as_slice().to_vec())?),
+        None => None,
+    })
+}
+
+/// Take theirs follows identity across files (ADR 0033): head moved
+/// `delta` to another file (same NodeId) and a third change edited it
+/// there; the parked change edited `delta` in its old place. Its text goes
+/// to the moved definition, and nothing is left at the old place.
+#[tokio::test]
+async fn taking_theirs_follows_a_definition_moved_to_another_file() -> TestResult {
+    let t = ladder_repo(TWO_ATTEMPTS, None, Arc::new(StubVerifier)).await?;
+    let mut parked = begin(&t.repo, "parked").await?;
+    edit(&mut parked, "src/lib.rs", LIB, "    4\n", "    44\n").await?;
+
+    let mut mover = begin(&t.repo, "mover").await?;
+    mover
+        .write_file(
+            &path("src/lib.rs"),
+            LIB.replace(&format!("\n{DELTA}"), "").replace(
+                "mod other;",
+                "mod other;\nmod moved;\n\npub use moved::delta;",
+            ),
+        )
+        .await?;
+    mover.write_file(&path("src/moved.rs"), DELTA).await?;
+    submit(&t.repo, &mut mover, "move delta").await?;
+    t.repo.land_local().await?;
+    let delta = def(&mut begin(&t.repo, "r").await?, "src/moved.rs", "delta").await?;
+    assert_eq!(
+        delta,
+        def(&mut parked, "src/lib.rs", "delta").await?,
+        "ADR 0033 kept the id"
+    );
+    let mut third = begin(&t.repo, "third").await?;
+    edit(&mut third, "src/moved.rs", DELTA, "    4\n", "    40\n").await?;
+    submit(&t.repo, &mut third, "delta returns 40").await?;
+    t.repo.land_local().await?;
+
+    let cb = submit(&t.repo, &mut parked, "delta returns 44").await?;
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    assert_eq!(entry.status, QueueStatus::Conflicted, "{entry:#?}");
+
+    let (resolution, pending) = t
+        .repo
+        .arbitrate(
+            cb,
+            Arbitration::PickTheirs,
+            Arbiter {
+                actor: actor("arbiter"),
+                signature: None,
+            },
+        )
+        .await?;
+    assert!(escalation(&pending)?.whole_file.is_empty());
+    t.repo.land_local().await?;
+    assert_eq!(
+        t.repo.status(cb).await?.status,
+        QueueStatus::Arbitrated { landed: resolution }
+    );
+    let lib = file_at_head(&t.repo, "src/lib.rs").await?.ok_or("lib.rs")?;
+    let moved = file_at_head(&t.repo, "src/moved.rs")
+        .await?
+        .ok_or("moved.rs")?;
+    assert!(!lib.contains("fn delta"), "nothing at the old place: {lib}");
+    assert!(
+        moved.contains("    44\n"),
+        "the parked edit, moved: {moved}"
+    );
+    assert!(lib.contains("pub use moved::delta;"), "{lib}");
+    let record = t.repo.change(resolution).await?;
+    assert!(record.parents.contains(&cb));
+    Ok(())
+}
