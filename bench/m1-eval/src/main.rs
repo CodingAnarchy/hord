@@ -16,8 +16,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use gix::bstr::ByteSlice;
-use hord_diff::{MergeMode, diff, merge, merge_blob};
-use hord_lang::{IdentifiedTree, LangAdapter, default_identify};
+use hord_diff::{MergeMode, diff, merge, merge_blob, same_after_leading_attrs};
+use hord_lang::{IdentifiedTree, LangAdapter, NodeTree, default_identify};
 use hord_lang_rust::RustAdapter;
 use hord_lang_toml::TomlAdapter;
 
@@ -262,11 +262,9 @@ fn case_class(dir: &Path) -> Result<CaseClass> {
         return Ok(CaseClass::Manual);
     }
     let conflicted = git_merge_file(&base, &ours, &theirs, false)?;
-    let coarse = match ext {
-        "rs" => hunk_covers_disjoint_defs(&RustAdapter, &base, &ours, &theirs, &conflicted),
-        "toml" => hunk_covers_disjoint_defs(&TomlAdapter, &base, &ours, &theirs, &conflicted),
-        _ => false,
-    };
+    let coarse = lang_of(ext).is_some_and(|(_, adapter)| {
+        hunk_covers_disjoint_defs(adapter, &base, &ours, &theirs, &conflicted)
+    });
     Ok(if coarse {
         CaseClass::Coarse
     } else {
@@ -289,7 +287,7 @@ struct DefSpan {
 /// an outer attribute belongs to the next definition (ADR 0011). Those two
 /// ids are still one definition when the qualified name matches. Different
 /// names, or two definitions on one side, are a coarse hunk (ADR 0006).
-fn hunk_covers_disjoint_defs<A: LangAdapter>(
+fn hunk_covers_disjoint_defs<A: LangAdapter + ?Sized>(
     adapter: &A,
     base_src: &[u8],
     ours_src: &[u8],
@@ -375,56 +373,6 @@ fn span_bytes<'a>(src: &'a [u8], spans: &[DefSpan], id: hord_core::NodeId) -> Op
     src.get(span.start..span.end)
 }
 
-/// Drop outer attributes and doc comments that sit in front of a definition.
-fn same_after_leading_attrs(ours: &[u8], theirs: &[u8]) -> bool {
-    without_leading_attrs(ours) == without_leading_attrs(theirs)
-}
-
-fn without_leading_attrs(raw: &[u8]) -> &[u8] {
-    let mut i = 0usize;
-    loop {
-        while i < raw.len() && raw[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if raw[i..].starts_with(b"#[")
-            && let Some(end) = end_of_attribute(raw, i)
-        {
-            i = end;
-            continue;
-        }
-        if raw[i..].starts_with(b"///") || raw[i..].starts_with(b"//!") {
-            match raw[i..].iter().position(|byte| *byte == b'\n') {
-                Some(nl) => {
-                    i += nl + 1;
-                    continue;
-                }
-                None => return &raw[i..],
-            }
-        }
-        break;
-    }
-    &raw[i..]
-}
-
-fn end_of_attribute(raw: &[u8], start: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut i = start;
-    while i < raw.len() {
-        match raw[i] {
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
 fn only_id(ids: &BTreeSet<hord_core::NodeId>) -> Option<&hord_core::NodeId> {
     let mut iter = ids.iter();
     let id = iter.next()?;
@@ -439,26 +387,30 @@ fn span_name(spans: &[DefSpan], id: hord_core::NodeId) -> &str {
         .unwrap_or("")
 }
 
-fn side_spans<A: LangAdapter>(
+fn side_spans<A: LangAdapter + ?Sized>(
     adapter: &A,
     base_src: &[u8],
     ours_src: &[u8],
     theirs_src: &[u8],
 ) -> Result<(Vec<DefSpan>, Vec<DefSpan>), ()> {
     let empty = IdentifiedTree::default();
-    let base_tree = adapter.parse(base_src).map_err(|_| ())?;
-    let base_map = default_identify(adapter, &empty, &base_tree);
-    let base = IdentifiedTree::new(base_tree, base_map.nodes);
-    let ours_tree = adapter.parse(ours_src).map_err(|_| ())?;
-    let ours_map = default_identify(adapter, &base, &ours_tree);
-    let ours = IdentifiedTree::new(ours_tree, ours_map.nodes);
-    let theirs_tree = adapter.parse(theirs_src).map_err(|_| ())?;
-    let theirs_map = default_identify(adapter, &base, &theirs_tree);
-    let theirs = IdentifiedTree::new(theirs_tree, theirs_map.nodes);
+    let base = identified(adapter, &empty, adapter.parse(base_src).map_err(|_| ())?);
+    let ours = identified(adapter, &base, adapter.parse(ours_src).map_err(|_| ())?);
+    let theirs = identified(adapter, &base, adapter.parse(theirs_src).map_err(|_| ())?);
     Ok((def_spans(adapter, &ours), def_spans(adapter, &theirs)))
 }
 
-fn def_spans<A: LangAdapter>(adapter: &A, tree: &IdentifiedTree) -> Vec<DefSpan> {
+/// `tree` with the definition ids [`default_identify`] carries from `base`.
+fn identified<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    base: &IdentifiedTree,
+    tree: NodeTree,
+) -> IdentifiedTree {
+    let mapping = default_identify(adapter, base, &tree);
+    IdentifiedTree::new(tree, mapping.nodes)
+}
+
+fn def_spans<A: LangAdapter + ?Sized>(adapter: &A, tree: &IdentifiedTree) -> Vec<DefSpan> {
     let mut out = Vec::new();
     if let Some(root) = tree.tree.root() {
         walk_defs(
@@ -474,9 +426,9 @@ fn def_spans<A: LangAdapter>(adapter: &A, tree: &IdentifiedTree) -> Vec<DefSpan>
     out
 }
 
-fn walk_defs<A: LangAdapter>(
+fn walk_defs<A: LangAdapter + ?Sized>(
     adapter: &A,
-    tree: &hord_lang::NodeTree,
+    tree: &NodeTree,
     ids: &BTreeMap<Vec<u32>, hord_core::NodeId>,
     id: hord_core::ObjectId,
     site: &mut Vec<u32>,
@@ -662,15 +614,16 @@ fn hard_reason_bucket(reason: &str) -> String {
 
 fn eval_one_merge(dir: &Path) -> Result<MergeOut> {
     let (ext, base_src, ours_src, theirs_src, want) = load_case(dir)?;
-    match ext {
-        "rs" => eval_merge_pair(&RustAdapter, ext, &base_src, &ours_src, &theirs_src, &want),
-        "toml" => eval_merge_pair(&TomlAdapter, ext, &base_src, &ours_src, &theirs_src, &want),
-        "md" => eval_blob_merge(&base_src, &ours_src, &theirs_src, &want),
-        other => bail!("unknown case suffix .{other}"),
+    if ext == "md" {
+        return eval_blob_merge(&base_src, &ours_src, &theirs_src, &want);
     }
+    let Some((_, adapter)) = lang_of(ext) else {
+        bail!("unknown case suffix .{ext}");
+    };
+    eval_merge_pair(adapter, ext, &base_src, &ours_src, &theirs_src, &want)
 }
 
-fn eval_merge_pair<A: LangAdapter>(
+fn eval_merge_pair<A: LangAdapter + ?Sized>(
     adapter: &A,
     ext: &str,
     base_src: &[u8],
@@ -679,15 +632,21 @@ fn eval_merge_pair<A: LangAdapter>(
     want: &[u8],
 ) -> Result<MergeOut> {
     let empty = IdentifiedTree::default();
-    let base_tree = adapter.parse(base_src).context("parse base")?;
-    let base_map = default_identify(adapter, &empty, &base_tree);
-    let base = IdentifiedTree::new(base_tree, base_map.nodes);
-    let ours_tree = adapter.parse(ours_src).context("parse ours")?;
-    let ours_map = default_identify(adapter, &base, &ours_tree);
-    let ours = IdentifiedTree::new(ours_tree, ours_map.nodes);
-    let theirs_tree = adapter.parse(theirs_src).context("parse theirs")?;
-    let theirs_map = default_identify(adapter, &base, &theirs_tree);
-    let theirs = IdentifiedTree::new(theirs_tree, theirs_map.nodes);
+    let base = identified(
+        adapter,
+        &empty,
+        adapter.parse(base_src).context("parse base")?,
+    );
+    let ours = identified(
+        adapter,
+        &base,
+        adapter.parse(ours_src).context("parse ours")?,
+    );
+    let theirs = identified(
+        adapter,
+        &base,
+        adapter.parse(theirs_src).context("parse theirs")?,
+    );
     // A corpus case has no repository path; only conflict node ids use it.
     let path: hord_core::RepoPath = format!("merge-case.{ext}").parse()?;
     match merge(adapter, &path, &base, &ours, &theirs, MergeMode::Corpus) {
@@ -718,7 +677,7 @@ enum LabelMatch {
     Miss,
 }
 
-fn classify_label<A: LangAdapter>(adapter: &A, got: &[u8], want: &[u8]) -> LabelMatch {
+fn classify_label<A: LangAdapter + ?Sized>(adapter: &A, got: &[u8], want: &[u8]) -> LabelMatch {
     if got == want {
         return LabelMatch::Byte;
     }
@@ -745,7 +704,10 @@ fn classify_label<A: LangAdapter>(adapter: &A, got: &[u8], want: &[u8]) -> Label
     LabelMatch::Miss
 }
 
-fn def_names_of<A: LangAdapter>(adapter: &A, src: &[u8]) -> std::collections::BTreeSet<String> {
+fn def_names_of<A: LangAdapter + ?Sized>(
+    adapter: &A,
+    src: &[u8],
+) -> std::collections::BTreeSet<String> {
     let Ok(tree) = adapter.parse(src) else {
         return Default::default();
     };
@@ -774,9 +736,9 @@ fn def_names_of<A: LangAdapter>(adapter: &A, src: &[u8]) -> std::collections::BT
         .collect()
 }
 
-fn def_norms<A: LangAdapter>(
+fn def_norms<A: LangAdapter + ?Sized>(
     adapter: &A,
-    tree: &hord_lang::NodeTree,
+    tree: &NodeTree,
 ) -> std::collections::BTreeSet<hord_core::ObjectId> {
     tree.iter()
         .filter(|(_, node)| adapter.is_definition(&node.kind))
@@ -999,7 +961,7 @@ struct ParseCache {
 
 struct ParseCacheInner {
     order: VecDeque<(gix::ObjectId, u8)>,
-    trees: HashMap<(gix::ObjectId, u8), hord_lang::NodeTree>,
+    trees: HashMap<(gix::ObjectId, u8), NodeTree>,
 }
 
 impl ParseCache {
@@ -1023,13 +985,13 @@ impl ParseCache {
         self.lookups.load(Ordering::Relaxed)
     }
 
-    fn tree<A: LangAdapter>(
+    fn tree<A: LangAdapter + ?Sized>(
         &self,
         lang: u8,
         oid: gix::ObjectId,
         adapter: &A,
         bytes: &[u8],
-    ) -> Result<hord_lang::NodeTree> {
+    ) -> Result<NodeTree> {
         self.lookups.fetch_add(1, Ordering::Relaxed);
         if bytes.len() <= PARSE_CACHE_MAX_BYTES
             && let Some(tree) = self.cached(lang, oid)
@@ -1044,7 +1006,7 @@ impl ParseCache {
         Ok(tree)
     }
 
-    fn cached(&self, lang: u8, oid: gix::ObjectId) -> Option<hord_lang::NodeTree> {
+    fn cached(&self, lang: u8, oid: gix::ObjectId) -> Option<NodeTree> {
         let mut inner = self.inner.lock().expect("parse cache");
         let key = (oid, lang);
         let tree = inner.trees.get(&key)?.clone();
@@ -1055,7 +1017,7 @@ impl ParseCache {
         Some(tree)
     }
 
-    fn store(&self, lang: u8, oid: gix::ObjectId, tree: hord_lang::NodeTree) {
+    fn store(&self, lang: u8, oid: gix::ObjectId, tree: NodeTree) {
         let mut inner = self.inner.lock().expect("parse cache");
         let key = (oid, lang);
         if inner.trees.contains_key(&key)
@@ -1074,7 +1036,7 @@ impl ParseCache {
 }
 
 fn check_lossless(path: &str, bytes: &[u8]) -> Result<()> {
-    let adapter = adapter_for(path)?;
+    let (_, adapter) = path_lang(path)?;
     let tree = adapter
         .parse(bytes)
         .with_context(|| format!("parse {path}"))?;
@@ -1090,16 +1052,11 @@ fn check_lossless(path: &str, bytes: &[u8]) -> Result<()> {
 }
 
 fn check_apply_diff(cache: &ParseCache, job: &FilePair) -> Result<()> {
-    if job.path.ends_with(".rs") {
-        check_apply_pair(cache, 1, &RustAdapter, &job.path, job)
-    } else if job.path.ends_with(".toml") {
-        check_apply_pair(cache, 2, &TomlAdapter, &job.path, job)
-    } else {
-        bail!("not a .rs/.toml path: {}", job.path);
-    }
+    let (lang, adapter) = path_lang(&job.path)?;
+    check_apply_pair(cache, lang, adapter, &job.path, job)
 }
 
-fn check_apply_pair<A: LangAdapter>(
+fn check_apply_pair<A: LangAdapter + ?Sized>(
     cache: &ParseCache,
     lang: u8,
     adapter: &A,
@@ -1108,9 +1065,7 @@ fn check_apply_pair<A: LangAdapter>(
 ) -> Result<()> {
     let base_tree = cache.tree(lang, job.base_oid, adapter, &job.base)?;
     let result_tree = cache.tree(lang, job.result_oid, adapter, &job.result)?;
-    let empty = IdentifiedTree::default();
-    let base_map = default_identify(adapter, &empty, &base_tree);
-    let base = IdentifiedTree::new(base_tree, base_map.nodes);
+    let base = identified(adapter, &IdentifiedTree::default(), base_tree);
     let mapping = default_identify(adapter, &base, &result_tree);
     let want = result_tree.root();
     let file: hord_core::RepoPath = path
@@ -1135,13 +1090,21 @@ fn check_apply_pair<A: LangAdapter>(
     Ok(())
 }
 
-fn adapter_for(path: &str) -> Result<Box<dyn LangAdapter>> {
-    if path.ends_with(".rs") {
-        Ok(Box::new(RustAdapter))
-    } else if path.ends_with(".toml") {
-        Ok(Box::new(TomlAdapter))
-    } else {
-        bail!("not a .rs/.toml path: {path}");
+/// Parse-cache language tag and adapter for a file extension. The tag keeps
+/// `.rs` and `.toml` parses of the same blob apart in [`ParseCache`].
+fn lang_of(ext: &str) -> Option<(u8, &'static dyn LangAdapter)> {
+    match ext {
+        "rs" => Some((1, &RustAdapter)),
+        "toml" => Some((2, &TomlAdapter)),
+        _ => None,
+    }
+}
+
+/// [`lang_of`] the extension of `path`.
+fn path_lang(path: &str) -> Result<(u8, &'static dyn LangAdapter)> {
+    match path.rsplit_once('.').and_then(|(_, ext)| lang_of(ext)) {
+        Some(lang) => Ok(lang),
+        None => bail!("not a .rs/.toml path: {path}"),
     }
 }
 

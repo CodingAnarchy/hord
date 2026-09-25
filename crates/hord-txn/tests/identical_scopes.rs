@@ -20,7 +20,7 @@ fn files(helper: &str, a_rest: &str, b_rest: &str) -> Vec<(String, String)> {
 }
 
 /// Both changes land (stub verifier) so each report can be inspected.
-async fn repo_of(files: &[(String, String)]) -> TempRepo {
+async fn repo_of(files: &[(String, String)]) -> TestResult<TempRepo> {
     let refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
@@ -28,8 +28,8 @@ async fn repo_of(files: &[(String, String)]) -> TempRepo {
     stub_repo(&refs).await
 }
 
-async fn id_in(repo: &Repo, file: &str, name: &str) -> NodeId {
-    let mut ws = begin(repo, "probe").await;
+async fn id_in(repo: &Repo, file: &str, name: &str) -> TestResult<NodeId> {
+    let mut ws = begin(repo, "probe").await?;
     def(&mut ws, file, name).await
 }
 
@@ -42,17 +42,17 @@ async fn change(
     text: &str,
     from: &str,
     to: &str,
-) -> hord_core::ChangeId {
-    let mut ws = begin(repo, who).await;
-    edit(&mut ws, file, text, from, to).await;
+) -> TestResult<hord_core::ChangeId> {
+    let mut ws = begin(repo, who).await?;
+    edit(&mut ws, file, text, from, to).await?;
     submit(repo, &mut ws, who).await
 }
 
 /// The id `change` landed under (a rebased change lands under a new id).
-async fn landed_as(repo: &Repo, change: hord_core::ChangeId) -> hord_core::ChangeId {
-    match repo.status(change).await.unwrap().status {
-        QueueStatus::Landed { landed } => landed,
-        other => panic!("{change} did not land: {other:?}"),
+async fn landed_as(repo: &Repo, change: hord_core::ChangeId) -> TestResult<hord_core::ChangeId> {
+    match repo.status(change).await?.status {
+        QueueStatus::Landed { landed } => Ok(landed),
+        other => Err(format!("{change} did not land: {other:?}").into()),
     }
 }
 
@@ -70,7 +70,7 @@ fn read_write_nodes(report: &ConflictReport, landed: hord_core::ChangeId) -> Vec
 /// read-write with change 1 on `b::target`, not on `a::target`. The mirror
 /// case (edits in `a`) holds too, so neither copy borrows the other's scope.
 #[tokio::test]
-async fn editing_a_copy_that_calls_a_changed_target_is_a_read_write_conflict() {
+async fn editing_a_copy_that_calls_a_changed_target_is_a_read_write_conflict() -> TestResult {
     let helper = "pub fn helper() -> u32 {\n    target()\n}\n";
     let a_rest = "pub fn target() -> u32 {\n    1\n}\n";
     let b_rest = "pub fn target() -> u32 {\n    2\n}\n";
@@ -79,12 +79,12 @@ async fn editing_a_copy_that_calls_a_changed_target_is_a_read_write_conflict() {
         ("b", "src/b.rs", &fs[2].1, "    2\n"),
         ("a", "src/a.rs", &fs[1].1, "    1\n"),
     ] {
-        let t = repo_of(&fs).await;
-        let a_target = id_in(&t.repo, "src/a.rs", "target").await;
-        let b_target = id_in(&t.repo, "src/b.rs", "target").await;
+        let t = repo_of(&fs).await?;
+        let a_target = id_in(&t.repo, "src/a.rs", "target").await?;
+        let b_target = id_in(&t.repo, "src/b.rs", "target").await?;
         let own = if module == "b" { b_target } else { a_target };
         let other = if module == "b" { a_target } else { b_target };
-        let c1 = change(&t.repo, "one", file, text, target_body, "    20\n").await;
+        let c1 = change(&t.repo, "one", file, text, target_body, "    20\n").await?;
         let c2 = change(
             &t.repo,
             "two",
@@ -93,14 +93,14 @@ async fn editing_a_copy_that_calls_a_changed_target_is_a_read_write_conflict() {
             "    target()\n",
             "    target() + 1\n",
         )
-        .await;
-        let done = t.repo.land_local().await.unwrap();
+        .await?;
+        let done = t.repo.land_local().await?;
         assert!(
             done.iter()
                 .all(|e| matches!(e.status, QueueStatus::Landed { .. }))
         );
-        let report = t.repo.conflicts(c2).await.unwrap();
-        let nodes = read_write_nodes(&report, landed_as(&t.repo, c1).await);
+        let report = t.repo.conflicts(c2).await?;
+        let nodes = read_write_nodes(&report, landed_as(&t.repo, c1).await?);
         assert!(
             nodes.contains(&own),
             "{module}: no read-write on {module}::target: {report:#?}"
@@ -110,6 +110,7 @@ async fn editing_a_copy_that_calls_a_changed_target_is_a_read_write_conflict() {
             "{module}: conflict names the other module's target"
         );
     }
+    Ok(())
 }
 
 /// The scope itself, where no over-approximation applies (a type path, not a
@@ -117,21 +118,21 @@ async fn editing_a_copy_that_calls_a_changed_target_is_a_read_write_conflict() {
 /// struct `Target`. A landed edit to `a::Target` does not conflict with an
 /// edit to `b::helper`; a landed edit to `b::Target` does.
 #[tokio::test]
-async fn a_copy_reads_only_its_own_modules_types() {
+async fn a_copy_reads_only_its_own_modules_types() -> TestResult {
     let helper = "pub fn helper() -> Target {\n    Target\n}\n";
     let rest = "pub struct Target;\n";
     let fs = files(helper, rest, rest);
-    let t = repo_of(&fs).await;
-    let a_target = id_in(&t.repo, "src/a.rs", "Target").await;
-    let b_target = id_in(&t.repo, "src/b.rs", "Target").await;
+    let t = repo_of(&fs).await?;
+    let a_target = id_in(&t.repo, "src/a.rs", "Target").await?;
+    let b_target = id_in(&t.repo, "src/b.rs", "Target").await?;
     assert_ne!(
         a_target, b_target,
         "identical definitions in two files have two ids"
     );
 
     let widen = ("pub struct Target;", "pub(crate) struct Target;");
-    let edit_a = change(&t.repo, "a-type", "src/a.rs", &fs[1].1, widen.0, widen.1).await;
-    let edit_b = change(&t.repo, "b-type", "src/b.rs", &fs[2].1, widen.0, widen.1).await;
+    let edit_a = change(&t.repo, "a-type", "src/a.rs", &fs[1].1, widen.0, widen.1).await?;
+    let edit_b = change(&t.repo, "b-type", "src/b.rs", &fs[2].1, widen.0, widen.1).await?;
     let helper_b = change(
         &t.repo,
         "helper",
@@ -140,24 +141,25 @@ async fn a_copy_reads_only_its_own_modules_types() {
         "    Target\n}",
         "    let t = Target;\n    t\n}",
     )
-    .await;
-    let done = t.repo.land_local().await.unwrap();
+    .await?;
+    let done = t.repo.land_local().await?;
     assert!(
         done.iter()
             .all(|e| matches!(e.status, QueueStatus::Landed { .. })),
         "{done:#?}"
     );
 
-    let report = t.repo.conflicts(helper_b).await.unwrap();
-    let with_b = read_write_nodes(&report, landed_as(&t.repo, edit_b).await);
+    let report = t.repo.conflicts(helper_b).await?;
+    let with_b = read_write_nodes(&report, landed_as(&t.repo, edit_b).await?);
     assert!(
         with_b.contains(&b_target),
         "b::helper must read b::Target: {report:#?}"
     );
-    let with_a = read_write_nodes(&report, landed_as(&t.repo, edit_a).await);
+    let with_a = read_write_nodes(&report, landed_as(&t.repo, edit_a).await?);
     assert!(
         with_a.is_empty(),
         "b::helper must not read a::Target: {report:#?}"
     );
     assert!(!report.nodes().contains(&a_target));
+    Ok(())
 }

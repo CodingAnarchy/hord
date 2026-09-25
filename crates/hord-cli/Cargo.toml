@@ -14,21 +14,28 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
+hord-api.workspace = true
 hord-core.workspace = true
+hord-encoding.workspace = true
 hord-git.workspace = true
+hord-policy.workspace = true
+hord-remote.workspace = true
+hord-server.workspace = true
 hord-store.workspace = true
 hord-txn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal", "time"] }
+tokio-stream.workspace = true
+toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
-hord-core.workspace = true
 hord-identity.workspace = true
 hord-lang.workspace = true
 hord-lang-rust.workspace = true
-hord-store.workspace = true
-serde.workspace = true
-serde_json.workspace = true

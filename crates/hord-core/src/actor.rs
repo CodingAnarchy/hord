@@ -25,6 +25,16 @@ pub enum Actor {
     },
 }
 
+impl Actor {
+    /// The stable identifier of either kind of actor.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Human { id } | Self::Agent { id, .. } => id,
+        }
+    }
+}
+
 /// Unix time in milliseconds.
 ///
 /// Hashed object fields must not contain floating-point values (spec §3.9).
@@ -45,5 +55,22 @@ impl Timestamp {
     #[must_use]
     pub const fn as_millis(self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_is_the_id_field_of_either_kind() {
+        assert_eq!(Actor::Human { id: "ada".into() }.id(), "ada");
+        let agent = Actor::Agent {
+            id: "agent-7".into(),
+            model: "m".into(),
+            model_hash: Bytes::default(),
+            harness: "h".into(),
+        };
+        assert_eq!(agent.id(), "agent-7");
     }
 }

@@ -114,13 +114,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repo_path_parse_display() {
-        let path: RepoPath = "crates/hord-core/src/lib.rs".parse().unwrap();
+    fn repo_path_parse_display() -> Result<(), Box<dyn std::error::Error>> {
+        let path: RepoPath = "crates/hord-core/src/lib.rs".parse()?;
         assert_eq!(path.to_string(), "crates/hord-core/src/lib.rs");
         assert_eq!(path.components(), ["crates", "hord-core", "src", "lib.rs"]);
         assert!("foo//bar".parse::<RepoPath>().is_err());
         assert!("/foo".parse::<RepoPath>().is_err());
-        let root: RepoPath = "".parse().unwrap();
+        let root: RepoPath = "".parse()?;
         assert!(root.is_root());
+        Ok(())
     }
 }

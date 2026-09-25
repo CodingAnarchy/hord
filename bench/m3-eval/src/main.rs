@@ -22,6 +22,15 @@
 //! to and landed by a freshly opened repository that did not propose them
 //! (the M4 remote case, [`remote`]). Gate: throughput ≥ 20 changes/s.
 //!
+//! `--policy` lands spec §7.2's example policy before the agents work and
+//! checks the lander enforces it (spec §12 M4, [`policy`]); it combines
+//! with the in-process run and with `--server`.
+//!
+//! `--server` runs only the simulation, against a spawned `hord serve`
+//! with one client connection per agent, and writes a flight-recorder log
+//! of the event stream ([`server`]). Gates: M3's, plus the recording reads
+//! back.
+//!
 //! The process exits nonzero if any gate fails.
 //!
 //! ```text
@@ -29,6 +38,7 @@
 //! cargo run -p hord-eval-m3 --release --offline -- --json target/m3-eval.json
 //! cargo run -p hord-eval-m3 --release --offline -- --seed 7 --strict-reads
 //! cargo run -p hord-eval-m3 --release --offline -- --remote-submit
+//! cargo run -p hord-eval-m3 --release --offline -- --server
 //! ```
 //!
 //! The corpus is `cargo.git` under `--cache`, `$HORD_CORPORA`, or
@@ -38,19 +48,19 @@
 
 mod corpus;
 mod lock;
+mod policy;
 mod remote;
 mod rust;
+mod server;
 mod sim;
 mod workspaces;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use hord_core::RepoPath;
-use hord_txn::{Repo, RepoConfig, RepoOptions, StubVerifier};
+use hord_txn::Repo;
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -84,6 +94,19 @@ struct Args {
     /// opened one (the M4 remote case). Runs only this simulation.
     #[arg(long)]
     remote_submit: bool,
+    /// Run the simulation against a spawned `hord serve`, one client
+    /// connection per agent, and record the event stream. Runs only this
+    /// simulation.
+    #[arg(long)]
+    server: bool,
+    /// Land §7.2's example policy first and check the lander enforces it,
+    /// with verification stubbed by evidence fixtures (spec §12 M4,
+    /// [`policy`]). With `--server`, against the server.
+    #[arg(long)]
+    policy: bool,
+    /// Internal: serve the repository at this path (the `--server` child).
+    #[arg(long, hide = true, value_name = "DIR")]
+    internal_serve: Option<PathBuf>,
     /// Print throughput without gating on it. Every correctness gate still
     /// applies. For shared CI runners, whose speed varies run to run;
     /// throughput is gated on the reference machine instead.
@@ -118,6 +141,19 @@ struct Gates {
     all: bool,
 }
 
+impl Args {
+    fn sim_config(&self) -> sim::SimConfig {
+        sim::SimConfig {
+            agents: self.agents,
+            overlap_percent: self.overlap_percent,
+            seed: self.seed,
+            strict_reads: self.strict_reads,
+            racy_submit: self.racy_submit,
+            policy: self.policy,
+        }
+    }
+}
+
 /// Scratch directory, removed on drop.
 struct Scratch(PathBuf);
 
@@ -140,6 +176,10 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<bool> {
+    if let Some(dir) = &args.internal_serve {
+        server::serve_child(dir, args.strict_reads, args.policy)?;
+        return Ok(true);
+    }
     let git_dir = corpus::cache_dir(args.cache.as_deref())?.join("cargo.git");
     if !git_dir.is_dir() {
         anyhow::bail!("missing cargo corpus at {}", git_dir.display());
@@ -162,32 +202,24 @@ fn run(args: &Args) -> Result<bool> {
     if args.remote_submit {
         return runtime.block_on(remote_submit(args, &corpus, &scratch.0));
     }
+    if args.server {
+        return runtime.block_on(server_run(args, &corpus, &scratch.0));
+    }
     let report = runtime.block_on(evaluate(args, &corpus, &scratch.0))?;
     print(&report, args);
-    if let Some(path) = &args.json {
-        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
-            .with_context(|| format!("write {}", path.display()))?;
-        eprintln!("[report] wrote {}", path.display());
-    }
+    write_json(args, &report)?;
     Ok(report.gates.all)
 }
 
 async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<bool> {
-    let files: Vec<(RepoPath, Vec<u8>)> = corpus
-        .files
-        .iter()
-        .filter_map(|(p, b)| p.parse::<RepoPath>().ok().map(|p| (p, b.clone())))
-        .collect();
     let report = remote::run(
         &scratch.join("remote"),
-        files,
+        corpus.repo_files(),
         &corpus.files,
         &sim::SimConfig {
-            agents: args.agents,
-            overlap_percent: args.overlap_percent,
-            seed: args.seed,
-            strict_reads: args.strict_reads,
             racy_submit: false,
+            policy: false,
+            ..args.sim_config()
         },
     )
     .await?;
@@ -205,33 +237,65 @@ async fn remote_submit(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> 
         report.rejected,
         throughput_status(report.throughput, args.report_throughput)
     );
-    if let Some(path) = &args.json {
-        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
-            .with_context(|| format!("write {}", path.display()))?;
-    }
+    write_json(args, &report)?;
+    // Remote mode gates only throughput, which --report-throughput reports.
     Ok(report.pass || args.report_throughput)
+}
+
+async fn server_run(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<bool> {
+    let report = server::run(
+        scratch,
+        corpus.repo_files(),
+        &corpus.files,
+        &args.sim_config(),
+    )
+    .await?;
+    let gates = sim_gates(&report.sim, args.report_throughput);
+    println!(
+        "[server] {} over {} client connections; pushed {} objects ({:.2}s summed over agents)",
+        report.url, report.client_connections, report.objects_pushed, report.push_secs
+    );
+    print_sim(&report.sim, &gates, args.report_throughput);
+    println!(
+        "[server] flight recording {} ({} events) replays {}",
+        report.recording,
+        report.recorded_events,
+        pass_fail(report.recording_replays)
+    );
+    let all = gates.all && report.recording_replays;
+    println!("m3 --server {}", pass_fail(all));
+    write_json(args, &report)?;
+    Ok(all)
+}
+
+/// The simulation's gates.
+struct SimGates {
+    throughput: bool,
+    false_negatives: bool,
+    false_positive_rate: bool,
+    disjoint_landed: bool,
+    all: bool,
+}
+
+fn sim_gates(sim: &sim::SimReport, report_throughput: bool) -> SimGates {
+    let policy = sim.policy.as_ref().is_none_or(|p| p.pass);
+    let throughput = sim.throughput >= 20.0 || report_throughput;
+    let false_negatives = sim.false_negatives.is_empty();
+    let false_positive_rate = sim.false_positive_rate <= 0.10;
+    let disjoint_landed = sim.disjoint_not_landed.is_empty() && sim.disjoint > 0;
+    SimGates {
+        throughput,
+        false_negatives,
+        false_positive_rate,
+        disjoint_landed,
+        all: throughput && false_negatives && false_positive_rate && disjoint_landed && policy,
+    }
 }
 
 async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Result<Report> {
     let store = hord_store::Store::create(scratch.join("sim")).context("create store")?;
-    let repo = Repo::from_store(
-        store,
-        RepoOptions {
-            config: RepoConfig {
-                strict_reads: args.strict_reads,
-            },
-            // Spec §12 M3: verification stubbed. Overlaps that rebase cleanly
-            // land flagged; the product default parks them.
-            verifier: Some(Arc::new(StubVerifier)),
-            ..RepoOptions::default()
-        },
-    )
-    .await?;
-    let files: Vec<(RepoPath, Vec<u8>)> = corpus
-        .files
-        .iter()
-        .filter_map(|(p, b)| p.parse::<RepoPath>().ok().map(|p| (p, b.clone())))
-        .collect();
+    let repo = Repo::from_store(store, sim::repo_options(args.strict_reads, args.policy)).await?;
+    let files = corpus.repo_files();
     let file_count = files.len();
     let started = Instant::now();
     let base = repo
@@ -249,19 +313,7 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
         snapshot.defs.len(),
         args.agents
     );
-    let sim = sim::run(
-        &repo,
-        base,
-        &snapshot,
-        &sim::SimConfig {
-            agents: args.agents,
-            overlap_percent: args.overlap_percent,
-            seed: args.seed,
-            strict_reads: args.strict_reads,
-            racy_submit: args.racy_submit,
-        },
-    )
-    .await?;
+    let sim = sim::run(&repo, base, &snapshot, &args.sim_config()).await?;
 
     eprintln!("[workspaces] {} live", args.workspaces);
     let workspaces = workspaces::run(&repo, args.workspaces, &sim.target_files).await?;
@@ -273,25 +325,17 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
     let cargo_lock = lock::run(scratch, manifest, lockfile).await?;
 
     let gates = {
-        let throughput = sim.throughput >= 20.0 || args.report_throughput;
-        let false_negatives = sim.false_negatives.is_empty();
-        let false_positive_rate = sim.false_positive_rate <= 0.10;
-        let disjoint_landed = sim.disjoint_not_landed.is_empty() && sim.disjoint > 0;
+        let sim_gates = sim_gates(&sim, args.report_throughput);
         let workspaces = workspaces::ok(&workspaces, args.workspaces);
         let cargo_lock = cargo_lock.iter().all(|c| c.pass);
         Gates {
-            throughput,
-            false_negatives,
-            false_positive_rate,
-            disjoint_landed,
+            throughput: sim_gates.throughput,
+            false_negatives: sim_gates.false_negatives,
+            false_positive_rate: sim_gates.false_positive_rate,
+            disjoint_landed: sim_gates.disjoint_landed,
             workspaces,
             cargo_lock,
-            all: throughput
-                && false_negatives
-                && false_positive_rate
-                && disjoint_landed
-                && workspaces
-                && cargo_lock,
+            all: sim_gates.all && workspaces && cargo_lock,
         }
     };
     Ok(Report {
@@ -307,6 +351,16 @@ async fn evaluate(args: &Args, corpus: &corpus::Corpus, scratch: &Path) -> Resul
     })
 }
 
+/// Write `report` to `--json`, if given.
+fn write_json(args: &Args, report: &impl Serialize) -> Result<()> {
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_vec_pretty(report)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        eprintln!("[report] wrote {}", path.display());
+    }
+    Ok(())
+}
+
 /// PASS/FAIL against the 20 changes/s gate, or REPORTED when it is not gated.
 fn throughput_status(changes_per_sec: f64, report_only: bool) -> &'static str {
     match (changes_per_sec >= 20.0, report_only) {
@@ -320,9 +374,7 @@ fn pass_fail(ok: bool) -> &'static str {
     if ok { "PASS" } else { "FAIL" }
 }
 
-fn print(report: &Report, args: &Args) {
-    let sim = &report.sim;
-    let gates = &report.gates;
+fn print_sim(sim: &sim::SimReport, gates: &SimGates, report_throughput: bool) {
     let kinds = |kind: sim::PairKind| sim.pairs.iter().filter(|p| p.2 == kind).count();
     println!(
         "[sim] seed {} agents {} (disjoint {}, overlapping {}: pairs write-write {} read-write {} name {}) target pool {} strict_reads {} racy_submit {}",
@@ -351,7 +403,7 @@ fn print(report: &Report, args: &Args) {
         sim.throughput,
         sim.agents,
         sim.land_secs,
-        throughput_status(sim.throughput, args.report_throughput)
+        throughput_status(sim.throughput, report_throughput)
     );
     for f in &sim.false_negatives {
         println!(
@@ -403,6 +455,20 @@ fn print(report: &Report, args: &Args) {
         "[sim] false positives not explained by identity loss {}/{} (diagnostic)",
         sim.false_positive_changes_clean_identity, sim.agents
     );
+    if let Some(policy) = &sim.policy {
+        println!(
+            "[policy] public API under {}; denied {} of {} the oracle polices; fired {:?}; parked {} {}",
+            policy.public_dir,
+            policy.denied,
+            policy.expected_denied,
+            policy.fired,
+            sim.parked,
+            pass_fail(policy.pass)
+        );
+        for m in &policy.mismatches {
+            println!("[policy] mismatch: {m}");
+        }
+    }
     println!(
         "[sim] structural rebase landed {}/{} oracle-disjoint changes without replay {}",
         sim.disjoint_landed,
@@ -421,6 +487,15 @@ fn print(report: &Report, args: &Args) {
             sim.unknown_landed_refs
         );
     }
+}
+
+fn print(report: &Report, args: &Args) {
+    print_sim(
+        &report.sim,
+        &sim_gates(&report.sim, args.report_throughput),
+        args.report_throughput,
+    );
+    let gates = &report.gates;
     let ws = &report.workspaces;
     println!(
         "[workspaces] begin p50 {:.1} µs p99 {:.1} µs max {:.1} µs over {} (target < 5 ms)",

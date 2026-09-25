@@ -13,11 +13,11 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Result;
-use hord_core::{Node, ObjectId, QualifiedName};
+use hord_core::ObjectId;
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree, default_identify};
 use hord_lang_rust::RustAdapter;
 
-use crate::git;
+use crate::{git, snapshot};
 
 const MAX_BYTES: usize = 500_000;
 
@@ -193,65 +193,20 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
 }
 
 fn sites(adapter: &RustAdapter, tree: &NodeTree) -> Vec<Site> {
-    let Some(root) = tree.root() else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    let mut ancestors = Vec::new();
-    walk(
-        adapter,
-        tree,
-        root,
-        &mut Vec::new(),
-        &mut ancestors,
-        &mut out,
-    );
-    out
-}
-
-fn walk(
-    adapter: &RustAdapter,
-    tree: &NodeTree,
-    oid: ObjectId,
-    at: &mut Vec<u32>,
-    ancestors: &mut Vec<ObjectId>,
-    out: &mut Vec<Site>,
-) {
-    let Some(node) = tree.get(oid) else {
-        return;
-    };
-    if adapter.is_definition(&node.kind)
-        && let Some(qname) = qname(adapter, tree, ancestors, node)
-    {
+    snapshot::named_defs(adapter, tree, |at, oid, node, qname| {
         let simple = qname.as_str().rsplit("::").next().unwrap_or(qname.as_str());
+        let mut leaves = BTreeSet::new();
+        collect_leaf_tokens(tree, oid, simple, &mut leaves);
         out.push(Site {
             oid,
-            at: at.clone(),
+            at: at.to_vec(),
             kind: node.kind.as_str().to_string(),
             qname: qname.as_str().to_string(),
-            leaves: leaf_tokens(tree, oid, simple),
+            leaves,
         });
-    }
-    ancestors.push(oid);
-    for (i, child) in node.children.iter().enumerate() {
-        at.push(u32::try_from(i).unwrap_or(u32::MAX));
-        walk(adapter, tree, *child, at, ancestors, out);
-        at.pop();
-    }
-    ancestors.pop();
-}
-
-fn qname(
-    adapter: &RustAdapter,
-    tree: &NodeTree,
-    ancestors: &[ObjectId],
-    node: &Node,
-) -> Option<QualifiedName> {
-    if let Some(name) = &node.name {
-        return Some(name.clone());
-    }
-    let nodes: Vec<&Node> = ancestors.iter().filter_map(|id| tree.get(*id)).collect();
-    adapter.qualified_name(&nodes, node)
+    });
+    out
 }
 
 fn tokens(text: &str, simple: &str) -> BTreeSet<String> {
@@ -259,12 +214,6 @@ fn tokens(text: &str, simple: &str) -> BTreeSet<String> {
         .filter(|tok| tok.len() >= 2 && !tok.eq_ignore_ascii_case(simple))
         .map(|tok| tok.to_ascii_lowercase())
         .collect()
-}
-
-fn leaf_tokens(tree: &NodeTree, oid: ObjectId, simple: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    collect_leaf_tokens(tree, oid, simple, &mut out);
-    out
 }
 
 fn collect_leaf_tokens(tree: &NodeTree, oid: ObjectId, simple: &str, out: &mut BTreeSet<String>) {

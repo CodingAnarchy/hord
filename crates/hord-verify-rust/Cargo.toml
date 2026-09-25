@@ -1,0 +1,23 @@
+[package]
+name = "hord-verify-rust"
+description = "Cargo check/test/clippy/bench runner, coverage, and test selection for Hord (spec §4.2 Tier 3)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hord-core.workspace = true
+hord-encoding.workspace = true
+hord-lang.workspace = true
+hord-lang-rust.workspace = true
+hord-verify.workspace = true
+rustc-demangle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hord-store.workspace = true

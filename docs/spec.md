@@ -706,7 +706,7 @@ hord/
 
 - Rust 2024 edition. MSRV = current stable at project start; bump freely.
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` gate every landing.
-- `#![forbid(unsafe_code)]` in every crate except `hord-vfs`.
+- `#![forbid(unsafe_code)]` in every crate except `hord-vfs`. (ADR 0027: `hord-cli` has one Windows-only `unsafe` function.)
 - Property tests (`proptest`) for: encoding round-trip, parse/project losslessness, `apply(base, diff(base, result)) == result`, merge commutativity where specified.
 - Every public type documented. `cargo doc` warnings are errors.
 - Errors: `thiserror` in libraries, `anyhow` only in `hord-cli`.

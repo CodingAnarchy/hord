@@ -46,9 +46,10 @@ fn is_modern(bytes: &[u8]) -> bool {
 
 #[test]
 #[ignore = "walks cargo.git history; run with --ignored when the corpus is present"]
-fn every_modern_lockfile_is_lossless_and_reemits_byte_identical() {
+fn every_modern_lockfile_is_lossless_and_reemits_byte_identical()
+-> Result<(), Box<dyn std::error::Error>> {
     let Some(git_dir) = cargo_git() else {
-        return;
+        return Ok(());
     };
     let revs = git(&git_dir, &["log", "--format=%H", "--", "Cargo.lock"]).expect("log");
     let mut checked = 0usize;
@@ -61,19 +62,20 @@ fn every_modern_lockfile_is_lossless_and_reemits_byte_identical() {
         }
         let tree = CargoLockAdapter
             .parse(&bytes)
-            .unwrap_or_else(|e| panic!("parse {rev}: {e}"));
+            .map_err(|e| format!("parse {rev}: {e}"))?;
         assert_eq!(
             CargoLockAdapter.project(&tree).as_slice(),
             bytes,
             "lossless {rev}"
         );
         let merged =
-            merge_cargo_lock(&bytes, &bytes, &bytes).unwrap_or_else(|e| panic!("merge {rev}: {e}"));
+            merge_cargo_lock(&bytes, &bytes, &bytes).map_err(|e| format!("merge {rev}: {e}"))?;
         assert!(merged == bytes, "re-emission differs at {rev}");
         checked += 1;
     }
     println!("checked {checked} lockfiles");
     assert!(checked > 0);
+    Ok(())
 }
 
 /// Replays every two-parent merge commit that touched `Cargo.lock` where both
@@ -81,9 +83,9 @@ fn every_modern_lockfile_is_lossless_and_reemits_byte_identical() {
 /// the committed lockfile; conflicts are counted, not failed.
 #[test]
 #[ignore = "walks cargo.git history; run with --ignored when the corpus is present"]
-fn real_merge_commits_reproduce_committed_lockfile() {
+fn real_merge_commits_reproduce_committed_lockfile() -> Result<(), Box<dyn std::error::Error>> {
     let Some(git_dir) = cargo_git() else {
-        return;
+        return Ok(());
     };
     let merges = git(
         &git_dir,
@@ -136,7 +138,7 @@ fn real_merge_commits_reproduce_committed_lockfile() {
                 println!("{merge}: conflict {c:?}");
                 conflicted += 1;
             }
-            Err(e) => panic!("{merge}: {e}"),
+            Err(e) => return Err(format!("{merge}: {e}").into()),
         }
     }
     println!(
@@ -152,4 +154,5 @@ fn real_merge_commits_reproduce_committed_lockfile() {
             .all(|m| NON_CANONICAL.contains(&m.as_str())),
         "clean merges must reproduce Cargo's bytes"
     );
+    Ok(())
 }

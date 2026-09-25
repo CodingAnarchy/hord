@@ -34,17 +34,17 @@ pub fn second(p: &str) -> usize {
 ";
 
 #[tokio::test(flavor = "multi_thread")]
-async fn edit_beside_duplicate_content_definitions_writes_the_edited_function() {
-    let t = repo(&[("src/lib.rs", SRC)]).await;
-    let mut ws = begin(&t.repo, "duplicate-content").await;
+async fn edit_beside_duplicate_content_definitions_writes_the_edited_function() -> TestResult {
+    let t = repo(&[("src/lib.rs", SRC)]).await?;
+    let mut ws = begin(&t.repo, "duplicate-content").await?;
     let target = rewrite(
         &mut ws,
         "src/lib.rs",
         "target",
         "pub fn target(x: u32) -> u32 {\n    let _sim = 1_u64;\n    x + 1\n}",
     )
-    .await;
-    let record = ws.propose(intent("edit target")).await.unwrap().record;
+    .await?;
+    let record = ws.propose(intent("edit target")).await?.record;
 
     // The edit is exactly one Replace of `target`: no whole-file replace of
     // the root (nil or the path-derived root), no spurious move.
@@ -67,4 +67,5 @@ async fn edit_beside_duplicate_content_definitions_writes_the_edited_function() 
         vec![target],
         "write set must be exactly the edited function (no root id)"
     );
+    Ok(())
 }

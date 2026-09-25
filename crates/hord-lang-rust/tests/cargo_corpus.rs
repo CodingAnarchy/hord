@@ -11,19 +11,20 @@ fn cargo_git_dir() -> PathBuf {
     PathBuf::from(home).join(".cache/hord/corpora/cargo.git")
 }
 
-fn git(git_dir: &Path, args: &[&str]) -> Vec<u8> {
+fn git(git_dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out.stdout
+        .map_err(|e| format!("git {args:?}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(out.stdout)
 }
 
 /// Parse every `.rs` file at HEAD of `~/.cache/hord/corpora/cargo.git`.
@@ -31,7 +32,7 @@ fn git(git_dir: &Path, args: &[&str]) -> Vec<u8> {
 /// Does not clone. Run with `cargo test -p hord-lang-rust -- --ignored`.
 #[test]
 #[ignore = "requires ~/.cache/hord/corpora/cargo.git"]
-fn cargo_head_rs_blobs_are_lossless() {
+fn cargo_head_rs_blobs_are_lossless() -> Result<(), Box<dyn std::error::Error>> {
     let git_dir = cargo_git_dir();
     assert!(
         git_dir.exists(),
@@ -39,7 +40,7 @@ fn cargo_head_rs_blobs_are_lossless() {
         git_dir.display()
     );
 
-    let listing = git(&git_dir, &["ls-tree", "-r", "-z", "HEAD"]);
+    let listing = git(&git_dir, &["ls-tree", "-r", "-z", "HEAD"])?;
     let adapter = RustAdapter;
     let mut checked = 0usize;
     for entry in listing.split(|b| *b == 0) {
@@ -54,16 +55,18 @@ fn cargo_head_rs_blobs_are_lossless() {
         if !path.ends_with(".rs") {
             continue;
         }
-        let Some(sha) = meta.split_whitespace().nth(2) else {
-            panic!("bad ls-tree line: {entry}");
-        };
-        let bytes = git(&git_dir, &["cat-file", "blob", sha]);
+        let sha = meta
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| format!("bad ls-tree line: {entry}"))?;
+        let bytes = git(&git_dir, &["cat-file", "blob", sha])?;
         let tree = adapter
             .parse(&bytes)
-            .unwrap_or_else(|e| panic!("parse {path} ({sha}): {e}"));
+            .map_err(|e| format!("parse {path} ({sha}): {e}"))?;
         let projected = adapter.project(&tree);
         assert_eq!(projected.as_slice(), bytes.as_slice(), "lossless {path}");
         checked += 1;
     }
     assert!(checked > 0, "no .rs blobs at HEAD of {}", git_dir.display());
+    Ok(())
 }

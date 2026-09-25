@@ -29,9 +29,9 @@ fn git(git_dir: &std::path::Path, args: &[&str]) -> Option<Vec<u8>> {
 
 #[test]
 #[ignore = "walks cargo.git HEAD; run with --ignored when the corpus is present"]
-fn cargo_git_toml_lossless() {
+fn cargo_git_toml_lossless() -> Result<(), Box<dyn std::error::Error>> {
     let Some(git_dir) = cargo_git() else {
-        return;
+        return Ok(());
     };
     let listing = git(&git_dir, &["ls-tree", "-r", "--name-only", "HEAD"]).expect("ls-tree");
     let adapter = TomlAdapter;
@@ -41,21 +41,22 @@ fn cargo_git_toml_lossless() {
             continue;
         }
         let bytes = git(&git_dir, &["show", &format!("HEAD:{path}")])
-            .unwrap_or_else(|| panic!("git show HEAD:{path}"));
+            .ok_or_else(|| format!("git show HEAD:{path}"))?;
         let tree = adapter
             .parse(&bytes)
-            .unwrap_or_else(|e| panic!("parse {path}: {e}"));
+            .map_err(|e| format!("parse {path}: {e}"))?;
         assert_eq!(
             adapter.project(&tree).as_slice(),
             bytes.as_slice(),
             "lossless {path}"
         );
         tree.check_concat()
-            .unwrap_or_else(|e| panic!("concat {path}: {e}"));
+            .map_err(|e| format!("concat {path}: {e}"))?;
         checked += 1;
     }
     assert!(
         checked > 0,
         "expected at least one .toml file in cargo.git HEAD"
     );
+    Ok(())
 }

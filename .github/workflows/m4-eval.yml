@@ -1,0 +1,221 @@
+# ADR 0023 selection-safety gate, as amended 2026-09-24: 150 real cargo
+# commits graded as 15 independent chains of 10 consecutive first-parent
+# commits, each chain on its own runner, exactly as the lander sees them
+# (ADR 0022: fresh per-test coverage, refreshed by every instrumented run).
+# Up to 5 seeded faults per commit where selection (b) does not contain (a);
+# one probe-graded fault where it does. A merge job gives one report and the
+# verdict: zero misses, and a median selected share <= 20% for write sets
+# <= 5. The literal full-suite sample runs as its own job (reported, not
+# gated; its failures join the quarantine).
+#
+# Never on pull requests: nightly and on demand only.
+#
+# Per-chain estimate on a standard ubuntu-latest runner (4 vCPU). Scaled
+# from the local 50-commit runs (10-core laptop under load 15-40):
+#   - setup (toolchain, cargo-llvm-cov, cached corpus, binary): 3-5 min
+#   - prepare (hord chain of the window): about 1 min
+#   - initial full instrumented run (cold build + about 4,350 tests, each in
+#     its own process): 15-25 min, or about 0 when its cache hits
+#   - 10 commits in the lander chain: about 60% of commits fall back to
+#     cargo's whole package (6-10 min each); the rest take 1-3 min
+#   - grading beside the chain on the same runner: up to 5 faults per
+#     informative commit (incremental build and selected tests each), and a
+#     probe elsewhere: 60-90 min of CPU, overlapped
+# Total 2.5-3.5 h per chain job. `--budget 320m` stops a slow chain at 5 h 20
+# min and uploads what it has; the merge then reports it incomplete and does
+# not gate. That stays well inside GitHub's 6 h job limit.
+name: M4 selection gate
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      corpus_head:
+        description: "cargo commit the chains count back from (reproducible windows)"
+        required: false
+        default: "8814ead110e36ed8fdcf1fdd4009baf82bd78523"
+      faults_per_commit:
+        description: "faults graded per commit where (b) does not contain (a)"
+        required: false
+        default: "5"
+
+concurrency:
+  group: m4-eval
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CORPUS_HEAD: ${{ inputs.corpus_head || '8814ead110e36ed8fdcf1fdd4009baf82bd78523' }}
+  FAULTS_PER_COMMIT: ${{ inputs.faults_per_commit || '5' }}
+  CHAINS: "15"
+  COMMITS_PER_CHAIN: "10"
+  CHAIN_STRIDE: "100"
+  FULL_SAMPLE: "20"
+  SAMPLE_SHARDS: "4"
+  HORD_CORPORA: /mnt/corpora
+  WORK: /mnt/m4
+
+jobs:
+  build:
+    name: build hord-eval-m4
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p hord-eval-m4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hord-eval-m4
+          path: target/release/hord-eval-m4
+          retention-days: 7
+
+  sample:
+    name: full-suite sample ${{ matrix.shard }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+      - &corpus-setup
+        name: prepare /mnt, toolchain, corpus
+        run: |
+          sudo mkdir -p /mnt/corpora /mnt/m4
+          sudo chown -R "$USER" /mnt/corpora /mnt/m4
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+      - &corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: /mnt/corpora/cargo.git
+          key: cargo-corpus-${{ env.CORPUS_HEAD }}
+      - &corpus-clone
+        name: clone the cargo corpus
+        run: |
+          if [ ! -d /mnt/corpora/cargo.git ]; then
+            git clone --bare --quiet https://github.com/rust-lang/cargo.git /mnt/corpora/cargo.git
+          fi
+          git --git-dir /mnt/corpora/cargo.git cat-file -e "$CORPUS_HEAD^{commit}"
+      - &registry-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: m4-cargo-registry-${{ env.CORPUS_HEAD }}
+      - &binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hord-eval-m4
+          path: /mnt/bin
+      - run: chmod +x /mnt/bin/hord-eval-m4
+      - name: literal full cargo test on a seeded sample
+        run: |
+          /mnt/bin/hord-eval-m4 --cache /mnt/corpora --work "$WORK" --head "$CORPUS_HEAD" \
+            --chain "0/$CHAINS" --commits-per-chain "$COMMITS_PER_CHAIN" --chain-stride "$CHAIN_STRIDE" \
+            --sample-only --full-sample "$FULL_SAMPLE" --sample-shard "${{ matrix.shard }}/$SAMPLE_SHARDS" \
+            --jobs 1 --budget 280m
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sample-${{ matrix.shard }}
+          path: /mnt/m4/sample
+          if-no-files-found: warn
+
+  chain:
+    name: chain ${{ matrix.chain }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        chain: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    steps:
+      - uses: actions/checkout@v5
+      - *corpus-setup
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - *corpus-cache
+      - *corpus-clone
+      - *registry-cache
+      - name: toolchain id
+        id: toolchain
+        run: echo "rustc=$(rustc -V | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      - name: cache the chain's initial full record
+        uses: actions/cache@v4
+        with:
+          path: |
+            /mnt/m4/chain/initial.cbor
+            /mnt/m4/chain/initial.json
+          key: m4-initial-${{ matrix.chain }}-${{ env.CORPUS_HEAD }}-${{ env.CHAIN_STRIDE }}-${{ env.COMMITS_PER_CHAIN }}-${{ steps.toolchain.outputs.rustc }}
+      - *binary
+      - run: chmod +x /mnt/bin/hord-eval-m4
+      - name: grade the chain as the lander sees it
+        run: |
+          /mnt/bin/hord-eval-m4 --cache /mnt/corpora --work "$WORK" --head "$CORPUS_HEAD" \
+            --chain "${{ matrix.chain }}/$CHAINS" --commits-per-chain "$COMMITS_PER_CHAIN" \
+            --chain-stride "$CHAIN_STRIDE" --faults-per-commit "$FAULTS_PER_COMMIT" \
+            --full-sample 0 --quarantine bench/m4-eval/quarantine.txt \
+            --jobs 1 --coverage-jobs 4 --budget 320m \
+            --json "$WORK/report.json" --summary "$WORK/report.md"
+      - name: chain summary
+        if: always()
+        run: cat "$WORK/report.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chain-${{ matrix.chain }}
+          path: |
+            /mnt/m4/chain/*.json
+            /mnt/m4/fresh-results
+            /mnt/m4/report.json
+            /mnt/m4/report.md
+          if-no-files-found: warn
+
+  merge:
+    name: merge and verdict
+    needs: [chain, sample]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: hord-eval-m4
+          path: bin
+      - run: chmod +x bin/hord-eval-m4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "{chain,sample}-*"
+          path: results
+      - name: merge the chains into one report and verdict
+        run: |
+          # Each chain artifact holds chain/ and fresh-results/; each sample
+          # artifact holds the sample JSON files, moved under sample/.
+          for d in results/sample-*; do
+            [ -d "$d" ] || continue
+            mkdir -p "$d/sample" && find "$d" -maxdepth 1 -name '*.json' -exec mv {} "$d/sample/" \;
+          done
+          bin/hord-eval-m4 --merge results/chain-* results/sample-* \
+            --quarantine bench/m4-eval/quarantine.txt \
+            --json m4-report.json --summary m4-report.md
+      - name: report
+        if: always()
+        run: cat m4-report.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m4-report
+          path: |
+            m4-report.json
+            m4-report.md

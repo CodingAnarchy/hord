@@ -16,11 +16,11 @@ const TWINS_BASE: &str = "pub fn a() -> u32 {\n    1\n}\n\npub fn m() -> u32 {\n
 const HELPER: &str = "\npub fn helper() -> u32 {\n    7\n}\n";
 
 /// Name → id of every definition of `file` at head.
-async fn head_ids(repo: &Repo, file: &str) -> BTreeMap<String, NodeId> {
-    let head = repo.head().await.unwrap().snapshot;
-    repo.definitions_in(head, path(file))
-        .await
-        .unwrap()
+async fn head_ids(repo: &Repo, file: &str) -> TestResult<BTreeMap<String, NodeId>> {
+    let head = repo.head().await?.snapshot;
+    Ok(repo
+        .definitions_in(head, path(file))
+        .await?
         .into_iter()
         .map(|d| {
             (
@@ -28,19 +28,19 @@ async fn head_ids(repo: &Repo, file: &str) -> BTreeMap<String, NodeId> {
                 d.node,
             )
         })
-        .collect()
+        .collect())
 }
 
 /// Every id of a definition named `name` in `file` at head, in source order.
-async fn ids_named(repo: &Repo, file: &str, name: &str) -> Vec<NodeId> {
-    let head = repo.head().await.unwrap().snapshot;
-    repo.definitions_in(head, path(file))
-        .await
-        .unwrap()
+async fn ids_named(repo: &Repo, file: &str, name: &str) -> TestResult<Vec<NodeId>> {
+    let head = repo.head().await?.snapshot;
+    Ok(repo
+        .definitions_in(head, path(file))
+        .await?
         .into_iter()
         .filter(|d| d.name.as_ref().is_some_and(|n| n.as_str().ends_with(name)))
         .map(|d| d.node)
-        .collect()
+        .collect())
 }
 
 fn births(record: &ChangeRecord) -> Vec<NodeId> {
@@ -65,10 +65,10 @@ fn deaths(record: &ChangeRecord) -> Vec<NodeId> {
         .collect()
 }
 
-async fn landed(repo: &Repo, submitted: ChangeId) -> ChangeId {
-    match repo.status(submitted).await.unwrap().status {
-        QueueStatus::Landed { landed } => landed,
-        other => panic!("{submitted} did not land: {other:?}"),
+async fn landed(repo: &Repo, submitted: ChangeId) -> TestResult<ChangeId> {
+    match repo.status(submitted).await?.status {
+        QueueStatus::Landed { landed } => Ok(landed),
+        other => Err(format!("{submitted} did not land: {other:?}").into()),
     }
 }
 
@@ -77,11 +77,11 @@ async fn landed(repo: &Repo, submitted: ChangeId) -> ChangeId {
 /// rebased. Its record states the birth it actually made, and `node_history`
 /// follows the landed deltas (ADR 0018).
 #[tokio::test]
-async fn a_rebased_record_states_what_it_landed() {
-    let t = stub_repo(&[("src/a.rs", TWINS_BASE)]).await;
+async fn a_rebased_record_states_what_it_landed() -> TestResult {
+    let t = stub_repo(&[("src/a.rs", TWINS_BASE)]).await?;
     let repo = &t.repo;
-    let mut w1 = begin(repo, "x").await;
-    let mut w2 = begin(repo, "y").await;
+    let mut w1 = begin(repo, "x").await?;
+    let mut w2 = begin(repo, "y").await?;
     edit(
         &mut w1,
         "src/a.rs",
@@ -89,7 +89,7 @@ async fn a_rebased_record_states_what_it_landed() {
         "}\n",
         &format!("}}\n{HELPER}"),
     )
-    .await;
+    .await?;
     edit(
         &mut w2,
         "src/a.rs",
@@ -97,24 +97,24 @@ async fn a_rebased_record_states_what_it_landed() {
         "    3\n}\n",
         &format!("    3\n}}\n{HELPER}"),
     )
-    .await;
-    let p1 = w1.propose(intent("helper top")).await.unwrap();
-    let p2 = w2.propose(intent("helper bottom")).await.unwrap();
-    repo.submit(p1.change).await.unwrap();
-    repo.submit(p2.change).await.unwrap();
-    repo.land_local().await.unwrap();
+    .await?;
+    let p1 = w1.propose(intent("helper top")).await?;
+    let p2 = w2.propose(intent("helper bottom")).await?;
+    repo.submit(p1.change).await?;
+    repo.submit(p2.change).await?;
+    repo.land_local().await?;
 
-    let first = landed(repo, p1.change).await;
-    let second = landed(repo, p2.change).await;
+    let first = landed(repo, p1.change).await?;
+    let second = landed(repo, p2.change).await?;
     assert_eq!(first, p1.change, "landed as proposed");
     assert_ne!(second, p2.change, "landed rebased");
-    let record = repo.change(second).await.unwrap();
+    let record = repo.change(second).await?;
 
     // Recomputed from head → result.
-    let head = repo.change(first).await.unwrap().result;
+    let head = repo.change(first).await?.result;
     assert_eq!(record.base, head);
     assert_eq!(record.parents, vec![first]);
-    let helpers = ids_named(repo, "src/a.rs", "helper").await;
+    let helpers = ids_named(repo, "src/a.rs", "helper").await?;
     assert_eq!(helpers.len(), 2);
     assert_ne!(helpers[0], helpers[1], "two lifetimes, two ids");
     let born = births(&record);
@@ -134,8 +134,7 @@ async fn a_rebased_record_states_what_it_landed() {
     );
     let attestation: Evidence = repo
         .store()
-        .get_object(*record.evidence.last().unwrap())
-        .unwrap();
+        .get_object(*record.evidence.last().ok_or("record has evidence")?)?;
     assert_eq!(
         attestation.kind,
         EvidenceKind::Rebase {
@@ -145,14 +144,15 @@ async fn a_rebased_record_states_what_it_landed() {
     assert_eq!(attestation.snapshot, record.result);
     assert_eq!(record.signature, None);
     assert_eq!(record.rebased_from, Some(p2.change));
-    assert_eq!(repo.store().rebased_to(p2.change).unwrap(), Some(second));
+    assert_eq!(repo.store().rebased_to(p2.change)?, Some(second));
 
     // `node_history` follows the landed records' deltas.
     for id in &helpers {
-        let history = repo.store().node_history(*id).unwrap();
+        let history = repo.store().node_history(*id)?;
         assert_eq!(history.len(), 1, "{id}: {history:?}");
     }
-    assert_eq!(repo.store().node_history(born[0]).unwrap(), vec![second]);
+    assert_eq!(repo.store().node_history(born[0])?, vec![second]);
+    Ok(())
 }
 
 /// ADR 0019, concurrent collision: two changes from one base add the same
@@ -160,77 +160,76 @@ async fn a_rebased_record_states_what_it_landed() {
 /// birth id. The one that lands second re-derives it with the head snapshot,
 /// and its landed record carries the final id.
 #[tokio::test]
-async fn a_concurrent_identical_birth_is_rederived_with_head() {
-    let t = stub_repo(&[("src/a.rs", TWINS_BASE)]).await;
+async fn a_concurrent_identical_birth_is_rederived_with_head() -> TestResult {
+    let t = stub_repo(&[("src/a.rs", TWINS_BASE)]).await?;
     let repo = &t.repo;
     let with_helper = TWINS_BASE.replacen("    3\n}\n", &format!("    3\n}}\n{HELPER}"), 1);
-    let mut w1 = begin(repo, "x").await;
-    let mut w2 = begin(repo, "y").await;
+    let mut w1 = begin(repo, "x").await?;
+    let mut w2 = begin(repo, "y").await?;
     // w1 also edits `z`, so the two results differ and w2 is not a no-op.
     w1.write_file(
         &path("src/a.rs"),
         with_helper.replace("    2\n", "    20\n"),
     )
-    .await
-    .unwrap();
+    .await?;
     w2.write_file(&path("src/a.rs"), with_helper.clone())
-        .await
-        .unwrap();
-    let p1 = w1.propose(intent("helper and z")).await.unwrap();
-    let p2 = w2.propose(intent("helper")).await.unwrap();
+        .await?;
+    let p1 = w1.propose(intent("helper and z")).await?;
+    let p2 = w2.propose(intent("helper")).await?;
     let (b1, b2) = (births(&p1.record), births(&p2.record));
     assert_eq!(b1, b2, "same content, file, site, and base: same birth id");
-    repo.submit(p1.change).await.unwrap();
-    repo.submit(p2.change).await.unwrap();
-    repo.land_local().await.unwrap();
+    repo.submit(p1.change).await?;
+    repo.submit(p2.change).await?;
+    repo.land_local().await?;
 
-    let second = landed(repo, p2.change).await;
-    let record = repo.change(second).await.unwrap();
+    let second = landed(repo, p2.change).await?;
+    let record = repo.change(second).await?;
     let born = births(&record);
     assert_eq!(born.len(), 1, "{:?}", record.identity_deltas);
     assert_ne!(born[0], b2[0], "the collision was re-derived");
-    let helpers = ids_named(repo, "src/a.rs", "helper").await;
+    let helpers = ids_named(repo, "src/a.rs", "helper").await?;
     assert!(
         helpers.contains(&b1[0]) && helpers.contains(&born[0]),
         "{helpers:?}"
     );
     assert_eq!(
-        repo.store().node_history(b1[0]).unwrap(),
-        vec![landed(repo, p1.change).await]
+        repo.store().node_history(b1[0])?,
+        vec![landed(repo, p1.change).await?]
     );
-    assert_eq!(repo.store().node_history(born[0]).unwrap(), vec![second]);
+    assert_eq!(repo.store().node_history(born[0])?, vec![second]);
+    Ok(())
 }
 
 /// ADR 0019, resurrection (system review item 9): delete `foo` and land, then
 /// re-add an identical `foo` and land. It is a new lifetime with a new id.
 #[tokio::test]
-async fn a_readded_definition_gets_a_new_id() {
+async fn a_readded_definition_gets_a_new_id() -> TestResult {
     let foo = "pub fn foo() -> u32 {\n    1\n}\n\npub fn bar() -> u32 {\n    2\n}\n";
-    let t = repo(&[("src/a.rs", foo)]).await;
+    let t = repo(&[("src/a.rs", foo)]).await?;
     let repo = &t.repo;
-    let old = head_ids(repo, "src/a.rs").await["foo"];
-    let mut ws = begin(repo, "x").await;
+    let old = head_ids(repo, "src/a.rs").await?["foo"];
+    let mut ws = begin(repo, "x").await?;
     ws.write_file(&path("src/a.rs"), "pub fn bar() -> u32 {\n    2\n}\n")
-        .await
-        .unwrap();
-    let deleted = submit(repo, &mut ws, "delete foo").await;
-    repo.land_local().await.unwrap();
-    let mut ws = begin(repo, "y").await;
-    ws.write_file(&path("src/a.rs"), foo).await.unwrap();
-    let readded = submit(repo, &mut ws, "re-add foo").await;
-    repo.land_local().await.unwrap();
+        .await?;
+    let deleted = submit(repo, &mut ws, "delete foo").await?;
+    repo.land_local().await?;
+    let mut ws = begin(repo, "y").await?;
+    ws.write_file(&path("src/a.rs"), foo).await?;
+    let readded = submit(repo, &mut ws, "re-add foo").await?;
+    repo.land_local().await?;
 
-    let new = head_ids(repo, "src/a.rs").await["foo"];
+    let new = head_ids(repo, "src/a.rs").await?["foo"];
     assert_ne!(new, old, "a re-added definition is born again");
     assert_eq!(
-        repo.store().node_history(old).unwrap(),
-        vec![landed(repo, deleted).await],
+        repo.store().node_history(old)?,
+        vec![landed(repo, deleted).await?],
         "the old lifetime ends at its deletion"
     );
     assert_eq!(
-        repo.store().node_history(new).unwrap(),
-        vec![landed(repo, readded).await]
+        repo.store().node_history(new)?,
+        vec![landed(repo, readded).await?]
     );
+    Ok(())
 }
 
 const MOVED: &str = "\
@@ -250,14 +249,14 @@ pub struct Thing {
 /// ADR 0020 (system review item 8): `git mv` keeps every NodeId. The change
 /// records a tree rename plus moves, no births or deaths, and lands.
 #[tokio::test]
-async fn moving_a_file_keeps_every_node_id() {
-    let t = repo(&[("src/a.rs", MOVED), ("README.md", "x\n")]).await;
+async fn moving_a_file_keeps_every_node_id() -> TestResult {
+    let t = repo(&[("src/a.rs", MOVED), ("README.md", "x\n")]).await?;
     let repo = &t.repo;
-    let before = head_ids(repo, "src/a.rs").await;
-    let mut ws = begin(repo, "x").await;
-    ws.delete_file(&path("src/a.rs")).await.unwrap();
-    ws.write_file(&path("src/b.rs"), MOVED).await.unwrap();
-    let proposal = ws.propose(intent("move a -> b")).await.unwrap();
+    let before = head_ids(repo, "src/a.rs").await?;
+    let mut ws = begin(repo, "x").await?;
+    ws.delete_file(&path("src/a.rs")).await?;
+    ws.write_file(&path("src/b.rs"), MOVED).await?;
+    let proposal = ws.propose(intent("move a -> b")).await?;
     let record = &proposal.record;
     assert!(
         births(record).is_empty() && deaths(record).is_empty(),
@@ -289,13 +288,14 @@ async fn moving_a_file_keeps_every_node_id() {
             .write_set
             .contains(&NodeId::file_root(&path("src/b.rs")))
     );
-    repo.submit(proposal.change).await.unwrap();
-    repo.land_local().await.unwrap();
-    landed(repo, proposal.change).await;
-    assert_eq!(head_ids(repo, "src/b.rs").await, before);
+    repo.submit(proposal.change).await?;
+    repo.land_local().await?;
+    landed(repo, proposal.change).await?;
+    assert_eq!(head_ids(repo, "src/b.rs").await?, before);
     // Blame follows the definition through the move.
-    let history = repo.store().node_history(before["foo"]).unwrap();
+    let history = repo.store().node_history(before["foo"])?;
     assert_eq!(history.last(), Some(&proposal.change));
+    Ok(())
 }
 
 /// A larger file, so one edit and one addition keep the pair above ADR
@@ -312,49 +312,50 @@ fn moved_long() -> String {
 /// matches; a new definition is a birth. It lands after an unrelated change,
 /// so it is rebased and re-validated on the way.
 #[tokio::test]
-async fn a_move_with_an_edit_keeps_matched_ids_and_lands_rebased() {
-    let t = repo(&[("src/a.rs", &moved_long()), ("README.md", "x\n")]).await;
+async fn a_move_with_an_edit_keeps_matched_ids_and_lands_rebased() -> TestResult {
+    let t = repo(&[("src/a.rs", &moved_long()), ("README.md", "x\n")]).await?;
     let repo = &t.repo;
-    let before = head_ids(repo, "src/a.rs").await;
-    let mut other = begin(repo, "other").await;
-    other.write_file(&path("README.md"), "y\n").await.unwrap();
-    let unrelated = submit(repo, &mut other, "readme").await;
+    let before = head_ids(repo, "src/a.rs").await?;
+    let mut other = begin(repo, "other").await?;
+    other.write_file(&path("README.md"), "y\n").await?;
+    let unrelated = submit(repo, &mut other, "readme").await?;
 
-    let mut ws = begin(repo, "x").await;
-    ws.delete_file(&path("src/a.rs")).await.unwrap();
+    let mut ws = begin(repo, "x").await?;
+    ws.delete_file(&path("src/a.rs")).await?;
     let edited =
         moved_long().replace("foo() + 1", "foo() + 2") + "\npub fn baz() -> u32 {\n    9\n}\n";
-    ws.write_file(&path("src/b.rs"), edited).await.unwrap();
-    let moved = submit(repo, &mut ws, "move and edit").await;
-    repo.land_local().await.unwrap();
-    landed(repo, unrelated).await;
-    let landed_id = landed(repo, moved).await;
+    ws.write_file(&path("src/b.rs"), edited).await?;
+    let moved = submit(repo, &mut ws, "move and edit").await?;
+    repo.land_local().await?;
+    landed(repo, unrelated).await?;
+    let landed_id = landed(repo, moved).await?;
     assert_ne!(landed_id, moved, "rebased onto the readme change");
 
-    let after = head_ids(repo, "src/b.rs").await;
+    let after = head_ids(repo, "src/b.rs").await?;
     for name in ["foo", "bar", "Thing", "p1", "p4"] {
         assert_eq!(after[name], before[name], "{name} keeps its id");
     }
-    let record = repo.change(landed_id).await.unwrap();
+    let record = repo.change(landed_id).await?;
     assert_eq!(births(&record), vec![after["baz"]]);
     assert!(deaths(&record).is_empty());
     assert!(
         record.write_set.contains(&after["bar"]),
         "bar's body changed"
     );
+    Ok(())
 }
 
 /// Below ADR 0007's threshold the files are not paired: a small file with
 /// half its definitions changed is a deletion and a creation.
 #[tokio::test]
-async fn a_dissimilar_created_file_is_not_a_move() {
-    let t = repo(&[("src/a.rs", MOVED)]).await;
+async fn a_dissimilar_created_file_is_not_a_move() -> TestResult {
+    let t = repo(&[("src/a.rs", MOVED)]).await?;
     let repo = &t.repo;
-    let mut ws = begin(repo, "x").await;
-    ws.delete_file(&path("src/a.rs")).await.unwrap();
+    let mut ws = begin(repo, "x").await?;
+    ws.delete_file(&path("src/a.rs")).await?;
     let edited = MOVED.replace("foo() + 1", "foo() + 2") + "\npub fn baz() -> u32 {\n    9\n}\n";
-    ws.write_file(&path("src/b.rs"), edited).await.unwrap();
-    let proposal = ws.propose(intent("rewrite")).await.unwrap();
+    ws.write_file(&path("src/b.rs"), edited).await?;
+    let proposal = ws.propose(intent("rewrite")).await?;
     assert!(!proposal.record.ops.iter().any(|op| matches!(
         op,
         Op::Tree {
@@ -363,25 +364,26 @@ async fn a_dissimilar_created_file_is_not_a_move() {
         }
     )));
     assert!(!deaths(&proposal.record).is_empty());
+    Ok(())
 }
 
 /// ADR 0020: a concurrent edit to the old path conflicts with the move.
 #[tokio::test]
-async fn an_edit_of_the_old_path_conflicts_with_a_move() {
-    let t = repo(&[("src/a.rs", MOVED)]).await;
+async fn an_edit_of_the_old_path_conflicts_with_a_move() -> TestResult {
+    let t = repo(&[("src/a.rs", MOVED)]).await?;
     let repo = &t.repo;
-    let mut editor = begin(repo, "editor").await;
-    edit(&mut editor, "src/a.rs", MOVED, "    1\n", "    10\n").await;
-    let mut mover = begin(repo, "mover").await;
-    mover.delete_file(&path("src/a.rs")).await.unwrap();
-    mover.write_file(&path("src/b.rs"), MOVED).await.unwrap();
-    let edited = submit(repo, &mut editor, "edit foo").await;
-    let moved = submit(repo, &mut mover, "move").await;
-    repo.land_local().await.unwrap();
-    landed(repo, edited).await;
-    let entry = repo.status(moved).await.unwrap();
+    let mut editor = begin(repo, "editor").await?;
+    edit(&mut editor, "src/a.rs", MOVED, "    1\n", "    10\n").await?;
+    let mut mover = begin(repo, "mover").await?;
+    mover.delete_file(&path("src/a.rs")).await?;
+    mover.write_file(&path("src/b.rs"), MOVED).await?;
+    let edited = submit(repo, &mut editor, "edit foo").await?;
+    let moved = submit(repo, &mut mover, "move").await?;
+    repo.land_local().await?;
+    landed(repo, edited).await?;
+    let entry = repo.status(moved).await?;
     assert_eq!(entry.status, QueueStatus::Conflicted, "{:?}", entry.report);
-    let report = entry.report.unwrap();
+    let report = entry.report.ok_or("conflicted entry has a report")?;
     assert!(
         report
             .conflicts
@@ -390,6 +392,7 @@ async fn an_edit_of_the_old_path_conflicts_with_a_move() {
             || report.merge.iter().any(|m| m.path == path("src/a.rs")),
         "{report:?}"
     );
+    Ok(())
 }
 
 /// A verifier that fails every rebased record and remembers their ids.
@@ -399,16 +402,19 @@ struct FailRebased {
 }
 
 impl Verifier for FailRebased {
-    fn verify<'a>(&'a self, request: VerifyRequest<'a>) -> VerifyFuture<'a> {
+    fn verify(&self, request: VerifyRequest) -> VerifyFuture<'_> {
         let verdict = if request.change.rebased_from.is_some() {
-            let mut failed = self.failed.lock().unwrap();
+            let mut failed = self.failed.lock().expect("lock the failed-ids list");
             failed.push(request.change_id);
             failed.extend(request.change.evidence.last().copied());
             Verdict::Fail {
+                evidence: Vec::new(),
                 reason: "rebased".into(),
             }
         } else {
-            Verdict::Pass
+            Verdict::Pass {
+                evidence: Vec::new(),
+            }
         };
         Box::pin(async move { verdict })
     }
@@ -417,7 +423,7 @@ impl Verifier for FailRebased {
 /// ADR 0018: the rebased record is stored only when it lands, so a failed
 /// verification leaves no orphan record.
 #[tokio::test]
-async fn a_rebased_record_that_fails_verification_is_not_stored() {
+async fn a_rebased_record_that_fails_verification_is_not_stored() -> TestResult {
     let verifier = Arc::new(FailRebased::default());
     let t = repo_with(
         &fixture(),
@@ -426,21 +432,22 @@ async fn a_rebased_record_that_fails_verification_is_not_stored() {
             ..RepoOptions::default()
         },
     )
-    .await;
+    .await?;
     let repo = &t.repo;
-    let mut a = begin(repo, "a").await;
-    edit(&mut a, "README.md", README, "line one\n", "line 1\n").await;
-    let mut b = begin(repo, "b").await;
-    edit(&mut b, "src/other.rs", OTHER, "    2\n", "    20\n").await;
-    let pa = submit(repo, &mut a, "a").await;
-    let pb = submit(repo, &mut b, "b").await;
-    repo.land_local().await.unwrap();
-    landed(repo, pa).await;
-    assert_eq!(
-        repo.status(pb).await.unwrap().status,
-        QueueStatus::Conflicted
-    );
-    let failed = verifier.failed.lock().unwrap().clone();
+    let mut a = begin(repo, "a").await?;
+    edit(&mut a, "README.md", README, "line one\n", "line 1\n").await?;
+    let mut b = begin(repo, "b").await?;
+    edit(&mut b, "src/other.rs", OTHER, "    2\n", "    20\n").await?;
+    let pa = submit(repo, &mut a, "a").await?;
+    let pb = submit(repo, &mut b, "b").await?;
+    repo.land_local().await?;
+    landed(repo, pa).await?;
+    assert_eq!(repo.status(pb).await?.status, QueueStatus::Conflicted);
+    let failed = verifier
+        .failed
+        .lock()
+        .expect("lock the failed-ids list")
+        .clone();
     assert_eq!(
         failed.len(),
         2,
@@ -448,15 +455,13 @@ async fn a_rebased_record_that_fails_verification_is_not_stored() {
     );
     assert_ne!(failed[0], pb);
     assert!(
-        !repo.store().contains(failed[0]).unwrap(),
+        !repo.store().contains(failed[0])?,
         "no orphan rebased record"
     );
     assert!(
-        !repo.store().contains(failed[1]).unwrap(),
+        !repo.store().contains(failed[1])?,
         "no orphan rebase attestation"
     );
-    assert!(
-        repo.store().contains(pb).unwrap(),
-        "the submitted record stays"
-    );
+    assert!(repo.store().contains(pb)?, "the submitted record stays");
+    Ok(())
 }

@@ -31,7 +31,7 @@ pub fn run_export(json: bool, hord_ref: String) -> Result<()> {
     if json {
         output::print_json(&report)?;
     } else {
-        println!("exported {} to {}", report.hord_ref, report.git_path);
+        println!("exported {} to {}", report.r#ref, report.git_path);
         if let Some(tree) = report.git_tree {
             println!("git_tree {tree}");
         }

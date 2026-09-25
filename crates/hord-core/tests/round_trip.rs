@@ -18,7 +18,7 @@ fn oid(byte: u8) -> ObjectId {
 }
 
 fn nid(s: &str) -> NodeId {
-    s.parse().unwrap()
+    s.parse().expect("test NodeId literals are valid ULIDs")
 }
 
 fn assert_round_trip<T>(value: &T)
@@ -122,12 +122,12 @@ fn sample_change() -> ChangeRecord {
                 to: QualifiedName::new("new"),
             },
             Op::Blob {
-                path: "a.bin".parse().unwrap(),
+                path: "a.bin".parse().expect("literal repo paths are valid"),
                 from: Some(oid(0x04)),
                 to: None,
             },
             Op::Tree {
-                path: "src".parse().unwrap(),
+                path: "src".parse().expect("literal repo paths are valid"),
                 kind: TreeOpKind::CreateDir,
             },
         ],
@@ -168,6 +168,7 @@ fn sample_change() -> ChangeRecord {
 fn sample_evidence() -> Evidence {
     Evidence {
         kind: EvidenceKind::Check,
+        qualifier: None,
         snapshot: oid(0xaa),
         toolchain: oid(0x07),
         command: "cargo check".into(),
@@ -190,7 +191,8 @@ fn sample_policy() -> Policy {
         land: LandPolicy {
             require: vec!["check".into(), "test:selected".into(), "lint".into()],
             strict_reads: false,
-            max_write_set: 200,
+            max_write_set: Some(200),
+            max_impact: Some(50),
             max_replay_attempts: 2,
         },
         rules: vec![PolicyRule {
@@ -209,7 +211,7 @@ fn sample_identity_map() -> IdentityMap {
     nodes.insert(
         nid("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         NodePath {
-            file: "src/lib.rs".parse().unwrap(),
+            file: "src/lib.rs".parse().expect("literal repo paths are valid"),
             pointer: vec![0, 2],
         },
     );
@@ -227,7 +229,7 @@ fn blob_round_trip_and_stable_id() {
 }
 
 #[test]
-fn node_round_trip_and_stable_id() {
+fn node_round_trip_and_stable_id() -> Result<(), Box<dyn std::error::Error>> {
     assert_round_trip(&sample_node());
     let leaf = sample_node();
     let leaf_mirror = LeafWire {
@@ -239,8 +241,8 @@ fn node_round_trip_and_stable_id() {
         name: leaf.name.clone(),
     };
     assert_eq!(
-        encode(&leaf).unwrap(),
-        encode(&leaf_mirror).unwrap(),
+        encode(&leaf)?,
+        encode(&leaf_mirror)?,
         "leaf ObjectId preimage must stay the derived Node encoding"
     );
     let internal = sample_internal_node();
@@ -249,14 +251,9 @@ fn node_round_trip_and_stable_id() {
     assert!(back.raw.is_empty(), "stored internal node has no raw");
     assert_eq!(back.children, internal.children);
     assert_eq!(back.normalized, internal.normalized);
-    assert_eq!(
-        ObjectId::of(&internal).unwrap(),
-        ObjectId::from_canonical(&encoded)
-    );
-    assert_eq!(
-        ObjectId::of(&internal).unwrap(),
-        ObjectId::of(&back).unwrap()
-    );
+    assert_eq!(ObjectId::of(&internal)?, ObjectId::from_canonical(&encoded));
+    assert_eq!(ObjectId::of(&internal)?, ObjectId::of(&back)?);
+    Ok(())
 }
 
 #[test]
@@ -290,8 +287,8 @@ fn change_record_round_trip() {
 /// ADR 0018: `rebased_from` is omitted when `None`, so a record that was not
 /// rebased encodes (and hashes) exactly as before the field existed.
 #[test]
-fn rebased_from_is_omitted_when_none() {
-    let plain = encode(&sample_change()).unwrap();
+fn rebased_from_is_omitted_when_none() -> Result<(), Box<dyn std::error::Error>> {
+    let plain = encode(&sample_change())?;
     assert!(
         !plain
             .windows(b"rebased_from".len())
@@ -302,22 +299,20 @@ fn rebased_from_is_omitted_when_none() {
         rebased_from: Some(oid(0xdd)),
         ..sample_change()
     };
-    let bytes = encode(&rebased).unwrap();
+    let bytes = encode(&rebased)?;
     assert!(
         bytes
             .windows(b"rebased_from".len())
             .any(|w| w == b"rebased_from")
     );
-    assert_ne!(
-        ObjectId::of(&rebased).unwrap(),
-        ObjectId::of(&sample_change()).unwrap()
-    );
+    assert_ne!(ObjectId::of(&rebased)?, ObjectId::of(&sample_change())?);
+    Ok(())
 }
 
 /// ADR 0017: the identity tree and file identity objects round-trip, and
 /// the empty snapshot names the empty tree and the empty identity tree.
 #[test]
-fn identity_tree_and_snapshot_round_trip() {
+fn identity_tree_and_snapshot_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let file = FileIdentity {
         blob: oid(0x10),
         nodes: vec![
@@ -329,23 +324,22 @@ fn identity_tree_and_snapshot_round_trip() {
     let mut tree = IdentityTree::default();
     tree.entries
         .insert("src".into(), IdentityEntry::Dir(oid(0x11)));
-    tree.entries.insert(
-        "lib.rs".into(),
-        IdentityEntry::File(ObjectId::of(&file).unwrap()),
-    );
+    tree.entries
+        .insert("lib.rs".into(), IdentityEntry::File(ObjectId::of(&file)?));
     assert_round_trip(&tree);
     let empty = Snapshot::empty();
-    assert_eq!(empty.root(), ObjectId::of(&Tree::default()).unwrap());
+    assert_eq!(empty.root(), ObjectId::of(&Tree::default())?);
     assert_eq!(
         empty.identity(),
-        Some(ObjectId::of(&IdentityTree::default()).unwrap())
+        Some(ObjectId::of(&IdentityTree::default())?)
     );
     assert_round_trip(&Snapshot::new(oid(1), oid(2)));
     assert_ne!(
-        ObjectId::of(&Snapshot::new(oid(1), oid(2))).unwrap(),
-        ObjectId::of(&Snapshot::new(oid(1), oid(3))).unwrap(),
+        ObjectId::of(&Snapshot::new(oid(1), oid(2)))?,
+        ObjectId::of(&Snapshot::new(oid(1), oid(3)))?,
         "same content, different identity: different snapshots"
     );
+    Ok(())
 }
 
 #[test]
@@ -356,9 +350,9 @@ fn evidence_policy_identity_round_trip() {
 }
 
 #[test]
-fn blob_bytes_are_cbor_major_type_2_not_int_array() {
+fn blob_bytes_are_cbor_major_type_2_not_int_array() -> Result<(), Box<dyn std::error::Error>> {
     let blob = sample_blob();
-    let encoded = encode(&blob).unwrap();
+    let encoded = encode(&blob)?;
     let hex = hex::encode(&encoded);
     assert!(
         hex.contains("44deadbeef"),
@@ -368,33 +362,37 @@ fn blob_bytes_are_cbor_major_type_2_not_int_array() {
         !hex.contains("84"),
         "bytes must not encode as a 4-element array: {hex}"
     );
+    Ok(())
 }
 
 #[test]
-fn nodeid_parse_display() {
+fn nodeid_parse_display() -> Result<(), Box<dyn std::error::Error>> {
     let s = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-    let id: NodeId = s.parse().unwrap();
+    let id: NodeId = s.parse()?;
     assert_eq!(id.to_string(), s);
-    let bytes = encode(&id).unwrap();
-    assert_eq!(decode::<NodeId>(&bytes).unwrap(), id);
+    let bytes = encode(&id)?;
+    assert_eq!(decode::<NodeId>(&bytes)?, id);
+    Ok(())
 }
 
 #[test]
-fn object_id_differs_when_value_differs() {
+fn object_id_differs_when_value_differs() -> Result<(), Box<dyn std::error::Error>> {
     let a = Blob::new(Bytes::from(vec![1]));
     let b = Blob::new(Bytes::from(vec![2]));
-    assert_ne!(ObjectId::of(&a).unwrap(), ObjectId::of(&b).unwrap());
+    assert_ne!(ObjectId::of(&a)?, ObjectId::of(&b)?);
+    Ok(())
 }
 
 #[test]
-fn repo_path_in_ops_round_trips() {
-    let path: RepoPath = "crates/hord-core/Cargo.toml".parse().unwrap();
+fn repo_path_in_ops_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let path: RepoPath = "crates/hord-core/Cargo.toml".parse()?;
     let op = Op::Tree {
         path: path.clone(),
         kind: TreeOpKind::Rename {
-            to: "crates/hord-core/Cargo.toml.bak".parse().unwrap(),
+            to: "crates/hord-core/Cargo.toml.bak".parse()?,
         },
     };
     assert_round_trip(&op);
     assert_eq!(path.to_string(), "crates/hord-core/Cargo.toml");
+    Ok(())
 }

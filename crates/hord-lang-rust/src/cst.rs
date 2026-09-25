@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 
 use hord_core::{LangId, NodeKind, ObjectId, QualifiedName};
-use hord_lang::{AttachedSpan, NodeTree, ParseError, TokenSpan, attach_trivia_spans};
+use hord_lang::{AttachedSpan, NodeTree, ParseError, TokenSpan, TreeBuilder, attach_trivia_spans};
 
 fn is_structural(node: tree_sitter::Node<'_>) -> bool {
     !node.is_extra() && !node.is_missing()
@@ -43,28 +43,33 @@ fn collect_tokens(node: tree_sitter::Node<'_>, out: &mut Vec<TokenSpan>) {
     }
 }
 
+/// Cursor over the attached tokens, consumed in source order.
+struct Tokens<'a> {
+    spans: &'a [AttachedSpan],
+    next: usize,
+}
+
 fn intern(
     node: tree_sitter::Node<'_>,
-    lang: &LangId,
     source: &[u8],
-    tokens: &[AttachedSpan],
-    token_i: &mut usize,
-    tree: &mut NodeTree,
+    tokens: &mut Tokens<'_>,
+    tree: &mut TreeBuilder<'_>,
     leading: Vec<ObjectId>,
 ) -> Result<Option<ObjectId>, ParseError> {
     if !is_structural(node) {
         return Ok(None);
     }
     if is_true_token(node) {
-        let token = tokens.get(*token_i).ok_or_else(|| {
+        let token = tokens.spans.get(tokens.next).ok_or_else(|| {
             ParseError::failed(format!(
-                "intern ran out of tokens at {} (source byte {}, token index {token_i})",
+                "intern ran out of tokens at {} (source byte {}, token index {})",
                 node.kind(),
-                node.start_byte()
+                node.start_byte(),
+                tokens.next
             ))
         })?;
-        *token_i += 1;
-        return Ok(Some(tree.intern_source_token(*lang, source, token, None)?));
+        tokens.next += 1;
+        return Ok(Some(tree.token(token)?));
     }
 
     let mut children = leading;
@@ -75,23 +80,17 @@ fn intern(
             let child = cursor.node();
             if is_structural(child) {
                 if child.kind() == "attribute_item" {
-                    if let Some(id) =
-                        intern(child, lang, source, tokens, token_i, tree, Vec::new())?
-                    {
+                    if let Some(id) = intern(child, source, tokens, tree, Vec::new())? {
                         pending_attrs.push(id);
                     }
                 } else if !pending_attrs.is_empty() && takes_outer_attributes(child.kind()) {
                     let leading_attrs = std::mem::take(&mut pending_attrs);
-                    if let Some(id) =
-                        intern(child, lang, source, tokens, token_i, tree, leading_attrs)?
-                    {
+                    if let Some(id) = intern(child, source, tokens, tree, leading_attrs)? {
                         children.push(id);
                     }
                 } else {
                     children.append(&mut pending_attrs);
-                    if let Some(id) =
-                        intern(child, lang, source, tokens, token_i, tree, Vec::new())?
-                    {
+                    if let Some(id) = intern(child, source, tokens, tree, Vec::new())? {
                         children.push(id);
                     }
                 }
@@ -105,12 +104,8 @@ fn intern(
     if children.is_empty() {
         return Ok(None);
     }
-    Ok(Some(tree.intern_branch(
-        NodeKind::new(node.kind()),
-        *lang,
-        children,
-        def_name(node, source),
-    )?))
+    let kind = NodeKind::new(node.kind());
+    Ok(Some(tree.branch(kind, children, def_name(node, source))?))
 }
 
 /// An outer attribute immediately before one of these belongs to it (ADR 0011).
@@ -198,17 +193,9 @@ pub(crate) fn local_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Opti
             })
         }
         "use_declaration" => use_clause_name(node, source),
-        "extern_crate_declaration" => {
-            named_field(node, source).or_else(|| first_identifier(node, source))
-        }
-        "inner_attribute_item" => {
-            let text = node.utf8_text(source).ok()?.trim();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text.to_owned())
-            }
-        }
+        "extern_crate_declaration" => named_field(node, source)
+            .or_else(|| trimmed_text(first_child_kind(node, "identifier")?, source)),
+        "inner_attribute_item" => trimmed_text(node, source),
         "foreign_mod_item" => {
             let abi = first_child_kind(node, "string_literal")
                 .and_then(|n| n.utf8_text(source).ok().map(|s| s.trim().to_owned()))
@@ -219,25 +206,14 @@ pub(crate) fn local_def_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Opti
     }
 }
 
-fn named_field(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    let name = node.child_by_field_name("name")?;
-    let text = name.utf8_text(source).ok()?.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_owned())
-    }
+/// `node`'s source text, trimmed, unless that is empty.
+fn trimmed_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let text = node.utf8_text(source).ok()?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
-fn first_identifier(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    first_child_kind(node, "identifier").and_then(|n| {
-        let text = n.utf8_text(source).ok()?.trim();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text.to_owned())
-        }
-    })
+fn named_field(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    trimmed_text(node.child_by_field_name("name")?, source)
 }
 
 fn first_child_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
@@ -386,25 +362,21 @@ pub(crate) fn parse(source: &[u8], lang: &LangId) -> Result<NodeTree, ParseError
     }
 
     let attached = attach_trivia_spans(source, tokens);
-    let mut tree = NodeTree::new();
-    let mut token_i = 0;
-    let root_id = intern(
-        root,
-        lang,
-        source,
-        &attached,
-        &mut token_i,
-        &mut tree,
-        Vec::new(),
-    )?
-    .ok_or_else(|| ParseError::failed("intern did not produce a root node"))?;
-    if token_i != attached.len() {
+    let mut tokens = Tokens {
+        spans: &attached,
+        next: 0,
+    };
+    let mut builder = TreeBuilder::new(*lang, source);
+    let root_id = intern(root, source, &mut tokens, &mut builder, Vec::new())?
+        .ok_or_else(|| ParseError::failed("intern did not produce a root node"))?;
+    if tokens.next != attached.len() {
         return Err(ParseError::failed(format!(
-            "intern consumed {token_i} tokens but trivia attachment produced {}",
+            "intern consumed {} tokens but trivia attachment produced {}",
+            tokens.next,
             attached.len()
         )));
     }
-    tree.set_root(root_id)?;
+    let tree = builder.finish(root_id)?;
     ensure_lossless(source, &tree)?;
     Ok(tree)
 }

@@ -1,7 +1,8 @@
 //! [`LangAdapter`] trait and supporting types (spec §4.3).
 
 use std::any::Any;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use hord_core::{Bytes, LangId, Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath};
@@ -110,11 +111,6 @@ pub struct ResolveCtx {
     imports: Vec<Import>,
     files: Vec<FileRoot>,
     links: Vec<Link>,
-    /// Changes whenever a definition, import, file, or link is added.
-    ///
-    /// Adapters use this to reuse a name index. Equal stamps mean equal
-    /// contents, including two clones that have not been edited since.
-    stamp: u64,
     /// Adapter data derived from these contents (a name index), built on
     /// first use by [`Self::derived`]. Replaced, not cleared, on every edit,
     /// so a clone that has not been edited keeps sharing it.
@@ -136,29 +132,11 @@ impl std::fmt::Debug for Derived {
     }
 }
 
-fn fresh_stamp() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
 impl ResolveCtx {
     /// An empty resolution context.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            stamp: fresh_stamp(),
-            ..Self::default()
-        }
-    }
-
-    /// Identity of this context's contents.
-    ///
-    /// Stable until [`Self::add_definition`], [`Self::add_import`],
-    /// [`Self::add_file`], or [`Self::add_link`]. Adapters may cache an
-    /// index keyed by it.
-    #[must_use]
-    pub fn stamp(&self) -> u64 {
-        self.stamp
+        Self::default()
     }
 
     /// Number of definitions in this snapshot.
@@ -167,14 +145,13 @@ impl ResolveCtx {
         self.definitions.len()
     }
 
-    fn bump(&mut self) {
-        self.stamp = fresh_stamp();
+    fn drop_derived(&mut self) {
         self.derived = Derived::default();
     }
 
     /// Attach adapter state that a later build can start from (for example
     /// per-file facts, so the next snapshot re-indexes only changed files).
-    /// It does not change the contents or [`Self::stamp`].
+    /// It does not change the contents or drop [`Self::derived`] data.
     pub fn set_carry<T: Any + Send + Sync>(&mut self, carry: Arc<T>) {
         self.carry = Some(carry);
     }
@@ -186,8 +163,8 @@ impl ResolveCtx {
     }
 
     /// Whether `self` and `other` hold the same definitions, imports, file
-    /// roots, and links, in the same order. Stamps, derived data, and carry
-    /// are ignored.
+    /// roots, and links, in the same order. Derived data and carry are
+    /// ignored.
     #[must_use]
     pub fn same_contents(&self, other: &Self) -> bool {
         self.definitions == other.definitions
@@ -241,7 +218,7 @@ impl ResolveCtx {
         is_test: bool,
         cfg_test: bool,
     ) {
-        self.bump();
+        self.drop_derived();
         self.definitions.push(Definition {
             node_id,
             object_id,
@@ -265,7 +242,7 @@ impl ResolveCtx {
         path: impl Into<QualifiedName>,
         glob: bool,
     ) {
-        self.bump();
+        self.drop_derived();
         self.imports.push(Import {
             module: module.into(),
             local: local.into(),
@@ -282,7 +259,7 @@ impl ResolveCtx {
         object_id: ObjectId,
         module: impl Into<QualifiedName>,
     ) {
-        self.bump();
+        self.drop_derived();
         self.files.push(FileRoot {
             object_id,
             path,
@@ -351,7 +328,7 @@ impl ResolveCtx {
         name: impl Into<QualifiedName>,
         target: impl Into<QualifiedName>,
     ) {
-        self.bump();
+        self.drop_derived();
         self.links.push(Link {
             from: from.into(),
             name: name.into(),
@@ -489,6 +466,28 @@ pub trait LangAdapter: Send + Sync {
     fn identify(&self, base: &IdentifiedTree, result: &NodeTree) -> IdentityMapping {
         default_identify(self, base, result)
     }
+
+    /// Tier 2. What policy matches on for definitions in `source` (ADR
+    /// 0026): one [`DefinitionFacts`] per span, in order. A span is a
+    /// definition's byte range in `source`, attached trivia included, as
+    /// the definition listing reports it. The default reports nothing.
+    fn definition_facts(&self, source: &[u8], spans: &[Range<usize>]) -> Vec<DefinitionFacts> {
+        let _ = source;
+        vec![DefinitionFacts::default(); spans.len()]
+    }
+}
+
+/// Facts about one definition that policy rules match on (spec §7.2, ADR
+/// 0026), reported by [`LangAdapter::definition_facts`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DefinitionFacts {
+    /// Node kinds inside the definition, for `touches_kind` (for Rust,
+    /// `unsafe_block` inside a `function_item`). Adapter kind names, sorted.
+    pub inner_kinds: BTreeSet<String>,
+    /// The visibility modifier as written (`pub`, `pub(crate)`), for
+    /// `touches_visibility`. `None` when there is none or the language has
+    /// no such concept.
+    pub visibility: Option<String>,
 }
 
 /// Compiled-in adapter registry (spec §4.3). First match wins.
@@ -543,13 +542,14 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn registry_first_match_wins() {
+    fn registry_first_match_wins() -> Result<(), Box<dyn std::error::Error>> {
         let mut reg = AdapterRegistry::new();
         reg.register(Arc::new(TestAdapter));
-        let path = RepoPath::from_str("src/lib.t").unwrap();
+        let path = RepoPath::from_str("src/lib.t")?;
         assert!(reg.get(&path, b"").is_some());
-        let other = RepoPath::from_str("src/lib.rs").unwrap();
+        let other = RepoPath::from_str("src/lib.rs")?;
         assert!(reg.get(&other, b"").is_none());
+        Ok(())
     }
 
     #[test]
@@ -568,6 +568,10 @@ mod tests {
         assert!(a.references(&ctx, &node).is_empty());
         assert!(a.resolve(&ctx, &NameRef::new("foo")).is_none());
         assert!(a.test_targets(&ctx, &node).is_empty());
+        assert_eq!(
+            a.definition_facts(b"fn a", &[0..4, 0..2]),
+            vec![DefinitionFacts::default(); 2]
+        );
         assert_eq!(a.tier(), Tier::Syntax);
         assert_eq!(a.tier().as_u8(), 1);
     }

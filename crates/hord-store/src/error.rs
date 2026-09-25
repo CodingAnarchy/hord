@@ -85,9 +85,6 @@ pub enum Error {
     /// An object (compressed or uncompressed) exceeded 4 GiB.
     #[error("object exceeds 4 GiB")]
     ObjectTooLarge,
-    /// A pack file or its sidecar index was unreadable.
-    #[error("invalid pack {}", .0.display())]
-    InvalidPack(PathBuf),
 }
 
 fn holder_name(holder: Option<u32>) -> String {

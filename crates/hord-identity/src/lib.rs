@@ -23,7 +23,7 @@ mod carry;
 mod error;
 mod map;
 
-pub use assign::{assign, birth_id};
+pub use assign::{assign, birth_id, is_fresh};
 pub use carry::{Declaration, carry};
 pub use error::Error;
 pub use map::{SnapshotFile, identity_map};

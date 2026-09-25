@@ -25,10 +25,19 @@ M3 decisions that constrain later work: read sets (ADR 0012), lander merge mode 
 
 - Rust edition 2024. MSRV = current stable; bump freely.
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` gate every landing.
-- `#![forbid(unsafe_code)]` in every crate except `hord-vfs`.
+- `#![forbid(unsafe_code)]` in every crate except `hord-vfs`. One exception: `hord-cli` denies it and allows one Windows-only function that keeps the CLI's stdio out of the daemon (ADR 0027).
 - Property tests (`proptest`) for encoding round-trip, parse/project losslessness, `apply(base, diff(base, result)) == result`, and specified merge commutativity.
 - Every public type documented. `cargo doc` warnings are errors.
 - Errors: `thiserror` in libraries, `anyhow` only in `hord-cli`.
+- No `.unwrap()`, in library, binary, bench, or test code. Enforced by `clippy::unwrap_used`:
+  - Code that can fail returns the error with `?`, adding context where the crate's error type allows.
+  - `.expect("…")` is only for a true invariant, and its message says why the call cannot fail.
+  - Tests return `Result` and use `?`, or use `.expect("…")` naming what was being attempted, so a failure says what broke.
+  - `unwrap_or_else(|e| panic!(…))` counts as an unwrap. A test that needs the error in its message returns `Result` and uses `map_err(|e| format!("{context}: {e}"))?`.
+- Imports go in `use` statements at the top of the file, or of the inline module (`mod tests { use … }`), not as full paths inline (`crate::a::b::f()`, `std::collections::BTreeMap::new()`). Exceptions:
+  - a qualified path that disambiguates two items with the same name;
+  - a path inside a macro body, where hygiene needs it.
+  Existing code is not yet converted. Apply the rule to code you write or touch.
 - Async: `tokio`. No blocking I/O in async contexts.
 - No hand-rolled parsers, hashes, or serialization formats. Use `tree-sitter`, `blake3`, canonical CBOR.
 - Deterministic everything: same inputs → same `ObjectId`s. Non-determinism is a P0 bug.

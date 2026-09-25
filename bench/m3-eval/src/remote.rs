@@ -9,12 +9,11 @@
 //! `land_local` ≥ 20 changes/s, the same measure as the in-process run.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use hord_core::{ChangeId, RepoPath};
-use hord_txn::{QueueStatus, Repo, RepoConfig, RepoOptions, StubVerifier};
+use hord_txn::{QueueStatus, Repo};
 use serde::Serialize;
 
 use crate::sim;
@@ -34,14 +33,6 @@ pub(crate) struct RemoteReport {
     pub pass: bool,
 }
 
-fn options(strict_reads: bool) -> RepoOptions {
-    RepoOptions {
-        config: RepoConfig { strict_reads },
-        verifier: Some(Arc::new(StubVerifier)),
-        ..RepoOptions::default()
-    }
-}
-
 pub(crate) async fn run(
     dir: &Path,
     files: Vec<(RepoPath, Vec<u8>)>,
@@ -49,7 +40,7 @@ pub(crate) async fn run(
     config: &sim::SimConfig,
 ) -> Result<RemoteReport> {
     let store = hord_store::Store::create(dir).context("create store")?;
-    let proposer = Repo::from_store(store, options(config.strict_reads)).await?;
+    let proposer = Repo::from_store(store, sim::repo_options(config.strict_reads, false)).await?;
     let base = proposer
         .bootstrap(files, sim::intent("import cargo"), sim::actor("m3-seed"))
         .await?;
@@ -80,7 +71,7 @@ pub(crate) async fn run(
     let propose_secs = started.elapsed().as_secs_f64();
     drop(proposer);
 
-    let lander = Repo::open_with(dir, options(config.strict_reads)).await?;
+    let lander = Repo::open_with(dir, sim::repo_options(config.strict_reads, false)).await?;
     let mut order: Vec<usize> = (0..changes.len()).collect();
     sim::Rng::new(config.seed.rotate_left(17)).shuffle(&mut order);
     let started = Instant::now();

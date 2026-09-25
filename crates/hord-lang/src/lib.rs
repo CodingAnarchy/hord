@@ -25,20 +25,19 @@ mod rename;
 mod tree;
 mod trivia;
 
-pub use adapter::{AdapterRegistry, Anchor, LangAdapter, NameRef, ResolveCtx, Tier};
+pub use adapter::{
+    AdapterRegistry, Anchor, DefinitionFacts, LangAdapter, NameRef, ResolveCtx, Tier,
+};
 pub use error::ParseError;
 pub use identify::{
     DefSite, IdentifiedTree, IdentityMapping, Site, def_sites, default_identify, enclosing_site,
     oid_at,
 };
 pub use normalized::normalized_hash;
-pub use tree::NodeTree;
+pub use tree::{NodeTree, TreeBuilder};
 pub use trivia::{
     AttachedSpan, AttachedToken, Lexeme, TokenSpan, attach_trivia, attach_trivia_spans,
 };
-
-/// Result alias for this crate.
-pub type Result<T, E = ParseError> = std::result::Result<T, E>;
 
 /// The 3-way merge of a value that only one side changed: ours when both
 /// sides agree or only ours changed, theirs when only theirs changed, and

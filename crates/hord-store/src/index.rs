@@ -153,25 +153,19 @@ impl Store {
         source: NodeId,
         target: NodeId,
     ) -> Result<ObjectId> {
-        let _guard = self.lock_index();
+        let _guard = super::lock(&self.index_lock);
         let key = edge_key(snapshot, kind, source, target);
-        if super::lock(&self.seen_edges).contains(&key) {
-            let bytes = hord_encoding::encode(&IndexFact::Edge {
-                format: INDEX_FACT_FORMAT,
-                snapshot,
-                kind,
-                source,
-                target,
-            })?;
-            return Ok(ObjectId::from_canonical(&bytes));
-        }
-        let id = self.put_object(&IndexFact::Edge {
+        let fact = IndexFact::Edge {
             format: INDEX_FACT_FORMAT,
             snapshot,
             kind,
             source,
             target,
-        })?;
+        };
+        if super::lock(&self.seen_edges).contains(&key) {
+            return Ok(ObjectId::of(&fact)?);
+        }
+        let id = self.put_object(&fact)?;
         let txn = self.db.begin_write().map_err(Error::index)?;
         {
             let mut table = txn.open_table(EDGES).map_err(Error::index)?;
@@ -235,7 +229,7 @@ impl Store {
     /// the landing log. Indexing it again is a no-op. Rows stay in landing
     /// order even when changes are indexed out of order.
     pub fn index_change(&self, change: ChangeId) -> Result<()> {
-        let _guard = self.lock_index();
+        let _guard = super::lock(&self.index_lock);
         self.flush()?;
         if !self.ensure_landing_log()?.first_pos.contains_key(&change) {
             return Err(Error::NotInLog(change));
@@ -268,17 +262,11 @@ impl Store {
     /// left in place. Edge rows come from the objects [`Self::put_edge`]
     /// writes.
     pub fn rebuild_index(&self) -> Result<()> {
-        let _guard = self.lock_index();
+        let _guard = super::lock(&self.index_lock);
         self.flush()?;
         let (history, rebased) = self.history_from_log()?;
         let edges = self.scan_edges()?;
         self.write_rebuilt_index(&history, &edges, &rebased)
-    }
-
-    pub(super) fn lock_index(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.index_lock
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
     }
 
     fn insert_history(&self, change: ChangeId, nodes: &BTreeSet<NodeId>) -> Result<()> {
@@ -288,23 +276,13 @@ impl Store {
         // `index_change` holds `index_lock`, so these rows cannot change before
         // the write below. A no-op reindex then skips the durable commit. The
         // landing-log lock covers only the planning, not the commit.
-        let mut updates = Vec::new();
-        {
+        let updates = {
             let log = self.ensure_landing_log()?;
             let pos_of = |id: &ChangeId| log.first_pos.get(id).copied();
             let txn = self.db.begin_read().map_err(Error::index)?;
             let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
-            for node in nodes {
-                let key = node_key(*node);
-                let existing = table
-                    .get(key.as_slice())
-                    .map_err(Error::index)?
-                    .map(|value| value.value().to_vec());
-                if let Some(encoded) = history_value(existing.as_deref(), change, &pos_of)? {
-                    updates.push((key, encoded));
-                }
-            }
-        }
+            history_rows(&table, change, nodes, &pos_of)?
+        };
         if updates.is_empty() {
             return Ok(());
         }
@@ -449,6 +427,17 @@ pub(super) fn plan_history_rows(
     pos_of: &impl Fn(&ChangeId) -> Option<usize>,
 ) -> Result<Vec<([u8; NODE_LEN], Vec<u8>)>> {
     let table = txn.open_table(NODE_HISTORY).map_err(Error::index)?;
+    history_rows(&table, change, nodes, pos_of)
+}
+
+/// The `node_history` rows `change` adds to `table`, one per node whose
+/// row changes.
+fn history_rows(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    change: ChangeId,
+    nodes: &BTreeSet<NodeId>,
+    pos_of: &impl Fn(&ChangeId) -> Option<usize>,
+) -> Result<Vec<([u8; NODE_LEN], Vec<u8>)>> {
     let mut updates = Vec::new();
     for node in nodes {
         let key = node_key(*node);
@@ -641,7 +630,8 @@ mod tests {
     }
 
     #[test]
-    fn index_facts_round_trip_and_do_not_match_other_objects() {
+    fn index_facts_round_trip_and_do_not_match_other_objects()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let edge = IndexFact::Edge {
             format: super::INDEX_FACT_FORMAT,
             snapshot: oid(1),
@@ -649,21 +639,23 @@ mod tests {
             source: nid(2),
             target: nid(3),
         };
-        let bytes = encode(&edge).unwrap();
-        assert_eq!(encode(&edge).unwrap(), bytes);
+        let bytes = encode(&edge)?;
+        assert_eq!(encode(&edge)?, bytes);
         assert!(bytes.starts_with(super::EDGE_FACT_PREFIX));
         assert!(looks_like_index_fact(&bytes));
-        assert_eq!(decode::<IndexFact>(&bytes).unwrap(), edge);
+        assert_eq!(decode::<IndexFact>(&bytes)?, edge);
 
-        let blob = encode(&Blob::new(b"hi".to_vec())).unwrap();
+        let blob = encode(&Blob::new(b"hi".to_vec()))?;
         assert!(decode::<IndexFact>(&blob).is_err());
-        let map = encode(&IdentityMap::default()).unwrap();
+        let map = encode(&IdentityMap::default())?;
         assert!(decode::<IndexFact>(&map).is_err());
         assert!(!looks_like_index_fact(&map));
+        Ok(())
     }
 
     #[test]
-    fn touched_nodes_include_writes_ops_and_deltas_not_reads() {
+    fn touched_nodes_include_writes_ops_and_deltas_not_reads()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let write = nid(1);
         let read = nid(2);
         let parent = nid(3);
@@ -719,12 +711,7 @@ mod tests {
                     kind: TreeOpKind::CreateFile,
                 },
             ],
-            intent: Intent {
-                summary: "s".into(),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            },
+            intent: Intent::from_summary("s"),
             provenance: Provenance {
                 actor: Actor::Human { id: "t".into() },
                 toolchain: oid(3),
@@ -777,9 +764,10 @@ mod tests {
             ])
         );
         assert!(!got.contains(&read));
-        let bytes = encode(&record).unwrap();
+        let bytes = encode(&record)?;
         assert!(decode::<IndexFact>(&bytes).is_err());
         assert!(!looks_like_index_fact(&bytes));
+        Ok(())
     }
 
     #[test]

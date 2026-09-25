@@ -45,22 +45,16 @@ pub(crate) fn merge_cst(
 
     match merge_seq(store, &b.children, &o.children, &t.children) {
         Ok(kids) => {
-            let kind = *take_edited(&b.kind, &o.kind, &t.kind);
-            let name = take_edited(&b.name, &o.name, &t.name).clone();
+            // Ours, unless only theirs changed.
+            let kind = *prefer_unchanged(&b.kind, &o.kind, &t.kind).unwrap_or(&o.kind);
+            let name = prefer_unchanged(&b.name, &o.name, &t.name)
+                .unwrap_or(&o.name)
+                .clone();
             store
                 .intern_branch(kind, o.lang, kids, name)
                 .map_err(|_| ())
         }
         Err(()) => merge_leaf(store, ours, theirs, &b, &o, &t),
-    }
-}
-
-/// Ours, unless only theirs changed.
-fn take_edited<'a, T: PartialEq + ?Sized>(base: &'a T, ours: &'a T, theirs: &'a T) -> &'a T {
-    if ours == base && theirs != base {
-        theirs
-    } else {
-        ours
     }
 }
 

@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use hord_core::{LangId, NodeKind, ObjectId, QualifiedName};
-use hord_lang::{AttachedSpan, NodeTree, ParseError, TokenSpan, attach_trivia_spans};
+use hord_lang::{AttachedSpan, NodeTree, ParseError, TokenSpan, TreeBuilder, attach_trivia_spans};
 
 /// Kind for bytes that tree-sitter-toml omits from the tree (string contents).
 ///
@@ -246,15 +246,13 @@ fn scalar_label(kind: &str, text: &str) -> String {
 
 fn intern_spans_before(
     before: usize,
-    lang: &LangId,
-    source: &[u8],
     tokens: &[AttachedSpan],
     token_i: &mut usize,
-    tree: &mut NodeTree,
+    tree: &mut TreeBuilder<'_>,
     children: &mut Vec<ObjectId>,
 ) -> Result<(), ParseError> {
     while *token_i < tokens.len() && tokens[*token_i].text.start < before {
-        children.push(tree.intern_source_token(*lang, source, &tokens[*token_i], None)?);
+        children.push(tree.token(&tokens[*token_i])?);
         *token_i += 1;
     }
     Ok(())
@@ -263,11 +261,10 @@ fn intern_spans_before(
 fn intern(
     node: tree_sitter::Node<'_>,
     namer: &Namer,
-    lang: &LangId,
     source: &[u8],
     tokens: &[AttachedSpan],
     token_i: &mut usize,
-    tree: &mut NodeTree,
+    tree: &mut TreeBuilder<'_>,
 ) -> Result<Option<ObjectId>, ParseError> {
     if !should_emit(node) {
         return Ok(None);
@@ -282,42 +279,26 @@ fn intern(
                 ))
             })?;
             *token_i += 1;
-            return Ok(Some(tree.intern_source_token(*lang, source, token, None)?));
+            return Ok(Some(tree.token(token)?));
         }
         return Ok(None);
     }
 
     let mut children = Vec::new();
     walk_emitted(node, |child| {
-        intern_spans_before(
-            child.start_byte(),
-            lang,
-            source,
-            tokens,
-            token_i,
-            tree,
-            &mut children,
-        )?;
-        if let Some(id) = intern(child, namer, lang, source, tokens, token_i, tree)? {
+        intern_spans_before(child.start_byte(), tokens, token_i, tree, &mut children)?;
+        if let Some(id) = intern(child, namer, source, tokens, token_i, tree)? {
             children.push(id);
         }
         Ok(false)
     })?;
-    intern_spans_before(
-        node.end_byte(),
-        lang,
-        source,
-        tokens,
-        token_i,
-        tree,
-        &mut children,
-    )?;
+    intern_spans_before(node.end_byte(), tokens, token_i, tree, &mut children)?;
     if children.is_empty() {
         return Ok(None);
     }
-    Ok(Some(tree.intern_branch(
-        NodeKind::new(node.kind()),
-        *lang,
+    let kind = NodeKind::new(node.kind());
+    Ok(Some(tree.branch(
+        kind,
         children,
         namer.def_name(node, source),
     )?))
@@ -385,26 +366,18 @@ pub(crate) fn parse(source: &[u8], lang: &LangId) -> Result<NodeTree, ParseError
     }
 
     let attached = attach_trivia_spans(source, tokens);
-    let mut tree = NodeTree::new();
+    let mut builder = TreeBuilder::new(*lang, source);
     let mut token_i = 0;
     let namer = Namer::new(root, source);
-    let root_id = intern(
-        root,
-        &namer,
-        lang,
-        source,
-        &attached,
-        &mut token_i,
-        &mut tree,
-    )?
-    .ok_or_else(|| ParseError::failed("intern produced no root"))?;
+    let root_id = intern(root, &namer, source, &attached, &mut token_i, &mut builder)?
+        .ok_or_else(|| ParseError::failed("intern produced no root"))?;
     if token_i != attached.len() {
         return Err(ParseError::failed(format!(
             "interned {token_i} of {} leaves",
             attached.len()
         )));
     }
-    tree.set_root(root_id)?;
+    let tree = builder.finish(root_id)?;
     ensure_lossless(source, &tree)?;
     Ok(tree)
 }

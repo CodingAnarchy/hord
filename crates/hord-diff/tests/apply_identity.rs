@@ -7,13 +7,16 @@ use hord_lang::LangAdapter;
 
 use common::{has_kind, identify_result, parse_identified, project, rust};
 
-fn round_trip(base_src: &[u8], result_src: &[u8]) -> Vec<hord_core::Op> {
+fn round_trip(
+    base_src: &[u8],
+    result_src: &[u8],
+) -> Result<Vec<hord_core::Op>, Box<dyn std::error::Error>> {
     let adapter = rust();
     let base = parse_identified(&adapter, base_src);
     let (result, mapping) = identify_result(&adapter, &base, result_src);
     let ops = diff(&common::file(), &base, &result, &mapping);
     let applied = apply(&common::file(), &base, &ops, &result)
-        .unwrap_or_else(|e| panic!("apply failed: {e}; ops={ops:?}"));
+        .map_err(|e| format!("apply failed: {e}; ops={ops:?}"))?;
     let got = project(&adapter, &applied.tree);
     assert_eq!(
         got.as_slice(),
@@ -22,40 +25,43 @@ fn round_trip(base_src: &[u8], result_src: &[u8]) -> Vec<hord_core::Op> {
         String::from_utf8_lossy(&got),
         String::from_utf8_lossy(result_src)
     );
-    ops
+    Ok(ops)
 }
 
 #[test]
-fn insert_a_function() {
+fn insert_a_function() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() {}\nfn b() {}\n";
     let result = b"fn a() {}\nfn c() {}\nfn b() {}\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "insert"),
         "expected Insert for new function, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn delete_a_function() {
+fn delete_a_function() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() {}\nfn b() {}\nfn c() {}\n";
     let result = b"fn a() {}\nfn c() {}\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "delete"),
         "expected Delete for removed function, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn replace_a_function() {
+fn replace_a_function() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() { let x = 1; }\nfn b() {}\n";
     let result = b"fn a() { let x = 2; }\nfn b() {}\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "replace"),
         "expected Replace for edited function, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
@@ -93,28 +99,31 @@ fn move_a_definition() {
 }
 
 #[test]
-fn reorder_sibling_functions_applies() {
+fn reorder_sibling_functions_applies() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() {}\nfn b() {}\n";
     let result = b"fn b() {}\nfn a() {}\n";
-    round_trip(base, result);
+    round_trip(base, result)?;
+    Ok(())
 }
 
 #[test]
-fn identical_trees_empty_ops() {
+fn identical_trees_empty_ops() -> Result<(), Box<dyn std::error::Error>> {
     let src = b"fn a() {}\nfn b() {}\n";
-    let ops = round_trip(src, src);
+    let ops = round_trip(src, src)?;
     assert!(ops.is_empty(), "expected no ops, got {ops:?}");
+    Ok(())
 }
 
 #[test]
-fn trivia_only_replace_still_applies() {
+fn trivia_only_replace_still_applies() -> Result<(), Box<dyn std::error::Error>> {
     let base = b"fn a() { let x = 1; }\n";
     let result = b"fn a() { let x  =  1; }\n";
-    let ops = round_trip(base, result);
+    let ops = round_trip(base, result)?;
     assert!(
         has_kind(&ops, "replace") || ops.is_empty(),
         "trivia-only should Replace or be a no-op if normalized+raw match, got {ops:?}"
     );
+    Ok(())
 }
 
 #[test]
@@ -132,14 +141,14 @@ fn toml_insert_table() {
 /// ADR 0015: file-level ops name the path-derived root, never nil, and the
 /// same edit in another file names that file's root.
 #[test]
-fn file_level_ops_name_the_path_derived_root() {
+fn file_level_ops_name_the_path_derived_root() -> Result<(), Box<dyn std::error::Error>> {
     use hord_core::{NodeId, Op, RepoPath};
 
     let adapter = rust();
     let base = parse_identified(&adapter, b"fn a() {}\n");
     let (result, mapping) = identify_result(&adapter, &base, b"fn a() {}\nfn b() {}\n");
-    let lib: RepoPath = "src/lib.rs".parse().unwrap();
-    let other: RepoPath = "src/other.rs".parse().unwrap();
+    let lib: RepoPath = "src/lib.rs".parse()?;
+    let other: RepoPath = "src/other.rs".parse()?;
     let ops = diff(&lib, &base, &result, &mapping);
     let root = NodeId::file_root(&lib);
     assert!(
@@ -165,7 +174,7 @@ fn file_level_ops_name_the_path_derived_root() {
     let nil = vec![Op::Insert {
         parent: NodeId::nil(),
         index: 0,
-        node: result.root().unwrap(),
+        node: result.root().ok_or("result tree has a root")?,
     }];
     assert!(apply(&lib, &base, &nil, &result).is_err());
     // A glue-only edit replaces the root id.
@@ -177,13 +186,14 @@ fn file_level_ops_name_the_path_derived_root() {
             .any(|op| matches!(op, Op::Replace { node, .. } if *node == NodeId::file_root(&lib))),
         "{glue_ops:?}"
     );
+    Ok(())
 }
 
 /// Identical definitions at two sites (the same `use` in two functions) are
 /// two identities. Editing a third function is a Replace of that function,
 /// not a whole-file replace, and apply reproduces the result.
 #[test]
-fn identical_definitions_do_not_collapse() {
+fn identical_definitions_do_not_collapse() -> Result<(), Box<dyn std::error::Error>> {
     use hord_core::Op;
     let adapter = rust();
     let src = "pub fn target(x: u32) -> u32 {\n    x + 1\n}\n\npub fn first(p: &str) -> usize {\n    #[cfg(unix)]\n    {\n        use std::os::unix::prelude::*;\n        p.len()\n    }\n}\n\npub fn second(p: &str) -> usize {\n    #[cfg(unix)]\n    {\n        use std::os::unix::prelude::*;\n        p.len() + 1\n    }\n}\n";
@@ -194,26 +204,27 @@ fn identical_definitions_do_not_collapse() {
     assert!(mapping.moves.is_empty(), "{:?}", mapping.moves);
     assert!(mapping.deltas.is_empty(), "{:?}", mapping.deltas);
     let ops = diff(&common::file(), &base, &result, &mapping);
-    let (_, target) = common::def_named(&base, "fn target").unwrap();
+    let (_, target) = common::def_named(&base, "fn target").ok_or("base defines fn target")?;
     assert_eq!(ops.len(), 1, "{ops:?}");
     assert!(
         matches!(ops[0], Op::Replace { node, .. } if node == target),
         "{ops:?}"
     );
-    let applied = apply(&common::file(), &base, &ops, &result).unwrap();
+    let applied = apply(&common::file(), &base, &ops, &result)?;
     assert_eq!(project(&adapter, &applied.tree), edited.as_bytes());
 
     // Editing the second copy of the duplicate edits `second`, not `first`.
     let edited = src.replace("p.len() + 1", "p.len() + 2");
     let (result, mapping) = identify_result(&adapter, &base, edited.as_bytes());
     let ops = diff(&common::file(), &base, &result, &mapping);
-    let (_, second) = common::def_named(&base, "fn second").unwrap();
+    let (_, second) = common::def_named(&base, "fn second").ok_or("base defines fn second")?;
     assert!(
         matches!(ops[..], [Op::Replace { node, .. }] if node == second),
         "{ops:?}"
     );
-    let applied = apply(&common::file(), &base, &ops, &result).unwrap();
+    let applied = apply(&common::file(), &base, &ops, &result)?;
     assert_eq!(project(&adapter, &applied.tree), edited.as_bytes());
+    Ok(())
 }
 
 /// `apply_identified` takes the ids of replaced and inserted content from

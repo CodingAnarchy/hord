@@ -3,11 +3,16 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hord_core::{Actor, Intent, NodeId, RepoPath};
 use hord_txn::{BeginOptions, Repo, RepoOptions, Workspace};
+
+/// What a test or fixture returns: `?` carries the underlying error into
+/// the failure message.
+pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 pub struct TempRepo {
     pub path: PathBuf,
@@ -16,43 +21,76 @@ pub struct TempRepo {
 
 impl Drop for TempRepo {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let _ = remove_tree(&self.path);
     }
 }
 
-pub fn temp_dir(tag: &str) -> PathBuf {
+/// Remove `path` and everything under it, if it exists. Directory
+/// workspaces keep a read-only pristine checkout under `.hord/pristine/`,
+/// which `fs::remove_dir_all` alone cannot empty, so write access is
+/// restored to every directory first.
+pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path).is_err_and(|err| err.kind() == ErrorKind::NotFound) {
+        return Ok(());
+    }
+    make_writable(path)?;
+    fs::remove_dir_all(path)
+}
+
+fn make_writable(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir)?.permissions().mode();
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700))?;
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            make_writable(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// A fresh, empty directory unique to this process. Paths repeat when the
+/// OS reuses a pid, so a leftover from an earlier process is removed first;
+/// failing to remove it is an error, not a collision later.
+pub fn temp_dir(tag: &str) -> TestResult<PathBuf> {
     static N: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "hord-txn-{tag}-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+    remove_tree(&path).map_err(|err| format!("remove stale temp dir {}: {err}", path.display()))?;
+    fs::create_dir_all(&path)
+        .map_err(|err| format!("create temp dir {}: {err}", path.display()))?;
+    Ok(path)
 }
 
-pub async fn repo_with(files: &[(&str, &str)], options: RepoOptions) -> TempRepo {
-    let path = temp_dir("repo");
-    let repo = Repo::create_with(&path, options).await.unwrap();
+pub async fn repo_with(files: &[(&str, &str)], options: RepoOptions) -> TestResult<TempRepo> {
+    let path = temp_dir("repo")?;
+    let repo = Repo::create_with(&path, options)
+        .await
+        .map_err(|err| format!("create repo in {}: {err:?}", path.display()))?;
     let files = files
         .iter()
-        .map(|(p, s)| (p.parse::<RepoPath>().unwrap(), s.as_bytes().to_vec()))
-        .collect();
+        .map(|(p, s)| Ok((p.parse::<RepoPath>()?, s.as_bytes().to_vec())))
+        .collect::<TestResult<_>>()?;
     repo.bootstrap(files, intent("bootstrap"), actor("seed"))
-        .await
-        .unwrap();
-    TempRepo { path, repo }
+        .await?;
+    Ok(TempRepo { path, repo })
 }
 
-pub async fn repo(files: &[(&str, &str)]) -> TempRepo {
+pub async fn repo(files: &[(&str, &str)]) -> TestResult<TempRepo> {
     repo_with(files, RepoOptions::default()).await
 }
 
 /// [`repo`] with the M3 stub verifier: changes whose sets overlap a landed
 /// change still land after a clean rebase (verification stubbed, spec §12
 /// M3). The default verifier parks them.
-pub async fn stub_repo(files: &[(&str, &str)]) -> TempRepo {
+pub async fn stub_repo(files: &[(&str, &str)]) -> TestResult<TempRepo> {
     let options = RepoOptions {
         verifier: Some(std::sync::Arc::new(hord_txn::StubVerifier)),
         ..RepoOptions::default()
@@ -70,43 +108,41 @@ pub fn actor(id: &str) -> Actor {
 }
 
 pub fn intent(summary: &str) -> Intent {
-    Intent {
-        summary: summary.into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    }
+    Intent::from_summary(summary)
 }
 
+/// `p` as a [`RepoPath`]. Tests pass literal fixture paths, so a parse
+/// failure is a bug in the test itself.
 pub fn path(p: &str) -> RepoPath {
-    p.parse().unwrap()
+    p.parse()
+        .expect("parse a fixture path literal as a RepoPath")
 }
 
-pub async fn begin(repo: &Repo, who: &str) -> Workspace {
-    repo.begin(BeginOptions::at_head(actor(who))).await.unwrap()
+pub async fn begin(repo: &Repo, who: &str) -> TestResult<Workspace> {
+    Ok(repo.begin(BeginOptions::at_head(actor(who))).await?)
 }
 
 /// NodeId of the definition whose name is `name` or ends in `::name`.
-pub async fn def(ws: &mut Workspace, file: &str, name: &str) -> NodeId {
+pub async fn def(ws: &mut Workspace, file: &str, name: &str) -> TestResult<NodeId> {
     let suffix = format!("::{name}");
-    ws.definitions(&path(file))
-        .await
-        .unwrap()
+    Ok(ws
+        .definitions(&path(file))
+        .await?
         .into_iter()
         .find(|d| {
             d.name
                 .as_ref()
                 .is_some_and(|n| n.as_str() == name || n.as_str().ends_with(&suffix))
         })
-        .unwrap_or_else(|| panic!("no definition {name} in {file}"))
-        .node
+        .ok_or_else(|| format!("no definition {name} in {file}"))?
+        .node)
 }
 
 /// Replace the whole text of definition `name` in `file`.
-pub async fn rewrite(ws: &mut Workspace, file: &str, name: &str, text: &str) -> NodeId {
-    let node = def(ws, file, name).await;
-    ws.write_definition(&path(file), node, text).await.unwrap();
-    node
+pub async fn rewrite(ws: &mut Workspace, file: &str, name: &str, text: &str) -> TestResult<NodeId> {
+    let node = def(ws, file, name).await?;
+    ws.write_definition(&path(file), node, text).await?;
+    Ok(node)
 }
 
 pub const LIB: &str = "\
@@ -154,18 +190,28 @@ pub fn fixture() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Write `file` as `content` with `from` replaced by `to` (no read logged).
-pub async fn edit(ws: &mut Workspace, file: &str, content: &str, from: &str, to: &str) {
+pub async fn edit(
+    ws: &mut Workspace,
+    file: &str,
+    content: &str,
+    from: &str,
+    to: &str,
+) -> TestResult {
     assert!(content.contains(from), "{from:?} not in {file}");
     ws.write_file(&path(file), content.replacen(from, to, 1))
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 /// Propose, submit, and return the change id.
-pub async fn submit(repo: &Repo, ws: &mut Workspace, summary: &str) -> hord_core::ChangeId {
-    let proposal = ws.propose(intent(summary)).await.unwrap();
-    repo.submit(proposal.change).await.unwrap();
-    proposal.change
+pub async fn submit(
+    repo: &Repo,
+    ws: &mut Workspace,
+    summary: &str,
+) -> TestResult<hord_core::ChangeId> {
+    let proposal = ws.propose(intent(summary)).await?;
+    repo.submit(proposal.change).await?;
+    Ok(proposal.change)
 }
 
 /// hord-store's dependency list header in the `hord-v4.lock` fixture.
@@ -210,32 +256,37 @@ pub fn file_identity(
     store: &hord_store::Store,
     snapshot: hord_core::SnapshotId,
     file: &str,
-) -> Option<hord_core::ObjectId> {
+) -> TestResult<Option<hord_core::ObjectId>> {
     use hord_core::{IdentityEntry, IdentityTree, Snapshot};
-    let snapshot: Snapshot = store.get_object(snapshot).unwrap();
-    let mut tree: IdentityTree = store.get_object(snapshot.identity().unwrap()).unwrap();
+    let snapshot: Snapshot = store.get_object(snapshot)?;
+    let identity = snapshot.identity().ok_or("snapshot has no identity tree")?;
+    let mut tree: IdentityTree = store.get_object(identity)?;
     let path = self::path(file);
-    let (last, dirs) = path.components().split_last().unwrap();
+    let (last, dirs) = path
+        .components()
+        .split_last()
+        .ok_or_else(|| format!("{file} has no components"))?;
     for dir in dirs {
         match tree.entries.get(dir) {
-            Some(IdentityEntry::Dir(id)) => tree = store.get_object(*id).unwrap(),
-            _ => return None,
+            Some(IdentityEntry::Dir(id)) => tree = store.get_object(*id)?,
+            _ => return Ok(None),
         }
     }
     match tree.entries.get(last) {
-        Some(IdentityEntry::File(id)) => Some(*id),
-        _ => None,
+        Some(IdentityEntry::File(id)) => Ok(Some(*id)),
+        _ => Ok(None),
     }
 }
 
 /// Delete the loose object `id` from the store at `root` (to simulate a
 /// lost object).
-pub fn remove_loose_object(root: &std::path::Path, id: hord_core::ObjectId) {
+pub fn remove_loose_object(root: &std::path::Path, id: hord_core::ObjectId) -> TestResult {
     let hex = id.to_hex();
     let file = root
         .join(".hord")
         .join("objects")
         .join(&hex[..2])
         .join(&hex[2..]);
-    fs::remove_file(&file).unwrap_or_else(|err| panic!("remove {}: {err}", file.display()));
+    fs::remove_file(&file).map_err(|err| format!("remove {}: {err}", file.display()))?;
+    Ok(())
 }

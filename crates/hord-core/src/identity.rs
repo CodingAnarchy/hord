@@ -96,6 +96,80 @@ pub enum IdentityEntry {
     File(crate::ObjectId),
 }
 
+/// Where [`edit_identity_tree`] reads and writes [`IdentityTree`] objects.
+pub trait IdentityTrees {
+    /// Error of a read or a write.
+    type Error;
+
+    /// The identity tree object `id`.
+    fn load(&mut self, id: crate::ObjectId) -> Result<IdentityTree, Self::Error>;
+
+    /// Store `tree` and return its id.
+    fn store(&mut self, tree: IdentityTree) -> Result<crate::ObjectId, Self::Error>;
+}
+
+/// A path's path components and its new [`FileIdentity`] object, or `None`
+/// to remove its entry ([`edit_identity_tree`]).
+pub type IdentityEdit<'a> = (&'a [String], Option<crate::ObjectId>);
+
+/// The identity tree `tree` (`None`: an empty one) with `edits` applied,
+/// stored: each is a path relative to `tree` and its new
+/// [`FileIdentity`] object, or `None` to remove the file's entry.
+/// Directories on edited paths are rewritten; emptied ones are dropped, and
+/// a missing one is not created only to remove from it. `None` when the
+/// result is empty.
+pub fn edit_identity_tree<T: IdentityTrees + ?Sized>(
+    trees: &mut T,
+    tree: Option<crate::ObjectId>,
+    edits: &[IdentityEdit<'_>],
+) -> Result<Option<crate::ObjectId>, T::Error> {
+    let mut out = match tree {
+        Some(id) => trees.load(id)?,
+        None => IdentityTree::default(),
+    };
+    let mut nested: BTreeMap<&str, Vec<IdentityEdit<'_>>> = BTreeMap::new();
+    for (components, identity) in edits {
+        match components {
+            [name] => match identity {
+                Some(id) => {
+                    out.entries.insert(name.clone(), IdentityEntry::File(*id));
+                }
+                None => {
+                    if matches!(out.entries.get(name), Some(IdentityEntry::File(_))) {
+                        out.entries.remove(name);
+                    }
+                }
+            },
+            [dir, rest @ ..] => nested
+                .entry(dir.as_str())
+                .or_default()
+                .push((rest, *identity)),
+            [] => {}
+        }
+    }
+    for (dir, sub) in nested {
+        let existing = match out.entries.get(dir) {
+            Some(IdentityEntry::Dir(id)) => Some(*id),
+            _ => None,
+        };
+        if existing.is_none() && sub.iter().all(|(_, id)| id.is_none()) {
+            continue;
+        }
+        match edit_identity_tree(trees, existing, &sub)? {
+            Some(id) => {
+                out.entries.insert(dir.to_owned(), IdentityEntry::Dir(id));
+            }
+            None => {
+                out.entries.remove(dir);
+            }
+        }
+    }
+    if out.entries.is_empty() {
+        return Ok(None);
+    }
+    trees.store(out).map(Some)
+}
+
 /// The [`NodeId`]s of one parsed file (ADR 0017).
 ///
 /// Bound to the blob they were computed for: a reader whose tree has a
@@ -107,4 +181,75 @@ pub struct FileIdentity {
     /// Definition site (the child-index walk from the file's root node) →
     /// identity, sorted by site.
     pub nodes: Vec<(Vec<u32>, NodeId)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::ObjectId;
+
+    #[derive(Default)]
+    struct Memory(HashMap<ObjectId, IdentityTree>);
+
+    impl IdentityTrees for Memory {
+        type Error = std::convert::Infallible;
+
+        fn load(&mut self, id: ObjectId) -> Result<IdentityTree, Self::Error> {
+            Ok(self.0[&id].clone())
+        }
+
+        fn store(&mut self, tree: IdentityTree) -> Result<ObjectId, Self::Error> {
+            let id = ObjectId::of(&tree).expect("an identity tree encodes");
+            self.0.insert(id, tree);
+            Ok(id)
+        }
+    }
+
+    fn path(p: &str) -> Vec<String> {
+        p.split('/').map(str::to_owned).collect()
+    }
+
+    /// Edits record and remove file entries along their paths, drop
+    /// emptied directories, and create none only to remove from it.
+    #[test]
+    fn edits_rewrite_the_paths_and_drop_emptied_directories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut trees = Memory::default();
+        let (a, b) = (
+            ObjectId::from_canonical(b"a"),
+            ObjectId::from_canonical(b"b"),
+        );
+        let (x, y, z) = (path("src/x.rs"), path("src/deep/y.rs"), path("z.rs"));
+        let root = edit_identity_tree(
+            &mut trees,
+            None,
+            &[(&x, Some(a)), (&y, Some(b)), (&z, Some(a))],
+        )?
+        .ok_or("recording files leaves a root")?;
+        let top = trees.0[&root].clone();
+        assert_eq!(top.entries.len(), 2);
+        assert_eq!(top.entries["z.rs"], IdentityEntry::File(a));
+        let Some(IdentityEntry::Dir(src)) = top.entries.get("src").cloned() else {
+            return Err("src is a directory".into());
+        };
+        assert_eq!(trees.0[&src].entries["x.rs"], IdentityEntry::File(a));
+
+        let (gone, missing) = (path("src/deep"), path("nowhere/w.rs"));
+        let pruned = edit_identity_tree(
+            &mut trees,
+            Some(root),
+            &[(&y, None), (&x, None), (&gone, None), (&missing, None)],
+        )?
+        .ok_or("z.rs still keeps the root")?;
+        let top = &trees.0[&pruned];
+        assert_eq!(top.entries.len(), 1, "src emptied and dropped: {top:?}");
+        assert_eq!(top.entries["z.rs"], IdentityEntry::File(a));
+        assert_eq!(
+            edit_identity_tree(&mut trees, Some(pruned), &[(&z, None)])?,
+            None
+        );
+        Ok(())
+    }
 }

@@ -805,7 +805,12 @@ mod tests {
         }
     }
 
-    fn merge(b: &str, o: &str, t: &str) -> Result<String, TomlMergeError> {
+    /// Merges both ways; the outer error means the two orders disagreed.
+    fn merge(
+        b: &str,
+        o: &str,
+        t: &str,
+    ) -> Result<Result<String, TomlMergeError>, Box<dyn std::error::Error>> {
         let config = keyed_config();
         let one = merge_toml(b.as_bytes(), o.as_bytes(), t.as_bytes(), &config);
         let two = merge_toml(b.as_bytes(), t.as_bytes(), o.as_bytes(), &config);
@@ -814,21 +819,25 @@ mod tests {
             (Err(TomlMergeError::Conflict(x)), Err(TomlMergeError::Conflict(y))) => {
                 assert_eq!(x, y, "conflicts not commutative");
             }
-            _ => panic!("asymmetric: {one:?} vs {two:?}"),
+            _ => return Err(format!("asymmetric: {one:?} vs {two:?}").into()),
         }
-        one.map(|b| String::from_utf8(b).unwrap())
+        Ok(one.map(|b| String::from_utf8(b).expect("merge output is built from UTF-8 inputs")))
     }
 
     const BASE: &str =
         "# generated\nformat = 1\n\n[[item]]\nid = \"a\"\nrev = 1\ntags = [\n  \"x\",\n]\n";
 
     #[test]
-    fn unchanged_round_trips_canonical_input() {
-        assert_eq!(merge(BASE, BASE, BASE).unwrap(), BASE);
+    fn unchanged_round_trips_canonical_input() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            merge(BASE, BASE, BASE)?.expect("merge unchanged input"),
+            BASE
+        );
+        Ok(())
     }
 
     #[test]
-    fn line_endings_are_kept() {
+    fn line_endings_are_kept() -> Result<(), Box<dyn std::error::Error>> {
         let crlf = |s: &str| s.replace('\n', "\r\n");
         let ours = format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n");
         let theirs = format!("{BASE}\n[[item]]\nid = \"c\"\nrev = 1\n");
@@ -836,45 +845,61 @@ mod tests {
             format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n\n[[item]]\nid = \"c\"\nrev = 1\n");
         // Every input CRLF: the output is CRLF.
         assert_eq!(
-            merge(&crlf(BASE), &crlf(&ours), &crlf(&theirs)).unwrap(),
+            merge(&crlf(BASE), &crlf(&ours), &crlf(&theirs))?.expect("merge all-CRLF inputs"),
             crlf(&want)
         );
         // One side switched to CRLF: that side's ending wins.
-        assert_eq!(merge(BASE, &crlf(&ours), &theirs).unwrap(), crlf(&want));
+        assert_eq!(
+            merge(BASE, &crlf(&ours), &theirs)?.expect("merge with ours switched to CRLF"),
+            crlf(&want)
+        );
         assert_eq!(LineEnding::detect("a = 1"), LineEnding::Lf);
+        Ok(())
     }
 
     #[test]
-    fn concurrent_element_additions_compose() {
+    fn concurrent_element_additions_compose() -> Result<(), Box<dyn std::error::Error>> {
         let ours = format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n");
         let theirs = format!("{BASE}\n[[item]]\nid = \"c\"\nrev = 1\n");
         let want =
             format!("{BASE}\n[[item]]\nid = \"b\"\nrev = 1\n\n[[item]]\nid = \"c\"\nrev = 1\n");
-        assert_eq!(merge(BASE, &ours, &theirs).unwrap(), want);
+        assert_eq!(
+            merge(BASE, &ours, &theirs)?.expect("merge ours and theirs"),
+            want
+        );
+        Ok(())
     }
 
     #[test]
-    fn set_fields_union_and_honour_removals() {
+    fn set_fields_union_and_honour_removals() -> Result<(), Box<dyn std::error::Error>> {
         let ours = BASE.replace("  \"x\",\n", "  \"w\",\n");
         let theirs = BASE.replace("  \"x\",\n", "  \"x\",\n  \"y\",\n");
         let want = BASE.replace("  \"x\",\n", "  \"w\",\n  \"y\",\n");
-        assert_eq!(merge(BASE, &ours, &theirs).unwrap(), want);
+        assert_eq!(
+            merge(BASE, &ours, &theirs)?.expect("merge ours and theirs"),
+            want
+        );
+        Ok(())
     }
 
     #[test]
-    fn rekeyed_element_merges_with_other_side_edit() {
+    fn rekeyed_element_merges_with_other_side_edit() -> Result<(), Box<dyn std::error::Error>> {
         let ours = BASE.replace("rev = 1", "rev = 2");
         let theirs = BASE.replace("  \"x\",\n", "  \"x\",\n  \"y\",\n");
         let want = ours.replace("  \"x\",\n", "  \"x\",\n  \"y\",\n");
-        assert_eq!(merge(BASE, &ours, &theirs).unwrap(), want);
+        assert_eq!(
+            merge(BASE, &ours, &theirs)?.expect("merge ours and theirs"),
+            want
+        );
+        Ok(())
     }
 
     #[test]
-    fn conflicting_rekeys_conflict() {
+    fn conflicting_rekeys_conflict() -> Result<(), Box<dyn std::error::Error>> {
         let ours = BASE.replace("rev = 1", "rev = 2");
         let theirs = BASE.replace("rev = 1", "rev = 3");
-        let Err(TomlMergeError::Conflict(c)) = merge(BASE, &ours, &theirs) else {
-            panic!("expected conflict");
+        let Err(TomlMergeError::Conflict(c)) = merge(BASE, &ours, &theirs)? else {
+            return Err("expected conflict".into());
         };
         assert_eq!(
             c,
@@ -883,27 +908,30 @@ mod tests {
                 kind: ConflictKind::BothChanged,
             }]
         );
+        Ok(())
     }
 
     #[test]
-    fn delete_vs_modify_conflicts() {
+    fn delete_vs_modify_conflicts() -> Result<(), Box<dyn std::error::Error>> {
         let ours = "# generated\nformat = 1\n";
         let theirs = BASE.replace("  \"x\",\n", "  \"z\",\n");
-        let Err(TomlMergeError::Conflict(c)) = merge(BASE, ours, &theirs) else {
-            panic!("expected conflict");
+        let Err(TomlMergeError::Conflict(c)) = merge(BASE, ours, &theirs)? else {
+            return Err("expected conflict".into());
         };
         assert_eq!(c[0].kind, ConflictKind::DeleteModify);
+        Ok(())
     }
 
     #[test]
-    fn scalar_and_table_values_merge_three_way() {
+    fn scalar_and_table_values_merge_three_way() -> Result<(), Box<dyn std::error::Error>> {
         let base = "a = 1\nb = 1\n\n[meta]\nx = 1\n";
         let ours = "a = 2\nb = 1\n\n[meta]\nx = 1\ny = 2\n";
         let theirs = "a = 1\nb = 3\n\n[meta]\nx = 1\nz = 3\n";
         assert_eq!(
-            merge(base, ours, theirs).unwrap(),
+            merge(base, ours, theirs)?.expect("merge ours and theirs"),
             "a = 2\nb = 3\n\n[meta]\nx = 1\ny = 2\nz = 3\n"
         );
+        Ok(())
     }
 
     #[test]

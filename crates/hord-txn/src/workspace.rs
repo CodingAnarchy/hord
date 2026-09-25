@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::materialize::{MaterializeMode, load_stat_index, read_checkout_file, walk_checkout};
 use crate::propose::{ProposeInput, ReadDeclaration};
 use crate::repo::{Inner, Repo, blocking, fs_path};
-use crate::semantic::{DefinitionInfo, definitions};
+use crate::semantic::{DefinitionInfo, carry, definitions};
 use crate::snapshot::blob_object_id;
 use crate::{Error, Result};
 
@@ -194,6 +194,14 @@ impl Workspace {
         &self.materialization
     }
 
+    /// Where this workspace reads objects from: its repository's
+    /// [`ObjectSource`](crate::ObjectSource) (ADR 0024), the local store
+    /// or a remote source that fetches on demand.
+    #[must_use]
+    pub fn objects(&self) -> &dyn crate::ObjectSource {
+        &self.repo
+    }
+
     /// Reads and writes so far.
     #[must_use]
     pub fn access_log(&self) -> &AccessLog {
@@ -333,28 +341,6 @@ impl Workspace {
         }
     }
 
-    /// Definitions named `name` in any parsed file of the workspace view.
-    ///
-    /// This parses every file the first time it runs on a snapshot. Not a
-    /// content read.
-    pub async fn find_definitions(&mut self, name: &str) -> Result<Vec<DefinitionInfo>> {
-        let mut out = Vec::new();
-        for path in self.list_files().await? {
-            let Some(bytes) = self.current(&path).await? else {
-                continue;
-            };
-            if let Some(view) = self.view(&path, &bytes).await? {
-                out.extend(
-                    view.defs
-                        .iter()
-                        .filter(|d| d.name.as_ref().is_some_and(|n| n.as_str() == name))
-                        .cloned(),
-                );
-            }
-        }
-        Ok(out)
-    }
-
     /// Source text of definition `node` in `path`. Records `node` and every
     /// definition nested in it as read.
     pub async fn read_definition(&mut self, path: &RepoPath, node: NodeId) -> Result<Bytes> {
@@ -433,7 +419,9 @@ impl Workspace {
     }
 
     /// Diff the workspace against its base, identify, and store a
-    /// [`ChangeRecord`] (spec §6.2 `propose`).
+    /// [`ChangeRecord`] (spec §6.2 `propose`). A `.hord-policy.toml` that
+    /// does not parse is [`Error::Policy`] (ADR 0026 amendment: the lander
+    /// would reject the change).
     ///
     /// The record's ops are checked to reproduce the result from the base
     /// before it is stored (spec §3.5). The workspace stays usable; proposing
@@ -452,6 +440,16 @@ impl Workspace {
     async fn build(&mut self, intent: Intent, store: bool) -> Result<Proposal> {
         let (changes, skipped) = self.changed_files().await?;
         self.skipped = skipped;
+        // ADR 0026 amendment: the lander rejects a change whose
+        // `.hord-policy.toml` does not parse; say so before proposing it.
+        if store
+            && let Some(Some(bytes)) = hord_policy::POLICY_PATH
+                .parse::<RepoPath>()
+                .ok()
+                .and_then(|p| changes.get(&p))
+        {
+            crate::gate::parse_policy_file(bytes.as_slice()).map_err(Error::Policy)?;
+        }
         self.access_log
             .written_paths
             .extend(changes.keys().cloned());
@@ -574,11 +572,7 @@ fn view_of(
                 .and_then(|v| v.parsed.as_ref())
                 .map(|p| Arc::clone(&p.tree));
             let base_ref = base_tree.as_deref().unwrap_or(&empty);
-            let mapping = hord_identity::carry(adapter, path, Some(base), base_ref, &parsed, &[])
-                .map_err(|source| Error::Identity {
-                path: path.clone(),
-                source,
-            })?;
+            let mapping = carry(adapter, path, base, base_ref, &parsed)?;
             (
                 adapter.lang(),
                 Arc::new(IdentifiedTree::new((*parsed).clone(), mapping.nodes)),

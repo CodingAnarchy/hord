@@ -3,41 +3,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use hord_api::proto::{GitExportResult, GitImportResult};
 use hord_core::{ChangeId, ObjectId, SnapshotId};
 use hord_store::Store;
-use serde::Serialize;
 
 use crate::repo;
 
-/// Result of importing git history into a hord store.
-#[derive(Clone, Debug, Serialize)]
-pub struct ImportReport {
-    /// Git repository that was imported.
-    pub git_path: String,
-    /// Git ref imported, if the import was ref-scoped.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_ref: Option<String>,
-    /// Resulting hord head.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub head: Option<String>,
-    /// Number of change records in the log after import.
-    pub changes: u64,
-}
-
-/// Result of exporting a hord ref to a git tree or commit.
-#[derive(Clone, Debug, Serialize)]
-pub struct ExportReport {
-    /// Hord ref or snapshot that was exported.
-    #[serde(rename = "ref")]
-    pub hord_ref: String,
-    /// Destination git repository.
-    pub git_path: String,
-    /// Exported git tree SHA, if the exporter produced one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_tree: Option<String>,
-    /// Exported git commit SHA, if the exporter produced one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_commit: Option<String>,
+/// Whether `path` holds a git worktree or is a bare repository.
+fn is_git_repo(path: &Path) -> bool {
+    path.join(".git").exists() || (path.join("HEAD").exists() && path.join("objects").exists())
 }
 
 /// Fail if the git path is not a repository.
@@ -45,9 +19,7 @@ pub fn ensure_git_repo(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!("git path does not exist: {}", path.display());
     }
-    let worktree = path.join(".git").exists();
-    let bare = path.join("HEAD").exists() && path.join("objects").exists();
-    if !worktree && !bare {
+    if !is_git_repo(path) {
         bail!("not a git repository: {}", path.display());
     }
     Ok(())
@@ -60,14 +32,14 @@ pub fn import_git(
     store: &mut Store,
     git_path: &Path,
     git_ref: Option<&str>,
-) -> Result<ImportReport> {
+) -> Result<GitImportResult> {
     let git_path_disp = abs_display(git_path)?;
     ensure_git_repo(Path::new(&git_path_disp))?;
     let head = match git_ref {
         None | Some("HEAD") | Some("head") => hord_git::import_git(store, &git_path_disp)?,
         Some(git_ref) => hord_git::import_git_ref(store, &git_path_disp, git_ref)?,
     };
-    Ok(ImportReport {
+    Ok(GitImportResult {
         git_path: git_path_disp,
         git_ref: git_ref.map(str::to_owned),
         head: Some(head.to_hex()),
@@ -76,14 +48,14 @@ pub fn import_git(
 }
 
 /// Export `hord_ref` from `store` into the git repository at `git_path`.
-pub fn export_tree(store: &Store, hord_ref: &str, git_path: &Path) -> Result<ExportReport> {
+pub fn export_tree(store: &Store, hord_ref: &str, git_path: &Path) -> Result<GitExportResult> {
     let git_path_disp = abs_display(git_path)?;
     ensure_git_repo(Path::new(&git_path_disp))?;
     match resolve_export_target(store, hord_ref)? {
         ExportTarget::Change(change) => {
             let commit = hord_git::export_change(store, change, &git_path_disp)?;
-            Ok(ExportReport {
-                hord_ref: hord_ref.to_owned(),
+            Ok(GitExportResult {
+                r#ref: hord_ref.to_owned(),
                 git_path: git_path_disp,
                 git_tree: None,
                 git_commit: Some(commit.to_hex()),
@@ -91,8 +63,8 @@ pub fn export_tree(store: &Store, hord_ref: &str, git_path: &Path) -> Result<Exp
         }
         ExportTarget::Tree(snapshot) => {
             let tree = hord_git::export_tree(store, snapshot, &git_path_disp)?;
-            Ok(ExportReport {
-                hord_ref: hord_ref.to_owned(),
+            Ok(GitExportResult {
+                r#ref: hord_ref.to_owned(),
                 git_path: git_path_disp,
                 git_tree: Some(tree.to_hex()),
                 git_commit: None,
@@ -139,11 +111,11 @@ fn abs_display(path: &Path) -> Result<String> {
 /// Git repository sitting next to `.hord/`, or `cwd` if that is a git repo.
 pub fn sibling_git(store: &Store) -> Result<PathBuf> {
     let root = store.repo_root();
-    if root.join(".git").exists() || (root.join("HEAD").exists() && root.join("objects").exists()) {
+    if is_git_repo(root) {
         return Ok(root.to_path_buf());
     }
     let cwd = std::env::current_dir().context("current directory")?;
-    if cwd.join(".git").exists() || (cwd.join("HEAD").exists() && cwd.join("objects").exists()) {
+    if is_git_repo(&cwd) {
         return Ok(cwd);
     }
     bail!(

@@ -25,7 +25,7 @@
 //! ADR 0002: GumTree-style matching on `normalized` hashes, definition
 //! granularity, no new crate. Sub-definition edits collapse to Replace on
 //! the enclosing definition. Optimality is not a gate. Rename similarity
-//! stays M2.
+//! is the adapter's identification (`hord_lang`, ADR 0007), not the diff's.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -46,4 +46,7 @@ pub use apply::{apply, apply_identified};
 pub use blob::merge_blob;
 pub use diff::diff;
 pub use error::Error;
-pub use merge::{Conflict, ConflictKind, MergeMode, MergeResult, merge};
+pub use merge::{
+    Conflict, ConflictKind, MergeMode, MergeResult, merge, same_after_leading_attrs,
+    without_leading_attrs,
+};

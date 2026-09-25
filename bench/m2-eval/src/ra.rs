@@ -20,11 +20,11 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use hord_core::ObjectId;
 use hord_lang::{LangAdapter, NameRef, NodeTree, ResolveCtx};
-use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
+use hord_lang_rust::RustAdapter;
 use serde::Deserialize;
 
 use crate::git;
-use crate::snapshot::{FileSnap, Sampled};
+use crate::snapshot::{self, FileSnap, Sampled};
 
 pub(crate) struct RaReport {
     /// Sampled definitions.
@@ -68,21 +68,7 @@ pub(crate) fn measure(
     );
 
     let adapter = RustAdapter;
-    let views: Vec<RustFile<'_>> = files
-        .iter()
-        .map(|file| RustFile {
-            path: &file.path,
-            tree: &file.tree,
-            ids: &file.ids,
-        })
-        .collect();
-    let manifest_views: Vec<ManifestFile<'_>> = manifests
-        .iter()
-        .map(|manifest| ManifestFile {
-            path: &manifest.path,
-            bytes: &manifest.bytes,
-        })
-        .collect();
+    let (views, manifest_views) = snapshot::views(files, manifests);
     let ctx = adapter.resolve_context_with(&views, &manifest_views);
     let by_path: HashMap<String, usize> = files
         .iter()

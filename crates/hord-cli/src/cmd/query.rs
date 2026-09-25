@@ -1,44 +1,36 @@
 //! `hord query <edge> <node>`
 //!
-//! Prints target [`hord_core::NodeId`]s from [`hord_txn::Query::edges`] for
-//! `head`'s result snapshot. The node argument is the source.
-//! `references`, `dependents`, and `tests-of` map to
-//! [`hord_store::EdgeKind::References`] (resolved over the snapshot, plus
-//! recorded edges), [`hord_store::EdgeKind::Depends`], and
-//! [`hord_store::EdgeKind::Tests`] (recorded edges).
+//! Target NodeIds of one edge kind leaving `node` in head's result
+//! snapshot, through the session's backend (`RepoBackend::edges`).
+//! `references`, `dependents`, and `tests-of` are the References, Depends,
+//! and Tests edges (spec §3.8).
 
 use anyhow::{Result, anyhow};
-use hord_store::EdgeKind;
-use serde::Serialize;
+use hord_api::proto;
 
 use crate::cli::QueryEdge;
 use crate::output;
 use crate::resolve;
+use crate::session::{Session, Target};
 use crate::txn::{self, block_on};
 
-#[derive(Debug, Serialize)]
-struct QueryResult {
-    snapshot: String,
-    edge: &'static str,
-    node: String,
-    targets: Vec<String>,
-}
-
-pub fn run(json: bool, edge: QueryEdge, node: String) -> Result<()> {
-    let repo = txn::open()?;
+pub fn run(json: bool, target: &Target, edge: QueryEdge, node: String) -> Result<()> {
     let node = resolve::parse_node_id(&node).ok_or_else(|| anyhow!("invalid NodeId {node:?}"))?;
-    let head = block_on(repo.head())?;
-    if head.change.is_none() {
+    let session = Session::open(target)?;
+    let backend = session.backend();
+    let Some((_, snapshot)) = txn::backend_head(backend.as_ref())? else {
         return Err(anyhow!("cannot resolve a snapshot: nothing has landed"));
-    }
-    let snapshot = head.snapshot;
-    let query = repo.query();
-    let targets = block_on(query.edges(snapshot, node, edge_kind(edge)))?;
-    let result = QueryResult {
-        snapshot: snapshot.to_hex(),
-        edge: edge_name(edge),
+    };
+    let reply = block_on(backend.edges(proto::EdgesRequest {
+        snapshot: txn::hex(snapshot),
         node: node.to_string(),
-        targets: targets.iter().map(ToString::to_string).collect(),
+        kind: edge_kind(edge).into(),
+    }))?;
+    let result = proto::QueryResult {
+        snapshot: txn::hex(snapshot),
+        edge: edge_name(edge).into(),
+        node: node.to_string(),
+        targets: reply.nodes,
     };
     if json {
         output::print_json(&result)?;
@@ -52,11 +44,11 @@ pub fn run(json: bool, edge: QueryEdge, node: String) -> Result<()> {
     Ok(())
 }
 
-fn edge_kind(edge: QueryEdge) -> EdgeKind {
+fn edge_kind(edge: QueryEdge) -> proto::EdgeKind {
     match edge {
-        QueryEdge::References => EdgeKind::References,
-        QueryEdge::Dependents => EdgeKind::Depends,
-        QueryEdge::TestsOf => EdgeKind::Tests,
+        QueryEdge::References => proto::EdgeKind::References,
+        QueryEdge::Dependents => proto::EdgeKind::Depends,
+        QueryEdge::TestsOf => proto::EdgeKind::Tests,
     }
 }
 

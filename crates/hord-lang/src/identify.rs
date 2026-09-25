@@ -570,7 +570,7 @@ mod tests {
             trailing: Bytes::default(),
         };
         tree.intern_token(lang(), &token, name.map(QualifiedName::new))
-            .unwrap()
+            .expect("intern test leaf")
     }
 
     /// First site of `oid` in `tree`, in preorder.
@@ -583,7 +583,7 @@ mod tests {
                 return false;
             };
             for (i, child) in node.children.iter().enumerate() {
-                path.push(u32::try_from(i).unwrap());
+                path.push(u32::try_from(i).expect("test tree child index fits in u32"));
                 if walk(tree, *child, want, path) {
                     return true;
                 }
@@ -606,21 +606,16 @@ mod tests {
     /// Preorder, nearest enclosing identified definition as the parent, and
     /// ids at sites the tree does not have skipped.
     #[test]
-    fn def_sites_are_preorder_with_nearest_identified_parent() {
+    fn def_sites_are_preorder_with_nearest_identified_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = NodeTree::new();
         let a = leaf(&mut tree, "fn", "a", Some("a"));
         let b = leaf(&mut tree, "fn", "b", Some("b"));
         let open = leaf(&mut tree, "{", "{", None);
-        let block = tree
-            .intern_branch(NodeKind::new("block"), lang(), vec![open, b], None)
-            .unwrap();
-        let module = tree
-            .intern_branch(NodeKind::new("mod"), lang(), vec![block], None)
-            .unwrap();
-        let root = tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![a, module], None)
-            .unwrap();
-        tree.set_root(root).unwrap();
+        let block = tree.intern_branch(NodeKind::new("block"), lang(), vec![open, b], None)?;
+        let module = tree.intern_branch(NodeKind::new("mod"), lang(), vec![block], None)?;
+        let root = tree.intern_branch(NodeKind::new("file"), lang(), vec![a, module], None)?;
+        tree.set_root(root)?;
         let ids = BTreeMap::from([
             (vec![0], nid(1)),
             (vec![1], nid(2)),
@@ -640,17 +635,16 @@ mod tests {
         );
         assert_eq!(enclosing_site(&ids, &[1, 0, 1]), Some(&vec![1]));
         assert_eq!(enclosing_site(&ids, &[1]), None);
+        Ok(())
     }
 
     #[test]
-    fn exact_same_normalized_and_parent_keeps_id() {
+    fn exact_same_normalized_and_parent_keeps_id() -> Result<(), Box<dyn std::error::Error>> {
         let adapter = TestAdapter;
         let mut tree = NodeTree::new();
         let foo = leaf(&mut tree, "fn", "foo_body", Some("foo"));
-        let root = tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![foo], None)
-            .unwrap();
-        tree.set_root(root).unwrap();
+        let root = tree.intern_branch(NodeKind::new("file"), lang(), vec![foo], None)?;
+        tree.set_root(root)?;
 
         let mut ids = BTreeMap::new();
         ids.insert(site(&tree, foo), nid(1));
@@ -660,27 +654,26 @@ mod tests {
         assert_eq!(mapping.nodes.get(&site(&tree, foo)).copied(), Some(nid(1)));
         assert!(mapping.deltas.is_empty());
         assert!(mapping.moves.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn named_same_parent_keeps_id_when_body_changes() {
+    fn named_same_parent_keeps_id_when_body_changes() -> Result<(), Box<dyn std::error::Error>> {
         let adapter = TestAdapter;
         let mut base_tree = NodeTree::new();
         let foo_old = leaf(&mut base_tree, "fn", "old_body", Some("foo"));
-        let base_root = base_tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![foo_old], None)
-            .unwrap();
-        base_tree.set_root(base_root).unwrap();
+        let base_root =
+            base_tree.intern_branch(NodeKind::new("file"), lang(), vec![foo_old], None)?;
+        base_tree.set_root(base_root)?;
         let mut ids = BTreeMap::new();
         ids.insert(site(&base_tree, foo_old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
         let foo_new = leaf(&mut result, "fn", "new_body", Some("foo"));
-        let result_root = result
-            .intern_branch(NodeKind::new("file"), lang(), vec![foo_new], None)
-            .unwrap();
-        result.set_root(result_root).unwrap();
+        let result_root =
+            result.intern_branch(NodeKind::new("file"), lang(), vec![foo_new], None)?;
+        result.set_root(result_root)?;
 
         let mapping = default_identify(&adapter, &base, &result);
         assert_ne!(foo_old, foo_new);
@@ -690,34 +683,31 @@ mod tests {
         );
         assert!(mapping.deltas.is_empty());
         assert!(mapping.moves.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn moved_same_normalized_different_parent_emits_move() {
+    fn moved_same_normalized_different_parent_emits_move() -> Result<(), Box<dyn std::error::Error>>
+    {
         let adapter = TestAdapter;
 
         let mut base_tree = NodeTree::new();
         let foo = leaf(&mut base_tree, "fn", "foo_body", Some("foo"));
-        let mod_a = base_tree
-            .intern_branch(
-                NodeKind::new("mod"),
-                lang(),
-                vec![foo],
-                Some(QualifiedName::new("A")),
-            )
-            .unwrap();
-        let mod_b = base_tree
-            .intern_branch(
-                NodeKind::new("mod"),
-                lang(),
-                vec![],
-                Some(QualifiedName::new("B")),
-            )
-            .unwrap();
-        let base_root = base_tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![mod_a, mod_b], None)
-            .unwrap();
-        base_tree.set_root(base_root).unwrap();
+        let mod_a = base_tree.intern_branch(
+            NodeKind::new("mod"),
+            lang(),
+            vec![foo],
+            Some(QualifiedName::new("A")),
+        )?;
+        let mod_b = base_tree.intern_branch(
+            NodeKind::new("mod"),
+            lang(),
+            vec![],
+            Some(QualifiedName::new("B")),
+        )?;
+        let base_root =
+            base_tree.intern_branch(NodeKind::new("file"), lang(), vec![mod_a, mod_b], None)?;
+        base_tree.set_root(base_root)?;
         let mut ids = BTreeMap::new();
         ids.insert(site(&base_tree, foo), nid(1));
         ids.insert(site(&base_tree, mod_a), nid(2));
@@ -726,26 +716,21 @@ mod tests {
 
         let mut result = NodeTree::new();
         let foo_r = leaf(&mut result, "fn", "foo_body", Some("foo"));
-        let mod_a_r = result
-            .intern_branch(
-                NodeKind::new("mod"),
-                lang(),
-                vec![],
-                Some(QualifiedName::new("A")),
-            )
-            .unwrap();
-        let mod_b_r = result
-            .intern_branch(
-                NodeKind::new("mod"),
-                lang(),
-                vec![foo_r],
-                Some(QualifiedName::new("B")),
-            )
-            .unwrap();
-        let result_root = result
-            .intern_branch(NodeKind::new("file"), lang(), vec![mod_a_r, mod_b_r], None)
-            .unwrap();
-        result.set_root(result_root).unwrap();
+        let mod_a_r = result.intern_branch(
+            NodeKind::new("mod"),
+            lang(),
+            vec![],
+            Some(QualifiedName::new("A")),
+        )?;
+        let mod_b_r = result.intern_branch(
+            NodeKind::new("mod"),
+            lang(),
+            vec![foo_r],
+            Some(QualifiedName::new("B")),
+        )?;
+        let result_root =
+            result.intern_branch(NodeKind::new("file"), lang(), vec![mod_a_r, mod_b_r], None)?;
+        result.set_root(result_root)?;
 
         assert_eq!(foo, foo_r);
 
@@ -772,27 +757,25 @@ mod tests {
                 index: 0,
             }]
         );
+        Ok(())
     }
 
     #[test]
-    fn unmatched_result_is_birth_unmatched_base_is_death() {
+    fn unmatched_result_is_birth_unmatched_base_is_death() -> Result<(), Box<dyn std::error::Error>>
+    {
         let adapter = TestAdapter;
         let mut base_tree = NodeTree::new();
         let old = leaf(&mut base_tree, "fn", "old", Some("old"));
-        let base_root = base_tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![old], None)
-            .unwrap();
-        base_tree.set_root(base_root).unwrap();
+        let base_root = base_tree.intern_branch(NodeKind::new("file"), lang(), vec![old], None)?;
+        base_tree.set_root(base_root)?;
         let mut ids = BTreeMap::new();
         ids.insert(site(&base_tree, old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
         let new = leaf(&mut result, "fn", "new", Some("new"));
-        let result_root = result
-            .intern_branch(NodeKind::new("file"), lang(), vec![new], None)
-            .unwrap();
-        result.set_root(result_root).unwrap();
+        let result_root = result.intern_branch(NodeKind::new("file"), lang(), vec![new], None)?;
+        result.set_root(result_root)?;
 
         let mapping = default_identify(&adapter, &base, &result);
         assert_eq!(mapping.deltas.len(), 2);
@@ -808,9 +791,14 @@ mod tests {
                 .iter()
                 .any(|d| matches!(d, IdentityDelta::Birth { .. }))
         );
-        let born = mapping.nodes.get(&site(&result, new)).copied().unwrap();
+        let born = mapping
+            .nodes
+            .get(&site(&result, new))
+            .copied()
+            .expect("born node has an id");
         assert_ne!(born, nid(1));
         assert!(mapping.moves.is_empty());
+        Ok(())
     }
 
     fn fn_with_leaves(tree: &mut NodeTree, name: &str, texts: &[&str]) -> ObjectId {
@@ -824,28 +812,25 @@ mod tests {
             leaves,
             Some(QualifiedName::new(name)),
         )
-        .unwrap()
+        .expect("intern test fn")
     }
 
     #[test]
-    fn rename_keeps_id_when_body_distance_is_within_threshold() {
+    fn rename_keeps_id_when_body_distance_is_within_threshold()
+    -> Result<(), Box<dyn std::error::Error>> {
         let adapter = TestAdapter;
         let mut base_tree = NodeTree::new();
         let old = fn_with_leaves(&mut base_tree, "foo", &["a", "b", "c", "d", "e"]);
-        let base_root = base_tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![old], None)
-            .unwrap();
-        base_tree.set_root(base_root).unwrap();
+        let base_root = base_tree.intern_branch(NodeKind::new("file"), lang(), vec![old], None)?;
+        base_tree.set_root(base_root)?;
         let mut ids = BTreeMap::new();
         ids.insert(site(&base_tree, old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
         let new = fn_with_leaves(&mut result, "bar", &["a", "b", "c", "d", "z"]);
-        let result_root = result
-            .intern_branch(NodeKind::new("file"), lang(), vec![new], None)
-            .unwrap();
-        result.set_root(result_root).unwrap();
+        let result_root = result.intern_branch(NodeKind::new("file"), lang(), vec![new], None)?;
+        result.set_root(result_root)?;
 
         let mapping = default_identify(&adapter, &base, &result);
         assert_eq!(
@@ -865,27 +850,24 @@ mod tests {
             }]
         );
         assert!(mapping.moves.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn dissimilar_bodies_stay_a_birth_and_a_death() {
+    fn dissimilar_bodies_stay_a_birth_and_a_death() -> Result<(), Box<dyn std::error::Error>> {
         let adapter = TestAdapter;
         let mut base_tree = NodeTree::new();
         let old = fn_with_leaves(&mut base_tree, "foo", &["a", "b", "c", "d", "e"]);
-        let base_root = base_tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![old], None)
-            .unwrap();
-        base_tree.set_root(base_root).unwrap();
+        let base_root = base_tree.intern_branch(NodeKind::new("file"), lang(), vec![old], None)?;
+        base_tree.set_root(base_root)?;
         let mut ids = BTreeMap::new();
         ids.insert(site(&base_tree, old), nid(1));
         let base = IdentifiedTree::new(base_tree, ids);
 
         let mut result = NodeTree::new();
         let new = fn_with_leaves(&mut result, "bar", &["a", "x", "y", "z", "e"]);
-        let result_root = result
-            .intern_branch(NodeKind::new("file"), lang(), vec![new], None)
-            .unwrap();
-        result.set_root(result_root).unwrap();
+        let result_root = result.intern_branch(NodeKind::new("file"), lang(), vec![new], None)?;
+        result.set_root(result_root)?;
 
         let mapping = default_identify(&adapter, &base, &result);
         assert_ne!(
@@ -899,17 +881,16 @@ mod tests {
                 .iter()
                 .any(|delta| matches!(delta, IdentityDelta::Death { node } if *node == nid(1)))
         );
+        Ok(())
     }
 
     #[test]
-    fn trait_identify_uses_default() {
+    fn trait_identify_uses_default() -> Result<(), Box<dyn std::error::Error>> {
         let adapter = TestAdapter;
         let mut tree = NodeTree::new();
         let foo = leaf(&mut tree, "fn", "x", Some("x"));
-        let root = tree
-            .intern_branch(NodeKind::new("file"), lang(), vec![foo], None)
-            .unwrap();
-        tree.set_root(root).unwrap();
+        let root = tree.intern_branch(NodeKind::new("file"), lang(), vec![foo], None)?;
+        tree.set_root(root)?;
         let mut ids = BTreeMap::new();
         ids.insert(site(&tree, foo), nid(9));
         let base = IdentifiedTree::new(tree.clone(), ids);
@@ -920,5 +901,6 @@ mod tests {
             via_trait.nodes.get(&site(&tree, foo)).copied(),
             Some(nid(9))
         );
+        Ok(())
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_core::{
@@ -12,9 +12,11 @@ use hord_core::{
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
 
-use crate::lander::{QueueEntry, Verdict, Verifier, VerifyFuture, VerifyRequest};
+use crate::gate::Verifier;
+use crate::lander::QueueEntry;
 use crate::materialize::MaterializeMode;
 use crate::semantic::RustCtx;
+use crate::source::ObjectSource;
 use crate::workspace::{Materialization, Workspace};
 use crate::{Error, Result};
 
@@ -36,6 +38,14 @@ const MAX_CACHED_CTX: usize = 8;
 /// by one per landing forever before).
 pub(crate) const MAX_TRACKED_CHANGES: usize = 16_384;
 
+/// Locks that make fetching an object from the [`ObjectSource`] single
+/// flight, by the id's first byte.
+const FETCH_SHARDS: usize = 64;
+
+/// Objects fetched per [`ObjectSource::get_objects`] call when prefetching
+/// (the batch limit of ADR 0024).
+const PREFETCH_BATCH: usize = 1_000;
+
 /// Repository-wide settings for the lander (spec §6.3, §7.2).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RepoConfig {
@@ -51,10 +61,17 @@ pub struct RepoOptions {
     pub config: RepoConfig,
     /// Language adapters. `None` registers [`default_adapters`].
     pub adapters: Option<AdapterRegistry>,
-    /// Verification step run by the lander. `None` uses
-    /// [`FailClosedVerifier`]: until M4's verifier exists, only clean
-    /// changes land. [`crate::StubVerifier`] (land everything) is opt-in.
+    /// Verification step run by the lander. `None` is
+    /// [`crate::EngineVerifier::rust`]: cargo, for the requirements head's
+    /// policy applies, and fail-closed ([`crate::FailClosedVerifier`]) with
+    /// no requirements or no toolchain. [`crate::StubVerifier`] (land
+    /// everything) is opt-in, for throughput simulations.
     pub verifier: Option<Arc<dyn Verifier>>,
+    /// Where snapshots, trees, blobs, and records the store lacks are read
+    /// from (ADR 0024). `None`: the store alone. A remote workspace passes
+    /// a source that fetches on demand (spec §8.3); what it fetches is kept
+    /// in the store, and writes go to the store.
+    pub objects: Option<Arc<dyn ObjectSource>>,
 }
 
 impl std::fmt::Debug for RepoOptions {
@@ -66,54 +83,8 @@ impl std::fmt::Debug for RepoOptions {
                 &self.adapters.as_ref().map(AdapterRegistry::len),
             )
             .field("verifier", &self.verifier.is_some())
+            .field("objects", &self.objects.is_some())
             .finish()
-    }
-}
-
-/// The default verifier until M4 (spec §15: never land an unverified merge).
-///
-/// Passes a change only when its report is clean: no set overlap with a
-/// landed change (spec §6.3) and no soft merge conflict from the structural
-/// rebase (§6.4 rung 1). One exemption (ADR 0013 amendment): overlaps whose
-/// every node and path lies in files a purpose-built adapter merge resolved
-/// with no conflict ([`crate::ConflictReport::only_adapter_merged`]).
-/// Anything else fails, so the lander parks it as
-/// [`crate::QueueStatus::Conflicted`] with the reason in
-/// [`crate::ConflictReport::verification`]. Disjoint, clean changes land
-/// without verification, as in M3.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FailClosedVerifier;
-
-impl Verifier for FailClosedVerifier {
-    fn verify<'a>(&'a self, request: VerifyRequest<'a>) -> VerifyFuture<'a> {
-        let report = request.report;
-        // ADR 0013 amendment: overlaps confined to files an adapter merge
-        // resolved (for example concurrent lockfile additions) land.
-        let verdict = if report.only_adapter_merged() {
-            Verdict::Pass
-        } else {
-            let mut kinds: Vec<&str> = report
-                .conflicts
-                .iter()
-                .map(|c| match c.kind {
-                    crate::ConflictKind::WriteWrite => "write-write",
-                    crate::ConflictKind::ReadWrite => "read-write",
-                    crate::ConflictKind::WriteRead => "write-read",
-                })
-                .collect();
-            kinds.sort_unstable();
-            kinds.dedup();
-            Verdict::Fail {
-                reason: format!(
-                    "unverified overlap: {} set conflict(s) [{}] and {} soft merge \
-                     conflict(s); no verifier is configured, so only clean changes land",
-                    report.conflicts.len(),
-                    kinds.join(", "),
-                    report.merge.len(),
-                ),
-            }
-        };
-        Box::pin(async move { verdict })
     }
 }
 
@@ -199,6 +170,8 @@ pub(crate) struct Inner {
     pub adapters: AdapterRegistry,
     pub config: RepoConfig,
     pub verifier: Arc<dyn Verifier>,
+    /// Object reads, when not the store ([`RepoOptions::objects`]).
+    pub objects: Option<Arc<dyn ObjectSource>>,
     pub toolchain: ObjectId,
     /// Root [`Tree`] with no entries.
     pub empty_tree: ObjectId,
@@ -219,6 +192,57 @@ pub(crate) struct Inner {
     pub proposed: Mutex<WeightedLru<ChangeId, ()>>,
     /// Serializes the lander (spec §6.7: one lander per repository).
     pub lander: tokio::sync::Mutex<crate::lander::LanderState>,
+    /// Wakes a spawned [`crate::Lander`] when a change is submitted.
+    pub wake: tokio::sync::Notify,
+    /// The persisted event log (spec §10.5.3), opened on first use.
+    pub events: Mutex<Option<Arc<crate::events::EventLog>>>,
+    /// Reference indexes for impact sets ([`crate::graph`]).
+    pub refs: Mutex<crate::graph::RefCache>,
+    /// Checkout slots for verification ([`crate::gate`]).
+    pub slots: crate::gate::Slots,
+    /// Single-flight locks for fetching from [`Self::objects`].
+    pub fetching: [Mutex<()>; FETCH_SHARDS],
+    /// Parsed policies by blob (ADR 0026).
+    pub policies: Mutex<HashMap<ObjectId, Arc<hord_policy::CompiledPolicy>>>,
+    /// Write sets of the latest landings, for coverage drift ([`crate::gate`]).
+    pub landed_chain: Mutex<crate::gate::LandedChain>,
+    /// Definitions of the last snapshot verified under coverage, updated by
+    /// difference to the next ([`crate::gate`]).
+    pub definition_index: Mutex<Option<(SnapshotId, Arc<hord_verify_rust::DefinitionIndex>)>>,
+}
+
+impl Drop for Inner {
+    /// Freeing the parse caches (up to [`MAX_CACHED_TREE_BYTES`] each, in
+    /// millions of small allocations) takes hundreds of milliseconds, and a
+    /// process that is exiting need not wait for it: they are freed on a
+    /// thread of their own. The store and the event log still close here,
+    /// in order, when the fields drop.
+    fn drop(&mut self) {
+        let caches = (
+            std::mem::replace(
+                self.parsed
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner),
+                WeightedLru::new(0),
+            ),
+            std::mem::replace(
+                self.identified
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner),
+                WeightedLru::new(0),
+            ),
+            std::mem::take(
+                self.rust_ctx
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner),
+            ),
+            std::mem::take(self.refs.get_mut().unwrap_or_else(PoisonError::into_inner)),
+        );
+        // If no thread can start, the closure (and the caches) drop here.
+        let _ = std::thread::Builder::new()
+            .name("hord-cache-drop".into())
+            .spawn(move || drop(caches));
+    }
 }
 
 /// Identified trees keyed by (path, blob, carried identity object). The path
@@ -341,6 +365,7 @@ struct Toolchain<'a> {
 
 impl Inner {
     fn new(store: Store, options: RepoOptions) -> Result<Self> {
+        let root = store.repo_root().to_path_buf();
         let toolchain = store.put_object(&Toolchain {
             tool: "hord-txn",
             version: env!("CARGO_PKG_VERSION"),
@@ -355,7 +380,8 @@ impl Inner {
             config: options.config,
             verifier: options
                 .verifier
-                .unwrap_or_else(|| Arc::new(FailClosedVerifier)),
+                .unwrap_or_else(|| Arc::new(crate::gate::EngineVerifier::rust(root.clone()))),
+            objects: options.objects,
             toolchain,
             empty_tree,
             empty_snapshot,
@@ -369,6 +395,14 @@ impl Inner {
             footprints: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
             proposed: Mutex::new(WeightedLru::new(MAX_TRACKED_CHANGES)),
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
+            wake: tokio::sync::Notify::new(),
+            events: Mutex::new(None),
+            refs: Mutex::new(crate::graph::RefCache::default()),
+            slots: crate::gate::Slots::default(),
+            fetching: std::array::from_fn(|_| Mutex::new(())),
+            policies: Mutex::new(HashMap::new()),
+            landed_chain: Mutex::new(crate::gate::LandedChain::default()),
+            definition_index: Mutex::new(None),
         })
     }
 
@@ -394,13 +428,87 @@ impl Inner {
         *lock(&self.head) = Some(head);
     }
 
-    pub(crate) fn change_record(&self, id: ChangeId) -> Result<ChangeRecord> {
-        match self.store.get_object::<ChangeRecord>(id) {
-            Ok(record) => Ok(record),
-            Err(hord_store::Error::MissingObject(_) | hord_store::Error::Encoding(_)) => {
-                Err(Error::MissingChange(id))
+    /// Canonical bytes of `id`: from the local store, else from the
+    /// repository's [`ObjectSource`], whose answer is checked against the
+    /// id and kept in the store (the store is the source's local cache, and
+    /// holds everything this handle writes).
+    pub(crate) fn get_bytes(&self, id: ObjectId) -> Result<Vec<u8>> {
+        let Some(source) = &self.objects else {
+            return Ok(self.store.get(id)?);
+        };
+        // One fetch per object at a time: tasks sharing this cache must not
+        // write the same loose object concurrently (a reader would see it
+        // half written) or fetch it twice.
+        let _flight = self.fetch_lock(id);
+        match self.store.get(id) {
+            Ok(bytes) => Ok(bytes),
+            Err(hord_store::Error::MissingObject(_)) => {
+                let bytes = source.get(id)?;
+                self.keep_fetched(id, &bytes)?;
+                Ok(bytes)
             }
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// The single-flight lock for fetching `id`.
+    fn fetch_lock(&self, id: ObjectId) -> MutexGuard<'_, ()> {
+        lock(&self.fetching[usize::from(id.as_bytes()[0]) % FETCH_SHARDS])
+    }
+
+    /// Check that `bytes` the [`ObjectSource`] returned for `id` hash to it,
+    /// and keep them in the store.
+    fn keep_fetched(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
+        if ObjectId::from_canonical(bytes) != id {
+            return Err(Error::Corrupt {
+                id,
+                reason: "the object source returned bytes with another hash".into(),
+            });
+        }
+        self.store.put(bytes)?;
+        Ok(())
+    }
+
+    /// Fetch every id in `ids` the store lacks from the [`ObjectSource`],
+    /// [`PREFETCH_BATCH`] at a time, and keep them in the store. A no-op
+    /// without a source.
+    pub(crate) fn prefetch(&self, ids: &[ObjectId]) -> Result<()> {
+        let Some(source) = &self.objects else {
+            return Ok(());
+        };
+        let mut missing = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if seen.insert(*id) && !self.store.contains(*id)? {
+                missing.push(*id);
+            }
+        }
+        for batch in missing.chunks(PREFETCH_BATCH) {
+            for (id, bytes) in batch.iter().zip(source.get_objects(batch)?) {
+                let _flight = self.fetch_lock(*id);
+                if !self.store.contains(*id)? {
+                    self.keep_fetched(*id, &bytes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read and decode `id` from the repository's [`ObjectSource`]. A
+    /// decoding failure is `Error::Store(hord_store::Error::Encoding(_))`,
+    /// as the store reports it.
+    pub(crate) fn get_object<T: serde::de::DeserializeOwned>(&self, id: ObjectId) -> Result<T> {
+        let bytes = self.get_bytes(id)?;
+        hord_encoding::decode(&bytes).map_err(|err| Error::Store(err.into()))
+    }
+
+    pub(crate) fn change_record(&self, id: ChangeId) -> Result<ChangeRecord> {
+        match self.get_object::<ChangeRecord>(id) {
+            Ok(record) => Ok(record),
+            Err(Error::Store(
+                hord_store::Error::MissingObject(_) | hord_store::Error::Encoding(_),
+            )) => Err(Error::MissingChange(id)),
+            Err(err) => Err(err),
         }
     }
 
@@ -507,6 +615,7 @@ impl Inner {
             change: Some(change),
             snapshot: result,
         });
+        self.emit(crate::events::landed(change, 0, None, &[], None))?;
         Ok(change)
     }
 
@@ -533,9 +642,21 @@ where
     F: FnOnce(&Inner) -> Result<T> + Send + 'static,
 {
     let inner = Arc::clone(inner);
-    tokio::task::spawn_blocking(move || f(&inner))
+    spawn_blocking(move || f(&inner)).await
+}
+
+/// Run `f` on tokio's blocking pool.
+async fn spawn_blocking<T, E>(
+    f: impl FnOnce() -> std::result::Result<T, E> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    Error: From<E>,
+{
+    Ok(tokio::task::spawn_blocking(f)
         .await
-        .map_err(|err| Error::Task(err.to_string()))?
+        .map_err(|err| Error::Task(err.to_string()))??)
 }
 
 impl Repo {
@@ -548,9 +669,7 @@ impl Repo {
     /// [`RepoConfig::strict_reads`], adapters, or a verifier).
     pub async fn create_with(root: impl AsRef<Path>, options: RepoOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let store = tokio::task::spawn_blocking(move || Store::create(root))
-            .await
-            .map_err(|err| Error::Task(err.to_string()))??;
+        let store = spawn_blocking(move || Store::create(root)).await?;
         Self::from_store(store, options).await
     }
 
@@ -562,17 +681,13 @@ impl Repo {
     /// Open the store at `<root>/.hord/` with `options`.
     pub async fn open_with(root: impl AsRef<Path>, options: RepoOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let store = tokio::task::spawn_blocking(move || Store::open(root))
-            .await
-            .map_err(|err| Error::Task(err.to_string()))??;
+        let store = spawn_blocking(move || Store::open(root)).await?;
         Self::from_store(store, options).await
     }
 
     /// Wrap an already-open [`Store`].
     pub async fn from_store(store: Store, options: RepoOptions) -> Result<Self> {
-        let inner = tokio::task::spawn_blocking(move || Inner::new(store, options))
-            .await
-            .map_err(|err| Error::Task(err.to_string()))??;
+        let inner = spawn_blocking(move || Inner::new(store, options)).await?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -620,16 +735,7 @@ impl Repo {
         path: RepoPath,
     ) -> Result<Vec<crate::DefinitionInfo>> {
         blocking(&self.inner, move |inner| {
-            let Some(view) = inner.file_view(snapshot, &path)? else {
-                return Ok(Vec::new());
-            };
-            let Some(parsed) = view.parsed else {
-                return Ok(Vec::new());
-            };
-            let Some(adapter) = inner.adapter_for(&path, parsed.lang) else {
-                return Ok(Vec::new());
-            };
-            Ok(crate::semantic::definitions(adapter, &path, &parsed.tree))
+            inner.definitions_at(snapshot, &path)
         })
         .await
     }
@@ -785,11 +891,23 @@ impl Repo {
         blocking(&self.inner, move |inner| inner.queue_status(change)).await
     }
 
-    /// Run the lander inline until no entry is queued (`hord land --local`).
+    /// Run the lander inline until no entry is queued (`hord land --local`):
+    /// one [`crate::Lander::drain`] pass.
     ///
     /// Returns the entries processed by this call, in order.
     pub async fn land_local(&self) -> Result<Vec<QueueEntry>> {
-        crate::lander::run(self).await
+        crate::Lander::drain(self).await
+    }
+
+    /// The repository's event stream (spec §10.5.3): with `from`, every
+    /// recorded event after that cursor, then live ones; without, live
+    /// events only.
+    pub async fn events(
+        &self,
+        from: Option<hord_api::EventCursor>,
+    ) -> Result<hord_api::EventStream> {
+        let log = blocking(&self.inner, Inner::event_log).await?;
+        Ok(log.subscribe(from))
     }
 
     /// Explain a change's conflicts (`hord conflicts`).
@@ -802,9 +920,15 @@ impl Repo {
 }
 
 impl Inner {
-    /// Write every file of `snapshot` under `dir`.
+    /// Write every file of `snapshot` under `dir`. With an
+    /// [`ObjectSource`], the blobs the store lacks are fetched first, in
+    /// batches (a remote `Directory` workspace fetches its base's blobs when
+    /// its checkout is first written, ADR 0024).
     pub(crate) fn checkout(&self, snapshot: SnapshotId, dir: &Path) -> Result<()> {
-        for (path, blob) in self.list_files(snapshot)? {
+        let files = self.list_files(snapshot)?;
+        let blobs: Vec<ObjectId> = files.iter().map(|(_, blob)| *blob).collect();
+        self.prefetch(&blobs)?;
+        for (path, blob) in files {
             let target = fs_path(dir, &path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -883,30 +1007,21 @@ mod bounded_tests {
     /// used go, and a recent one is still there. Both grew by one entry per
     /// change forever before.
     #[tokio::test]
-    async fn footprints_and_proposed_stay_bounded() {
+    async fn footprints_and_proposed_stay_bounded() -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join(format!("hord-txn-bounded-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let repo = Repo::create(&dir).await.unwrap();
+        let repo = Repo::create(&dir).await?;
         let inner = &repo.inner;
         let record: ChangeRecord = {
             let mut ws = repo
                 .begin(crate::BeginOptions::at_head(hord_core::Actor::Human {
                     id: "t".into(),
                 }))
-                .await
-                .unwrap();
-            ws.write_file(&"a.txt".parse().unwrap(), "a\n")
-                .await
-                .unwrap();
-            ws.preview(hord_core::Intent {
-                summary: "s".into(),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            })
-            .await
-            .unwrap()
-            .record
+                .await?;
+            ws.write_file(&"a.txt".parse()?, "a\n").await?;
+            ws.preview(hord_core::Intent::from_summary("s"))
+                .await?
+                .record
         };
         let footprint = Arc::new(Footprint::of(id(0), &record, &[]));
         let total = MAX_TRACKED_CHANGES + 100;
@@ -920,5 +1035,6 @@ mod bounded_tests {
         assert!(!inner.was_proposed(id(0)), "the oldest went");
         drop(repo);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

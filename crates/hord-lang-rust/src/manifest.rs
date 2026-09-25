@@ -418,12 +418,11 @@ fn dep_from_pair(tree: &NodeTree, pair: ObjectId) -> Option<(String, Dep)> {
         read_inline(tree, value, &mut dep);
         key.join(".")
     } else if key.len() >= 2
-        && key
+        && let Some(field) = key
             .last()
-            .is_some_and(|part| part == "workspace" || part == "path" || part == "package")
+            .filter(|part| *part == "workspace" || *part == "path" || *part == "package")
     {
-        let field = key.last().unwrap().clone();
-        apply_field(&mut dep, &field, tree, value);
+        apply_field(&mut dep, field, tree, value);
         key[..key.len() - 1].join(".")
     } else {
         return None;
@@ -558,7 +557,7 @@ support = { path = "crates/support" }
 support.workspace = true
 registry = "1.0"
 "#;
-        let path = RepoPath::from_str("Cargo.toml").unwrap();
+        let path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
         let manifest = parse_manifest(&path, src.as_bytes()).expect("manifest");
         assert!(manifest.package && manifest.workspace);
         assert_eq!(
@@ -589,7 +588,8 @@ path = "../helper"
 name = "app"
 path = "lib.rs"
 "#;
-        let path = RepoPath::from_str("crates/app/Cargo.toml").unwrap();
+        let path = RepoPath::from_str("crates/app/Cargo.toml")
+            .expect("parse repo path crates/app/Cargo.toml");
         let manifest = parse_manifest(&path, src.as_bytes()).expect("manifest");
         assert!(manifest.workspace);
         assert_eq!(
@@ -622,7 +622,7 @@ local = { path = "crates/local" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 "#;
-        let path = RepoPath::from_str("Cargo.toml").unwrap();
+        let path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
         let manifest = parse_manifest(&path, src.as_bytes()).expect("manifest");
         assert!(!manifest.normal.contains_key("serde"));
         assert!(!manifest.normal.contains_key("gix"));

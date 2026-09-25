@@ -13,9 +13,20 @@ use clap::{Parser, Subcommand, ValueEnum};
     arg_required_else_help = true
 )]
 pub struct Cli {
-    /// Emit JSON (canonical agent output).
+    /// Emit JSON (canonical agent output): the protobuf JSON mapping of
+    /// the command's `hord.proto` message.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Run against this configured remote (`hord remote add`) instead of
+    /// the local repository or its default upstream.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub remote: Option<String>,
+
+    /// Open the store in this process instead of talking to the
+    /// repository's daemon (ADR 0021). Also `HORD_NO_DAEMON=1`.
+    #[arg(long, global = true)]
+    pub no_daemon: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -44,6 +55,16 @@ pub enum Command {
         #[arg(long)]
         paranoid: bool,
     },
+    /// Run the checks head's policy requires for a workspace's proposal and
+    /// attach the evidence to its snapshot (spec §10.2, §10.3).
+    Verify {
+        /// Workspace id.
+        #[arg(short = 'w', long = "workspace", value_name = "WS")]
+        workspace: Option<String>,
+        /// Print the plan (with reuse) without running anything.
+        #[arg(long)]
+        plan_only: bool,
+    },
     /// Build a change record from a workspace (spec §6.2) and print its id.
     Propose {
         /// Workspace id.
@@ -66,9 +87,10 @@ pub enum Command {
         #[arg(long)]
         mine: bool,
     },
-    /// Run the lander inline until the queue is empty (single-user mode).
+    /// Run the lander until the queue is empty (single-user mode). With a
+    /// daemon, wait for its lander instead.
     Land {
-        /// Run the lander in this process. Required: there is no remote yet.
+        /// Land in this repository (required).
         #[arg(long)]
         local: bool,
         /// Submit this change first.
@@ -111,10 +133,71 @@ pub enum Command {
         #[arg(value_name = "NODE")]
         node: String,
     },
+    /// Configured remotes (hord servers).
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+    /// Tail the event stream (spec §10.5.3).
+    Watch {
+        /// Only lander queue events.
+        #[arg(long)]
+        queue: bool,
+        /// Only events about this change; exit once it lands, parks, or is
+        /// rejected.
+        #[arg(long, value_name = "CHANGE")]
+        change: Option<String>,
+        /// Resume after this event cursor (0 replays everything).
+        #[arg(long, value_name = "CURSOR")]
+        from: Option<u64>,
+    },
+    /// Run the hord server (spec §10.5.1).
+    Serve {
+        /// Host this repository (default: the current one).
+        #[arg(long, value_name = "PATH", conflicts_with = "root")]
+        repo: Option<PathBuf>,
+        /// Host every repository under this directory, at `/r/<name>/`.
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Address to listen on (default: server.toml's, else 127.0.0.1:7878).
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<String>,
+        /// Allow a non-loopback address (there is no authentication until M5).
+        #[arg(long)]
+        insecure_bind: bool,
+        /// `server.toml` (default: `<repo>/.hord/server.toml` or
+        /// `<root>/server.toml`).
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// Run as the repository's daemon: listen on its local endpoint and
+        /// exit when idle (started by the CLI on demand).
+        #[arg(long, hide = true)]
+        daemon: bool,
+    },
     /// Git import/export.
     Git {
         #[command(subcommand)]
         command: GitCommand,
+    },
+    /// Policy commands (spec §7.2).
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+}
+
+/// `hord policy` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum PolicyCommand {
+    /// Dry-run a policy against a workspace's current proposal. Exits 1 on
+    /// deny.
+    Check {
+        /// Workspace id.
+        #[arg(short = 'w', long = "workspace", value_name = "WS")]
+        workspace: Option<String>,
+        /// Evaluate this policy file instead of head's `.hord-policy.toml`.
+        #[arg(long, value_name = "FILE")]
+        policy: Option<PathBuf>,
     },
 }
 
@@ -123,13 +206,15 @@ pub enum Command {
 pub enum WsCommand {
     /// Create a workspace and print its id and materialization path.
     New {
-        /// Base snapshot id (hex) or ref name.
+        /// Base snapshot or change id (hex), ref name, or `<remote>/<ref>`.
         #[arg(long, value_name = "SNAP|REF")]
         base: Option<String>,
         /// `clone` (copy-on-write, falls back to copy) or `copy` (ADR 0016).
         #[arg(long, value_name = "MODE", default_value = "clone")]
         materialize: Materialize,
     },
+    /// List workspaces.
+    List,
     /// Delete a workspace and its checkout.
     Rm {
         /// Workspace id.
@@ -138,6 +223,38 @@ pub enum WsCommand {
     },
     /// Remove pristine checkouts no workspace uses (ADR 0016).
     Gc,
+}
+
+/// `hord remote` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommand {
+    /// Add a remote: `http://host:port`, or `http://host:port/r/<name>`.
+    Add {
+        /// Its name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Its address.
+        #[arg(value_name = "URL")]
+        url: String,
+    },
+    /// Remove a remote.
+    Rm {
+        /// Its name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// List remotes.
+    List,
+    /// Make a remote the default upstream (commands use it without
+    /// `--remote`); `--clear` removes the default.
+    SetDefault {
+        /// Its name.
+        #[arg(value_name = "NAME", required_unless_present = "clear")]
+        name: Option<String>,
+        /// Remove the default upstream.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// How `hord ws new` materializes the checkout (ADR 0016).

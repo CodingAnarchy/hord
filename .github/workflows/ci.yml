@@ -21,6 +21,8 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A stuck test should fail the job, not run until GitHub's 6 h limit.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -175,3 +177,12 @@ jobs:
 
       - name: M3 simulation (changes proposed in another process)
         run: cargo run -p hord-eval-m3 --release -- --remote-submit --report-throughput
+
+      - name: M3 simulation against a spawned server (100 clients, flight recording)
+        run: cargo run -p hord-eval-m3 --release -- --server --report-throughput
+
+      - name: M3 simulation with section 7.2 policy enforced
+        run: cargo run -p hord-eval-m3 --release -- --policy --report-throughput
+
+      - name: M3 simulation with policy, against the server
+        run: cargo run -p hord-eval-m3 --release -- --server --policy --report-throughput

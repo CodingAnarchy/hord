@@ -26,10 +26,7 @@ pub enum Error {
     /// The same [`NodeId`] was located at two paths, or assigned twice.
     #[error("duplicate node id {0}")]
     DuplicateNode(NodeId),
-    /// An identified content id is not interned in its file.
-    #[error("node {0} is not interned")]
-    MissingNode(ObjectId),
-    /// A [`NodeId`] is in the file's id map but not reachable from the root.
+    /// A [`NodeId`] is in the file's id map at a site that is not in its tree.
     #[error("node id {0} is not reachable in the snapshot")]
     Unmapped(NodeId),
 }

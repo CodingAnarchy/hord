@@ -89,13 +89,38 @@ pub struct ConflictReport {
     /// Empty for reports recorded before this field existed.
     #[serde(default)]
     pub adapter_merged: Vec<AdapterMerge>,
+    /// Why head's policy denied the change (ADR 0026): every unmet
+    /// requirement, machine-readable. Empty when it allowed it or was not
+    /// reached.
+    #[serde(default)]
+    pub policy: Vec<hord_policy::Violation>,
 }
 
 impl ConflictReport {
-    /// No set overlap, no merge conflict, no verification failure.
+    /// A report on `change` (based on `base`) with nothing found yet.
+    pub(crate) fn empty(change: ChangeId, base: SnapshotId) -> Self {
+        Self {
+            change,
+            base,
+            head: None,
+            checked_against: Vec::new(),
+            strict_reads: false,
+            conflicts: Vec::new(),
+            merge: Vec::new(),
+            verification: None,
+            adapter_merged: Vec::new(),
+            policy: Vec::new(),
+        }
+    }
+
+    /// No set overlap, no merge conflict, no verification failure, no
+    /// policy denial.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.conflicts.is_empty() && self.merge.is_empty() && self.verification.is_none()
+        self.conflicts.is_empty()
+            && self.merge.is_empty()
+            && self.verification.is_none()
+            && self.policy.is_empty()
     }
 
     /// Whether any merge conflict is hard.
@@ -207,41 +232,28 @@ pub(crate) fn check(
         let mut ww: BTreeSet<NodeId> = change.writes.intersection(&other.writes).copied().collect();
         ww.extend(change.touched.intersection(&other.coarse));
         ww.extend(change.coarse.intersection(&other.touched));
-        if !ww.is_empty() {
-            let (nodes, paths) = labels(ww.clone());
-            out.push(SetConflict {
-                kind: ConflictKind::WriteWrite,
-                landed: other.change,
-                nodes,
-                paths,
-            });
-        }
-        let rw: BTreeSet<NodeId> = change
-            .reads
-            .intersection(&other.writes)
-            .filter(|id| !ww.contains(id))
-            .copied()
-            .collect();
-        if !rw.is_empty() {
-            let (nodes, paths) = labels(rw);
-            out.push(SetConflict {
-                kind: ConflictKind::ReadWrite,
-                landed: other.change,
-                nodes,
-                paths,
-            });
-        }
-        if strict {
-            let wr: BTreeSet<NodeId> = change
-                .writes
-                .intersection(&other.reads)
+        // Read overlaps that are not already write-write.
+        let beyond_ww = |a: &BTreeSet<NodeId>, b: &BTreeSet<NodeId>| -> BTreeSet<NodeId> {
+            a.intersection(b)
                 .filter(|id| !ww.contains(id))
                 .copied()
-                .collect();
-            if !wr.is_empty() {
-                let (nodes, paths) = labels(wr);
+                .collect()
+        };
+        let rw = beyond_ww(&change.reads, &other.writes);
+        let wr = if strict {
+            beyond_ww(&change.writes, &other.reads)
+        } else {
+            BTreeSet::new()
+        };
+        for (kind, ids) in [
+            (ConflictKind::WriteWrite, ww),
+            (ConflictKind::ReadWrite, rw),
+            (ConflictKind::WriteRead, wr),
+        ] {
+            if !ids.is_empty() {
+                let (nodes, paths) = labels(ids);
                 out.push(SetConflict {
-                    kind: ConflictKind::WriteRead,
+                    kind,
                     landed: other.change,
                     nodes,
                     paths,
@@ -270,12 +282,7 @@ mod tests {
             result: ObjectId::from_bytes([2; 32]),
             parents: Vec::new(),
             ops,
-            intent: Intent {
-                summary: String::new(),
-                body: String::new(),
-                refs: Vec::new(),
-                acceptance: Vec::new(),
-            },
+            intent: Intent::from_summary(""),
             provenance: Provenance {
                 actor: Actor::Human { id: "t".into() },
                 toolchain: ObjectId::from_bytes([3; 32]),
@@ -293,13 +300,16 @@ mod tests {
     }
 
     fn fp(n: u8, record: &ChangeRecord, touched: &[&str]) -> Footprint {
-        let touched: Vec<RepoPath> = touched.iter().map(|p| p.parse().unwrap()).collect();
+        let touched: Vec<RepoPath> = touched
+            .iter()
+            .map(|p| p.parse().expect("parse test path literal"))
+            .collect();
         Footprint::of(ObjectId::from_bytes([n; 32]), record, &touched)
     }
 
     fn blob(path: &str) -> Op {
         Op::Blob {
-            path: path.parse().unwrap(),
+            path: path.parse().expect("parse test path literal"),
             from: Some(ObjectId::from_bytes([4; 32])),
             to: Some(ObjectId::from_bytes([5; 32])),
         }
@@ -347,7 +357,8 @@ mod tests {
     }
 
     #[test]
-    fn coarse_write_conflicts_with_any_touch_of_the_file() {
+    fn coarse_write_conflicts_with_any_touch_of_the_file() -> Result<(), Box<dyn std::error::Error>>
+    {
         // A Tier 0 import that rewrote a.rs as a blob.
         let import = fp(2, &record(&[], &[], vec![blob("a.rs")]), &["a.rs"]);
         let change = fp(1, &record(&[], &[7], vec![replace(7)]), &["a.rs"]);
@@ -357,14 +368,15 @@ mod tests {
         ] {
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].kind, ConflictKind::WriteWrite);
-            assert_eq!(found[0].paths, vec!["a.rs".parse::<RepoPath>().unwrap()]);
+            assert_eq!(found[0].paths, vec!["a.rs".parse::<RepoPath>()?]);
             assert!(found[0].nodes.is_empty());
         }
+        Ok(())
     }
 
     #[test]
-    fn glue_edits_conflict_only_with_glue_edits() {
-        let path: RepoPath = "a.rs".parse().unwrap();
+    fn glue_edits_conflict_only_with_glue_edits() -> Result<(), Box<dyn std::error::Error>> {
+        let path: RepoPath = "a.rs".parse()?;
         let root = NodeId::file_root(&path);
         let glue = |n: u8| {
             let record = ChangeRecord {
@@ -378,5 +390,6 @@ mod tests {
         let found = check(&glue(2), &[Arc::new(glue(1))], false);
         assert_eq!(found[0].kind, ConflictKind::WriteWrite);
         assert_eq!(found[0].paths, vec![path]);
+        Ok(())
     }
 }

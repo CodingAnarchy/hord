@@ -3,20 +3,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use hord_api::proto;
 
-use crate::git_bridge::{self, ImportReport};
+use crate::git_bridge;
 use crate::output;
 use crate::repo;
-
-#[derive(Debug, Serialize)]
-struct InitResult {
-    hord_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    from_git: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    imported: Option<ImportReport>,
-}
 
 pub fn run(json: bool, from_git: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().context("current directory")?;
@@ -25,12 +16,12 @@ pub fn run(json: bool, from_git: Option<PathBuf>) -> Result<()> {
     }
 
     let mut store = repo::create(&cwd)?;
-    let mut imported = None;
-    if let Some(ref git_path) = from_git {
-        imported = Some(git_bridge::import_git(&mut store, git_path, None)?);
-    }
+    let imported = match &from_git {
+        Some(git_path) => Some(git_bridge::import_git(&mut store, git_path, None)?),
+        None => None,
+    };
 
-    let result = InitResult {
+    let result = proto::InitResult {
         hord_dir: store.hord_dir().display().to_string(),
         from_git: from_git.as_ref().map(|p| p.display().to_string()),
         imported,

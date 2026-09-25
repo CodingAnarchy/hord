@@ -37,7 +37,7 @@ pub struct RustFile<'a> {
     /// are not returned from [`RustAdapter::resolve`](crate::RustAdapter::resolve).
     /// Keyed by site (child-index path from the root), so identical
     /// definitions at two places keep their own ids.
-    pub ids: &'a std::collections::BTreeMap<hord_lang::Site, NodeId>,
+    pub ids: &'a BTreeMap<hord_lang::Site, NodeId>,
 }
 
 /// Qualified name of a definition from its ancestor chain.
@@ -77,9 +77,18 @@ pub(crate) fn manifest_links(
     files: &[RustFile<'_>],
     manifests: &[crate::manifest::ManifestFile<'_>],
 ) -> Vec<(String, String, String)> {
-    let modules = assign_modules(files);
+    link_rows(files, &assign_modules(files), manifests)
+}
+
+/// The `(from, name, target)` links [`crate::manifest::install_links`]
+/// adds to an empty context.
+fn link_rows(
+    files: &[RustFile<'_>],
+    modules: &[Vec<String>],
+    manifests: &[crate::manifest::ManifestFile<'_>],
+) -> Vec<(String, String, String)> {
     let mut ctx = ResolveCtx::new();
-    crate::manifest::install_links(files, &modules, manifests, &mut ctx);
+    crate::manifest::install_links(files, modules, manifests, &mut ctx);
     let mut out = Vec::new();
     ctx.for_each_link(|from, name, target| {
         out.push((
@@ -101,7 +110,7 @@ pub(crate) fn resolve_context_with(
         if module.is_empty() {
             continue;
         }
-        index_file(file, module, &mut ctx);
+        add_rows(file.path, &file_rows(file, module), &mut ctx);
     }
     crate::manifest::install_links(files, &modules, manifests, &mut ctx);
     ctx
@@ -114,7 +123,7 @@ type FileKey = (ObjectId, Option<ObjectId>);
 impl RustAdapter {
     /// [`Self::resolve_context_with`] for a snapshot, reusing the per-file
     /// work of `prev`, the context of an earlier snapshot built by this
-    /// method (perf review #1).
+    /// method.
     ///
     /// `files` lists every candidate Rust path in snapshot order, each with
     /// a key: at one path, equal keys must mean an equal parse and equal
@@ -252,11 +261,7 @@ fn resolve_context_incremental<E>(
                         },
                         module,
                     ),
-                    _ => FileRows {
-                        root: None,
-                        defs: Vec::new(),
-                        imports: Vec::new(),
-                    },
+                    _ => FileRows::default(),
                 };
                 Arc::new(FileFacts {
                     key: *key,
@@ -328,16 +333,7 @@ fn links_memo(
             ids: &empty_ids,
         })
         .collect();
-    let mut scratch = ResolveCtx::new();
-    crate::manifest::install_links(&views, modules, manifests, &mut scratch);
-    let mut links = Vec::new();
-    scratch.for_each_link(|from, name, target| {
-        links.push((
-            from.as_str().to_owned(),
-            name.as_str().to_owned(),
-            target.as_str().to_owned(),
-        ));
-    });
+    let links = link_rows(&views, modules, manifests);
     Arc::new(LinksMemo {
         paths: paths.iter().map(|p| (*p).clone()).collect(),
         modules: modules.to_vec(),
@@ -367,8 +363,7 @@ pub(crate) fn resolve_name(ctx: &ResolveCtx, name: &NameRef) -> Option<NodeId> {
         let scope = name.scope.as_ref().map(QualifiedName::as_str);
         let hits = idx.lookup(scope, None, name.name.as_str());
         let mut ids: Vec<NodeId> = hits.finals.into_iter().filter_map(real_id).collect();
-        ids.sort();
-        ids.dedup();
+        dedup_ids(&mut ids);
         if ids.len() == 1 { Some(ids[0]) } else { None }
     })
 }
@@ -382,8 +377,7 @@ pub(crate) fn test_targets(ctx: &ResolveCtx, test: &Node) -> Vec<NodeId> {
         ids.extend(inner_test_targets(idx, test));
         let own = idx.node_ids_of(test);
         ids.retain(|id| !own.contains(id));
-        ids.sort();
-        ids.dedup();
+        dedup_ids(&mut ids);
         ids
     })
 }
@@ -643,7 +637,7 @@ fn join_relative(dir: &[String], rel: &str) -> Option<Vec<String>> {
 }
 
 fn parse_mods(source: &[u8]) -> Vec<ModFound> {
-    let Ok(Some(tree)) = cst::with_parser(|parser| parser.parse(source, None)) else {
+    let Some(tree) = parse_ts(source) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -652,34 +646,47 @@ fn parse_mods(source: &[u8]) -> Vec<ModFound> {
 }
 
 fn collect_mods(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<ModFound>) {
+    for_each_child_with_attrs(node, |child, attrs| {
+        let Some(attrs) = attrs else { return };
+        if child.kind() != "mod_item" {
+            return;
+        }
+        let Some(name) = field_text(child, source, "name") else {
+            return;
+        };
+        let mut inline = Vec::new();
+        let body = child.child_by_field_name("body");
+        if let Some(body) = body {
+            collect_mods(body, source, &mut inline);
+        }
+        out.push(ModFound {
+            name,
+            path_attr: path_attr_of(attrs, source),
+            inline,
+            has_body: body.is_some(),
+        });
+    });
+}
+
+/// Calls `f` on each structural child of `node`, in order. An attribute
+/// (outer or inner) gets `None`; any other child gets the outer attributes
+/// written right before it.
+fn for_each_child_with_attrs<'t>(
+    node: tree_sitter::Node<'t>,
+    mut f: impl FnMut(tree_sitter::Node<'t>, Option<&[tree_sitter::Node<'t>]>),
+) {
     let mut pending = Vec::new();
     for child in structural_children(node) {
         match child.kind() {
-            "attribute_item" => pending.push(child),
-            "inner_attribute_item" => {}
-            "mod_item" => {
-                let path_attr = path_attr_of(&pending, source);
-                pending.clear();
-                let name = child
-                    .child_by_field_name("name")
-                    .and_then(|n| node_text(n, source))
-                    .unwrap_or_default();
-                if name.is_empty() {
-                    continue;
-                }
-                let mut inline = Vec::new();
-                let has_body = child.child_by_field_name("body").is_some();
-                if let Some(body) = child.child_by_field_name("body") {
-                    collect_mods(body, source, &mut inline);
-                }
-                out.push(ModFound {
-                    name,
-                    path_attr,
-                    inline,
-                    has_body,
-                });
+            "attribute_item" => {
+                pending.push(child);
+                f(child, None);
             }
-            _ => pending.clear(),
+            "inner_attribute_item" => f(child, None),
+            _ => {
+                f(child, Some(&pending));
+                pending.clear();
+            }
         }
     }
 }
@@ -710,7 +717,8 @@ struct RawDef {
     local_name: Option<String>,
 }
 
-/// What [`index_file`] adds to a context for one file in one module.
+/// What [`add_rows`] adds to a context for one file in one module.
+#[derive(Default)]
 struct FileRows {
     /// Root content id and module, when the tree has a root.
     root: Option<(ObjectId, String)>,
@@ -727,10 +735,6 @@ struct DefRow {
     parent: String,
     is_test: bool,
     cfg_test: bool,
-}
-
-fn index_file(file: &RustFile<'_>, module: &[String], ctx: &mut ResolveCtx) {
-    add_rows(file.path, &file_rows(file, module), ctx);
 }
 
 fn add_rows(path: &RepoPath, rows: &FileRows, ctx: &mut ResolveCtx) {
@@ -877,7 +881,7 @@ fn fallback_parent(kind: &str) -> String {
 }
 
 fn collect_ts(source: &[u8], module: &[String]) -> (Vec<(String, TsInfo)>, Vec<RawImport>) {
-    let Ok(Some(tree)) = cst::with_parser(|parser| parser.parse(source, None)) else {
+    let Some(tree) = parse_ts(source) else {
         return (Vec::new(), Vec::new());
     };
     let mut infos = Vec::new();
@@ -924,7 +928,6 @@ fn walk_ts(
 ) {
     let kind = node.kind();
     let cfg_test = inherited_cfg || outer.cfg_test || item_inner_cfg_test(node, source);
-    let module_s = segs_join(module);
 
     if RustAdapter.is_definition(&NodeKind::new(kind))
         && let Some(qname) = cst::def_name(node, source)
@@ -943,7 +946,7 @@ fn walk_ts(
     if kind == "use_declaration"
         && let Some(arg) = node.child_by_field_name("argument")
     {
-        expand_use(arg, source, &[], &module_s, imports);
+        expand_use(arg, source, &[], &segs_join(module), imports);
     }
     if kind == "extern_crate_declaration" {
         let name = node
@@ -956,7 +959,7 @@ fn walk_ts(
             .unwrap_or_else(|| name.clone());
         if !local.is_empty() && !name.is_empty() {
             imports.push(RawImport {
-                module: module_s.clone(),
+                module: segs_join(module),
                 local,
                 path: format!("::{name}"),
                 glob: false,
@@ -978,76 +981,32 @@ fn walk_ts(
                 .map(|t| type_key(&t))
                 .unwrap_or_default(),
         }),
-        "trait_item" => {
+        "trait_item" | "struct_item" | "enum_item" | "union_item" | "enum_variant" => {
             if let Some(name) = field_text(node, source, "name") {
-                child_frames.push(Frame::Trait(name));
-            }
-        }
-        "struct_item" => {
-            if let Some(name) = field_text(node, source, "name") {
-                child_frames.push(Frame::Struct(name));
-            }
-        }
-        "enum_item" => {
-            if let Some(name) = field_text(node, source, "name") {
-                child_frames.push(Frame::Enum(name));
-            }
-        }
-        "union_item" => {
-            if let Some(name) = field_text(node, source, "name") {
-                child_frames.push(Frame::Union(name));
-            }
-        }
-        "enum_variant" => {
-            if let Some(name) = field_text(node, source, "name") {
-                child_frames.push(Frame::Variant(name));
+                child_frames.push(match kind {
+                    "trait_item" => Frame::Trait(name),
+                    "struct_item" => Frame::Struct(name),
+                    "enum_item" => Frame::Enum(name),
+                    "union_item" => Frame::Union(name),
+                    _ => Frame::Variant(name),
+                });
             }
         }
         _ => {}
     }
 
-    let mut pending = Vec::new();
-    for child in structural_children(node) {
-        match child.kind() {
-            "attribute_item" => {
-                pending.push(child);
-                walk_ts(
-                    child,
-                    source,
-                    &child_module,
-                    &child_frames,
-                    cfg_test,
-                    Flags::default(),
-                    infos,
-                    imports,
-                );
-            }
-            "inner_attribute_item" => walk_ts(
-                child,
-                source,
-                &child_module,
-                &child_frames,
-                cfg_test,
-                Flags::default(),
-                infos,
-                imports,
-            ),
-            _ => {
-                let flags = flags_of_attrs(&pending, source);
-                pending.clear();
-                walk_ts(
-                    child,
-                    source,
-                    &child_module,
-                    &child_frames,
-                    cfg_test,
-                    flags,
-                    infos,
-                    imports,
-                );
-            }
-        }
-    }
+    for_each_child_with_attrs(node, |child, attrs| {
+        walk_ts(
+            child,
+            source,
+            &child_module,
+            &child_frames,
+            cfg_test,
+            flags_of_attrs(attrs.unwrap_or_default(), source),
+            infos,
+            imports,
+        );
+    });
 }
 
 fn simple_of(node: tree_sitter::Node<'_>, source: &[u8], kind: &str) -> String {
@@ -1536,9 +1495,20 @@ struct Index {
     externs: HashMap<String, Vec<(String, String)>>,
 }
 
+#[derive(Default)]
 struct PathHits {
     all: Vec<NodeId>,
     finals: Vec<NodeId>,
+}
+
+impl PathHits {
+    /// `ids` as both every hit and the final hits.
+    fn both(ids: Vec<NodeId>) -> Self {
+        Self {
+            all: ids.clone(),
+            finals: ids,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1563,6 +1533,17 @@ enum Head {
     Ready(Vec<Hit>),
     Pending,
     Missing,
+}
+
+impl Head {
+    /// [`Head::Ready`] with `hits`, or [`Head::Missing`] when there are none.
+    fn from_hits(hits: Vec<Hit>) -> Self {
+        if hits.is_empty() {
+            Self::Missing
+        } else {
+            Self::Ready(hits)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1724,7 +1705,7 @@ impl Index {
         let mut hits = Vec::new();
         for (n, seg) in segs.iter().enumerate() {
             let head = if n == 0 {
-                self.head_status(module, seg, None)?
+                self.head_status(module, seg, None)
             } else {
                 let mut next = Vec::new();
                 let mut pending = false;
@@ -1769,17 +1750,17 @@ impl Index {
         })
     }
 
-    fn head_status(&self, module: &str, seg: &str, self_ty: Option<&str>) -> Option<Head> {
+    fn head_status(&self, module: &str, seg: &str, self_ty: Option<&str>) -> Head {
         match seg {
-            "crate" => Some(Head::Ready(vec![self.module_hit(crate_key(module))])),
-            "self" => Some(Head::Ready(vec![self.module_hit(module)])),
-            "super" => Some(match parent_module(module) {
+            "crate" => Head::Ready(vec![self.module_hit(crate_key(module))]),
+            "self" => Head::Ready(vec![self.module_hit(module)]),
+            "super" => match parent_module(module) {
                 Some(p) => Head::Ready(vec![self.module_hit(&p)]),
                 None => Head::Missing,
-            }),
-            "::" => Some(Head::Missing),
-            "Self" => Some(Head::Ready(self.self_hits(module, self_ty))),
-            _ => Some(self.ident_status(module, seg)),
+            },
+            "::" => Head::Missing,
+            "Self" => Head::Ready(self.self_hits(module, self_ty)),
+            _ => self.ident_status(module, seg),
         }
     }
 
@@ -1802,8 +1783,6 @@ impl Index {
     }
 
     fn ident_status(&self, module: &str, name: &str) -> Head {
-        let key = (module.to_owned(), name.to_owned());
-        let locals = self.direct.get(&key);
         let mut ready = Vec::new();
         let mut pending = false;
         let mut external = false;
@@ -1818,11 +1797,7 @@ impl Index {
             }
             ready.extend(self.hits_from_import(imp));
         }
-        if let Some(ids) = locals {
-            for &i in ids {
-                ready.push(self.hit_from_def(i));
-            }
-        }
+        ready.extend(self.direct_hits(module, name));
         if !ready.is_empty() {
             return Head::Ready(ready);
         }
@@ -1850,11 +1825,17 @@ impl Index {
         for imp in self.glob_imports(module).filter(|i| i.done) {
             glob_hits.extend(self.glob_hits(imp, name));
         }
-        if glob_hits.is_empty() {
-            Head::Missing
-        } else {
-            Head::Ready(glob_hits)
-        }
+        Head::from_hits(glob_hits)
+    }
+
+    /// Hits for the direct (parent-empty) definitions of `name` in `module`.
+    fn direct_hits(&self, module: &str, name: &str) -> Vec<Hit> {
+        self.direct
+            .get(&(module.to_owned(), name.to_owned()))
+            .into_iter()
+            .flatten()
+            .map(|&i| self.hit_from_def(i))
+            .collect()
     }
 
     fn hits_from_import(&self, imp: &Imp) -> Vec<Hit> {
@@ -1874,12 +1855,7 @@ impl Index {
         let Some(module) = imp.target_module.as_deref() else {
             return Vec::new();
         };
-        let mut hits = Vec::new();
-        if let Some(ids) = self.direct.get(&(module.to_owned(), name.to_owned())) {
-            for &i in ids {
-                hits.push(self.hit_from_def(i));
-            }
-        }
+        let mut hits = self.direct_hits(module, name);
         for other in self
             .named_imports(module, name)
             .filter(|i| i.done && !i.external)
@@ -1898,23 +1874,16 @@ impl Index {
                 };
                 let def = &self.defs[i];
                 let from_trait = def.kind == "trait_item";
-                let key = def.simple.clone();
-                let crate_k = crate_key(&def.module).to_owned();
-                let hits = self.associated_hits(&crate_k, &key, seg, from_trait);
-                if hits.is_empty() {
-                    Head::Missing
-                } else {
-                    Head::Ready(hits)
-                }
+                Head::from_hits(self.associated_hits(
+                    crate_key(&def.module),
+                    &def.simple,
+                    seg,
+                    from_trait,
+                ))
             }
             HitKind::Type => {
                 let key = hit.type_name.as_deref().unwrap_or("");
-                let hits = self.associated_hits(&hit.module, key, seg, false);
-                if hits.is_empty() {
-                    Head::Missing
-                } else {
-                    Head::Ready(hits)
-                }
+                Head::from_hits(self.associated_hits(&hit.module, key, seg, false))
             }
         }
     }
@@ -1946,12 +1915,7 @@ impl Index {
         let Some(ty) = self_ty.filter(|s| !s.is_empty()) else {
             return Vec::new();
         };
-        let mut hits = Vec::new();
-        if let Some(ids) = self.direct.get(&(module.to_owned(), ty.to_owned())) {
-            for &i in ids {
-                hits.push(self.hit_from_def(i));
-            }
-        }
+        let mut hits = self.direct_hits(module, ty);
         if hits.is_empty() {
             let key = crate_key(module);
             for (i, def) in self.defs.iter().enumerate() {
@@ -2015,16 +1979,19 @@ impl Index {
     }
 
     fn lookup(&self, scope: Option<&str>, self_ty: Option<&str>, written: &str) -> PathHits {
-        let scope_owned;
-        let module = if let Some(scope) = scope.filter(|s| !s.is_empty()) {
-            scope
-        } else if self.crate_keys.len() == 1 {
-            scope_owned = self.crate_keys.iter().next().cloned().unwrap_or_default();
-            scope_owned.as_str()
-        } else {
+        let Some(module) = scope.filter(|s| !s.is_empty()).or(self.sole_crate()) else {
             return self.lookup_everywhere(written);
         };
         self.lookup_in(module, self_ty, written)
+    }
+
+    /// The crate key, when this index holds exactly one crate.
+    fn sole_crate(&self) -> Option<&str> {
+        if self.crate_keys.len() == 1 {
+            self.crate_keys.first().map(String::as_str)
+        } else {
+            None
+        }
     }
 
     fn lookup_everywhere(&self, written: &str) -> PathHits {
@@ -2049,42 +2016,24 @@ impl Index {
     fn lookup_in(&self, module: &str, self_ty: Option<&str>, written: &str) -> PathHits {
         let written = written.trim();
         if let Some(name) = written.strip_prefix('.') {
-            let ids = self.method_ids(module, name.trim());
-            return PathHits {
-                all: ids.clone(),
-                finals: ids,
-            };
+            return PathHits::both(self.method_ids(module, name.trim()));
         }
         if written.starts_with("::") {
-            return PathHits {
-                all: Vec::new(),
-                finals: Vec::new(),
-            };
+            return PathHits::default();
         }
-        let segs: Vec<String> = written
-            .split("::")
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let segs = split_path(written);
         if segs.is_empty() {
-            return PathHits {
-                all: Vec::new(),
-                finals: Vec::new(),
-            };
+            return PathHits::default();
         }
-        let mut all = Vec::new();
         let mut current = match self.head_status(module, &segs[0], self_ty) {
-            Some(Head::Ready(hits)) => hits,
+            Head::Ready(hits) => hits,
             _ => Vec::new(),
         };
         let first_ids = hit_ids(&current);
         if segs.len() == 1 {
-            return PathHits {
-                all: first_ids.clone(),
-                finals: first_ids,
-            };
+            return PathHits::both(first_ids);
         }
-        all.extend(first_ids);
+        let mut all = first_ids;
         for seg in segs.iter().skip(1) {
             let mut next = Vec::new();
             for hit in &current {
@@ -2116,44 +2065,36 @@ impl Index {
     }
 
     fn method_ids(&self, module: &str, name: &str) -> Vec<NodeId> {
-        let Some(ids) = self.associated.get(name) else {
-            return Vec::new();
-        };
-        let crates = self.visible_crates(module);
-        let mut out = Vec::new();
-        for &i in ids {
-            let def = &self.defs[i];
-            if !crates.iter().any(|key| crate_key(&def.module) == key) {
-                continue;
-            }
-            if is_method_parent(&def.parent)
-                && let Some(id) = real_id(def.node_id)
-            {
-                out.push(id);
-            }
-        }
-        dedup_ids(&mut out);
-        out
+        self.visible_ids(self.associated.get(name), module, |def| {
+            is_method_parent(&def.parent)
+        })
     }
 
     /// Functions and methods named `name` in this crate or a linked package.
     ///
     /// A bare call has no type to pick one of them (ADR 0011).
     fn callable_ids(&self, module: &str, name: &str) -> Vec<NodeId> {
-        let Some(ids) = self.callables.get(name) else {
+        self.visible_ids(self.callables.get(name), module, |_| true)
+    }
+
+    /// Sorted, deduplicated ids of the definitions `candidates` that sit in
+    /// a crate [`Self::visible_crates`] from `module` and satisfy `keep`.
+    fn visible_ids(
+        &self,
+        candidates: Option<&Vec<usize>>,
+        module: &str,
+        keep: impl Fn(&Def) -> bool,
+    ) -> Vec<NodeId> {
+        let Some(candidates) = candidates else {
             return Vec::new();
         };
         let crates = self.visible_crates(module);
-        let mut out = Vec::new();
-        for &i in ids {
-            let def = &self.defs[i];
-            if !crates.iter().any(|key| crate_key(&def.module) == key) {
-                continue;
-            }
-            if let Some(id) = real_id(def.node_id) {
-                out.push(id);
-            }
-        }
+        let mut out: Vec<NodeId> = candidates
+            .iter()
+            .map(|&i| &self.defs[i])
+            .filter(|def| crates.iter().any(|key| crate_key(&def.module) == key) && keep(def))
+            .filter_map(|def| real_id(def.node_id))
+            .collect();
         dedup_ids(&mut out);
         out
     }
@@ -2200,10 +2141,7 @@ impl Index {
     }
 
     fn fallback_scope(&self) -> Scope {
-        if self.crate_keys.len() == 1 {
-            return Self::module_scope(&self.crate_keys.iter().next().cloned().unwrap_or_default());
-        }
-        Self::module_scope("")
+        Self::module_scope(self.sole_crate().unwrap_or(""))
     }
 
     /// Scopes `node` may sit in, found by content: one per distinct scope of
@@ -2381,23 +2319,15 @@ fn refs_from_node(idx: &Index, node: &Node) -> Vec<NameRef> {
 }
 
 fn refs_in_scopes(idx: &Index, node: &Node, scopes: Vec<Scope>) -> Vec<NameRef> {
-    let bytes = node.raw.clone();
+    let source = node.raw.as_slice();
     let mut refs = Vec::new();
-    let _ = cst::with_parser(|parser| {
-        if let Some(tree) = parser.parse(bytes.as_slice(), None) {
-            for scope in scopes {
-                let mut walk = RefWalk {
-                    idx,
-                    source: bytes.as_slice(),
-                    module: scope.module,
-                    self_ty: scope.self_ty,
-                    refs: Vec::new(),
-                };
-                walk.walk(tree.root_node());
-                refs.extend(walk.refs);
-            }
+    if let Some(tree) = parse_ts(source) {
+        for scope in scopes {
+            let mut walk = RefWalk::new(idx, source, scope.module, scope.self_ty);
+            walk.walk(tree.root_node());
+            refs.extend(walk.refs);
         }
-    });
+    }
     refs.sort_by(|a, b| {
         a.name
             .as_str()
@@ -2417,7 +2347,17 @@ struct RefWalk<'a> {
     refs: Vec<NameRef>,
 }
 
-impl RefWalk<'_> {
+impl<'a> RefWalk<'a> {
+    fn new(idx: &'a Index, source: &'a [u8], module: String, self_ty: Option<String>) -> Self {
+        Self {
+            idx,
+            source,
+            module,
+            self_ty,
+            refs: Vec::new(),
+        }
+    }
+
     fn walk(&mut self, node: tree_sitter::Node<'_>) {
         if node.is_extra() || node.is_missing() {
             return;
@@ -2434,26 +2374,12 @@ impl RefWalk<'_> {
                 self.module = saved;
             }
             "impl_item" => {
-                let saved_ty = self.self_ty.clone();
                 let ty = type_key(&field_text(node, self.source, "type").unwrap_or_default());
-                if !ty.is_empty() {
-                    self.self_ty = Some(ty);
-                }
-                // Header bounds and the where clause are part of the item.
-                for child in structural_children(node) {
-                    self.walk(child);
-                }
-                self.self_ty = saved_ty;
+                self.walk_with_self_ty(node, (!ty.is_empty()).then_some(ty));
             }
             "trait_item" => {
-                let saved_ty = self.self_ty.clone();
-                if let Some(name) = field_text(node, self.source, "name") {
-                    self.self_ty = Some(name);
-                }
-                for child in structural_children(node) {
-                    self.walk(child);
-                }
-                self.self_ty = saved_ty;
+                let name = field_text(node, self.source, "name");
+                self.walk_with_self_ty(node, name);
             }
             "macro_invocation" => self.walk_macro(node),
             "scoped_identifier" | "scoped_type_identifier" => {
@@ -2470,8 +2396,9 @@ impl RefWalk<'_> {
                 }
             }
             "generic_function" => {
-                // Walk the callee. `path_segments` on a field expression is
-                // empty, which used to drop the receiver (`xs.map(...).collect::<T>()`).
+                // Walk the callee rather than emit its path: `path_segments`
+                // on a field expression is empty and would drop the receiver
+                // (`xs.map(...).collect::<T>()`).
                 if let Some(fun) = node.child_by_field_name("function") {
                     self.walk(fun);
                 }
@@ -2526,6 +2453,20 @@ impl RefWalk<'_> {
         }
     }
 
+    /// Walks every child of `node` (header bounds and the where clause are
+    /// part of the item) with `Self` naming `ty`, or the enclosing `Self`
+    /// when `ty` is `None`.
+    fn walk_with_self_ty(&mut self, node: tree_sitter::Node<'_>, ty: Option<String>) {
+        let saved = self.self_ty.clone();
+        if ty.is_some() {
+            self.self_ty = ty;
+        }
+        for child in structural_children(node) {
+            self.walk(child);
+        }
+        self.self_ty = saved;
+    }
+
     fn walk_macro(&mut self, node: tree_sitter::Node<'_>) {
         if let Some(mac) = node.child_by_field_name("macro") {
             let segs = path_segments(mac, self.source);
@@ -2578,19 +2519,13 @@ impl RefWalk<'_> {
             return;
         }
         if segs.first().is_some_and(|s| s == "::") {
-            self.push(
-                &segs[1..].join("::"),
-                &PathHits {
-                    all: Vec::new(),
-                    finals: Vec::new(),
-                },
-            );
+            self.push(&segs[1..].join("::"), &PathHits::default());
             return;
         }
         let written = segs.join("::");
-        let module = self.module.clone();
-        let self_ty = self.self_ty.clone();
-        let hits = self.idx.lookup_in(&module, self_ty.as_deref(), &written);
+        let hits = self
+            .idx
+            .lookup_in(&self.module, self.self_ty.as_deref(), &written);
         self.push(&written, &hits);
     }
 
@@ -2598,13 +2533,8 @@ impl RefWalk<'_> {
         if is_skippable_bare(name) {
             return;
         }
-        let written = format!(".{name}");
-        let ids = self.idx.method_ids(&self.module, name);
-        let hits = PathHits {
-            all: ids.clone(),
-            finals: ids,
-        };
-        self.push(&written, &hits);
+        let hits = PathHits::both(self.idx.method_ids(&self.module, name));
+        self.push(&format!(".{name}"), &hits);
     }
 
     /// A call with no path. Resolved names stay, and every visible same-named
@@ -2613,10 +2543,10 @@ impl RefWalk<'_> {
         if is_skippable_bare(name) {
             return;
         }
-        let module = self.module.clone();
-        let self_ty = self.self_ty.clone();
-        let mut hits = self.idx.lookup_in(&module, self_ty.as_deref(), name);
-        let extra = self.idx.callable_ids(&module, name);
+        let mut hits = self
+            .idx
+            .lookup_in(&self.module, self.self_ty.as_deref(), name);
+        let extra = self.idx.callable_ids(&self.module, name);
         hits.all.extend(extra.iter().copied());
         hits.finals.extend(extra);
         dedup_ids(&mut hits.all);
@@ -2649,23 +2579,21 @@ impl RefWalk<'_> {
 /// Test targets inside `node`, searched in every scope its content may sit
 /// in (see [`Index::scopes_of`]).
 fn inner_test_targets(idx: &Index, node: &Node) -> Vec<NodeId> {
-    let bytes = node.raw.clone();
+    let source = node.raw.as_slice();
     let mut ids = Vec::new();
-    let _ = cst::with_parser(|parser| {
-        if let Some(tree) = parser.parse(bytes.as_slice(), None) {
-            for scope in idx.scopes_of(node) {
-                scan_tests(
-                    idx,
-                    tree.root_node(),
-                    bytes.as_slice(),
-                    &scope.module,
-                    scope.self_ty.as_deref(),
-                    scope.cfg_test,
-                    &mut ids,
-                );
-            }
+    if let Some(tree) = parse_ts(source) {
+        for scope in idx.scopes_of(node) {
+            scan_tests(
+                idx,
+                tree.root_node(),
+                source,
+                &scope.module,
+                scope.self_ty.as_deref(),
+                scope.cfg_test,
+                &mut ids,
+            );
         }
-    });
+    }
     ids
 }
 
@@ -2732,35 +2660,22 @@ fn scan_list(
     out: &mut Vec<NodeId>,
 ) {
     let cfg = inherited_cfg || item_inner_cfg_test(node, source);
-    let mut pending = Vec::new();
-    for child in structural_children(node) {
-        match child.kind() {
-            "attribute_item" => pending.push(child),
-            "inner_attribute_item" => {}
-            _ => {
-                let flags = flags_of_attrs(&pending, source);
-                pending.clear();
-                let testish =
-                    flags.is_test || ((cfg || flags.cfg_test) && is_fn_kind(child.kind()));
-                if testish && is_fn_kind(child.kind()) {
-                    out.extend(refs_of_ts(idx, child, source, module, self_ty));
-                }
-                let next_cfg = cfg || flags.cfg_test;
-                if matches!(
-                    child.kind(),
-                    "mod_item"
-                        | "impl_item"
-                        | "trait_item"
-                        | "declaration_list"
-                        | "block"
-                        | "source_file"
-                ) || child.child_by_field_name("body").is_some()
-                {
-                    scan_tests(idx, child, source, module, self_ty, next_cfg, out);
-                }
-            }
+    for_each_child_with_attrs(node, |child, attrs| {
+        let Some(attrs) = attrs else { return };
+        let flags = flags_of_attrs(attrs, source);
+        let testish = flags.is_test || ((cfg || flags.cfg_test) && is_fn_kind(child.kind()));
+        if testish && is_fn_kind(child.kind()) {
+            out.extend(refs_of_ts(idx, child, source, module, self_ty));
         }
-    }
+        let next_cfg = cfg || flags.cfg_test;
+        if matches!(
+            child.kind(),
+            "mod_item" | "impl_item" | "trait_item" | "declaration_list" | "block" | "source_file"
+        ) || child.child_by_field_name("body").is_some()
+        {
+            scan_tests(idx, child, source, module, self_ty, next_cfg, out);
+        }
+    });
 }
 
 fn refs_of_ts(
@@ -2770,13 +2685,7 @@ fn refs_of_ts(
     module: &str,
     self_ty: Option<&str>,
 ) -> Vec<NodeId> {
-    let mut walk = RefWalk {
-        idx,
-        source,
-        module: module.to_owned(),
-        self_ty: self_ty.map(str::to_owned),
-        refs: Vec::new(),
-    };
+    let mut walk = RefWalk::new(idx, source, module.to_owned(), self_ty.map(str::to_owned));
     walk.walk(node);
     resolved_ids(&walk.refs)
 }
@@ -2913,6 +2822,14 @@ fn is_primitive(name: &str) -> bool {
 
 // --- tree-sitter helpers ---------------------------------------------------
 
+/// Tree-sitter parse of `source`, or `None` when the parser is unavailable
+/// or gives up.
+pub(crate) fn parse_ts(source: &[u8]) -> Option<tree_sitter::Tree> {
+    cst::with_parser(|parser| parser.parse(source, None))
+        .ok()
+        .flatten()
+}
+
 fn structural_children<'a>(node: tree_sitter::Node<'a>) -> Vec<tree_sitter::Node<'a>> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
@@ -2995,7 +2912,9 @@ mod incremental {
     /// Deterministic ids per (path, site, salt), so a salt change models a
     /// carried identity that differs while the bytes stay the same.
     fn identify(path: &RepoPath, source: &str, salt: u8) -> IdentifiedTree {
-        let tree = RustAdapter.parse(source.as_bytes()).unwrap();
+        let tree = RustAdapter
+            .parse(source.as_bytes())
+            .expect("parse Rust test source");
         let mut ids = BTreeMap::new();
         fn walk(
             tree: &hord_lang::NodeTree,
@@ -3004,7 +2923,7 @@ mod incremental {
             seed: &str,
             ids: &mut BTreeMap<Site, NodeId>,
         ) {
-            let node = tree.get(oid).unwrap();
+            let node = tree.get(oid).expect("walk visits only ids the tree holds");
             if RustAdapter.is_definition(&node.kind) {
                 let h = ObjectId::of_byte_string(format!("{seed}{site:?}").as_bytes());
                 let mut b = [0u8; 16];
@@ -3012,7 +2931,7 @@ mod incremental {
                 ids.insert(site.clone(), NodeId::from_u128(u128::from_le_bytes(b)));
             }
             for (i, child) in node.children.iter().enumerate() {
-                site.push(u32::try_from(i).unwrap());
+                site.push(u32::try_from(i).expect("test files have fewer than 2^32 children"));
                 walk(tree, *child, site, seed, ids);
                 site.pop();
             }
@@ -3089,13 +3008,12 @@ mod incremental {
                 .map(|(p, (s, salt))| (p.clone(), Self::key(p, s, *salt)))
                 .collect();
             let mut loaded = HashSet::new();
-            let inc = RustAdapter
-                .resolve_context_incremental(prev, &keys, &manifest_views, |path| {
+            let Ok(inc) =
+                RustAdapter.resolve_context_incremental(prev, &keys, &manifest_views, |path| {
                     loaded.insert(path.clone());
                     let (s, salt) = &self.files[path];
                     Ok::<_, Infallible>(Some(Arc::new(identify(path, s, *salt))))
-                })
-                .unwrap();
+                });
             (full, inc, loaded)
         }
     }
@@ -3172,7 +3090,11 @@ mod incremental {
             (
                 "move a file to mod.rs",
                 |s| {
-                    let body = s.files.remove(&rp("a/src/y.rs")).unwrap().0;
+                    let body = s
+                        .files
+                        .remove(&rp("a/src/y.rs"))
+                        .expect("a/src/y.rs is in the snapshot")
+                        .0;
                     s.set("a/src/y/mod.rs", &body);
                 },
                 &["a/src/y/mod.rs"],
@@ -3195,7 +3117,12 @@ mod incremental {
             ),
             (
                 "carried identity changes, bytes do not",
-                |s| s.files.get_mut(&rp("b/src/lib.rs")).unwrap().1 = 7,
+                |s| {
+                    s.files
+                        .get_mut(&rp("b/src/lib.rs"))
+                        .expect("b/src/lib.rs is in the snapshot")
+                        .1 = 7;
+                },
                 &["b/src/lib.rs"],
             ),
             (

@@ -14,6 +14,8 @@ struct Owned {
     ids: BTreeMap<Vec<u32>, NodeId>,
 }
 
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
 fn adapter() -> RustAdapter {
     RustAdapter
 }
@@ -22,7 +24,7 @@ fn parse_one(path: &str, src: &str) -> Owned {
     let tree = adapter().parse(src.as_bytes()).expect("parse");
     let ids = assign_ids(&tree);
     Owned {
-        path: RepoPath::from_str(path).unwrap(),
+        path: RepoPath::from_str(path).expect("parse fixture repo path"),
         tree,
         ids,
     }
@@ -52,7 +54,7 @@ fn assign_walk(
         *n += 1;
     }
     for (i, child) in node.children.clone().into_iter().enumerate() {
-        site.push(u32::try_from(i).unwrap());
+        site.push(u32::try_from(i).expect("test files have fewer than 2^32 children"));
         assign_walk(tree, child, site, ids, n);
         site.pop();
     }
@@ -68,7 +70,7 @@ fn site_of(tree: &NodeTree, oid: ObjectId) -> Vec<u32> {
             return false;
         };
         for (i, child) in node.children.iter().enumerate() {
-            path.push(u32::try_from(i).unwrap());
+            path.push(u32::try_from(i).expect("test files have fewer than 2^32 children"));
             if walk(tree, *child, want, path) {
                 return true;
             }
@@ -93,7 +95,7 @@ fn context(files: &[Owned]) -> hord_lang::ResolveCtx {
     adapter().resolve_context(&views)
 }
 
-fn find<'a>(file: &'a Owned, qualified: &str) -> &'a Node {
+fn find<'a>(file: &'a Owned, qualified: &str) -> TestResult<&'a Node> {
     file.tree
         .iter()
         .map(|(_, node)| node)
@@ -102,14 +104,14 @@ fn find<'a>(file: &'a Owned, qualified: &str) -> &'a Node {
                 .as_ref()
                 .is_some_and(|name| name.as_str() == qualified)
         })
-        .unwrap_or_else(|| panic!("no definition {qualified} in {}", file.path))
+        .ok_or_else(|| format!("no definition {qualified} in {}", file.path).into())
 }
 
-fn id_of(file: &Owned, want: &str) -> NodeId {
+fn id_of(file: &Owned, want: &str) -> TestResult<NodeId> {
     id_of_kind(file, want, None)
 }
 
-fn id_of_kind(file: &Owned, want: &str, kind: Option<&str>) -> NodeId {
+fn id_of_kind(file: &Owned, want: &str, kind: Option<&str>) -> TestResult<NodeId> {
     let node = file
         .tree
         .iter()
@@ -118,12 +120,12 @@ fn id_of_kind(file: &Owned, want: &str, kind: Option<&str>) -> NodeId {
             node.name.as_ref().is_some_and(|name| name.as_str() == want)
                 && kind.is_none_or(|k| node.kind.as_str() == k)
         })
-        .unwrap_or_else(|| panic!("no definition {want} kind {kind:?} in {}", file.path));
+        .ok_or_else(|| format!("no definition {want} kind {kind:?} in {}", file.path))?;
     let oid = ObjectId::of(node).expect("object id");
-    *file
+    Ok(*file
         .ids
         .get(&site_of(&file.tree, oid))
-        .unwrap_or_else(|| panic!("no id for {want}"))
+        .ok_or_else(|| format!("no id for {want}"))?)
 }
 
 /// Give every definition in `files` a distinct [`NodeId`].
@@ -153,16 +155,16 @@ fn testdata() -> PathBuf {
 }
 
 #[test]
-fn every_fixture_definition_has_a_qualified_name() {
+fn every_fixture_definition_has_a_qualified_name() -> TestResult {
     let adapter = adapter();
     let mut files = 0;
-    for entry in std::fs::read_dir(testdata()).unwrap() {
-        let path = entry.unwrap().path();
+    for entry in std::fs::read_dir(testdata())? {
+        let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let bytes = std::fs::read(&path).unwrap();
-        let tree = adapter.parse(&bytes).unwrap();
+        let bytes = std::fs::read(&path)?;
+        let tree = adapter.parse(&bytes)?;
         let Some(root) = tree.root() else {
             continue;
         };
@@ -171,6 +173,7 @@ fn every_fixture_definition_has_a_qualified_name() {
         files += 1;
     }
     assert!(files >= 5);
+    Ok(())
 }
 
 fn check_names(
@@ -179,11 +182,18 @@ fn check_names(
     oid: ObjectId,
     ancestors: &mut Vec<ObjectId>,
 ) {
-    let node = tree.get(oid).unwrap().clone();
+    let node = tree
+        .get(oid)
+        .expect("check_names visits only ids the tree holds")
+        .clone();
     if adapter.is_definition(&node.kind) {
         let owned: Vec<Node> = ancestors
             .iter()
-            .map(|id| tree.get(*id).unwrap().clone())
+            .map(|id| {
+                tree.get(*id)
+                    .expect("ancestors are ids the tree holds")
+                    .clone()
+            })
             .collect();
         let path: Vec<&Node> = owned.iter().collect();
         let named = adapter.qualified_name(&path, &node);
@@ -218,7 +228,7 @@ fn check_names(
 }
 
 #[test]
-fn path_dependency_resolves_across_crates() {
+fn path_dependency_resolves_across_crates() -> TestResult {
     let lib = parse_one("crates/support/src/lib.rs", "pub fn project() {}\n");
     let test = parse_one(
         "tests/testsuite/main.rs",
@@ -226,7 +236,7 @@ fn path_dependency_resolves_across_crates() {
     );
     let mut files = [lib, test];
     reassign_ids(&mut files);
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -250,17 +260,18 @@ support.workspace = true
         bytes: manifest.as_bytes(),
     }];
     let ctx = adapter().resolve_context_with(&views, &manifests);
-    let project = id_of(&files[0], "project");
-    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    let project = id_of(&files[0], "project")?;
+    let refs = adapter().references(&ctx, find(&files[1], "caller")?);
     let edge = refs
         .iter()
         .find(|r| r.name.as_str() == "support::project")
         .expect("edge");
     assert_eq!(edge.resolved, Some(project));
+    Ok(())
 }
 
 #[test]
-fn linked_crate_method_is_a_candidate() {
+fn linked_crate_method_is_a_candidate() -> TestResult {
     let lib = parse_one(
         "crates/support/src/lib.rs",
         "pub struct Foo;\nimpl Foo { pub fn layout(&self) {} }\n",
@@ -271,7 +282,7 @@ fn linked_crate_method_is_a_candidate() {
     );
     let mut files = [lib, test];
     reassign_ids(&mut files);
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -297,13 +308,14 @@ support.workspace = true
             bytes: manifest.as_bytes(),
         }],
     );
-    let layout = id_of(&files[0], "impl Foo::layout");
-    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    let layout = id_of(&files[0], "impl Foo::layout")?;
+    let refs = adapter().references(&ctx, find(&files[1], "caller")?);
     assert!(refs.iter().any(|r| r.resolved == Some(layout)), "{refs:?}");
+    Ok(())
 }
 
 #[test]
-fn unresolved_call_includes_linked_crate_functions() {
+fn unresolved_call_includes_linked_crate_functions() -> TestResult {
     let lib = parse_one("crates/support/src/lib.rs", "pub fn project_layout() {}\n");
     let test = parse_one(
         "tests/testsuite/main.rs",
@@ -311,7 +323,7 @@ fn unresolved_call_includes_linked_crate_functions() {
     );
     let mut files = [lib, test];
     reassign_ids(&mut files);
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -337,13 +349,14 @@ support.workspace = true
             bytes: manifest.as_bytes(),
         }],
     );
-    let project = id_of(&files[0], "project_layout");
-    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    let project = id_of(&files[0], "project_layout")?;
+    let refs = adapter().references(&ctx, find(&files[1], "caller")?);
     assert!(refs.iter().any(|r| r.resolved == Some(project)), "{refs:?}");
+    Ok(())
 }
 
 #[test]
-fn nested_function_call_is_a_candidate() {
+fn nested_function_call_is_a_candidate() -> TestResult {
     let src = r#"
 #[track_caller]
 pub fn assert_deps() {
@@ -362,26 +375,28 @@ pub fn assert_deps() {
     let mut files = [parse_one("src/lib.rs", src)];
     reassign_ids(&mut files);
     let ctx = context(&files);
-    let target = id_of(&files[0], "read_u64");
-    let refs = adapter().references(&ctx, find(&files[0], "assert_deps"));
+    let target = id_of(&files[0], "read_u64")?;
+    let refs = adapter().references(&ctx, find(&files[0], "assert_deps")?);
     assert!(refs.iter().any(|r| r.resolved == Some(target)), "{refs:?}");
+    Ok(())
 }
 
 #[test]
-fn unresolved_call_includes_same_crate_functions_outside_the_module() {
+fn unresolved_call_includes_same_crate_functions_outside_the_module() -> TestResult {
     let src = "mod inner { pub fn project_layout() {} }\nfn caller() { project_layout(); }\n";
     let mut files = [parse_one("src/lib.rs", src)];
     reassign_ids(&mut files);
     let ctx = context(&files);
-    let project = id_of(&files[0], "inner::project_layout");
-    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let project = id_of(&files[0], "inner::project_layout")?;
+    let refs = adapter().references(&ctx, find(&files[0], "caller")?);
     assert!(refs.iter().any(|r| r.resolved == Some(project)), "{refs:?}");
+    Ok(())
 }
 
 #[test]
-fn outer_attribute_belongs_to_the_next_definition() {
+fn outer_attribute_belongs_to_the_next_definition() -> TestResult {
     let files = [parse_one("src/lib.rs", "#[foo::bar]\nfn qux() {}\n")];
-    let node = find(&files[0], "qux");
+    let node = find(&files[0], "qux")?;
     let raw = String::from_utf8_lossy(node.raw.as_slice());
     assert!(raw.contains("foo"), "{raw}");
     let ctx = context(&files);
@@ -390,13 +405,14 @@ fn outer_attribute_belongs_to_the_next_definition() {
         refs.iter().any(|r| r.name.as_str() == "foo::bar"),
         "{refs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn registry_dependency_stays_unresolved() {
+fn registry_dependency_stays_unresolved() -> TestResult {
     let lib = parse_one("src/lib.rs", "fn caller() { serde::json(); }\n");
     let files = [lib];
-    let manifest_path = RepoPath::from_str("Cargo.toml").unwrap();
+    let manifest_path = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = r#"
 [package]
 name = "app"
@@ -418,13 +434,14 @@ serde = "1.0"
             bytes: manifest.as_bytes(),
         }],
     );
-    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let refs = adapter().references(&ctx, find(&files[0], "caller")?);
     let edge = refs.iter().find(|r| r.name.as_str() == "serde::json");
     assert!(edge.is_none_or(|r| r.resolved.is_none()), "{refs:?}");
+    Ok(())
 }
 
 #[test]
-fn use_resolves_across_files() {
+fn use_resolves_across_files() -> TestResult {
     let files = vec![
         parse_one(
             "src/lib.rs",
@@ -433,16 +450,17 @@ fn use_resolves_across_files() {
         parse_one("src/foo.rs", "pub fn helper() {}\n"),
     ];
     let ctx = context(&files);
-    let caller = find(&files[0], "caller");
-    let helper = id_of(&files[1], "helper");
+    let caller = find(&files[0], "caller")?;
+    let helper = id_of(&files[1], "helper")?;
     assert!(resolved(&ctx, caller).contains(&helper));
     let mut path = NameRef::new("crate::foo::helper");
     path.scope = Some("crate".into());
     assert_eq!(adapter().resolve(&ctx, &path), Some(helper));
+    Ok(())
 }
 
 #[test]
-fn inline_mod_super_and_test_attributes() {
+fn inline_mod_super_and_test_attributes() -> TestResult {
     let src = r#"
 fn prod() {}
 
@@ -462,9 +480,9 @@ mod tests {
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let prod = id_of(&files[0], "prod");
-    let helper = id_of(&files[0], "tests::helper");
-    let test_fn = find(&files[0], "tests::t");
+    let prod = id_of(&files[0], "prod")?;
+    let helper = id_of(&files[0], "tests::helper")?;
+    let test_fn = find(&files[0], "tests::t")?;
     let targets = adapter().test_targets(&ctx, test_fn);
     assert!(
         targets.contains(&helper),
@@ -475,17 +493,18 @@ mod tests {
         "the test fn calls helper, not prod directly"
     );
 
-    let module = find(&files[0], "tests");
+    let module = find(&files[0], "tests")?;
     let module_targets = adapter().test_targets(&ctx, module);
     assert!(
         module_targets.contains(&prod),
         "cfg(test) module should include helper's callees, got {module_targets:?}"
     );
     assert!(module_targets.contains(&helper));
+    Ok(())
 }
 
 #[test]
-fn inner_cfg_test_marks_the_module() {
+fn inner_cfg_test_marks_the_module() -> TestResult {
     let src = r#"
 fn prod() {}
 
@@ -505,31 +524,34 @@ mod tests {
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let module_targets = adapter().test_targets(&ctx, find(&files[0], "tests"));
-    assert!(module_targets.contains(&id_of(&files[0], "prod")));
-    assert!(module_targets.contains(&id_of(&files[0], "tests::helper")));
+    let module_targets = adapter().test_targets(&ctx, find(&files[0], "tests")?);
+    assert!(module_targets.contains(&id_of(&files[0], "prod")?));
+    assert!(module_targets.contains(&id_of(&files[0], "tests::helper")?));
+    Ok(())
 }
 
 #[test]
-fn cfg_not_test_is_not_a_test() {
+fn cfg_not_test_is_not_a_test() -> TestResult {
     let src = "fn other() {}\n#[cfg(not(test))]\nfn prod() { other(); }\n";
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let prod = find(&files[0], "prod");
+    let prod = find(&files[0], "prod")?;
     assert!(adapter().test_targets(&ctx, prod).is_empty());
+    Ok(())
 }
 
 #[test]
-fn path_test_attribute_counts() {
+fn path_test_attribute_counts() -> TestResult {
     let src = "fn target() {}\n#[tokio::test]\nfn t() { target(); }\n";
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let targets = adapter().test_targets(&ctx, find(&files[0], "t"));
-    assert!(targets.contains(&id_of(&files[0], "target")));
+    let targets = adapter().test_targets(&ctx, find(&files[0], "t")?);
+    assert!(targets.contains(&id_of(&files[0], "target")?));
+    Ok(())
 }
 
 #[test]
-fn macro_invocation_stays_lexical() {
+fn macro_invocation_stays_lexical() -> TestResult {
     let hidden = r#"
 macro_rules! call_hidden {
     () => { hidden() };
@@ -541,16 +563,17 @@ fn caller_with_ident() { call_hidden!(hidden); }
 "#;
     let files = vec![parse_one("src/lib.rs", hidden)];
     let ctx = context(&files);
-    let hidden_id = id_of(&files[0], "hidden");
+    let hidden_id = id_of(&files[0], "hidden")?;
     assert!(
-        !resolved(&ctx, find(&files[0], "caller")).contains(&hidden_id),
+        !resolved(&ctx, find(&files[0], "caller")?).contains(&hidden_id),
         "opaque invocation must not see names that exist only after expansion"
     );
-    assert!(resolved(&ctx, find(&files[0], "caller_with_ident")).contains(&hidden_id));
+    assert!(resolved(&ctx, find(&files[0], "caller_with_ident")?).contains(&hidden_id));
+    Ok(())
 }
 
 #[test]
-fn path_attribute_and_mod_rs_layout() {
+fn path_attribute_and_mod_rs_layout() -> TestResult {
     let files = vec![
         parse_one(
             "src/lib.rs",
@@ -561,14 +584,15 @@ fn path_attribute_and_mod_rs_layout() {
         parse_one("src/foo/bar.rs", "pub fn baz() {}\n"),
     ];
     let ctx = context(&files);
-    let caller = find(&files[0], "caller");
+    let caller = find(&files[0], "caller")?;
     let edges = resolved(&ctx, caller);
-    assert!(edges.contains(&id_of(&files[1], "bar")));
-    assert!(edges.contains(&id_of(&files[3], "baz")));
+    assert!(edges.contains(&id_of(&files[1], "bar")?));
+    assert!(edges.contains(&id_of(&files[3], "baz")?));
+    Ok(())
 }
 
 #[test]
-fn inherent_method_and_self_path() {
+fn inherent_method_and_self_path() -> TestResult {
     let src = r#"
 struct Point;
 impl Point {
@@ -578,13 +602,14 @@ impl Point {
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[0], "impl Point::other"));
-    assert!(edges.contains(&id_of(&files[0], "impl Point::origin")));
-    assert!(edges.contains(&id_of(&files[0], "Point")));
+    let edges = resolved(&ctx, find(&files[0], "impl Point::other")?);
+    assert!(edges.contains(&id_of(&files[0], "impl Point::origin")?));
+    assert!(edges.contains(&id_of(&files[0], "Point")?));
+    Ok(())
 }
 
 #[test]
-fn method_calls_over_approximate_without_types() {
+fn method_calls_over_approximate_without_types() -> TestResult {
     let src = r#"
 struct A;
 struct B;
@@ -594,7 +619,7 @@ fn paint(a: &A) { a.draw(); }
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[0], "paint"));
+    let edges = resolved(&ctx, find(&files[0], "paint")?);
     let draws: Vec<_> = files[0]
         .tree
         .iter()
@@ -606,27 +631,31 @@ fn paint(a: &A) { a.draw(); }
         .collect();
     assert_eq!(draws.len(), 2);
     for (_, node) in draws {
-        let id = files[0].ids[&site_of(&files[0].tree, ObjectId::of(node).unwrap())];
+        let id = files[0].ids[&site_of(
+            &files[0].tree,
+            ObjectId::of(node).expect("encode draw node"),
+        )];
         assert!(edges.contains(&id), "missing draw candidate {id}");
     }
+    Ok(())
 }
 
 #[test]
-fn external_paths_do_not_resolve_inside_the_crate() {
+fn external_paths_do_not_resolve_inside_the_crate() -> TestResult {
     let src = "fn f() { let _ = std::vec::Vec::<u8>::new(); }\n";
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let refs = adapter().references(&ctx, find(&files[0], "f"));
-    let std_ref = refs.iter().find(|r| r.name.as_str().contains("std::"));
-    assert!(
-        std_ref.is_some(),
-        "lexical path should be reported: {refs:?}"
-    );
-    assert!(std_ref.unwrap().resolved.is_none());
+    let refs = adapter().references(&ctx, find(&files[0], "f")?);
+    let std_ref = refs
+        .iter()
+        .find(|r| r.name.as_str().contains("std::"))
+        .ok_or_else(|| format!("lexical path should be reported: {refs:?}"))?;
+    assert!(std_ref.resolved.is_none());
+    Ok(())
 }
 
 #[test]
-fn glob_and_alias_imports() {
+fn glob_and_alias_imports() -> TestResult {
     let src = r#"
 mod foo {
     pub struct Bar;
@@ -638,9 +667,10 @@ fn f(x: Baz) { helper(); let _ = x; }
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[0], "f"));
-    assert!(edges.contains(&id_of(&files[0], "foo::Bar")));
-    assert!(edges.contains(&id_of(&files[0], "foo::helper")));
+    let edges = resolved(&ctx, find(&files[0], "f")?);
+    assert!(edges.contains(&id_of(&files[0], "foo::Bar")?));
+    assert!(edges.contains(&id_of(&files[0], "foo::helper")?));
+    Ok(())
 }
 
 #[test]
@@ -659,7 +689,7 @@ impl B { fn draw(&self) {} }
 }
 
 #[test]
-fn method_call_emits_one_edge_per_candidate() {
+fn method_call_emits_one_edge_per_candidate() -> TestResult {
     let src = r#"
 struct A;
 struct B;
@@ -669,7 +699,7 @@ fn paint(a: &A) { a.draw(); }
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let refs = adapter().references(&ctx, find(&files[0], "paint"));
+    let refs = adapter().references(&ctx, find(&files[0], "paint")?);
     let draws: Vec<_> = refs.iter().filter(|r| r.name.as_str() == ".draw").collect();
     assert_eq!(draws.len(), 2, "one NameRef per candidate: {refs:?}");
     assert!(draws.iter().all(|r| r.resolved.is_some()));
@@ -679,10 +709,11 @@ fn paint(a: &A) { a.draw(); }
             .iter()
             .all(|r| r.scope.as_ref().is_some_and(|s| s.as_str() == "crate"))
     );
+    Ok(())
 }
 
 #[test]
-fn cfg_any_and_all_include_test_not_does_not() {
+fn cfg_any_and_all_include_test_not_does_not() -> TestResult {
     let src = r#"
 fn target() {}
 #[cfg(any(unix, test))]
@@ -704,9 +735,9 @@ fn via_other_attr() { target(); }
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let target = id_of(&files[0], "target");
+    let target = id_of(&files[0], "target")?;
     for name in ["via_any", "via_all", "via_nested"] {
-        let got = adapter().test_targets(&ctx, find(&files[0], name));
+        let got = adapter().test_targets(&ctx, find(&files[0], name)?);
         assert!(
             got.contains(&target),
             "{name} should count as a test: {got:?}"
@@ -719,38 +750,41 @@ fn via_other_attr() { target(); }
         "via_feature",
         "via_other_attr",
     ] {
-        let got = adapter().test_targets(&ctx, find(&files[0], name));
+        let got = adapter().test_targets(&ctx, find(&files[0], name)?);
         assert!(got.is_empty(), "{name} is not a test: {got:?}");
     }
+    Ok(())
 }
 
 #[test]
-fn cfg_test_function_is_a_test_target() {
+fn cfg_test_function_is_a_test_target() -> TestResult {
     let src = "fn prod() {}\n#[cfg(test)]\nfn helper() { prod(); }\n";
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let got = adapter().test_targets(&ctx, find(&files[0], "helper"));
-    assert!(got.contains(&id_of(&files[0], "prod")), "{got:?}");
+    let got = adapter().test_targets(&ctx, find(&files[0], "helper")?);
+    assert!(got.contains(&id_of(&files[0], "prod")?), "{got:?}");
+    Ok(())
 }
 
 #[test]
-fn single_file_uses_the_crate_path() {
+fn single_file_uses_the_crate_path() -> TestResult {
     let files = vec![parse_one(
         "src/not_a_root.rs",
         "fn helper() {}\nfn caller() { helper(); }\n",
     )];
     let ctx = context(&files);
-    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let refs = adapter().references(&ctx, find(&files[0], "caller")?);
     let helper = refs
         .iter()
         .find(|r| r.name.as_str() == "helper")
         .expect("helper");
     assert_eq!(helper.scope.as_ref().map(|s| s.as_str()), Some("crate"));
-    assert_eq!(helper.resolved, Some(id_of(&files[0], "helper")));
+    assert_eq!(helper.resolved, Some(id_of(&files[0], "helper")?));
+    Ok(())
 }
 
 #[test]
-fn several_crate_roots_are_disambiguated_by_repo_path() {
+fn several_crate_roots_are_disambiguated_by_repo_path() -> TestResult {
     let files = vec![
         parse_one(
             "src/lib.rs",
@@ -769,21 +803,21 @@ fn several_crate_roots_are_disambiguated_by_repo_path() {
     let mut files = files;
     reassign_ids(&mut files);
     let ctx = context(&files);
-    let lib_helper = id_of(&files[0], "helper");
-    let bin_helper = id_of(&files[1], "helper");
-    let build_helper = id_of(&files[2], "helper");
-    let test_helper = id_of(&files[3], "helper");
+    let lib_helper = id_of(&files[0], "helper")?;
+    let bin_helper = id_of(&files[1], "helper")?;
+    let build_helper = id_of(&files[2], "helper")?;
+    let test_helper = id_of(&files[3], "helper")?;
 
-    let scope_of = |file: &Owned| {
-        adapter()
-            .references(&ctx, find(file, "caller"))
+    let scope_of = |file: &Owned| -> TestResult<_> {
+        Ok(adapter()
+            .references(&ctx, find(file, "caller")?)
             .into_iter()
             .find(|r| r.name.as_str() == "helper")
-            .and_then(|r| r.scope)
+            .and_then(|r| r.scope))
     };
-    let lib_scope = scope_of(&files[0]).expect("lib scope");
-    let bin_scope = scope_of(&files[1]).expect("bin scope");
-    let test_scope = scope_of(&files[3]).expect("integration scope");
+    let lib_scope = scope_of(&files[0])?.expect("lib scope");
+    let bin_scope = scope_of(&files[1])?.expect("bin scope");
+    let test_scope = scope_of(&files[3])?.expect("integration scope");
     assert_ne!(lib_scope, bin_scope);
     assert_ne!(lib_scope, test_scope);
     assert_ne!(lib_scope.as_str(), "crate");
@@ -798,7 +832,7 @@ fn several_crate_roots_are_disambiguated_by_repo_path() {
     assert_eq!(resolve_in(&test_scope, "helper"), Some(test_helper));
     assert_eq!(
         resolve_in(&lib_scope, "crate::only_lib"),
-        Some(id_of(&files[0], "only_lib"))
+        Some(id_of(&files[0], "only_lib")?)
     );
     assert_eq!(resolve_in(&bin_scope, "crate::only_lib"), None);
     assert_eq!(resolve_in(&lib_scope, "only_bin"), None);
@@ -811,47 +845,49 @@ fn several_crate_roots_are_disambiguated_by_repo_path() {
     bare.name = "only_lib".into();
     assert_eq!(
         adapter().resolve(&ctx, &bare),
-        Some(id_of(&files[0], "only_lib"))
+        Some(id_of(&files[0], "only_lib")?)
     );
     bare.name = "only_bin".into();
     assert_eq!(
         adapter().resolve(&ctx, &bare),
-        Some(id_of(&files[1], "only_bin"))
+        Some(id_of(&files[1], "only_bin")?)
     );
 
-    let lib_edges = resolved(&ctx, find(&files[0], "caller"));
+    let lib_edges = resolved(&ctx, find(&files[0], "caller")?);
     assert!(lib_edges.contains(&lib_helper));
     assert!(!lib_edges.contains(&bin_helper));
     assert!(!lib_edges.contains(&build_helper));
     assert!(!lib_edges.contains(&test_helper));
+    Ok(())
 }
 
 #[test]
-fn qualified_name_stays_file_local() {
+fn qualified_name_stays_file_local() -> TestResult {
     let files = vec![
         parse_one("src/lib.rs", "mod foo;\n"),
         parse_one("src/foo.rs", "pub fn helper() {}\n"),
     ];
-    let helper = find(&files[1], "helper");
+    let helper = find(&files[1], "helper")?;
     assert_eq!(helper.name.as_ref().map(|n| n.as_str()), Some("helper"));
     let ctx = context(&files);
     let mut path = NameRef::new("crate::foo::helper");
     path.scope = Some("crate".into());
     assert_eq!(
         adapter().resolve(&ctx, &path),
-        Some(id_of(&files[1], "helper"))
+        Some(id_of(&files[1], "helper")?)
     );
+    Ok(())
 }
 
 #[test]
-fn resolve_prefers_a_set_id_else_the_unique_final() {
+fn resolve_prefers_a_set_id_else_the_unique_final() -> TestResult {
     let files = vec![parse_one(
         "src/lib.rs",
         "mod foo { pub fn helper() {} }\nfn caller() { foo::helper(); }\n",
     )];
     let ctx = context(&files);
-    let helper = id_of(&files[0], "foo::helper");
-    let module = id_of(&files[0], "foo");
+    let helper = id_of(&files[0], "foo::helper")?;
+    let module = id_of(&files[0], "foo")?;
     let mut path = NameRef::new("foo::helper");
     path.scope = Some("crate".into());
     assert_eq!(adapter().resolve(&ctx, &path), Some(helper));
@@ -865,16 +901,17 @@ fn resolve_prefers_a_set_id_else_the_unique_final() {
     path.resolved = Some(NodeId::nil());
     assert_eq!(adapter().resolve(&ctx, &path), None);
 
-    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let refs = adapter().references(&ctx, find(&files[0], "caller")?);
     let finals: Vec<_> = refs
         .iter()
         .filter(|r| r.name.as_str() == "foo::helper" && r.resolved == Some(helper))
         .collect();
     assert_eq!(finals.len(), 1, "{refs:?}");
+    Ok(())
 }
 
 #[test]
-fn duplicate_imports_stay_ambiguous() {
+fn duplicate_imports_stay_ambiguous() -> TestResult {
     let src = r#"
 mod a { pub fn f() {} }
 mod b { pub fn f() {} }
@@ -884,29 +921,30 @@ fn caller() { f(); }
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let refs = adapter().references(&ctx, find(&files[0], "caller"));
+    let refs = adapter().references(&ctx, find(&files[0], "caller")?);
     let ids: BTreeSet<_> = refs
         .iter()
         .filter(|r| r.name.as_str() == "f")
         .filter_map(|r| r.resolved)
         .collect();
     // `use a::f` stores the same file-local name as `mod a`'s function.
-    assert!(ids.contains(&id_of_kind(&files[0], "a::f", Some("function_item"))));
-    assert!(ids.contains(&id_of_kind(&files[0], "b::f", Some("function_item"))));
+    assert!(ids.contains(&id_of_kind(&files[0], "a::f", Some("function_item"))?));
+    assert!(ids.contains(&id_of_kind(&files[0], "b::f", Some("function_item"))?));
     let mut name = NameRef::new("f");
     name.scope = Some("crate".into());
     assert!(adapter().resolve(&ctx, &name).is_none());
+    Ok(())
 }
 
 #[test]
-fn nil_definition_ids_are_skipped() {
+fn nil_definition_ids_are_skipped() -> TestResult {
     let mut file = parse_one("src/lib.rs", "fn helper() {}\nfn caller() { helper(); }\n");
-    let helper = find(&file, "helper");
+    let helper = find(&file, "helper")?;
     let oid = ObjectId::of(helper).expect("object id");
     let site = site_of(&file.tree, oid);
     file.ids.insert(site, NodeId::nil());
     let ctx = context(std::slice::from_ref(&file));
-    let refs = adapter().references(&ctx, find(&file, "caller"));
+    let refs = adapter().references(&ctx, find(&file, "caller")?);
     let mention = refs
         .iter()
         .find(|r| r.name.as_str() == "helper")
@@ -915,10 +953,11 @@ fn nil_definition_ids_are_skipped() {
     let mut path = NameRef::new("helper");
     path.scope = Some("crate".into());
     assert_eq!(adapter().resolve(&ctx, &path), None);
+    Ok(())
 }
 
 #[test]
-fn macro_token_tree_paths_are_lexical() {
+fn macro_token_tree_paths_are_lexical() -> TestResult {
     let src = r#"
 fn helper() {}
 mod foo { pub fn bar() {} }
@@ -926,35 +965,38 @@ fn caller() { mac!(helper); mac!(foo::bar); }
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[0], "caller"));
-    assert!(edges.contains(&id_of(&files[0], "helper")));
-    assert!(edges.contains(&id_of(&files[0], "foo::bar")));
+    let edges = resolved(&ctx, find(&files[0], "caller")?);
+    assert!(edges.contains(&id_of(&files[0], "helper")?));
+    assert!(edges.contains(&id_of(&files[0], "foo::bar")?));
+    Ok(())
 }
 
 #[test]
-fn enum_variant_paths_resolve() {
+fn enum_variant_paths_resolve() -> TestResult {
     let src =
         "enum Kind { A, B { n: i32 } }\nfn f() { let _ = Kind::A; let _ = Kind::B { n: 1 }; }\n";
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[0], "f"));
-    assert!(edges.contains(&id_of(&files[0], "Kind::A")), "{edges:?}");
-    assert!(edges.contains(&id_of(&files[0], "Kind::B")), "{edges:?}");
+    let edges = resolved(&ctx, find(&files[0], "f")?);
+    assert!(edges.contains(&id_of(&files[0], "Kind::A")?), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[0], "Kind::B")?), "{edges:?}");
+    Ok(())
 }
 
 #[test]
-fn super_from_a_child_file() {
+fn super_from_a_child_file() -> TestResult {
     let files = vec![
         parse_one("src/lib.rs", "mod foo;\nfn prod() {}\n"),
         parse_one("src/foo.rs", "pub fn child() { super::prod(); }\n"),
     ];
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[1], "child"));
-    assert!(edges.contains(&id_of(&files[0], "prod")), "{edges:?}");
+    let edges = resolved(&ctx, find(&files[1], "child")?);
+    assert!(edges.contains(&id_of(&files[0], "prod")?), "{edges:?}");
+    Ok(())
 }
 
 #[test]
-fn pub_use_reexport_resolves() {
+fn pub_use_reexport_resolves() -> TestResult {
     let src = r#"
 mod foo { pub fn helper() {} }
 mod bar { pub use super::foo::helper; }
@@ -962,15 +1004,16 @@ fn caller() { bar::helper(); }
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[0], "caller"));
+    let edges = resolved(&ctx, find(&files[0], "caller")?);
     assert!(
-        edges.contains(&id_of(&files[0], "foo::helper")),
+        edges.contains(&id_of(&files[0], "foo::helper")?),
         "{edges:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn self_inside_a_trait_names_that_trait() {
+fn self_inside_a_trait_names_that_trait() -> TestResult {
     let src = r#"
 trait Trait {
     fn method(&self);
@@ -986,27 +1029,28 @@ impl Trait for S {
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let method = id_of(&files[0], "Trait::method");
-    let item = id_of(&files[0], "Trait::Item");
-    let caller_edges = resolved(&ctx, find(&files[0], "Trait::caller"));
+    let method = id_of(&files[0], "Trait::method")?;
+    let item = id_of(&files[0], "Trait::Item")?;
+    let caller_edges = resolved(&ctx, find(&files[0], "Trait::caller")?);
     assert!(
         caller_edges.contains(&method),
         "Self::method in the trait: {caller_edges:?}"
     );
-    let other_edges = resolved(&ctx, find(&files[0], "Trait::Other"));
+    let other_edges = resolved(&ctx, find(&files[0], "Trait::Other")?);
     assert!(
         other_edges.contains(&item),
         "Self::Item in the trait: {other_edges:?}"
     );
-    let trait_edges = resolved(&ctx, find(&files[0], "Trait"));
+    let trait_edges = resolved(&ctx, find(&files[0], "Trait")?);
     assert!(
         trait_edges.contains(&method),
         "walking the trait should see Self::method: {trait_edges:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn trait_test_sees_self_paths() {
+fn trait_test_sees_self_paths() -> TestResult {
     let src = r#"
 trait Trait {
     fn method(&self) {}
@@ -1016,15 +1060,16 @@ trait Trait {
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let method = id_of(&files[0], "Trait::method");
-    let on_fn = adapter().test_targets(&ctx, find(&files[0], "Trait::t"));
+    let method = id_of(&files[0], "Trait::method")?;
+    let on_fn = adapter().test_targets(&ctx, find(&files[0], "Trait::t")?);
     assert!(on_fn.contains(&method), "{on_fn:?}");
-    let on_trait = adapter().test_targets(&ctx, find(&files[0], "Trait"));
+    let on_trait = adapter().test_targets(&ctx, find(&files[0], "Trait")?);
     assert!(on_trait.contains(&method), "{on_trait:?}");
+    Ok(())
 }
 
 #[test]
-fn impl_header_bounds_are_references() {
+fn impl_header_bounds_are_references() -> TestResult {
     let src = r#"
 trait Bound {}
 trait Other {}
@@ -1038,14 +1083,15 @@ where
 "#;
     let files = vec![parse_one("src/lib.rs", src)];
     let ctx = context(&files);
-    let impl_node = find(&files[0], "impl Point<T>");
+    let impl_node = find(&files[0], "impl Point<T>")?;
     let edges = resolved(&ctx, impl_node);
-    assert!(edges.contains(&id_of(&files[0], "Bound")), "{edges:?}");
-    assert!(edges.contains(&id_of(&files[0], "Other")), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[0], "Bound")?), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[0], "Other")?), "{edges:?}");
+    Ok(())
 }
 
 #[test]
-fn path_attribute_accepts_raw_and_byte_strings() {
+fn path_attribute_accepts_raw_and_byte_strings() -> TestResult {
     let files = vec![
         parse_one(
             "src/lib.rs",
@@ -1058,10 +1104,11 @@ fn path_attribute_accepts_raw_and_byte_strings() {
     let mut files = files;
     reassign_ids(&mut files);
     let ctx = context(&files);
-    let edges = resolved(&ctx, find(&files[0], "caller"));
-    assert!(edges.contains(&id_of(&files[1], "raw_f")), "{edges:?}");
-    assert!(edges.contains(&id_of(&files[2], "hash_f")), "{edges:?}");
-    assert!(edges.contains(&id_of(&files[3], "byte_f")), "{edges:?}");
+    let edges = resolved(&ctx, find(&files[0], "caller")?);
+    assert!(edges.contains(&id_of(&files[1], "raw_f")?), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[2], "hash_f")?), "{edges:?}");
+    assert!(edges.contains(&id_of(&files[3], "byte_f")?), "{edges:?}");
+    Ok(())
 }
 
 fn ctx_with<'a>(
@@ -1083,18 +1130,18 @@ fn ctx_with<'a>(
     adapter().resolve_context_with(&views, &parsed)
 }
 
-fn node_named<'a>(file: &'a Owned, kind: &str, name: &str) -> &'a Node {
+fn node_named<'a>(file: &'a Owned, kind: &str, name: &str) -> TestResult<&'a Node> {
     file.tree
         .iter()
         .map(|(_, node)| node)
         .find(|node| {
             node.kind.as_str() == kind && node.name.as_ref().is_some_and(|q| q.as_str() == name)
         })
-        .unwrap_or_else(|| panic!("no {kind} named {name}"))
+        .ok_or_else(|| format!("no {kind} named {name}").into())
 }
 
 #[test]
-fn outer_attributes_belong_to_the_definition_and_stay_lossless() {
+fn outer_attributes_belong_to_the_definition_and_stay_lossless() -> TestResult {
     let src = r#"
 /// docs
 #[foo::bar]
@@ -1131,7 +1178,7 @@ fn after_let() {}
     let files = [parse_one("src/lib.rs", src)];
     let ctx = context(&files);
 
-    let qux = find(&files[0], "qux");
+    let qux = find(&files[0], "qux")?;
     let qux_raw = String::from_utf8_lossy(qux.raw.as_slice());
     assert!(qux_raw.contains("foo::bar"), "{qux_raw}");
     assert!(qux_raw.contains("/// docs"), "{qux_raw}");
@@ -1145,7 +1192,7 @@ fn after_let() {}
         "{refs:?}"
     );
 
-    let ext = node_named(&files[0], "foreign_mod_item", "extern \"C\"");
+    let ext = node_named(&files[0], "foreign_mod_item", "extern \"C\"")?;
     let ext_raw = String::from_utf8_lossy(ext.raw.as_slice());
     assert!(ext_raw.contains("link_name::c"), "{ext_raw}");
     let refs = adapter().references(&ctx, ext);
@@ -1154,37 +1201,38 @@ fn after_let() {}
         "{refs:?}"
     );
 
-    let variant = find(&files[0], "E::A");
+    let variant = find(&files[0], "E::A")?;
     let refs = adapter().references(&ctx, variant);
     assert!(
         refs.iter().any(|r| r.name.as_str() == "serde::rename"),
         "{refs:?}"
     );
 
-    let method = find(&files[0], "impl S::method");
+    let method = find(&files[0], "impl S::method")?;
     let refs = adapter().references(&ctx, method);
     assert!(
         refs.iter().any(|r| r.name.as_str() == "method::attr"),
         "{refs:?}"
     );
 
-    let tuple = find(&files[0], "Tuple");
+    let tuple = find(&files[0], "Tuple")?;
     let refs = adapter().references(&ctx, tuple);
     assert!(
         refs.iter().any(|r| r.name.as_str() == "tuple::attr"),
         "{refs:?}"
     );
 
-    let after = find(&files[0], "after_let");
+    let after = find(&files[0], "after_let")?;
     let after_raw = String::from_utf8_lossy(after.raw.as_slice());
     assert!(
         !after_raw.contains("foo::bar"),
         "attribute on the let must not move onto the next function: {after_raw}"
     );
+    Ok(())
 }
 
 #[test]
-fn custom_lib_path_resolves_a_workspace_dependency() {
+fn custom_lib_path_resolves_a_workspace_dependency() -> TestResult {
     let lib = parse_one("crates/crates-io/lib.rs", "pub fn registry_index() {}\n");
     let caller = parse_one(
         "src/lib.rs",
@@ -1192,8 +1240,9 @@ fn custom_lib_path_resolves_a_workspace_dependency() {
     );
     let mut files = [lib, caller];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
-    let member = RepoPath::from_str("crates/crates-io/Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
+    let member = RepoPath::from_str("crates/crates-io/Cargo.toml")
+        .expect("parse repo path crates/crates-io/Cargo.toml");
     let root_src = br#"
 [package]
 name = "cargo"
@@ -1217,8 +1266,8 @@ path = "lib.rs"
             (&member, member_src.as_slice()),
         ],
     );
-    let target = id_of(&files[0], "registry_index");
-    let refs = adapter().references(&ctx, find(&files[1], "caller"));
+    let target = id_of(&files[0], "registry_index")?;
+    let refs = adapter().references(&ctx, find(&files[1], "caller")?);
     assert!(
         refs.iter()
             .any(|r| r.name.as_str() == "crates_io::registry_index" && r.resolved == Some(target)),
@@ -1229,10 +1278,11 @@ path = "lib.rs"
             .any(|r| r.name.as_str() == "registry_index" && r.resolved == Some(target)),
         "{refs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn table_form_workspace_dep_resolves_from_a_nested_module() {
+fn table_form_workspace_dep_resolves_from_a_nested_module() -> TestResult {
     let lib = parse_one("crates/support/src/lib.rs", "pub fn project_layout() {}\n");
     let main = parse_one("tests/testsuite/main.rs", "mod inner;\n");
     let inner = parse_one(
@@ -1241,7 +1291,7 @@ fn table_form_workspace_dep_resolves_from_a_nested_module() {
     );
     let mut files = [lib, main, inner];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = br#"
 [package]
 name = "app"
@@ -1252,8 +1302,8 @@ path = "crates/support"
 workspace = true
 "#;
     let ctx = ctx_with(&files, &[(&root, manifest.as_slice())]);
-    let target = id_of(&files[0], "project_layout");
-    let refs = adapter().references(&ctx, find(&files[2], "caller"));
+    let target = id_of(&files[0], "project_layout")?;
+    let refs = adapter().references(&ctx, find(&files[2], "caller")?);
     assert!(
         refs.iter()
             .any(|r| r.name.as_str() == "support::project_layout" && r.resolved == Some(target)),
@@ -1264,10 +1314,11 @@ workspace = true
             .any(|r| r.name.as_str() == "project_layout" && r.resolved == Some(target)),
         "{refs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn registry_and_git_deps_stay_unresolved_when_source_is_present() {
+fn registry_and_git_deps_stay_unresolved_when_source_is_present() -> TestResult {
     let serde = parse_one("crates/serde/src/lib.rs", "pub fn json() {}\n");
     let gix = parse_one("vendor/gix/src/lib.rs", "pub fn discover() {}\n");
     let caller = parse_one(
@@ -1276,7 +1327,7 @@ fn registry_and_git_deps_stay_unresolved_when_source_is_present() {
     );
     let mut files = [serde, gix, caller];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = br#"
 [package]
 name = "app"
@@ -1289,25 +1340,26 @@ serde.workspace = true
 gix = { git = "https://example.com/gix.git" }
 "#;
     let ctx = ctx_with(&files, &[(&root, manifest.as_slice())]);
-    let refs = adapter().references(&ctx, find(&files[2], "caller"));
+    let refs = adapter().references(&ctx, find(&files[2], "caller")?);
     assert!(
         refs.iter()
             .filter(|r| r.name.as_str() == "serde::json" || r.name.as_str() == "gix::discover")
             .all(|r| r.resolved.is_none()),
         "{refs:?}"
     );
-    let serde_id = id_of(&files[0], "json");
-    let gix_id = id_of(&files[1], "discover");
+    let serde_id = id_of(&files[0], "json")?;
+    let gix_id = id_of(&files[1], "discover")?;
     assert!(
         refs.iter()
             .filter(|r| r.name.as_str() == "json" || r.name.as_str() == "discover")
             .all(|r| r.resolved != Some(serde_id) && r.resolved != Some(gix_id)),
         "{refs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn bare_call_includes_same_crate_and_linked_functions_only() {
+fn bare_call_includes_same_crate_and_linked_functions_only() -> TestResult {
     let linked = parse_one("crates/support/src/lib.rs", "pub fn project_layout() {}\n");
     let unlinked = parse_one("crates/other/src/lib.rs", "pub fn project_layout() {}\n");
     let caller = parse_one(
@@ -1316,7 +1368,7 @@ fn bare_call_includes_same_crate_and_linked_functions_only() {
     );
     let mut files = [linked, unlinked, caller];
     reassign_ids(&mut files);
-    let root = RepoPath::from_str("Cargo.toml").unwrap();
+    let root = RepoPath::from_str("Cargo.toml").expect("parse repo path Cargo.toml");
     let manifest = br#"
 [package]
 name = "app"
@@ -1324,21 +1376,25 @@ name = "app"
 support = { path = "crates/support" }
 "#;
     let ctx = ctx_with(&files, &[(&root, manifest.as_slice())]);
-    let refs = adapter().references(&ctx, find(&files[2], "caller"));
+    let refs = adapter().references(&ctx, find(&files[2], "caller")?);
     let hit: BTreeSet<NodeId> = refs
         .iter()
         .filter(|r| r.name.as_str() == "project_layout")
         .filter_map(|r| r.resolved)
         .collect();
-    assert!(hit.contains(&id_of(&files[0], "project_layout")), "{hit:?}");
     assert!(
-        hit.contains(&id_of(&files[2], "inner::project_layout")),
+        hit.contains(&id_of(&files[0], "project_layout")?),
         "{hit:?}"
     );
     assert!(
-        !hit.contains(&id_of(&files[1], "project_layout")),
+        hit.contains(&id_of(&files[2], "inner::project_layout")?),
         "{hit:?}"
     );
+    assert!(
+        !hit.contains(&id_of(&files[1], "project_layout")?),
+        "{hit:?}"
+    );
+    Ok(())
 }
 
 /// Definition sites of `kind` whose text contains every needle, in file
@@ -1354,7 +1410,10 @@ fn defs_with(
             let Some(oid) = hord_lang::oid_at(&file.tree, site) else {
                 continue;
             };
-            let node = file.tree.get(oid).unwrap();
+            let node = file
+                .tree
+                .get(oid)
+                .expect("oid_at returns an id the tree holds");
             let raw = String::from_utf8_lossy(node.raw.as_slice()).into_owned();
             if node.kind.as_str() == kind && needles.iter().all(|n| raw.contains(n)) {
                 out.push((f, site.clone(), *id, oid));
@@ -1371,7 +1430,10 @@ fn anchored_targets(files: &[Owned]) -> [BTreeSet<NodeId>; 2] {
     let helpers = defs_with(files, "function_item", &["fn helper"]);
     assert_eq!(helpers.len(), 2);
     let resolve = |(file, _, id, oid): &(usize, Vec<u32>, NodeId, ObjectId)| {
-        let node = files[*file].tree.get(*oid).unwrap();
+        let node = files[*file]
+            .tree
+            .get(*oid)
+            .expect("defs_with returns ids the tree holds");
         adapter()
             .references_at(&ctx, &hord_lang::Anchor::Definition(*id), node)
             .iter()
@@ -1446,7 +1508,10 @@ fn identical_helpers_in_two_files_resolve_types_in_their_own_module() {
     // a superset that includes each copy's own target.
     let ctx = context(&files);
     let helper = defs_with(&files, "function_item", &["fn helper"])[1].clone();
-    let node = files[helper.0].tree.get(helper.3).unwrap();
+    let node = files[helper.0]
+        .tree
+        .get(helper.3)
+        .expect("defs_with returns ids the tree holds");
     let union: BTreeSet<NodeId> = adapter()
         .references(&ctx, node)
         .iter()

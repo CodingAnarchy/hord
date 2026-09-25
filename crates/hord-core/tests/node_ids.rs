@@ -7,10 +7,10 @@ fn nid(n: u128) -> NodeId {
 }
 
 #[test]
-fn op_node_ids_cover_every_node_id_field() {
+fn op_node_ids_cover_every_node_id_field() -> Result<(), Box<dyn std::error::Error>> {
     let oid = ObjectId::from_bytes([1; 32]);
     let name = |s: &str| QualifiedName::from(s.to_owned());
-    let path: RepoPath = "src/lib.rs".parse().unwrap();
+    let path: RepoPath = "src/lib.rs".parse()?;
     let cases = [
         (
             Op::Insert {
@@ -65,6 +65,7 @@ fn op_node_ids_cover_every_node_id_field() {
     for (op, ids) in cases {
         assert_eq!(op.node_ids().collect::<Vec<_>>(), ids, "{op:?}");
     }
+    Ok(())
 }
 
 #[test]

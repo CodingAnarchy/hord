@@ -1,54 +1,54 @@
-//! `hord blame <name|path:line>`
+//! `hord blame <name|path:line|NodeId>`
 //!
-//! Resolution and history come from [`hord_txn::Query`], which reads NodeIds
-//! from the snapshots' identity (ADR 0017), so changes landed with `hord
-//! land --local` resolve. A NodeId argument does not scan anything;
-//! `path:line` reads one file at `head`. Evidence is the change's object ids
-//! only.
+//! A NodeId or a qualified name (resolved at head) goes through the
+//! session's backend (`resolve_name`, `node_history`). `path:line` parses
+//! one file at head, which needs the store: it runs in this process (a
+//! running daemon is asked to stop first), and not against a remote.
+//! Evidence is the change's object ids only.
 
-use anyhow::{Context, Result};
-use hord_core::ChangeRecord;
-use serde::Serialize;
+use anyhow::{Result, bail};
+use hord_api::proto;
 
 use crate::output;
-use crate::resolve;
+use crate::resolve::{self, BlameTarget};
+use crate::session::{Session, Target};
 use crate::txn::{self, block_on};
 
-#[derive(Debug, Serialize)]
-struct BlameResult {
-    node: String,
-    history: Vec<BlameEntry>,
-}
-
-#[derive(Debug, Serialize)]
-struct BlameEntry {
-    change: String,
-    intent: String,
-    actor: String,
-    evidence: Vec<String>,
-}
-
-pub fn run(json: bool, target: String) -> Result<()> {
-    let repo = txn::open()?;
-    let query = repo.query();
-    let node = resolve::resolve_blame_target(&query, &target)?;
-    let history = block_on(query.node_history(node))?;
-    let mut entries = Vec::with_capacity(history.len());
-    for id in history {
-        let change: ChangeRecord =
-            block_on(repo.change(id)).with_context(|| format!("change {id} in node history"))?;
-        entries.push(BlameEntry {
-            change: id.to_hex(),
-            intent: change.intent.summary,
-            actor: resolve::actor_id(&change.provenance.actor).to_owned(),
-            evidence: change
-                .evidence
-                .iter()
-                .map(hord_core::ObjectId::to_hex)
-                .collect(),
+pub fn run(json: bool, target: &Target, spec: String) -> Result<()> {
+    let parsed = resolve::parse_blame_target(&spec)?;
+    let session = match parsed {
+        BlameTarget::Line { .. } => {
+            if target.remote.is_some() {
+                bail!("blame by path:line needs the local store; not supported against a remote");
+            }
+            Session::direct(&crate::repo::discover_root()?)?
+        }
+        _ => Session::open(target)?,
+    };
+    let backend = session.backend();
+    let node = match parsed {
+        BlameTarget::Node(id) => id,
+        BlameTarget::Name(name) => txn::backend_resolve_node(backend.as_ref(), &name)?,
+        BlameTarget::Line { path, line } => match &session {
+            Session::Direct { repo } => block_on(repo.query().resolve_line(path, line))?,
+            _ => unreachable!("path:line opens the store"),
+        },
+    };
+    let history = block_on(backend.node_history(proto::NodeHistoryRequest {
+        node: node.to_string(),
+    }))?;
+    let mut entries = Vec::with_capacity(history.changes.len());
+    for summary in &history.changes {
+        let id = hord_api::wire::object_id("change", &summary.change)?;
+        let record = txn::backend_change(backend.as_ref(), id)?;
+        entries.push(proto::BlameEntry {
+            change: summary.change.clone(),
+            intent: record.intent.summary,
+            actor: record.provenance.actor.id().to_owned(),
+            evidence: record.evidence.iter().map(|e| e.to_hex()).collect(),
         });
     }
-    let result = BlameResult {
+    let result = proto::BlameResult {
         node: node.to_string(),
         history: entries,
     };

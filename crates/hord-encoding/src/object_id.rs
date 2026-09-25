@@ -208,10 +208,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hex_round_trip() {
+    fn hex_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let id = ObjectId::from_canonical(&[0x00]);
-        let parsed: ObjectId = id.to_hex().parse().unwrap();
+        let parsed: ObjectId = id.to_hex().parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 
     #[test]
@@ -220,12 +221,13 @@ mod tests {
     }
 
     #[test]
-    fn serializes_as_32_byte_cbor_string() {
+    fn serializes_as_32_byte_cbor_string() -> Result<(), Box<dyn std::error::Error>> {
         let id = ObjectId::from_canonical(&[0x00]);
-        let bytes = crate::encode(&id).unwrap();
+        let bytes = crate::encode(&id)?;
         assert_eq!(bytes[0], 0x58, "major type 2, one-byte length");
         assert_eq!(bytes[1], ObjectId::LEN as u8);
         assert_eq!(&bytes[2..], id.as_bytes().as_slice());
-        assert_eq!(crate::decode::<ObjectId>(&bytes).unwrap(), id);
+        assert_eq!(crate::decode::<ObjectId>(&bytes)?, id);
+        Ok(())
     }
 }

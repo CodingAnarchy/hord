@@ -131,6 +131,15 @@ pub enum Error {
     /// A blocking task panicked or was cancelled.
     #[error("background task failed: {0}")]
     Task(String),
+    /// The event log (`.hord/events.redb`, spec §10.5.3) failed.
+    #[error("event log: {0}")]
+    EventLog(String),
+    /// Head's `.hord-policy.toml` does not parse (ADR 0026).
+    #[error("policy: {0}")]
+    Policy(String),
+    /// Verification could not run.
+    #[error("verification: {0}")]
+    Verify(String),
 }
 
 fn list(nodes: &[NodeId]) -> String {

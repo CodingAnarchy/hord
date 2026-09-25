@@ -9,7 +9,7 @@ use std::str::FromStr;
 use hord_core::{
     Bytes, IdentityDelta, LangId, NodeId, NodeKind, NodePath, ObjectId, Op, QualifiedName, RepoPath,
 };
-use hord_identity::{Declaration, Error, SnapshotFile, assign, carry, identity_map};
+use hord_identity::{Declaration, Error, SnapshotFile, assign, carry, identity_map, is_fresh};
 use hord_lang::{
     AttachedToken, IdentifiedTree, LangAdapter, NodeTree, ParseError, Site, Tier, default_identify,
 };
@@ -58,7 +58,7 @@ fn leaf(tree: &mut NodeTree, kind: &str, text: &str, name: Option<&str>) -> Obje
         trailing: Bytes::default(),
     };
     tree.intern_token(lang(), &token, name.map(QualifiedName::new))
-        .unwrap()
+        .expect("intern test token")
 }
 
 fn branch(
@@ -73,7 +73,7 @@ fn branch(
         children,
         name.map(QualifiedName::new),
     )
-    .unwrap()
+    .expect("intern test branch")
 }
 
 fn kind_of(kind: &str) -> NodeKind {
@@ -82,7 +82,7 @@ fn kind_of(kind: &str) -> NodeKind {
 
 fn finish(tree: &mut NodeTree, children: Vec<ObjectId>) {
     let root = branch(tree, "file", children, None);
-    tree.set_root(root).unwrap();
+    tree.set_root(root).expect("set test tree root");
 }
 
 fn identified(tree: NodeTree, ids: &[(ObjectId, u128)]) -> IdentifiedTree {
@@ -103,7 +103,7 @@ fn site(tree: &NodeTree, oid: ObjectId) -> Site {
             return false;
         };
         for (i, child) in node.children.iter().enumerate() {
-            path.push(u32::try_from(i).unwrap());
+            path.push(u32::try_from(i).expect("test trees have fewer than 2^32 children"));
             if walk(tree, *child, want, path) {
                 return true;
             }
@@ -120,7 +120,7 @@ fn site(tree: &NodeTree, oid: ObjectId) -> Site {
 }
 
 fn path() -> RepoPath {
-    RepoPath::from_str("src/lib.t").unwrap()
+    RepoPath::from_str("src/lib.t").expect("parse path src/lib.t")
 }
 
 fn fn_file(body: &str, name: &str) -> (NodeTree, ObjectId) {
@@ -136,7 +136,7 @@ fn exact_carry_keeps_id() {
     let (tree, foo) = fn_file("foo_body", "foo");
     let base = identified(tree.clone(), &[(foo, 1)]);
 
-    let carried = carry(&adapter, &path(), None, &base, &tree, &[]).unwrap();
+    let carried = carry(&adapter, &path(), None, &base, &tree, &[]).expect("carry identities");
     let direct = default_identify(&adapter, &base, &tree);
     assert_eq!(carried, direct);
     assert_eq!(carried.nodes.get(&site(&tree, foo)).copied(), Some(nid(1)));
@@ -151,7 +151,7 @@ fn named_carry_keeps_id_when_body_changes() {
     let base = identified(base_tree, &[(foo_old, 1)]);
     let (result, foo_new) = fn_file("new_body", "foo");
 
-    let carried = carry(&adapter, &path(), None, &base, &result, &[]).unwrap();
+    let carried = carry(&adapter, &path(), None, &base, &result, &[]).expect("carry identities");
     let direct = default_identify(&adapter, &base, &result);
     assert_eq!(carried, direct);
     assert_ne!(foo_old, foo_new);
@@ -171,7 +171,7 @@ fn moved_carry_keeps_id_and_emits_move() {
     let (result, foo_r, mod_a_r, mod_b_r) = moved_result();
     assert_eq!(foo, foo_r);
 
-    let carried = carry(&adapter, &path(), None, &base, &result, &[]).unwrap();
+    let carried = carry(&adapter, &path(), None, &base, &result, &[]).expect("carry identities");
     let direct = default_identify(&adapter, &base, &result);
     assert_eq!(carried, direct);
     assert_eq!(
@@ -204,7 +204,7 @@ fn moved_carry_keeps_id_and_emits_move() {
         }],
         carried.deltas,
     )
-    .unwrap();
+    .expect("build identity map");
     assert!(view.deltas.is_empty());
     assert_eq!(
         view.nodes.get(&nid(2)),
@@ -236,8 +236,12 @@ fn derived_from_overrides_birth() {
     let base = identified(base_tree, &[(old, 1)]);
     let (result, new) = fn_file("new_body", "new");
 
-    let without = carry(&adapter, &path(), None, &base, &result, &[]).unwrap();
-    let born = without.nodes.get(&site(&result, new)).copied().unwrap();
+    let without = carry(&adapter, &path(), None, &base, &result, &[]).expect("carry identities");
+    let born = without
+        .nodes
+        .get(&site(&result, new))
+        .copied()
+        .expect("new has an id");
     assert_ne!(born, nid(1));
     assert!(
         without
@@ -263,7 +267,7 @@ fn derived_from_overrides_birth() {
             from: nid(1),
         }],
     )
-    .unwrap();
+    .expect("carry identities with declarations");
     assert_eq!(with.nodes.get(&site(&result, new)).copied(), Some(nid(1)));
     assert_eq!(
         with.deltas,
@@ -281,9 +285,15 @@ fn derived_from_overrides_birth() {
         }],
         with.deltas.clone(),
     )
-    .unwrap();
+    .expect("build identity map");
     assert_eq!(view.deltas, with.deltas);
-    assert_eq!(view.nodes.get(&nid(1)).unwrap().pointer, vec![0]);
+    assert_eq!(
+        view.nodes
+            .get(&nid(1))
+            .expect("nid(1) is in the view")
+            .pointer,
+        vec![0]
+    );
 }
 
 #[test]
@@ -309,7 +319,7 @@ fn derived_from_across_parents_emits_move() {
             from: nid(1),
         }],
     )
-    .unwrap();
+    .expect("carry identities with declarations");
     assert_eq!(
         carried.nodes.get(&site(&result, renamed)).copied(),
         Some(nid(1))
@@ -364,12 +374,16 @@ fn derived_from_copies_when_source_remains() {
             from: nid(1),
         }],
     )
-    .unwrap();
+    .expect("carry identities with declarations");
     assert_eq!(
         carried.nodes.get(&site(&result, foo_r)).copied(),
         Some(nid(1))
     );
-    let copy = carried.nodes.get(&site(&result, bar)).copied().unwrap();
+    let copy = carried
+        .nodes
+        .get(&site(&result, bar))
+        .copied()
+        .expect("bar has an id");
     assert_ne!(copy, nid(1));
     assert_eq!(
         carried.deltas,
@@ -403,9 +417,17 @@ fn split_into_replaces_births_and_death() {
             into: vec![left, right],
         }],
     )
-    .unwrap();
-    let left_id = carried.nodes.get(&site(&result, left)).copied().unwrap();
-    let right_id = carried.nodes.get(&site(&result, right)).copied().unwrap();
+    .expect("carry identities with declarations");
+    let left_id = carried
+        .nodes
+        .get(&site(&result, left))
+        .copied()
+        .expect("left has an id");
+    let right_id = carried
+        .nodes
+        .get(&site(&result, right))
+        .copied()
+        .expect("right has an id");
     assert_ne!(left_id, nid(1));
     assert_ne!(right_id, nid(1));
     assert_ne!(left_id, right_id);
@@ -439,7 +461,7 @@ fn merged_from_adopts_first_free_source() {
             from: vec![nid(1), nid(2)],
         }],
     )
-    .unwrap();
+    .expect("carry identities with declarations");
     assert_eq!(
         carried.nodes.get(&site(&result, merged)).copied(),
         Some(nid(1))
@@ -461,7 +483,7 @@ fn different_name_and_body_is_not_a_rename() {
     let base = identified(base_tree, &[(old, 1)]);
     let (result, new) = fn_file("beta_body", "beta");
 
-    let carried = carry(&adapter, &path(), None, &base, &result, &[]).unwrap();
+    let carried = carry(&adapter, &path(), None, &base, &result, &[]).expect("carry identities");
     assert_ne!(
         carried.nodes.get(&site(&result, new)).copied(),
         Some(nid(1))
@@ -492,8 +514,16 @@ fn assign_births_each_definition_and_locates_it() {
     let mapping = assign(&adapter, &path(), None, &tree);
     assert_eq!(mapping.nodes.len(), 2);
     assert!(mapping.moves.is_empty());
-    let foo_id = mapping.nodes.get(&site(&tree, foo)).copied().unwrap();
-    let bar_id = mapping.nodes.get(&site(&tree, bar)).copied().unwrap();
+    let foo_id = mapping
+        .nodes
+        .get(&site(&tree, foo))
+        .copied()
+        .expect("foo has an id");
+    let bar_id = mapping
+        .nodes
+        .get(&site(&tree, bar))
+        .copied()
+        .expect("bar has an id");
     assert_ne!(foo_id, bar_id);
     assert_ne!(foo_id, NodeId::nil());
     assert_eq!(
@@ -511,10 +541,22 @@ fn assign_births_each_definition_and_locates_it() {
         }],
         mapping.deltas.clone(),
     )
-    .unwrap();
+    .expect("build identity map");
     assert_eq!(view.deltas, mapping.deltas);
-    assert_eq!(view.nodes.get(&foo_id).unwrap().pointer, vec![0]);
-    assert_eq!(view.nodes.get(&bar_id).unwrap().pointer, vec![1]);
+    assert_eq!(
+        view.nodes
+            .get(&foo_id)
+            .expect("foo_id is in the view")
+            .pointer,
+        vec![0]
+    );
+    assert_eq!(
+        view.nodes
+            .get(&bar_id)
+            .expect("bar_id is in the view")
+            .pointer,
+        vec![1]
+    );
 }
 
 #[test]
@@ -523,11 +565,19 @@ fn identity_map_root_definition_has_empty_pointer() {
     let mut tree = NodeTree::new();
     let foo = leaf(&mut tree, "fn", "foo_body", Some("foo"));
     let root = branch(&mut tree, "mod", vec![foo], Some("root"));
-    tree.set_root(root).unwrap();
+    tree.set_root(root).expect("set test tree root");
 
     let mapping = assign(&adapter, &path(), None, &tree);
-    let root_id = mapping.nodes.get(&site(&tree, root)).copied().unwrap();
-    let foo_id = mapping.nodes.get(&site(&tree, foo)).copied().unwrap();
+    let root_id = mapping
+        .nodes
+        .get(&site(&tree, root))
+        .copied()
+        .expect("root has an id");
+    let foo_id = mapping
+        .nodes
+        .get(&site(&tree, foo))
+        .copied()
+        .expect("foo has an id");
     let view = identity_map(
         &[SnapshotFile {
             path: path(),
@@ -535,9 +585,21 @@ fn identity_map_root_definition_has_empty_pointer() {
         }],
         Vec::new(),
     )
-    .unwrap();
-    assert_eq!(view.nodes.get(&root_id).unwrap().pointer, Vec::<u32>::new());
-    assert_eq!(view.nodes.get(&foo_id).unwrap().pointer, vec![0]);
+    .expect("build identity map");
+    assert_eq!(
+        view.nodes
+            .get(&root_id)
+            .expect("root_id is in the view")
+            .pointer,
+        Vec::<u32>::new()
+    );
+    assert_eq!(
+        view.nodes
+            .get(&foo_id)
+            .expect("foo_id is in the view")
+            .pointer,
+        vec![0]
+    );
 }
 
 #[test]
@@ -550,11 +612,12 @@ fn identity_map_rejects_duplicate_node_id() {
             identified: identified.clone(),
         },
         SnapshotFile {
-            path: RepoPath::from_str("src/other.t").unwrap(),
+            path: RepoPath::from_str("src/other.t").expect("parse path src/other.t"),
             identified,
         },
     ];
-    let err = identity_map(&files, Vec::new()).unwrap_err();
+    let err =
+        identity_map(&files, Vec::new()).expect_err("identity map rejects a duplicate node id");
     assert!(matches!(err, Error::DuplicateNode(id) if id == nid(1)));
 }
 
@@ -572,8 +635,68 @@ fn identity_map_rejects_ids_at_sites_not_in_the_tree() {
         }],
         Vec::new(),
     )
-    .unwrap_err();
+    .expect_err("identity map rejects an id at a missing site");
     assert!(matches!(err, Error::Unmapped(id) if id == nid(4)));
+}
+
+/// `assign` equals the stabilized `default_identify` against an empty base
+/// (`carry` with no declarations), which it computes directly.
+#[test]
+fn assign_equals_carry_from_an_empty_base() {
+    let adapter = TestAdapter;
+    let mut tree = NodeTree::new();
+    let dup = leaf(&mut tree, "fn", "same_body", Some("same"));
+    let other = leaf(&mut tree, "fn", "other_body", Some("other"));
+    let inner = branch(&mut tree, "mod", vec![dup, other], Some("inner"));
+    let mod_a = branch(&mut tree, "mod", vec![inner, dup, other], Some("a"));
+    let text = leaf(&mut tree, "text", "glue", None);
+    finish(&mut tree, vec![mod_a, text, dup, mod_a]);
+    let empty = IdentifiedTree::default();
+    for snapshot in [None, Some(ObjectId::from_canonical(b"base"))] {
+        let assigned = assign(&adapter, &path(), snapshot, &tree);
+        let carried =
+            carry(&adapter, &path(), snapshot, &empty, &tree, &[]).expect("carry identities");
+        assert_eq!(assigned, carried);
+        assert_eq!(assigned.nodes.len(), 13);
+    }
+    let bare = NodeTree::new();
+    assert_eq!(assign(&adapter, &path(), None, &bare), Default::default());
+}
+
+/// `is_fresh` answers exactly what comparing with `assign` does.
+#[test]
+fn is_fresh_agrees_with_comparing_against_assign() {
+    let adapter = TestAdapter;
+    let mut tree = NodeTree::new();
+    let dup = leaf(&mut tree, "fn", "same_body", Some("same"));
+    let other = leaf(&mut tree, "fn", "other_body", Some("other"));
+    let mod_a = branch(&mut tree, "mod", vec![dup, other], Some("a"));
+    let mod_b = branch(&mut tree, "mod", vec![dup], Some("b"));
+    finish(&mut tree, vec![mod_a, mod_b]);
+    let fresh = assign(&adapter, &path(), None, &tree).nodes;
+    let agrees = |ids: BTreeMap<Site, NodeId>| {
+        let identified = IdentifiedTree::new(tree.clone(), ids);
+        let expected = fresh == identified.ids;
+        assert_eq!(is_fresh(&adapter, &path(), &identified), expected);
+        expected
+    };
+    assert!(agrees(fresh.clone()));
+    let snapshot = ObjectId::from_canonical(b"base");
+    assert!(!agrees(
+        assign(&adapter, &path(), Some(snapshot), &tree).nodes
+    ));
+    let mut changed = fresh.clone();
+    changed.insert(vec![1, 0], nid(7));
+    assert!(!agrees(changed));
+    let mut missing = fresh.clone();
+    missing.remove(&vec![0, 1]);
+    assert!(!agrees(missing));
+    let mut extra = fresh.clone();
+    extra.insert(vec![5], nid(8));
+    assert!(!agrees(extra));
+    assert!(!agrees(BTreeMap::new()));
+    let empty = IdentifiedTree::default();
+    assert!(is_fresh(&adapter, &path(), &empty));
 }
 
 /// Two definitions with the same text under different parents are one
@@ -587,13 +710,21 @@ fn identical_definitions_at_two_sites_keep_distinct_ids() {
     let mod_b = branch(&mut tree, "mod", vec![dup], Some("b"));
     finish(&mut tree, vec![mod_a, mod_b]);
     let mapping = assign(&adapter, &path(), None, &tree);
-    let first = mapping.nodes.get(&vec![0, 0]).copied().unwrap();
-    let second = mapping.nodes.get(&vec![1, 0]).copied().unwrap();
+    let first = mapping
+        .nodes
+        .get(&vec![0, 0])
+        .copied()
+        .expect("site [0, 0] has an id");
+    let second = mapping
+        .nodes
+        .get(&vec![1, 0])
+        .copied()
+        .expect("site [1, 0] has an id");
     assert_ne!(first, second);
     // Deterministic, and carried unchanged with no spurious move.
     assert_eq!(assign(&adapter, &path(), None, &tree).nodes, mapping.nodes);
     let base = IdentifiedTree::new(tree.clone(), mapping.nodes.clone());
-    let carried = carry(&adapter, &path(), None, &base, &tree, &[]).unwrap();
+    let carried = carry(&adapter, &path(), None, &base, &tree, &[]).expect("carry identities");
     assert_eq!(carried.nodes, mapping.nodes);
     assert!(carried.moves.is_empty(), "{:?}", carried.moves);
     assert!(carried.deltas.is_empty(), "{:?}", carried.deltas);
@@ -604,9 +735,21 @@ fn identical_definitions_at_two_sites_keep_distinct_ids() {
         }],
         Vec::new(),
     )
-    .unwrap();
-    assert_eq!(view.nodes.get(&first).unwrap().pointer, vec![0, 0]);
-    assert_eq!(view.nodes.get(&second).unwrap().pointer, vec![1, 0]);
+    .expect("build identity map");
+    assert_eq!(
+        view.nodes
+            .get(&first)
+            .expect("first is in the view")
+            .pointer,
+        vec![0, 0]
+    );
+    assert_eq!(
+        view.nodes
+            .get(&second)
+            .expect("second is in the view")
+            .pointer,
+        vec![1, 0]
+    );
 }
 
 #[test]
@@ -628,7 +771,7 @@ fn declaration_errors() {
             from: nid(1),
         }],
     )
-    .unwrap_err();
+    .expect_err("carry rejects an unknown result");
     assert!(matches!(unknown, Error::UnknownResult(id) if id == missing));
 
     let conflict = carry(
@@ -648,7 +791,7 @@ fn declaration_errors() {
             },
         ],
     )
-    .unwrap_err();
+    .expect_err("carry rejects conflicting declarations");
     assert!(matches!(conflict, Error::Conflict(id) if id == new));
 
     let empty = carry(
@@ -662,7 +805,7 @@ fn declaration_errors() {
             into: Vec::new(),
         }],
     )
-    .unwrap_err();
+    .expect_err("carry rejects an empty split");
     assert!(matches!(empty, Error::EmptySplit(id) if id == nid(1)));
 }
 
@@ -693,7 +836,7 @@ fn second_continuation_of_the_same_id_is_claimed() {
             },
         ],
     )
-    .unwrap_err();
+    .expect_err("carry rejects a second continuation");
     assert!(matches!(err, Error::Claimed(id) if id == nid(1)));
 }
 
@@ -707,7 +850,11 @@ fn birth_ids_are_stable_and_ignore_nodes_after_them() {
     let once = assign(&adapter, &path(), None, &tree);
     let twice = assign(&adapter, &path(), None, &tree);
     assert_eq!(once, twice);
-    let foo_id = once.nodes.get(&site(&tree, foo)).copied().unwrap();
+    let foo_id = once
+        .nodes
+        .get(&site(&tree, foo))
+        .copied()
+        .expect("foo has an id");
 
     let mut with_extra = NodeTree::new();
     let foo2 = leaf(&mut with_extra, "fn", "foo_body", Some("foo"));
@@ -731,13 +878,18 @@ fn birth_ids_are_stable_and_ignore_nodes_after_them() {
 fn birth_ids_depend_on_the_base_snapshot() {
     let adapter = TestAdapter;
     let (tree, foo) = fn_file("foo_body", "foo");
-    let path = RepoPath::from_str("src/a.t").unwrap();
+    let path = RepoPath::from_str("src/a.t").expect("parse path src/a.t");
     let first = ObjectId::from_bytes([1; 32]);
     let later = ObjectId::from_bytes([2; 32]);
     let empty = IdentifiedTree::default();
     let born = |snapshot| {
-        let mapping = carry(&adapter, &path, snapshot, &empty, &tree, &[]).unwrap();
-        mapping.nodes.get(&site(&tree, foo)).copied().unwrap()
+        let mapping =
+            carry(&adapter, &path, snapshot, &empty, &tree, &[]).expect("carry identities");
+        mapping
+            .nodes
+            .get(&site(&tree, foo))
+            .copied()
+            .expect("foo has an id")
     };
     assert_eq!(born(Some(first)), born(Some(first)));
     assert_ne!(born(Some(first)), born(Some(later)));
@@ -801,8 +953,12 @@ fn copy_id_is_stable_and_ignores_unrelated_nodes() {
                 from: nid(1),
             }],
         )
-        .unwrap();
-        carried.nodes.get(&site(&result, other_r)).copied().unwrap()
+        .expect("carry identities with declarations");
+        carried
+            .nodes
+            .get(&site(&result, other_r))
+            .copied()
+            .expect("other_r has an id")
     };
 
     let first = copy_of(false);
@@ -837,8 +993,8 @@ fn moved_result() -> (NodeTree, ObjectId, ObjectId, ObjectId) {
 fn assign_keeps_identical_files_apart() {
     let adapter = TestAdapter;
     let (tree, _) = fn_file("same_body", "same");
-    let a = RepoPath::from_str("src/a.t").unwrap();
-    let b = RepoPath::from_str("src/b.t").unwrap();
+    let a = RepoPath::from_str("src/a.t").expect("parse path src/a.t");
+    let b = RepoPath::from_str("src/b.t").expect("parse path src/b.t");
     assert_eq!(
         assign(&adapter, &path(), None, &tree).nodes,
         assign(&adapter, &path(), None, &tree).nodes
@@ -850,8 +1006,8 @@ fn assign_keeps_identical_files_apart() {
     assert!(ids(&in_a).iter().all(|id| !ids(&in_b).contains(id)));
 
     let empty = IdentifiedTree::default();
-    let born_a = carry(&adapter, &a, None, &empty, &tree, &[]).unwrap();
-    let born_b = carry(&adapter, &b, None, &empty, &tree, &[]).unwrap();
+    let born_a = carry(&adapter, &a, None, &empty, &tree, &[]).expect("carry identities");
+    let born_b = carry(&adapter, &b, None, &empty, &tree, &[]).expect("carry identities");
     assert_eq!(born_a.nodes, in_a.nodes);
     assert_ne!(born_a.nodes, born_b.nodes);
 }

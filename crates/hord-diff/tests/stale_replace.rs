@@ -27,7 +27,7 @@ fn ours(base: &IdentifiedTree, src: &[u8]) -> IdentifiedTree {
 }
 
 #[test]
-fn replace_over_a_changed_definition_is_stale() {
+fn replace_over_a_changed_definition_is_stale() -> Result<(), Box<dyn std::error::Error>> {
     let base = parse_identified(&rust(), BASE);
     let (theirs, mapping) = identify_result(&rust(), &base, THEIRS);
     let ops = diff(&common::file(), &base, &theirs, &mapping);
@@ -36,11 +36,15 @@ fn replace_over_a_changed_definition_is_stale() {
         Err(Error::StaleReplace {
             expected, found, ..
         }) => assert_ne!(expected, found),
-        other => panic!(
-            "expected StaleReplace, got {:?}",
-            other.map(|t| project(&rust(), &t.tree))
-        ),
+        other => {
+            return Err(format!(
+                "expected StaleReplace, got {:?}",
+                other.map(|t| project(&rust(), &t.tree))
+            )
+            .into());
+        }
     }
+    Ok(())
 }
 
 #[test]

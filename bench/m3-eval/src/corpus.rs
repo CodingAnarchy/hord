@@ -15,6 +15,14 @@ pub(crate) struct Corpus {
 }
 
 impl Corpus {
+    /// The files whose paths are repository paths, for `Repo::bootstrap`.
+    pub(crate) fn repo_files(&self) -> Vec<(hord_core::RepoPath, Vec<u8>)> {
+        self.files
+            .iter()
+            .filter_map(|(p, b)| p.parse().ok().map(|p| (p, b.clone())))
+            .collect()
+    }
+
     pub(crate) fn file(&self, path: &str) -> Option<&[u8]> {
         self.files
             .iter()

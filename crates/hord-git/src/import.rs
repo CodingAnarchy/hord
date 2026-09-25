@@ -7,8 +7,9 @@ use std::rc::Rc;
 use gix::bstr::ByteSlice;
 use gix::objs::tree::{EntryKind, EntryMode};
 use hord_core::{
-    Actor, Blob, ChangeId, ChangeRecord, IdentityEntry, IdentityTree, Intent, IntentRef, ObjectId,
+    Actor, Blob, ChangeId, ChangeRecord, IdentityTree, IdentityTrees, Intent, IntentRef, ObjectId,
     Op, Provenance, RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeEntry, TreeOpKind,
+    edit_identity_tree,
 };
 
 use crate::leaf::{GitLeaf, MODE_BLOB};
@@ -68,6 +69,10 @@ fn import_revwalk<S: Store>(
     git_ref: &str,
     max_commits: Option<usize>,
 ) -> Result<ChangeId, Error> {
+    let store = &mut Staged {
+        store,
+        pending: HashMap::new(),
+    };
     let git_dir = git_dir.as_ref();
     let mut repo = open_repo(git_dir)?;
     repo.object_cache_size_if_unset(64 * 1024 * 1024);
@@ -116,6 +121,64 @@ fn import_revwalk<S: Store>(
     let last = last.ok_or_else(|| Error::EmptyHistory(git_ref.to_owned()))?;
     store.set_head(last)?;
     Ok(last)
+}
+
+/// A commit's new objects, held until something names them (the commit's
+/// log entry, a ref, or head) and then written together
+/// ([`Store::put_all`]), so their writes overlap. Reads see held objects.
+struct Staged<'a, S> {
+    store: &'a mut S,
+    pending: HashMap<ObjectId, Vec<u8>>,
+}
+
+impl<S: Store> Staged<'_, S> {
+    fn write(&mut self) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.store.put_all(self.pending.drain().collect())
+    }
+}
+
+impl<S: Store> Store for Staged<'_, S> {
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), Error> {
+        self.pending.insert(id, bytes);
+        Ok(())
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Vec<u8>, Error> {
+        match self.pending.get(&id) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => self.store.get(id),
+        }
+    }
+
+    fn append_log(&mut self, change: ChangeId) -> Result<(), Error> {
+        self.write()?;
+        self.store.append_log(change)
+    }
+
+    fn log(&self) -> Result<Vec<ChangeId>, Error> {
+        self.store.log()
+    }
+
+    fn set_head(&mut self, change: ChangeId) -> Result<(), Error> {
+        self.write()?;
+        self.store.set_head(change)
+    }
+
+    fn head(&self) -> Result<Option<ChangeId>, Error> {
+        self.store.head()
+    }
+
+    fn set_ref(&mut self, name: &str, id: ObjectId) -> Result<(), Error> {
+        self.write()?;
+        self.store.set_ref(name, id)
+    }
+
+    fn get_ref(&self, name: &str) -> Result<Option<ObjectId>, Error> {
+        self.store.get_ref(name)
+    }
 }
 
 /// Order `ids` so every parent that is also in `ids` appears before its children.
@@ -376,44 +439,26 @@ fn identity_without<S: Store>(
     if tree.entries.is_empty() || paths.is_empty() {
         return Ok(root);
     }
-    let components: Vec<&[String]> = paths.iter().map(RepoPath::components).collect();
-    match prune_identity(store, tree, &components)? {
-        Some(tree) => store.put_object(&tree),
+    let edits: Vec<_> = paths.iter().map(|path| (path.components(), None)).collect();
+    match edit_identity_tree(&mut StoreTrees(store), Some(root), &edits)? {
+        Some(id) => Ok(id),
         None => store.put_object(&IdentityTree::default()),
     }
 }
 
-fn prune_identity<S: Store>(
-    store: &mut S,
-    mut tree: IdentityTree,
-    paths: &[&[String]],
-) -> Result<Option<IdentityTree>, Error> {
-    let mut nested: BTreeMap<&str, Vec<&[String]>> = BTreeMap::new();
-    for path in paths {
-        match path {
-            [name] => {
-                tree.entries.remove(name);
-            }
-            [dir, rest @ ..] => nested.entry(dir.as_str()).or_default().push(rest),
-            [] => {}
-        }
+/// Identity trees read from and written to an import's store.
+struct StoreTrees<'a, S>(&'a mut S);
+
+impl<S: Store> IdentityTrees for StoreTrees<'_, S> {
+    type Error = Error;
+
+    fn load(&mut self, id: ObjectId) -> Result<IdentityTree, Error> {
+        self.0.get_object(id)
     }
-    for (dir, rest) in nested {
-        let Some(IdentityEntry::Dir(id)) = tree.entries.get(dir).cloned() else {
-            continue;
-        };
-        let sub: IdentityTree = store.get_object(id)?;
-        match prune_identity(store, sub, &rest)? {
-            Some(sub) => {
-                let id = store.put_object(&sub)?;
-                tree.entries.insert(dir.to_owned(), IdentityEntry::Dir(id));
-            }
-            None => {
-                tree.entries.remove(dir);
-            }
-        }
+
+    fn store(&mut self, tree: IdentityTree) -> Result<ObjectId, Error> {
+        self.0.put_object(&tree)
     }
-    Ok((!tree.entries.is_empty()).then_some(tree))
 }
 
 fn import_tree<S: Store>(

@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use hord_core::{
-    Actor, ChangeRecord, Intent, Node, NodeId, ObjectId, Provenance, RepoPath, Timestamp,
+    Actor, ChangeRecord, Intent, Node, NodeId, ObjectId, Provenance, QualifiedName, RepoPath,
+    Timestamp,
 };
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree, default_identify};
 use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
@@ -62,7 +63,7 @@ pub(crate) struct BlameReport {
 pub(crate) fn load_head(git_dir: &Path) -> Result<Vec<FileSnap>> {
     let adapter = RustAdapter;
     let mut files = Vec::new();
-    for path in git::head_rust_files(git_dir)? {
+    for path in git::head_files(git_dir, ".rs")? {
         let bytes = git::blob(git_dir, "HEAD", &path).unwrap_or_default();
         if bytes.is_empty() || bytes.len() > MAX_BYTES {
             continue;
@@ -92,13 +93,9 @@ pub(crate) struct ManifestSnap {
 }
 
 pub(crate) fn load_manifests(git_dir: &Path) -> Result<Vec<ManifestSnap>> {
-    let raw = git::git(git_dir, &["ls-tree", "-r", "--name-only", "HEAD"])?;
     let mut out = Vec::new();
-    for path in String::from_utf8(raw)?.lines() {
-        if !path.ends_with("Cargo.toml") {
-            continue;
-        }
-        let Ok(bytes) = git::blob(git_dir, "HEAD", path) else {
+    for path in git::head_files(git_dir, "Cargo.toml")? {
+        let Ok(bytes) = git::blob(git_dir, "HEAD", &path) else {
             continue;
         };
         if bytes.is_empty() || bytes.len() > MAX_BYTES {
@@ -115,27 +112,36 @@ pub(crate) fn load_manifests(git_dir: &Path) -> Result<Vec<ManifestSnap>> {
     Ok(out)
 }
 
-pub(crate) fn references(
-    files: &[&FileSnap],
-    manifests: &[ManifestSnap],
-    sample: usize,
-) -> ReferenceReport {
-    let adapter = RustAdapter;
-    let views: Vec<RustFile<'_>> = files
-        .iter()
+/// Adapter views of `files` and `manifests`.
+pub(crate) fn views<'a>(
+    files: impl IntoIterator<Item = &'a FileSnap>,
+    manifests: &'a [ManifestSnap],
+) -> (Vec<RustFile<'a>>, Vec<ManifestFile<'a>>) {
+    let files = files
+        .into_iter()
         .map(|file| RustFile {
             path: &file.path,
             tree: &file.tree,
             ids: &file.ids,
         })
         .collect();
-    let manifest_views: Vec<ManifestFile<'_>> = manifests
+    let manifests = manifests
         .iter()
         .map(|manifest| ManifestFile {
             path: &manifest.path,
             bytes: &manifest.bytes,
         })
         .collect();
+    (files, manifests)
+}
+
+pub(crate) fn references(
+    files: &[&FileSnap],
+    manifests: &[ManifestSnap],
+    sample: usize,
+) -> ReferenceReport {
+    let adapter = RustAdapter;
+    let (views, manifest_views) = views(files.iter().copied(), manifests);
     let ctx = adapter.resolve_context_with(&views, &manifest_views);
     let mut counts = BTreeMap::<String, usize>::new();
     for file in files {
@@ -179,7 +185,8 @@ pub(crate) fn references(
                 continue;
             };
             let own = site.qname.rsplit("::").next().unwrap_or("");
-            let leaves = identifier_leaves(&file.tree, site.oid);
+            let mut leaves = Vec::new();
+            collect_idents(&file.tree, site.oid, "", &mut leaves);
             let mut expected: Vec<(&str, &str)> = Vec::new();
             let mut seen = BTreeSet::new();
             for leaf in &leaves {
@@ -268,27 +275,17 @@ pub(crate) fn blame(files: &[&FileSnap]) -> Result<BlameReport> {
     let snapshot = ObjectId::from_bytes([2; 32]);
     // One write per definition site; the history index is what is measured
     // (NodeIds live in snapshot objects since ADR 0017, not in the index).
-    let mut seen = std::collections::BTreeSet::new();
-    let mut write_set = std::collections::BTreeSet::new();
-    for file in files {
-        for (site, node_id) in &file.ids {
-            if seen.insert((file.path.clone(), site.clone())) {
-                write_set.insert(*node_id);
-            }
-        }
-    }
+    let write_set: BTreeSet<NodeId> = files
+        .iter()
+        .flat_map(|file| file.ids.values().copied())
+        .collect();
     let defs = write_set.len();
     let record = ChangeRecord {
         base: ObjectId::from_bytes([1; 32]),
         result: snapshot,
         parents: Vec::new(),
         ops: Vec::new(),
-        intent: Intent {
-            summary: "m2 blame sample".into(),
-            body: String::new(),
-            refs: Vec::new(),
-            acceptance: Vec::new(),
-        },
+        intent: Intent::from_summary("m2 blame sample"),
         provenance: Provenance {
             actor: Actor::Human {
                 id: "m2-eval".into(),
@@ -337,54 +334,73 @@ struct Def {
 }
 
 fn defs(adapter: &RustAdapter, tree: &NodeTree) -> Vec<Def> {
-    let Some(root) = tree.root() else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    let mut ancestors = Vec::new();
-    walk(adapter, tree, root, &mut ancestors, &mut out);
+    named_defs(adapter, tree, |_, oid, node, qname| {
+        out.push(Def {
+            oid,
+            kind: node.kind.as_str().to_string(),
+            qname: qname.as_str().to_string(),
+        });
+    });
     out
+}
+
+/// Calls `visit` on every definition of `tree` that has a qualified name, in
+/// preorder, with its child-index path from the root, content id, node, and
+/// name.
+pub(crate) fn named_defs(
+    adapter: &RustAdapter,
+    tree: &NodeTree,
+    mut visit: impl FnMut(&[u32], ObjectId, &Node, QualifiedName),
+) {
+    if let Some(root) = tree.root() {
+        walk(
+            adapter,
+            tree,
+            root,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut visit,
+        );
+    }
 }
 
 fn walk(
     adapter: &RustAdapter,
     tree: &NodeTree,
     oid: ObjectId,
+    at: &mut Vec<u32>,
     ancestors: &mut Vec<ObjectId>,
-    out: &mut Vec<Def>,
+    visit: &mut impl FnMut(&[u32], ObjectId, &Node, QualifiedName),
 ) {
     let Some(node) = tree.get(oid) else {
         return;
     };
     if adapter.is_definition(&node.kind)
-        && let Some(qname) = name_of(adapter, tree, ancestors, node)
+        && let Some(qname) = qualified_name(adapter, tree, ancestors, node)
     {
-        out.push(Def {
-            oid,
-            kind: node.kind.as_str().to_string(),
-            qname,
-        });
+        visit(at, oid, node, qname);
     }
     ancestors.push(oid);
-    for child in &node.children {
-        walk(adapter, tree, *child, ancestors, out);
+    for (i, child) in node.children.iter().enumerate() {
+        at.push(u32::try_from(i).unwrap_or(u32::MAX));
+        walk(adapter, tree, *child, at, ancestors, visit);
+        at.pop();
     }
     ancestors.pop();
 }
 
-fn name_of(
+fn qualified_name(
     adapter: &RustAdapter,
     tree: &NodeTree,
     ancestors: &[ObjectId],
     node: &Node,
-) -> Option<String> {
+) -> Option<QualifiedName> {
     if let Some(name) = &node.name {
-        return Some(name.as_str().to_string());
+        return Some(name.clone());
     }
     let nodes: Vec<&Node> = ancestors.iter().filter_map(|id| tree.get(*id)).collect();
-    adapter
-        .qualified_name(&nodes, node)
-        .map(|name| name.as_str().to_string())
+    adapter.qualified_name(&nodes, node)
 }
 
 fn is_named_item(kind: &str) -> bool {
@@ -405,14 +421,8 @@ struct IdentLeaf<'a> {
     parent: &'a str,
 }
 
-/// Identifier, type, and field leaves under `root`. Strings and comments are
+/// Identifier, type, and field leaves under `oid`. Strings and comments are
 /// not leaves of these kinds, so they are not expected references.
-fn identifier_leaves<'a>(tree: &'a NodeTree, root: ObjectId) -> Vec<IdentLeaf<'a>> {
-    let mut out = Vec::new();
-    collect_idents(tree, root, "", &mut out);
-    out
-}
-
 fn collect_idents<'a>(
     tree: &'a NodeTree,
     oid: ObjectId,

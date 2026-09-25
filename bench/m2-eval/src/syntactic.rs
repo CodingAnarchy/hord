@@ -19,9 +19,9 @@ use std::collections::{HashMap, HashSet};
 use hord_core::{NodeId, ObjectId};
 use hord_lang::LangAdapter;
 use hord_lang::NodeTree;
-use hord_lang_rust::{ManifestFile, RustAdapter, RustFile};
+use hord_lang_rust::RustAdapter;
 
-use crate::snapshot::{FileSnap, ManifestSnap, Sampled};
+use crate::snapshot::{self, FileSnap, ManifestSnap, Sampled};
 
 pub(crate) struct SyntacticReport {
     pub labeled: usize,
@@ -35,22 +35,8 @@ pub(crate) fn measure(
     sample: &[Sampled],
 ) -> SyntacticReport {
     let adapter = RustAdapter;
-    let views: Vec<RustFile<'_>> = files
-        .iter()
-        .map(|file| RustFile {
-            path: &file.path,
-            tree: &file.tree,
-            ids: &file.ids,
-        })
-        .collect();
+    let (views, manifest_views) = snapshot::views(files, manifests);
     let file_modules = adapter.file_modules(&views);
-    let manifest_views: Vec<ManifestFile<'_>> = manifests
-        .iter()
-        .map(|manifest| ManifestFile {
-            path: &manifest.path,
-            bytes: &manifest.bytes,
-        })
-        .collect();
     let links = adapter.manifest_links(&views, &manifest_views);
 
     let mut visible: HashMap<String, HashSet<String>> = HashMap::new();

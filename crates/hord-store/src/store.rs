@@ -6,7 +6,7 @@ use std::fs;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +19,8 @@ use crate::pack::{self, PackWriter, PackedLocation, pack_path};
 use crate::workspace::WorkspaceRow;
 use crate::{Error, Result, WorkspaceId, WorkspaceMeta};
 
+#[path = "evidence.rs"]
+mod evidence;
 #[path = "index.rs"]
 mod index;
 #[path = "lock.rs"]
@@ -38,14 +40,17 @@ const REF_FLUSH_BATCH: usize = 4096;
 /// Persist buffered log entries in one redb transaction. Git import is one
 /// `append_log` per commit; fsyncing each one caps throughput well below 200/s.
 const LOG_FLUSH_BATCH: usize = 4096;
+/// Threads [`Store::put_all`] writes with, at most.
+const MAX_WRITERS: usize = 8;
+/// Objects per thread below which [`Store::put_all`] writes on fewer
+/// threads: spawning one costs about as much as a few writes.
+const MIN_OBJECTS_PER_WRITER: usize = 2;
 
 const LOG: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("log");
 const REFS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("refs");
 const WORKSPACES: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("workspaces");
 const OBJECTS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("objects");
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
-const EVIDENCE_BY_SNAPSHOT: TableDefinition<'_, &[u8], &[u8]> =
-    TableDefinition::new("evidence_by_snapshot");
 
 const META_HEAD: &str = "head";
 const META_NEXT_PACK: &str = "next_pack";
@@ -151,30 +156,14 @@ impl Store {
             return Err(Error::AlreadyExists(hord_dir));
         }
         fs::create_dir_all(&hord_dir)?;
-        let objects_dir = hord_dir.join("objects");
-        create_shard_dirs(&objects_dir)?;
+        create_shard_dirs(&hord_dir.join("objects"))?;
         fs::create_dir_all(hord_dir.join("ws"))?;
         let index = hord_dir.join("index.redb");
         let db = lock::acquire(&hord_dir, &index, lock::timeout_from_env()?, || {
             Database::create(&index)
         })?;
         init_tables(&db)?;
-        Ok(Self {
-            repo_root,
-            hord_dir,
-            objects_dir,
-            db,
-            pack_lock: Mutex::new(()),
-            pending_refs: Mutex::new(HashMap::new()),
-            pending_log: Mutex::new(Vec::new()),
-            has_packs: AtomicBool::new(false),
-            index_lock: Mutex::new(()),
-            resident: Mutex::new(HashMap::new()),
-            pack_files: Mutex::new(HashMap::new()),
-            landing_log: Mutex::new(LandingLog::empty()),
-            seen_edges: Mutex::new(HashSet::new()),
-            queue_names_ready: AtomicBool::new(false),
-        })
+        Ok(Self::with_index(repo_root, db, false))
     }
 
     /// Open an existing store at `<repo>/.hord/`.
@@ -198,9 +187,16 @@ impl Store {
         let db = lock::acquire(&hord_dir, &index, timeout, || Database::open(&index))?;
         index::ensure_tables(&db)?;
         queue::ensure_tables(&db)?;
+        let has_packs = pack_dir_has_packs(&hord_dir.join("objects").join("pack"));
+        Ok(Self::with_index(repo_root, db, has_packs))
+    }
+
+    /// A handle on the store at `<repo_root>/.hord/` whose index `db` is
+    /// open, with nothing cached yet.
+    fn with_index(repo_root: PathBuf, db: Database, has_packs: bool) -> Self {
+        let hord_dir = repo_root.join(HORD_DIR);
         let objects_dir = hord_dir.join("objects");
-        let has_packs = pack_dir_has_packs(&objects_dir.join("pack"));
-        Ok(Self {
+        Self {
             repo_root,
             hord_dir,
             objects_dir,
@@ -215,7 +211,7 @@ impl Store {
             landing_log: Mutex::new(LandingLog::empty()),
             seen_edges: Mutex::new(HashSet::new()),
             queue_names_ready: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Repository root this store was opened against.
@@ -233,8 +229,10 @@ impl Store {
     /// Store already-canonical CBOR bytes. The [`ObjectId`] is BLAKE3-256 of
     /// `canonical_cbor` (spec §3.1, §3.9).
     ///
-    /// Writes a loose object. Identical bytes are idempotent. An object this
-    /// process has already stored, loose or packed, is not written again.
+    /// Writes a loose object, atomically. Identical bytes are idempotent. An
+    /// object this process has already stored, loose or packed, or one
+    /// already whole on disk as a loose file, is not written again; a
+    /// damaged loose file is replaced.
     /// Does not pack; call [`Store::pack`] (spec §8.1: packing is a background
     /// job).
     pub fn put(&self, canonical_cbor: &[u8]) -> Result<ObjectId> {
@@ -242,9 +240,52 @@ impl Store {
         if self.remembered(id).is_some() {
             return Ok(id);
         }
-        self.write_loose(id, canonical_cbor)?;
+        // Already on disk and whole (written by another handle or process):
+        // nothing to write. A damaged copy is replaced, atomically.
+        let whole = self.loose_path(id).is_file()
+            && self
+                .read_loose(id)?
+                .is_some_and(|bytes| ObjectId::from_canonical(&bytes) == id);
+        if !whole {
+            self.write_loose(id, canonical_cbor)?;
+        }
         self.remember(id, Resident::Loose);
         Ok(id)
+    }
+
+    /// [`Store::put`] every one of `objects`, several at once on scoped
+    /// threads: loose writes are system calls, not CPU, so they overlap.
+    /// Each object is written as `put` writes it, atomically. Ids in input
+    /// order.
+    pub fn put_all(&self, objects: &[Vec<u8>]) -> Result<Vec<ObjectId>> {
+        let writers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(MAX_WRITERS)
+            .min(objects.len() / MIN_OBJECTS_PER_WRITER);
+        if writers <= 1 {
+            return objects.iter().map(|bytes| self.put(bytes)).collect();
+        }
+        let per_writer = objects.len().div_ceil(writers);
+        std::thread::scope(|scope| {
+            let writing: Vec<_> = objects
+                .chunks(per_writer)
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|bytes| self.put(bytes))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+            let mut ids = Vec::with_capacity(objects.len());
+            for writer in writing {
+                let part = writer
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+                ids.extend(part);
+            }
+            Ok(ids)
+        })
     }
 
     /// Load the canonical bytes for `id`.
@@ -309,7 +350,7 @@ impl Store {
     /// entries that have not been flushed yet.
     pub fn append_log(&self, change: ChangeId) -> Result<()> {
         let flush = {
-            let mut log = lock_vec(&self.pending_log);
+            let mut log = lock(&self.pending_log);
             log.push(change);
             lock(&self.landing_log).note(change);
             log.len() >= LOG_FLUSH_BATCH
@@ -355,8 +396,8 @@ impl Store {
     ///
     /// Flushes buffered refs and log entries in the same durable write.
     pub fn set_head(&self, change: ChangeId) -> Result<()> {
-        let mut refs = lock_map(&self.pending_refs);
-        let mut log = lock_vec(&self.pending_log);
+        let mut refs = lock(&self.pending_refs);
+        let mut log = lock(&self.pending_log);
         self.persist_locked(&mut refs, &mut log, Durability::Immediate, Some(change))
     }
 
@@ -373,7 +414,7 @@ impl Store {
     /// are not.
     pub fn set_ref(&self, name: &str, id: ObjectId) -> Result<()> {
         validate_ref_name(name)?;
-        let mut pending = lock_map(&self.pending_refs);
+        let mut pending = lock(&self.pending_refs);
         pending.insert(name.to_owned(), id);
         let flush = pending.len() >= REF_FLUSH_BATCH;
         drop(pending);
@@ -387,7 +428,7 @@ impl Store {
     pub fn get_ref(&self, name: &str) -> Result<Option<ObjectId>> {
         validate_ref_name(name)?;
         {
-            let pending = lock_map(&self.pending_refs);
+            let pending = lock(&self.pending_refs);
             if let Some(id) = pending.get(name) {
                 return Ok(Some(*id));
             }
@@ -400,6 +441,29 @@ impl Store {
         }
     }
 
+    /// Named refs whose name starts with `prefix` (`""` for all), by name
+    /// (spec §3.7), including refs not yet flushed.
+    pub fn refs(&self, prefix: &str) -> Result<std::collections::BTreeMap<String, ObjectId>> {
+        let mut out = std::collections::BTreeMap::new();
+        let txn = self.db.begin_read().map_err(Error::index)?;
+        let table = txn.open_table(REFS).map_err(Error::index)?;
+        for row in table.range(prefix..).map_err(Error::index)? {
+            let (name, value) = row.map_err(Error::index)?;
+            let name = name.value();
+            if !name.starts_with(prefix) {
+                break;
+            }
+            out.insert(name.to_owned(), object_id_from_value(value.value())?);
+        }
+        let pending = lock(&self.pending_refs);
+        for (name, id) in pending.iter() {
+            if name.starts_with(prefix) {
+                out.insert(name.clone(), *id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Persist buffered refs and log entries to the redb index.
     ///
     /// [`Store::set_ref`] and [`Store::append_log`] batch into the next
@@ -410,8 +474,8 @@ impl Store {
     }
 
     fn persist_pending(&self, durability: Durability) -> Result<()> {
-        let mut refs = lock_map(&self.pending_refs);
-        let mut log = lock_vec(&self.pending_log);
+        let mut refs = lock(&self.pending_refs);
+        let mut log = lock(&self.pending_log);
         self.persist_locked(&mut refs, &mut log, durability, None)
     }
 
@@ -467,13 +531,7 @@ impl Store {
         let mut out = Vec::new();
         for entry in table.iter().map_err(Error::index)? {
             let (_, v) = entry.map_err(Error::index)?;
-            let row: WorkspaceRow = hord_encoding::decode(v.value())?;
-            let path = self.workspace_dir(row.id);
-            out.push(WorkspaceMeta {
-                id: row.id,
-                base: row.base,
-                path,
-            });
+            out.push(self.workspace_meta(v.value())?);
         }
         Ok(out)
     }
@@ -509,16 +567,19 @@ impl Store {
         let txn = self.db.begin_read().map_err(Error::index)?;
         let table = txn.open_table(WORKSPACES).map_err(Error::index)?;
         match table.get(key.as_str()).map_err(Error::index)? {
-            Some(v) => {
-                let row: WorkspaceRow = hord_encoding::decode(v.value())?;
-                Ok(Some(WorkspaceMeta {
-                    id: row.id,
-                    base: row.base,
-                    path: self.workspace_dir(row.id),
-                }))
-            }
+            Some(v) => Ok(Some(self.workspace_meta(v.value())?)),
             None => Ok(None),
         }
+    }
+
+    /// The workspace a stored `workspaces` row describes.
+    fn workspace_meta(&self, row: &[u8]) -> Result<WorkspaceMeta> {
+        let row: WorkspaceRow = hord_encoding::decode(row)?;
+        Ok(WorkspaceMeta {
+            id: row.id,
+            base: row.base,
+            path: self.workspace_dir(row.id),
+        })
     }
 
     /// Pack all current loose objects into a new zstd pack file with a sidecar
@@ -527,7 +588,7 @@ impl Store {
     /// Also persists any buffered [`Store::set_ref`] calls.
     pub fn pack(&self) -> Result<usize> {
         self.flush()?;
-        let _guard = self.pack_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock(&self.pack_lock);
         self.pack_inner()
     }
 
@@ -585,18 +646,44 @@ impl Store {
         Ok(n)
     }
 
+    /// Write a loose object atomically: into a unique temporary file in its
+    /// shard, then renamed over the object's path, so a concurrent reader
+    /// sees either no file or the whole object, never a torn one. Objects
+    /// are content-addressed, so when the rename finds the object already
+    /// there (Windows does not replace an existing file), that copy is just
+    /// as good and the temporary file is dropped.
     fn write_loose(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
+        static TEMP: AtomicU64 = AtomicU64::new(0);
         let path = self.loose_path(id);
-        match fs::write(&path, bytes) {
-            Ok(()) => Ok(()),
+        let parent = path.parent().expect("a loose path has a shard directory");
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a loose name is hex");
+        // Leading `.`: `list_loose` skips it.
+        let temp = parent.join(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::write(&temp, bytes) {
+            Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&path, bytes)?;
+                fs::create_dir_all(parent)?;
+                fs::write(&temp, bytes)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        match fs::rename(&temp, &path) {
+            Ok(()) => Ok(()),
+            Err(_) if path.is_file() => {
+                let _ = fs::remove_file(&temp);
                 Ok(())
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                let _ = fs::remove_file(&temp);
+                Err(e.into())
+            }
         }
     }
 
@@ -653,7 +740,7 @@ impl Store {
                 return Ok(log);
             }
         }
-        let pending = lock_vec(&self.pending_log);
+        let pending = lock(&self.pending_log);
         let mut log = lock(&self.landing_log);
         if !log.loaded {
             let mut order = self.read_persisted_log()?;
@@ -847,7 +934,7 @@ fn init_tables(db: &Database) -> Result<()> {
     txn.open_table(WORKSPACES).map_err(Error::index)?;
     txn.open_table(OBJECTS).map_err(Error::index)?;
     txn.open_table(META).map_err(Error::index)?;
-    txn.open_table(EVIDENCE_BY_SNAPSHOT).map_err(Error::index)?;
+    txn.open_table(evidence::EVIDENCE).map_err(Error::index)?;
     index::open_tables(&txn)?;
     index::write_format(&txn)?;
     queue::open_tables(&txn)?;
@@ -897,12 +984,6 @@ fn object_id_from_loose_name(shard: &str, name: &str) -> Result<ObjectId> {
     text.parse().map_err(Error::from)
 }
 
-fn lock_map(
-    mutex: &Mutex<HashMap<String, ObjectId>>,
-) -> std::sync::MutexGuard<'_, HashMap<String, ObjectId>> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 fn write_pending_refs(txn: &WriteTransaction, pending: &HashMap<String, ObjectId>) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
@@ -932,10 +1013,6 @@ fn write_pending_log(txn: &WriteTransaction, pending: &[ChangeId]) -> Result<()>
             .map_err(Error::index)?;
     }
     Ok(())
-}
-
-fn lock_vec(mutex: &Mutex<Vec<ChangeId>>) -> std::sync::MutexGuard<'_, Vec<ChangeId>> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn create_shard_dirs(objects_dir: &Path) -> Result<()> {
@@ -971,4 +1048,153 @@ fn hex_encode(bytes: &[u8; ObjectId::LEN]) -> [u8; ObjectId::LEN * 2] {
         out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
     out
+}
+
+#[cfg(test)]
+mod refs_tests {
+    use hord_core::ObjectId;
+
+    use super::Store;
+
+    #[test]
+    fn refs_lists_flushed_and_pending_refs_by_prefix()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("hord-store-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let store = Store::create(&dir)?;
+        let a = ObjectId::from_canonical(b"a");
+        let b = ObjectId::from_canonical(b"b");
+        store.set_ref("main", a)?;
+        store.set_ref("release/1.0", b)?;
+        store.flush()?;
+        store.set_ref("release/1.1", a)?;
+        store.set_ref("main", b)?;
+        let all = store.refs("")?;
+        assert_eq!(all.len(), 3);
+        assert_eq!(all["main"], b, "a pending ref wins over the flushed one");
+        let release = store.refs("release/")?;
+        assert_eq!(
+            release.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["release/1.0", "release/1.1"]
+        );
+        assert!(store.refs("zzz")?.is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod put_all_tests {
+    use hord_core::ObjectId;
+
+    use super::Store;
+
+    /// A batch spread over several writers stores every object and
+    /// returns the ids in input order, duplicates included.
+    #[test]
+    fn put_all_stores_every_object_in_input_order()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("hord-store-put-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let store = Store::create(&dir)?;
+        let mut objects: Vec<Vec<u8>> = (0..50u8).map(|n| vec![n; 64 + usize::from(n)]).collect();
+        objects.push(objects[3].clone());
+        let ids = store.put_all(&objects)?;
+        assert_eq!(ids.len(), objects.len());
+        for (bytes, id) in objects.iter().zip(&ids) {
+            assert_eq!(*id, ObjectId::from_canonical(bytes));
+            assert_eq!(store.get(*id)?, *bytes);
+        }
+        assert!(store.put_all(&[])?.is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use hord_core::ObjectId;
+
+    use super::Store;
+    use crate::Error;
+
+    /// Concurrent `put`s and `get`s of one object never see a torn loose
+    /// file (`Corrupt`): the object is either absent or whole. Writers use
+    /// separate handles, as separate processes or caches do, so none skips
+    /// the write because another remembered it. Before `write_loose` wrote a
+    /// temporary file and renamed it, a writer truncating the file under a
+    /// reader failed this within a few rounds.
+    #[test]
+    fn concurrent_puts_and_gets_never_read_a_torn_object()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("hord-store-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let store = Arc::new(Store::create(&dir)?);
+        const WRITERS: usize = 4;
+        const READERS: usize = 4;
+        const PUTS: usize = 6;
+        for round in 0..20u32 {
+            // A large object widens the window a torn write would leave.
+            let mut bytes = vec![0x5a_u8; 4 << 20];
+            bytes[..4].copy_from_slice(&round.to_be_bytes());
+            let bytes = Arc::new(bytes);
+            let id = ObjectId::from_canonical(&bytes);
+            let barrier = Arc::new(Barrier::new(WRITERS + READERS));
+            let writing = Arc::new(AtomicUsize::new(WRITERS));
+            let mut threads = Vec::new();
+            for _ in 0..WRITERS {
+                let (store, bytes, barrier, writing) = (
+                    Arc::clone(&store),
+                    Arc::clone(&bytes),
+                    Arc::clone(&barrier),
+                    Arc::clone(&writing),
+                );
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..PUTS {
+                        // A fresh write each time: what another handle or
+                        // process that has not seen the object does.
+                        store.forget(ObjectId::from_canonical(&bytes));
+                        store.put(&bytes)?;
+                    }
+                    writing.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }));
+            }
+            for _ in 0..READERS {
+                let (store, barrier, writing) = (
+                    Arc::clone(&store),
+                    Arc::clone(&barrier),
+                    Arc::clone(&writing),
+                );
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    while writing.load(Ordering::SeqCst) > 0 {
+                        match store.get(id) {
+                            Ok(_) | Err(Error::MissingObject(_)) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            for thread in threads {
+                if let Err(err) = thread.join().expect("join reader thread") {
+                    return Err(format!("round {round}: {err}").into());
+                }
+            }
+            assert_eq!(store.get(id)?, *bytes);
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

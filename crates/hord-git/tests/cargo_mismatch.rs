@@ -8,6 +8,8 @@ use gix::bstr::ByteSlice;
 use hord_core::{ChangeRecord, IntentRef};
 use hord_git::{MemoryStore, Store, export_tree, import_git_window};
 
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
 const CARGO_GIT: &str = ".cache/hord/corpora/cargo.git";
 const FAILING_GITLINK: &str = "ee1a81a801d61d5bedd71bf26038a5f2f500f9e9";
 const FAILING_CHMOD: &str = "24ba7c80661a5bb6a5ac612733335ed4579e6276";
@@ -17,20 +19,23 @@ fn cargo_git() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn list_tree(repo: &gix::Repository, id: gix::ObjectId) -> Vec<(String, String, String)> {
-    let tree = repo.find_tree(id).unwrap();
+fn list_tree(
+    repo: &gix::Repository,
+    id: gix::ObjectId,
+) -> TestResult<Vec<(String, String, String)>> {
+    let tree = repo.find_tree(id)?;
     let mut out = Vec::new();
     for entry in tree.iter() {
-        let entry = entry.unwrap();
+        let entry = entry?;
         let mode = {
             let mut buf = [0u8; 6];
-            entry.mode().as_bytes(&mut buf).to_str().unwrap().to_owned()
+            entry.mode().as_bytes(&mut buf).to_str()?.to_owned()
         };
-        let name = entry.filename().to_str().unwrap().to_owned();
+        let name = entry.filename().to_str()?.to_owned();
         let oid = entry.oid().to_hex().to_string();
         out.push((mode, name, oid));
     }
-    out
+    Ok(out)
 }
 
 fn dump_diff(
@@ -38,16 +43,16 @@ fn dump_diff(
     exported: &gix::Repository,
     orig_id: gix::ObjectId,
     exp_id: gix::ObjectId,
-) {
+) -> TestResult {
     fn rec(
         orig: &gix::Repository,
         exported: &gix::Repository,
         orig_id: gix::ObjectId,
         exp_id: gix::ObjectId,
         path: &str,
-    ) {
-        let a = list_tree(orig, orig_id);
-        let b = list_tree(exported, exp_id);
+    ) -> TestResult {
+        let a = list_tree(orig, orig_id)?;
+        let b = list_tree(exported, exp_id)?;
         eprintln!("--- tree {path} orig={orig_id} exp={exp_id} ---");
         let n = a.len().max(b.len());
         for i in 0..n {
@@ -70,81 +75,74 @@ fn dump_diff(
                     rec(
                         orig,
                         exported,
-                        gix::ObjectId::from_hex(ao.as_bytes()).unwrap(),
-                        gix::ObjectId::from_hex(bo.as_bytes()).unwrap(),
+                        gix::ObjectId::from_hex(ao.as_bytes())?,
+                        gix::ObjectId::from_hex(bo.as_bytes())?,
                         &child,
-                    );
+                    )?;
                 }
-                return;
+                return Ok(());
             }
         }
         eprintln!("  (no entry differences; SHA still differs — encoding?)");
+        Ok(())
     }
-    rec(orig, exported, orig_id, exp_id, "");
+    rec(orig, exported, orig_id, exp_id, "")
 }
 
 #[test]
-fn cargo_ee1a81a_gitlink_tree_sha() {
+fn cargo_ee1a81a_gitlink_tree_sha() -> TestResult {
     let Some(git_dir) = cargo_git() else {
         eprintln!("skip: {CARGO_GIT} not present");
-        return;
+        return Ok(());
     };
 
-    let orig = gix::open_opts(&git_dir, gix::open::Options::isolated()).unwrap();
-    round_trip_one(&git_dir, &orig, FAILING_GITLINK);
-    round_trip_one(&git_dir, &orig, FAILING_CHMOD);
+    let orig = gix::open_opts(&git_dir, gix::open::Options::isolated())?;
+    round_trip_one(&git_dir, &orig, FAILING_GITLINK)?;
+    round_trip_one(&git_dir, &orig, FAILING_CHMOD)?;
 
     // Same store: later imports must not clobber earlier trees' modes.
     let mut store = MemoryStore::new();
-    import_git_window(&mut store, &git_dir, FAILING_GITLINK, 1).unwrap();
-    import_git_window(&mut store, &git_dir, FAILING_CHMOD, 1).unwrap();
-    let dest = tempfile();
+    import_git_window(&mut store, &git_dir, FAILING_GITLINK, 1)?;
+    import_git_window(&mut store, &git_dir, FAILING_CHMOD, 1)?;
+    let dest = tempfile()?;
     for sha in [FAILING_GITLINK, FAILING_CHMOD] {
-        let change_id = store
-            .log()
-            .unwrap()
-            .into_iter()
-            .find(|id| {
-                let c: ChangeRecord = store.get_object(*id).unwrap();
-                c.intent
-                    .refs
-                    .iter()
-                    .any(|r| matches!(r, IntentRef::GitCommit { sha: s } if s == sha))
-            })
-            .unwrap();
-        let change: ChangeRecord = store.get_object(change_id).unwrap();
+        let mut change_id = None;
+        for id in store.log()? {
+            let c: ChangeRecord = store.get_object(id)?;
+            if c.intent
+                .refs
+                .iter()
+                .any(|r| matches!(r, IntentRef::GitCommit { sha: s } if s == sha))
+            {
+                change_id = Some(id);
+                break;
+            }
+        }
+        let change_id = change_id.ok_or(format!("no imported change for {sha}"))?;
+        let change: ChangeRecord = store.get_object(change_id)?;
         let orig_tree = orig
-            .rev_parse_single(sha)
-            .unwrap()
-            .object()
-            .unwrap()
-            .try_into_commit()
-            .unwrap()
-            .tree_id()
-            .unwrap()
+            .rev_parse_single(sha)?
+            .object()?
+            .try_into_commit()?
+            .tree_id()?
             .detach();
-        let exported = export_tree(&store, change.result, dest.path()).unwrap();
+        let exported = export_tree(&store, change.result, dest.path())?;
         assert_eq!(
             exported.to_hex(),
             orig_tree.to_hex().to_string(),
             "joint import clobbered {sha}"
         );
     }
+    Ok(())
 }
 
-fn round_trip_one(git_dir: &Path, orig: &gix::Repository, sha: &str) {
-    let commit = orig
-        .rev_parse_single(sha)
-        .unwrap()
-        .object()
-        .unwrap()
-        .try_into_commit()
-        .unwrap();
-    let orig_tree = commit.tree_id().unwrap().detach();
+fn round_trip_one(git_dir: &Path, orig: &gix::Repository, sha: &str) -> TestResult {
+    let commit = orig.rev_parse_single(sha)?.object()?.try_into_commit()?;
+    let orig_tree = commit.tree_id()?.detach();
 
     let mut store = MemoryStore::new();
-    let head = import_git_window(&mut store, git_dir, sha, 1).unwrap();
-    let change: ChangeRecord = store.get_object(head).unwrap();
+    let head = import_git_window(&mut store, git_dir, sha, 1)?;
+    let change: ChangeRecord = store.get_object(head)?;
     assert!(
         change
             .intent
@@ -154,37 +152,37 @@ fn round_trip_one(git_dir: &Path, orig: &gix::Repository, sha: &str) {
         "imported the requested commit {sha}"
     );
 
-    let dest = tempfile();
-    let exported = export_tree(&store, change.result, dest.path()).unwrap();
+    let dest = tempfile()?;
+    let exported = export_tree(&store, change.result, dest.path())?;
     if exported.as_gix() != orig_tree {
-        let exp_repo = gix::open_opts(dest.path(), gix::open::Options::isolated()).unwrap();
-        dump_diff(orig, &exp_repo, orig_tree, exported.as_gix());
+        let exp_repo = gix::open_opts(dest.path(), gix::open::Options::isolated())?;
+        dump_diff(orig, &exp_repo, orig_tree, exported.as_gix())?;
     }
     assert_eq!(
         exported.to_hex(),
         orig_tree.to_hex().to_string(),
         "export(import({sha})) must match git tree SHA"
     );
+    Ok(())
 }
 
-fn tempfile() -> TempDir {
+fn tempfile() -> TestResult<TempDir> {
     TempDir::new("cargo-mismatch")
 }
 
 struct TempDir(std::path::PathBuf);
 
 impl TempDir {
-    fn new(prefix: &str) -> Self {
+    fn new(prefix: &str) -> TestResult<Self> {
         let path = std::env::temp_dir().join(format!(
             "hord-git-{prefix}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
     }
     fn path(&self) -> &Path {
         &self.0

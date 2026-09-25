@@ -39,11 +39,15 @@
 //! that overlaps nothing landed before it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use hord_core::{Actor, ChangeId, Intent, NodeId, RepoPath};
-use hord_txn::{Base, BeginOptions, ConflictKind, DefinitionInfo, QueueStatus, Repo};
+use hord_txn::{
+    Base, BeginOptions, ConflictKind, DefinitionInfo, QueueStatus, Repo, RepoConfig, RepoOptions,
+    StubVerifier,
+};
 use serde::Serialize;
 
 use crate::rust;
@@ -144,6 +148,8 @@ pub(crate) struct AgentPlan {
     /// Name the first edit's statement refers to (a name pair).
     pub names: Option<String>,
     pub pair: Option<(usize, PairKind)>,
+    /// The first edit is an `unsafe` block (`--policy`).
+    pub unsafe_edit: bool,
 }
 
 struct Picker<'a> {
@@ -301,6 +307,7 @@ pub(crate) fn plan(
             reads: Vec::new(),
             names: None,
             pair: None,
+            unsafe_edit: false,
         });
     }
     let overlapping = (agents * overlap_percent / 100) & !1;
@@ -356,18 +363,13 @@ pub(crate) fn actor(id: &str) -> Actor {
 }
 
 pub(crate) fn intent(summary: &str) -> Intent {
-    Intent {
-        summary: summary.into(),
-        body: String::new(),
-        refs: Vec::new(),
-        acceptance: Vec::new(),
-    }
+    Intent::from_summary(summary)
 }
 
 /// What one agent did, recorded by the harness.
 pub(crate) struct AgentRun {
     index: usize,
-    change: ChangeId,
+    pub change: ChangeId,
     begin: Duration,
     /// `(node, base text, edited text)` per written definition.
     written: Vec<(NodeId, Vec<u8>, Vec<u8>)>,
@@ -445,6 +447,9 @@ pub(crate) async fn agent_work(
         reads.insert(target.node);
         let stmt = match (&plan.names, i) {
             (Some(name), 0) => format!("let _ = {name};"),
+            (None, 0) if plan.unsafe_edit => {
+                "let _ = unsafe { std::hint::black_box(0_u64) };".to_owned()
+            }
             _ => statement(&mut rng, plan.index, i),
         };
         let Some(edited) = rust::insert_stmt(text.as_slice(), &stmt) else {
@@ -545,6 +550,8 @@ pub(crate) struct SimReport {
     pub landed: usize,
     pub conflicted: usize,
     pub rejected: usize,
+    /// Parked by policy (`--policy`).
+    pub parked: usize,
     pub flagged: usize,
     pub false_negatives: Vec<PairFinding>,
     pub false_positive_pairs: Vec<PairFinding>,
@@ -561,9 +568,27 @@ pub(crate) struct SimReport {
     /// lost identity. Printed; not a gate.
     pub false_positive_changes_clean_identity: usize,
     pub changes: Vec<ChangeRow>,
+    /// `--policy`: enforcement against the oracle.
+    pub policy: Option<crate::policy::PolicyReport>,
     /// Files the targets live in, for the workspace run.
     #[serde(skip)]
     pub target_files: Vec<RepoPath>,
+}
+
+/// Repository options for a run: verification stubbed (spec §12 M3), and
+/// with `policy` stubbed by evidence fixtures ([`crate::policy`]).
+/// Overlaps that rebase cleanly land flagged; the product default parks
+/// them.
+pub(crate) fn repo_options(strict_reads: bool, policy: bool) -> RepoOptions {
+    RepoOptions {
+        config: RepoConfig { strict_reads },
+        verifier: Some(if policy {
+            Arc::new(crate::policy::FixtureVerifier)
+        } else {
+            Arc::new(StubVerifier)
+        }),
+        ..RepoOptions::default()
+    }
 }
 
 /// Simulation parameters.
@@ -574,6 +599,9 @@ pub(crate) struct SimConfig {
     pub strict_reads: bool,
     /// Submit in completion order instead of a seeded order.
     pub racy_submit: bool,
+    /// Land §7.2's example policy first and check it is enforced
+    /// ([`crate::policy`]).
+    pub policy: bool,
 }
 
 pub(crate) async fn run(
@@ -582,14 +610,87 @@ pub(crate) async fn run(
     snapshot: &Snapshot,
     config: &SimConfig,
 ) -> Result<SimReport> {
+    let mut plan = plan(snapshot, config.agents, config.overlap_percent, config.seed)?;
+    let (base, policed) = if config.policy {
+        let (base, dir) = crate::policy::install(repo, base, &mut plan, snapshot).await?;
+        (base, Some(dir))
+    } else {
+        (base, None)
+    };
+    let started = Instant::now();
+    // Agents work concurrently; unless racy, they submit in a seeded order
+    // so a seed fixes the landing order too.
+    let positions = submit_positions(config);
+    let (turn, _) = tokio::sync::watch::channel(0usize);
+    let mut tasks = Vec::with_capacity(config.agents);
+    for agent in plan.agents.iter().cloned() {
+        let turns = (!config.racy_submit).then(|| (turn.clone(), positions[agent.index]));
+        tasks.push(tokio::spawn(run_agent(
+            repo.clone(),
+            base,
+            agent,
+            config.seed,
+            turns,
+        )));
+    }
+    let mut runs = Vec::with_capacity(config.agents);
+    for task in tasks {
+        runs.push(task.await.context("agent task")??);
+    }
+    let agents_secs = started.elapsed().as_secs_f64();
+
+    let started = Instant::now();
+    let done = repo.land_local().await?;
+    let land = started.elapsed();
+    if done.len() != config.agents {
+        bail!(
+            "land_local processed {} of {} changes",
+            done.len(),
+            config.agents
+        );
+    }
+    analyze(
+        repo,
+        snapshot,
+        &plan,
+        config,
+        runs,
+        done,
+        agents_secs,
+        land,
+        policed.as_deref(),
+    )
+    .await
+}
+
+/// Each agent's turn in the seeded submission order.
+pub(crate) fn submit_positions(config: &SimConfig) -> Vec<usize> {
+    let mut positions: Vec<usize> = (0..config.agents).collect();
+    Rng::new(config.seed.rotate_left(17)).shuffle(&mut positions);
+    positions
+}
+
+/// The oracle over a finished run: `done` is every agent's queue entry
+/// after landing, `land` the time landing took.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn analyze(
+    repo: &Repo,
+    snapshot: &Snapshot,
+    plan: &Plan,
+    config: &SimConfig,
+    runs: Vec<AgentRun>,
+    done: Vec<hord_txn::QueueEntry>,
+    agents_secs: f64,
+    land: Duration,
+    public_dir: Option<&str>,
+) -> Result<SimReport> {
     let &SimConfig {
         agents,
-        overlap_percent,
         seed,
         strict_reads,
         racy_submit,
+        ..
     } = config;
-    let plan = plan(snapshot, agents, overlap_percent, seed)?;
     let planned_overlapping = plan.agents.iter().filter(|a| a.pair.is_some()).count();
     let target_files: Vec<RepoPath> = plan
         .agents
@@ -598,45 +699,25 @@ pub(crate) async fn run(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-
-    let started = Instant::now();
-    // Agents work concurrently; unless racy, they submit in a seeded order
-    // so a seed fixes the landing order too.
-    let mut positions: Vec<usize> = (0..agents).collect();
-    Rng::new(seed.rotate_left(17)).shuffle(&mut positions);
-    let (turn, _) = tokio::sync::watch::channel(0usize);
-    let mut tasks = Vec::with_capacity(agents);
-    for agent in plan.agents.iter().cloned() {
-        let turns = (!racy_submit).then(|| (turn.clone(), positions[agent.index]));
-        tasks.push(tokio::spawn(run_agent(
-            repo.clone(),
-            base,
-            agent,
-            seed,
-            turns,
-        )));
-    }
-    let mut runs = Vec::with_capacity(agents);
-    for task in tasks {
-        runs.push(task.await.context("agent task")??);
-    }
-    let agents_secs = started.elapsed().as_secs_f64();
     let agent_begin_max_ms = runs
         .iter()
         .map(|r| r.begin.as_secs_f64() * 1000.0)
         .fold(0.0, f64::max);
 
-    let started = Instant::now();
-    let done = repo.land_local().await?;
-    let land = started.elapsed();
-    if done.len() != agents {
-        bail!("land_local processed {} of {agents} changes", done.len());
-    }
-
     let by_change: HashMap<ChangeId, usize> = runs.iter().map(|r| (r.change, r.index)).collect();
     let runs_by_index: BTreeMap<usize, &AgentRun> = runs.iter().map(|r| (r.index, r)).collect();
     let truths: BTreeMap<usize, Truth> =
         runs.iter().map(|r| (r.index, truth(r, snapshot))).collect();
+    // `--policy`: the rules the oracle says apply to each agent.
+    let expected = public_dir.map(|dir| {
+        let written: BTreeMap<usize, usize> = truths.iter().map(|(a, t)| (*a, t.w.len())).collect();
+        crate::policy::expected(&plan.agents, snapshot, dir, &written)
+    });
+    let policed = |agent: usize| {
+        expected
+            .as_ref()
+            .is_some_and(|e| e.get(&agent).is_some_and(|r| !r.is_empty()))
+    };
     let mut landed_as: HashMap<ChangeId, usize> = HashMap::new();
     let mut landed_before: Vec<usize> = Vec::new();
 
@@ -656,6 +737,7 @@ pub(crate) async fn run(
         landed: 0,
         conflicted: 0,
         rejected: 0,
+        parked: 0,
         flagged: 0,
         false_negatives: Vec::new(),
         false_positive_pairs: Vec::new(),
@@ -668,6 +750,7 @@ pub(crate) async fn run(
         identity_loss: Vec::new(),
         false_positive_changes_clean_identity: 0,
         changes: Vec::new(),
+        policy: None,
         target_files,
     };
 
@@ -698,6 +781,7 @@ pub(crate) async fn run(
             QueueStatus::Landed { .. } => report.landed += 1,
             QueueStatus::Conflicted => report.conflicted += 1,
             QueueStatus::Rejected { .. } => report.rejected += 1,
+            QueueStatus::Parked { .. } => report.parked += 1,
             QueueStatus::Queued => bail!("change of agent {b} still queued after land_local"),
         }
         let mut reported: BTreeMap<usize, Vec<ConflictKind>> = BTreeMap::new();
@@ -765,7 +849,10 @@ pub(crate) async fn run(
                 });
             }
         }
-        if !overlaps_landed && (!merge_conflicts.is_empty() || !landed) {
+        // A change the policy parks, as the oracle expects, is not a
+        // conflict false positive.
+        let policy_parked = matches!(entry.status, QueueStatus::Parked { .. }) && policed(b);
+        if !overlaps_landed && (!merge_conflicts.is_empty() || !landed) && !policy_parked {
             false_positive = true;
             explained = false;
         }
@@ -775,7 +862,7 @@ pub(crate) async fn run(
                 report.false_positive_changes_clean_identity += 1;
             }
         }
-        if !overlaps_landed {
+        if !overlaps_landed && !policy_parked {
             report.disjoint += 1;
             if landed {
                 report.disjoint_landed += 1;
@@ -804,6 +891,14 @@ pub(crate) async fn run(
         });
     }
     report.false_positive_rate = report.false_positive_changes as f64 / agents as f64;
+    if let (Some(expected), Some(dir)) = (&expected, public_dir) {
+        report.policy = Some(crate::policy::check(
+            &entries,
+            &|e| by_change.get(&e.change).copied(),
+            expected,
+            dir,
+        )?);
+    }
     Ok(report)
 }
 
@@ -888,5 +983,6 @@ pub(crate) fn status_name(status: &QueueStatus) -> String {
         QueueStatus::Landed { .. } => "landed".into(),
         QueueStatus::Conflicted => "conflicted".into(),
         QueueStatus::Rejected { reason } => format!("rejected: {reason}"),
+        QueueStatus::Parked { reason } => format!("parked: {reason}"),
     }
 }

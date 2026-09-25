@@ -1,21 +1,11 @@
-//! Parse node specs and blame targets; resolution itself is
-//! [`hord_txn::Query`] (NodeIds read from the snapshots' identity, ADR 0017).
+//! Parse node specs and blame targets; resolution itself goes through the
+//! session's backend (NodeIds read from the snapshots' identity, ADR 0017).
 //!
 //! Node ids accept the ULID text [`NodeId`] displays and a 32-digit hex
 //! encoding of the same 128 bits.
 
 use anyhow::{Context, Result, bail};
-use hord_core::{Actor, NodeId, RepoPath};
-use hord_txn::Query;
-
-use crate::txn::block_on;
-
-/// `Actor` id used by `log --actor` and blame output.
-pub(crate) fn actor_id(actor: &Actor) -> &str {
-    match actor {
-        Actor::Human { id } | Actor::Agent { id, .. } => id,
-    }
-}
+use hord_core::{NodeId, RepoPath};
 
 /// Parse a ULID or a 32-digit hex NodeId. `None` means the string is not an id.
 pub(crate) fn parse_node_id(spec: &str) -> Option<NodeId> {
@@ -25,19 +15,11 @@ pub(crate) fn parse_node_id(spec: &str) -> Option<NodeId> {
     parse_node_hex(spec)
 }
 
-/// NodeId for `log --node`: an id, or a qualified name.
-pub(crate) fn resolve_node_spec(query: &Query, spec: &str) -> Result<NodeId> {
-    if let Some(id) = parse_node_id(spec) {
-        return Ok(id);
-    }
-    Ok(block_on(query.resolve_name(spec))?)
-}
-
 /// A blame argument after it has been classified.
 pub(crate) enum BlameTarget {
     /// ULID or 32-digit hex. History is the store's `node_history`, no scan.
     Node(NodeId),
-    /// Qualified name resolved by [`Query::resolve_name`].
+    /// Qualified name, resolved at head (`RepoBackend::resolve_name`).
     Name(String),
     /// 1-based line in a repository path.
     Line { path: RepoPath, line: u32 },
@@ -57,42 +39,16 @@ pub(crate) fn parse_blame_target(spec: &str) -> Result<BlameTarget> {
     Ok(BlameTarget::Name(spec.to_owned()))
 }
 
-/// Resolve a blame argument to the definition it names.
-pub(crate) fn resolve_blame_target(query: &Query, spec: &str) -> Result<NodeId> {
-    Ok(match parse_blame_target(spec)? {
-        BlameTarget::Node(id) => id,
-        BlameTarget::Name(name) => block_on(query.resolve_name(&name))?,
-        BlameTarget::Line { path, line } => block_on(query.resolve_line(path, line))?,
-    })
-}
-
 fn parse_node_hex(spec: &str) -> Option<NodeId> {
     let spec = spec
         .strip_prefix("0x")
         .or_else(|| spec.strip_prefix("0X"))
         .unwrap_or(spec);
-    if spec.len() != 32 {
+    // `from_str_radix` alone would also take a leading `+`.
+    if spec.len() != 32 || !spec.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let bytes = spec.as_bytes();
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = hex_byte(bytes[i * 2], bytes[i * 2 + 1])?;
-    }
-    Some(NodeId::from_u128(u128::from_be_bytes(out)))
-}
-
-fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
-    Some(hex_nibble(hi)? << 4 | hex_nibble(lo)?)
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    u128::from_str_radix(spec, 16).ok().map(NodeId::from_u128)
 }
 
 fn split_path_line(spec: &str) -> Result<Option<(RepoPath, u32)>> {
@@ -122,7 +78,7 @@ fn split_path_line(spec: &str) -> Result<Option<(RepoPath, u32)>> {
 
 #[cfg(test)]
 mod tests {
-    use hord_core::{Actor, Bytes, NodeId};
+    use hord_core::NodeId;
 
     use super::*;
 
@@ -144,39 +100,26 @@ mod tests {
     }
 
     #[test]
-    fn blame_target_splits_path_line_and_names() {
-        let line = parse_blame_target("src/lib.rs:12").unwrap();
+    fn blame_target_splits_path_line_and_names() -> anyhow::Result<()> {
+        let line = parse_blame_target("src/lib.rs:12")?;
         match line {
             BlameTarget::Line { path, line } => {
                 assert_eq!(path.to_string(), "src/lib.rs");
                 assert_eq!(line, 12);
             }
-            BlameTarget::Node(_) | BlameTarget::Name(_) => panic!("expected path:line"),
+            BlameTarget::Node(_) | BlameTarget::Name(_) => anyhow::bail!("expected path:line"),
         }
         assert!(matches!(
-            parse_blame_target("crate::alpha").unwrap(),
+            parse_blame_target("crate::alpha")?,
             BlameTarget::Name(name) if name == "crate::alpha"
         ));
         let id = node(1);
         assert!(matches!(
-            parse_blame_target(&id.to_string()).unwrap(),
+            parse_blame_target(&id.to_string())?,
             BlameTarget::Node(parsed) if parsed == id
         ));
         assert!(parse_blame_target("src/lib.rs:0").is_err());
         assert!(parse_blame_target("/src/lib.rs:1").is_err());
-    }
-
-    #[test]
-    fn actor_id_is_the_id_field() {
-        assert_eq!(actor_id(&Actor::Human { id: "ada".into() }), "ada");
-        assert_eq!(
-            actor_id(&Actor::Agent {
-                id: "agent-7".into(),
-                model: "m".into(),
-                model_hash: Bytes::default(),
-                harness: "h".into(),
-            }),
-            "agent-7"
-        );
+        Ok(())
     }
 }

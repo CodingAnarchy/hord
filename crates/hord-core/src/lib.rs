@@ -36,7 +36,8 @@ pub use evidence::{Evidence, EvidenceKind, EvidenceResult};
 pub use hord_encoding::ObjectId;
 pub use id::{ChangeId, NodeId, SnapshotId};
 pub use identity::{
-    FileIdentity, IdentityDelta, IdentityEntry, IdentityMap, IdentityTree, NodePath,
+    FileIdentity, IdentityDelta, IdentityEdit, IdentityEntry, IdentityMap, IdentityTree,
+    IdentityTrees, NodePath, edit_identity_tree,
 };
 pub use node::{AdapterId, LangId, Node, NodeKind, QualifiedName};
 pub use policy::{LandPolicy, Policy, PolicyRule, PolicyWhen};

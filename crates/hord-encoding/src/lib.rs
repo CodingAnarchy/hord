@@ -74,22 +74,23 @@ mod tests {
     }
 
     #[test]
-    fn struct_map_keys_are_sorted() {
+    fn struct_map_keys_are_sorted() -> Result<(), Box<dyn std::error::Error>> {
         let value = Named {
             lang: "rust".into(),
             kind: "fn_item".into(),
         };
         // "kind" (0x64…) sorts before "lang" (0x64… with a later first-diff).
-        let bytes = encode(&value).unwrap();
+        let bytes = encode(&value)?;
         assert_eq!(
             hex::encode(&bytes),
             "a2646b696e6467666e5f6974656d646c616e676472757374"
         );
-        assert_eq!(decode::<Named>(&bytes).unwrap(), value);
+        assert_eq!(decode::<Named>(&bytes)?, value);
+        Ok(())
     }
 
     #[test]
-    fn hashmap_insertion_order_is_irrelevant() {
+    fn hashmap_insertion_order_is_irrelevant() -> Result<(), Box<dyn std::error::Error>> {
         let mut a = HashMap::new();
         a.insert("z", 1i64);
         a.insert("aa", 2);
@@ -98,24 +99,24 @@ mod tests {
         b.insert("aa", 2i64);
         b.insert("b", 3);
         b.insert("z", 1);
-        assert_eq!(encode(&a).unwrap(), encode(&b).unwrap());
-        assert_eq!(hex::encode(encode(&a).unwrap()), "a3616203617a0162616102");
+        assert_eq!(encode(&a)?, encode(&b)?);
+        assert_eq!(hex::encode(encode(&a)?), "a3616203617a0162616102");
+        Ok(())
     }
 
     #[test]
-    fn trailing_bytes_are_rejected() {
-        let mut bytes = encode(&42i64).unwrap();
+    fn trailing_bytes_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let mut bytes = encode(&42i64)?;
         bytes.push(0x00);
         assert!(decode::<i64>(&bytes).is_err());
+        Ok(())
     }
 
     #[test]
-    fn object_id_matches_hash_of_encoding() {
+    fn object_id_matches_hash_of_encoding() -> Result<(), Box<dyn std::error::Error>> {
         let value = 0u8;
-        let encoded = encode(&value).unwrap();
-        assert_eq!(
-            ObjectId::of(&value).unwrap(),
-            ObjectId::from_canonical(&encoded)
-        );
+        let encoded = encode(&value)?;
+        assert_eq!(ObjectId::of(&value)?, ObjectId::from_canonical(&encoded));
+        Ok(())
     }
 }

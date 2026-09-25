@@ -8,12 +8,12 @@
 //! each CST node. The identity tree holds a [`hord_core::FileIdentity`] for
 //! each parsed file whose ids differ from the fresh assignment.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use hord_core::{
-    Blob, Bytes, IdentityEntry, IdentityTree, ObjectId, RepoPath, Snapshot, SnapshotId, Tree,
-    TreeEntry,
+    Blob, Bytes, IdentityEntry, IdentityTree, IdentityTrees, ObjectId, RepoPath, Snapshot,
+    SnapshotId, Tree, TreeEntry, edit_identity_tree,
 };
 
 use crate::repo::{Inner, lock};
@@ -40,6 +40,20 @@ const MAX_CACHED_SNAPSHOTS: usize = 16_384;
 /// object, or `None` when the file is gone or takes the fresh assignment.
 pub(crate) type IdentityEdits = BTreeMap<RepoPath, Option<ObjectId>>;
 
+/// Insert into a cache that is emptied when it reaches `cap` entries.
+fn cache_insert<K: Eq + std::hash::Hash, V>(
+    cache: &Mutex<HashMap<K, Arc<V>>>,
+    cap: usize,
+    key: K,
+    value: Arc<V>,
+) {
+    let mut cache = lock(cache);
+    if cache.len() >= cap {
+        cache.clear();
+    }
+    cache.insert(key, value);
+}
+
 /// [`ObjectId`] of `bytes` stored as a [`Blob`], without storing it.
 pub(crate) fn blob_object_id(bytes: &[u8]) -> Result<ObjectId> {
     Ok(ObjectId::of(&Blob::new(bytes.to_vec()))?)
@@ -51,22 +65,23 @@ impl Inner {
         if let Some(snapshot) = lock(&self.snapshots).get(&id) {
             return Ok(Arc::clone(snapshot));
         }
-        let snapshot: Snapshot = match self.store.get_object(id) {
+        let snapshot: Snapshot = match self.get_object(id) {
             Ok(snapshot) => snapshot,
-            Err(hord_store::Error::Encoding(err)) => {
+            Err(Error::Store(hord_store::Error::Encoding(err))) => {
                 return Err(Error::Corrupt {
                     id,
                     reason: format!("not a snapshot: {err}"),
                 });
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         };
         let snapshot = Arc::new(snapshot);
-        let mut cache = lock(&self.snapshots);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::clone(&snapshot));
+        cache_insert(
+            &self.snapshots,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::clone(&snapshot),
+        );
         Ok(snapshot)
     }
 
@@ -88,19 +103,20 @@ impl Inner {
         if let Some(tree) = lock(&self.identity_trees).get(&id) {
             return Ok(Arc::clone(tree));
         }
-        let tree: IdentityTree = match self.store.get_object(id) {
+        let tree: IdentityTree = match self.get_object(id) {
             Ok(tree) => tree,
-            Err(hord_store::Error::MissingObject(_)) => {
+            Err(Error::Store(hord_store::Error::MissingObject(_))) => {
                 return Err(Error::MissingIdentity(snapshot));
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         };
         let tree = Arc::new(tree);
-        let mut cache = lock(&self.identity_trees);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::clone(&tree));
+        cache_insert(
+            &self.identity_trees,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::clone(&tree),
+        );
         Ok(tree)
     }
 
@@ -134,11 +150,12 @@ impl Inner {
     pub(crate) fn put_snapshot(&self, tree: ObjectId, identity: ObjectId) -> Result<SnapshotId> {
         let snapshot = Snapshot::new(tree, identity);
         let id = self.store.put_object(&snapshot)?;
-        let mut cache = lock(&self.snapshots);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::new(snapshot));
+        cache_insert(
+            &self.snapshots,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::new(snapshot),
+        );
         Ok(id)
     }
 
@@ -177,81 +194,22 @@ impl Inner {
             .filter(|(path, _)| !path.is_root())
             .map(|(path, id)| (path.components(), *id))
             .collect();
-        match self.update_identity_subtree(snapshot, Some(root), &list)? {
+        let mut trees = SnapshotIdentityTrees {
+            inner: self,
+            snapshot,
+        };
+        match edit_identity_tree(&mut trees, Some(root), &list)? {
             Some(id) => Ok(id),
             None => Ok(self.store.put_object(&IdentityTree::default())?),
         }
-    }
-
-    fn update_identity_subtree(
-        &self,
-        snapshot: SnapshotId,
-        tree: Option<ObjectId>,
-        changes: PathChangesRef<'_, '_>,
-    ) -> Result<Option<ObjectId>> {
-        let mut out = match tree {
-            Some(id) => (*self.identity_tree(snapshot, id)?).clone(),
-            None => IdentityTree::default(),
-        };
-        let mut nested: BTreeMap<&str, PathChanges<'_>> = BTreeMap::new();
-        for (components, identity) in changes {
-            match components {
-                [name] => match identity {
-                    Some(id) => {
-                        out.entries.insert(name.clone(), IdentityEntry::File(*id));
-                    }
-                    None => {
-                        if matches!(out.entries.get(name), Some(IdentityEntry::File(_))) {
-                            out.entries.remove(name);
-                        }
-                    }
-                },
-                [dir, rest @ ..] => nested
-                    .entry(dir.as_str())
-                    .or_default()
-                    .push((rest, *identity)),
-                [] => {}
-            }
-        }
-        for (dir, sub) in nested {
-            let existing = match out.entries.get(dir) {
-                Some(IdentityEntry::Dir(id)) => Some(*id),
-                _ => None,
-            };
-            if existing.is_none() && sub.iter().all(|(_, id)| id.is_none()) {
-                continue;
-            }
-            match self.update_identity_subtree(snapshot, existing, &sub)? {
-                Some(id) => {
-                    out.entries.insert(dir.to_owned(), IdentityEntry::Dir(id));
-                }
-                None => {
-                    out.entries.remove(dir);
-                }
-            }
-        }
-        if out.entries.is_empty() {
-            return Ok(None);
-        }
-        let id = self.store.put_object(&out)?;
-        let mut cache = lock(&self.identity_trees);
-        if cache.len() >= MAX_CACHED_SNAPSHOTS {
-            cache.clear();
-        }
-        cache.insert(id, Arc::new(out));
-        Ok(Some(id))
     }
 
     pub(crate) fn tree(&self, id: ObjectId) -> Result<Arc<Tree>> {
         if let Some(tree) = lock(&self.trees).get(&id) {
             return Ok(Arc::clone(tree));
         }
-        let tree: Arc<Tree> = Arc::new(self.store.get_object(id)?);
-        let mut cache = lock(&self.trees);
-        if cache.len() >= MAX_CACHED_TREES {
-            cache.clear();
-        }
-        cache.insert(id, Arc::clone(&tree));
+        let tree: Arc<Tree> = Arc::new(self.get_object(id)?);
+        cache_insert(&self.trees, MAX_CACHED_TREES, id, Arc::clone(&tree));
         Ok(tree)
     }
 
@@ -287,7 +245,7 @@ impl Inner {
     }
 
     pub(crate) fn blob_bytes(&self, id: ObjectId) -> Result<Bytes> {
-        let blob: Blob = self.store.get_object(id)?;
+        let blob: Blob = self.get_object(id)?;
         Ok(blob.bytes)
     }
 
@@ -502,13 +460,33 @@ impl Inner {
             return Ok(None);
         }
         let id = self.store.put_object(&out)?;
-        {
-            let mut cache = lock(&self.trees);
-            if cache.len() >= MAX_CACHED_TREES {
-                cache.clear();
-            }
-            cache.insert(id, Arc::new(out));
-        }
+        cache_insert(&self.trees, MAX_CACHED_TREES, id, Arc::new(out));
         Ok(Some(id))
+    }
+}
+
+/// The identity trees of `snapshot`: read through the cache, a missing one
+/// is [`Error::MissingIdentity`]; written to the store and the cache.
+struct SnapshotIdentityTrees<'a> {
+    inner: &'a Inner,
+    snapshot: SnapshotId,
+}
+
+impl IdentityTrees for SnapshotIdentityTrees<'_> {
+    type Error = Error;
+
+    fn load(&mut self, id: ObjectId) -> Result<IdentityTree> {
+        Ok((*self.inner.identity_tree(self.snapshot, id)?).clone())
+    }
+
+    fn store(&mut self, tree: IdentityTree) -> Result<ObjectId> {
+        let id = self.inner.store.put_object(&tree)?;
+        cache_insert(
+            &self.inner.identity_trees,
+            MAX_CACHED_SNAPSHOTS,
+            id,
+            Arc::new(tree),
+        );
+        Ok(id)
     }
 }

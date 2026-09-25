@@ -16,14 +16,13 @@ pub trait Store {
     /// Write canonical bytes at `id`, which must be their BLAKE3 hash.
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), Error>;
 
-    /// Write canonical bytes and return their [`ObjectId`].
-    ///
-    /// Stores that hash on write (like [`hord_store::Store`]) override this
-    /// so the import path hashes each object once.
-    fn put_bytes(&mut self, bytes: Vec<u8>) -> Result<ObjectId, Error> {
-        let id = ObjectId::from_canonical(&bytes);
-        self.put(id, bytes)?;
-        Ok(id)
+    /// [`Store::put`] every `(id, bytes)` pair. Stores that can write
+    /// several objects at once (like [`hord_store::Store`]) override this.
+    fn put_all(&mut self, objects: Vec<(ObjectId, Vec<u8>)>) -> Result<(), Error> {
+        for (id, bytes) in objects {
+            self.put(id, bytes)?;
+        }
+        Ok(())
     }
 
     /// Read canonical bytes for `id`.
@@ -31,7 +30,10 @@ pub trait Store {
 
     /// Canonical-encode `value`, store it, and return its [`ObjectId`].
     fn put_object<T: Serialize>(&mut self, value: &T) -> Result<ObjectId, Error> {
-        self.put_bytes(hord_encoding::encode(value)?)
+        let bytes = hord_encoding::encode(value)?;
+        let id = ObjectId::from_canonical(&bytes);
+        self.put(id, bytes)?;
+        Ok(id)
     }
 
     /// Load and decode the object at `id`.
@@ -120,17 +122,18 @@ impl Store for MemoryStore {
 
 impl Store for hord_store::Store {
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), Error> {
-        let got = hord_store::Store::put(self, &bytes)?;
-        if got != id {
-            return Err(Error::Git(format!(
-                "object id mismatch: store computed {got}, importer supplied {id}"
-            )));
-        }
-        Ok(())
+        check_id(id, hord_store::Store::put(self, &bytes)?)
     }
 
-    fn put_bytes(&mut self, bytes: Vec<u8>) -> Result<ObjectId, Error> {
-        hord_store::Store::put(self, &bytes).map_err(Into::into)
+    fn put_all(&mut self, objects: Vec<(ObjectId, Vec<u8>)>) -> Result<(), Error> {
+        let (ids, bytes): (Vec<_>, Vec<_>) = objects.into_iter().unzip();
+        for (id, got) in ids
+            .into_iter()
+            .zip(hord_store::Store::put_all(self, &bytes)?)
+        {
+            check_id(id, got)?;
+        }
+        Ok(())
     }
 
     fn get(&self, id: ObjectId) -> Result<Vec<u8>, Error> {
@@ -160,4 +163,15 @@ impl Store for hord_store::Store {
     fn get_ref(&self, name: &str) -> Result<Option<ObjectId>, Error> {
         hord_store::Store::get_ref(self, name).map_err(Into::into)
     }
+}
+
+/// `got`, the id a store computed, must be `id`, the one the importer
+/// supplied.
+fn check_id(id: ObjectId, got: ObjectId) -> Result<(), Error> {
+    if got != id {
+        return Err(Error::Git(format!(
+            "object id mismatch: store computed {got}, importer supplied {id}"
+        )));
+    }
+    Ok(())
 }

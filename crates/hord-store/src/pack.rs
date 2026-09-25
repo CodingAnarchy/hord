@@ -281,54 +281,59 @@ mod tests {
     use std::env;
 
     #[test]
-    fn compress_round_trip() {
+    fn compress_round_trip() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let src = b"the same inputs produce the same ObjectId";
-        let c = compress(src).unwrap();
+        let c = compress(src)?;
         assert_ne!(c, src);
-        assert_eq!(compress(src).unwrap(), c);
-        assert_eq!(decompress(&c).unwrap(), src);
+        assert_eq!(compress(src)?, c);
+        assert_eq!(decompress(&c)?, src);
 
         let zeros = vec![0u8; 100_000];
-        let compressed = compress(&zeros).unwrap();
+        let compressed = compress(&zeros)?;
         assert!(compressed.len() < zeros.len());
-        assert_eq!(decompress(&compressed).unwrap(), zeros);
-        assert_eq!(compress(&zeros).unwrap(), compressed);
+        assert_eq!(decompress(&compressed)?, zeros);
+        assert_eq!(compress(&zeros)?, compressed);
 
-        let empty = compress(b"").unwrap();
-        assert_eq!(decompress(&empty).unwrap(), b"");
+        let empty = compress(b"")?;
+        assert_eq!(decompress(&empty)?, b"");
+        Ok(())
     }
 
     #[test]
-    fn decompresses_frames_without_a_content_size() {
+    fn decompresses_frames_without_a_content_size()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Packs written before the bulk compressor used the streaming encoder.
         let zeros = vec![7u8; 300_000];
-        let streamed = zstd::encode_all(zeros.as_slice(), COMPRESSION_LEVEL).unwrap();
+        let streamed = zstd::encode_all(zeros.as_slice(), COMPRESSION_LEVEL)?;
         assert_eq!(
-            zstd::zstd_safe::get_frame_content_size(&streamed).unwrap(),
+            zstd::zstd_safe::get_frame_content_size(&streamed)
+                .expect("read the frame header of a valid zstd frame"),
             None
         );
-        assert_eq!(decompress(&streamed).unwrap(), zeros);
+        assert_eq!(decompress(&streamed)?, zeros);
+        Ok(())
     }
 
     #[test]
-    fn pack_writer_round_trip() {
+    fn pack_writer_round_trip() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = env::temp_dir().join(format!(
             "hord-pack-{}-{}",
             std::process::id(),
             ulid::Ulid::generate()
         ));
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir)?;
         let id = ObjectId::from_canonical(b"abc");
-        let mut writer = PackWriter::create(&dir, 1).unwrap();
-        let loc = writer.add(id, b"abc").unwrap();
-        writer.finish(&dir).unwrap();
-        let file = File::open(pack_path(&dir, 1)).unwrap();
-        let got = read_packed_file(&file, &loc).unwrap();
+        let mut writer = PackWriter::create(&dir, 1)?;
+        let loc = writer.add(id, b"abc")?;
+        writer.finish(&dir)?;
+        let file = File::open(pack_path(&dir, 1))?;
+        let got = read_packed_file(&file, &loc)?;
         assert_eq!(got, b"abc");
-        let idx_bytes = fs::read(index_path(&dir, 1)).unwrap();
-        let idx: PackIndex = hord_encoding::decode(&idx_bytes).unwrap();
+        let idx_bytes = fs::read(index_path(&dir, 1))?;
+        let idx: PackIndex = hord_encoding::decode(&idx_bytes)?;
         assert_eq!(idx.pack, 1);
         assert_eq!(idx.entries.len(), 1);
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
