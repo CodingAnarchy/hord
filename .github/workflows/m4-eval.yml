@@ -23,7 +23,24 @@
 #     probe elsewhere: 60-90 min of CPU, overlapped
 # Total 2.5-3.5 h per chain job. `--budget 320m` stops a slow chain at 5 h 20
 # min and uploads what it has; the merge then reports it incomplete and does
-# not gate. That stays well inside GitHub's 6 h job limit.
+# not gate. That stays well inside GitHub's 6 h job limit. (Measured on the
+# first run: chain 4 took 1 h 42 min.)
+#
+# Disk. A runner has one root disk (about 72 GB, about 20-25 GB free as
+# imaged); whether /mnt is a separate temp disk varies by image, and the
+# `findmnt`/`df` lines at job start say which. Chain 3 of run 36145004665
+# filled the root filesystem. Everything the eval writes is on /mnt
+# (work dir, corpus, CARGO_HOME, TMPDIR); preinstalled SDKs are removed at
+# job start; and the eval prunes each target directory after every step
+# (stale unit generations and cargo's per-test scratch trees; see
+# bench/m4-eval/src/disk.rs), which bounds a chain at two instrumented
+# targets and one grader target of about 8-10 GB each. `[disk]` lines in
+# the eval log and the chain summary's "Peak disk used" column show usage.
+#
+# Re-running part of a gate: dispatch with `chains` (for example `3` or
+# `3,7`), `samples: false`, and `merge_with_run` set to the earlier run's ID;
+# the merge fills in every chain and sample this run did not produce from
+# that run's artifacts.
 name: M4 selection gate
 
 on:
@@ -39,6 +56,19 @@ on:
         description: "faults graded per commit where (b) does not contain (a)"
         required: false
         default: "5"
+      chains:
+        description: "chains to run, comma-separated (for example 3 or 3,7); empty runs all 15"
+        required: false
+        default: ""
+      samples:
+        description: "run the literal full-suite sample jobs"
+        type: boolean
+        required: false
+        default: true
+      merge_with_run:
+        description: "run ID whose chain and sample artifacts fill in what this run does not produce"
+        required: false
+        default: ""
 
 concurrency:
   group: m4-eval
@@ -77,6 +107,7 @@ jobs:
   sample:
     name: full-suite sample ${{ matrix.shard }}
     needs: build
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.samples }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -85,13 +116,29 @@ jobs:
         shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v5
+      - &free-disk
+        name: free the root disk
+        run: |
+          findmnt -T /mnt || true
+          df -h / /mnt
+          # Preinstalled SDKs the gate never uses (about 25-30 GB).
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft /opt/google
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / /mnt
       - &corpus-setup
         name: prepare /mnt, toolchain, corpus
         run: |
-          sudo mkdir -p /mnt/corpora /mnt/m4 /mnt/bin
-          sudo chown -R "$USER" /mnt/corpora /mnt/m4 /mnt/bin
+          sudo mkdir -p /mnt/corpora /mnt/m4 /mnt/bin /mnt/tmp /mnt/cargo-home
+          sudo chown -R "$USER" /mnt/corpora /mnt/m4 /mnt/bin /mnt/tmp /mnt/cargo-home
           rustup toolchain install stable --profile minimal --component llvm-tools-preview
           rustup default stable
+          # Everything the eval and cargo write goes to /mnt, from the next
+          # step on. rustup's toolchains stay in ~/.rustup (fixed size).
+          echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=/mnt/cargo-home" >> "$GITHUB_ENV"
+          echo "/mnt/cargo-home/bin" >> "$GITHUB_PATH"
       - &corpus-cache
         uses: actions/cache@v4
         with:
@@ -108,9 +155,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            /mnt/cargo-home/registry/index
+            /mnt/cargo-home/registry/cache
+            /mnt/cargo-home/git/db
           key: m4-cargo-registry-${{ env.CORPUS_HEAD }}
       - &binary
         uses: actions/download-artifact@v4
@@ -124,6 +171,17 @@ jobs:
             --chain "0/$CHAINS" --commits-per-chain "$COMMITS_PER_CHAIN" --chain-stride "$CHAIN_STRIDE" \
             --sample-only --full-sample "$FULL_SAMPLE" --sample-shard "${{ matrix.shard }}/$SAMPLE_SHARDS" \
             --jobs 1 --budget 280m
+      - &disk-report
+        name: disk usage
+        if: always()
+        run: |
+          {
+            echo '### Disk at the end of the job'
+            echo '```'
+            df -h / /mnt
+            du -xsh /mnt/m4/* /mnt/m4/*/target /mnt/tmp /mnt/cargo-home 2> /dev/null | sort -h
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -139,12 +197,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        chain: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        chain: ${{ fromJSON(format('[{0}]', inputs.chains || '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14')) }}
     steps:
       - uses: actions/checkout@v5
+      - *free-disk
       - *corpus-setup
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --version
       - *corpus-cache
       - *corpus-clone
       - *registry-cache
@@ -171,6 +231,7 @@ jobs:
       - name: chain summary
         if: always()
         run: cat "$WORK/report.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - *disk-report
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -187,6 +248,9 @@ jobs:
     needs: [chain, sample]
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
@@ -198,6 +262,27 @@ jobs:
         with:
           pattern: "{chain,sample}-*"
           path: results
+      - name: download the earlier run's chains and samples
+        if: ${{ inputs.merge_with_run != '' && inputs.merge_with_run != null }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{chain,sample}-*"
+          path: earlier
+          run-id: ${{ inputs.merge_with_run }}
+          github-token: ${{ github.token }}
+      - name: fill in what this run did not produce
+        if: ${{ inputs.merge_with_run != '' && inputs.merge_with_run != null }}
+        run: |
+          mkdir -p results
+          for d in earlier/*; do
+            n=$(basename "$d")
+            if [ -e "results/$n" ]; then
+              echo "$n: this run's"
+            else
+              echo "$n: from run ${{ inputs.merge_with_run }}"
+              mv "$d" "results/$n"
+            fi
+          done
       - name: merge the chains into one report and verdict
         run: |
           # Each chain artifact holds chain/ and fresh-results/; each sample

@@ -35,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+mod disk;
 mod fault;
 mod fresh;
 mod git;
@@ -814,10 +815,13 @@ fn sample_only(
     let workers: Vec<run::Worker> = (0..args.jobs.max(1))
         .map(|i| run::worker(work, corpus, i))
         .collect::<Result<_>>()?;
+    let monitor = disk::Monitor::new(work, None);
+    monitor.sample("start");
     run_parallel(&workers, mine, over_budget, |worker, commit| {
         eprintln!("[sample] full cargo test on {}", &commit[..10]);
+        let since = std::time::SystemTime::now();
         let (failed, elapsed_ms, timed_out) = run::full_suite(worker, &commit, timeout)?;
-        write_json(
+        let written = write_json(
             &sample_dir.join(format!("{commit}.json")),
             &SampleResult {
                 commit: commit.clone(),
@@ -825,7 +829,12 @@ fn sample_only(
                 elapsed_ms,
                 timed_out,
             },
-        )
+        );
+        let label = format!("sample {}", &commit[..10]);
+        disk::prune_and_log(&label, &worker.target_dir, since);
+        disk::clear_dir(&worker.profraw_dir());
+        monitor.sample(&label);
+        written
     });
     Ok(())
 }
@@ -845,6 +854,8 @@ fn run_fresh(
     over_budget: &(dyn Fn() -> bool + Sync),
 ) -> Result<()> {
     let checkpoint = prepared.checkpoints.first().context("no checkpoint")?;
+    let monitor = disk::Monitor::new(work, Some(work.join("chain/disk.json")));
+    monitor.sample("start");
     let initial_path = fresh::initial_path(work);
     let initial_meta = work.join("chain/initial.json");
     let initial: CoverageRecord = match fs::read(&initial_path)
@@ -860,6 +871,8 @@ fn run_fresh(
             );
             let w = &workers[0];
             w.checkout.checkout(&checkpoint.commit)?;
+            let target_dir = fresh::coverage_target(work, 0);
+            let since = std::time::SystemTime::now();
             let run = run::collect_corpus(
                 &VerifyCheckout {
                     root: w.checkout.root.clone(),
@@ -869,7 +882,7 @@ fn run_fresh(
                 &checkpoint.defs,
                 &CoverageOptions {
                     packages: None,
-                    target_dir: work.join("coverage-target"),
+                    target_dir: target_dir.clone(),
                     jobs: args.coverage_jobs,
                     test_timeout: Duration::from_secs(600),
                     skip: BTreeSet::new(),
@@ -877,6 +890,8 @@ fn run_fresh(
                     lines_of_interest: BTreeMap::new(),
                 },
             )?;
+            disk::prune_and_log("initial", &target_dir, since);
+            monitor.sample("initial");
             fs::create_dir_all(work.join("chain"))?;
             fs::write(&initial_path, hord_encoding::encode(&run.record)?)?;
             write_json(
@@ -930,10 +945,12 @@ fn run_fresh(
             initial,
             in_shard,
             over_budget,
+            disk: &monitor,
         },
         chain_workers,
         graders,
     )?;
+    monitor.sample("end");
     let mut report = fresh::report(&[work.to_path_buf()], quarantine_names);
     report.profraw_in_cwd = profraw_leaks(started_at);
     let md = fresh::print(&report);

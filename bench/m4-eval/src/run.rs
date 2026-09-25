@@ -95,11 +95,15 @@ impl Worker {
     /// `LLVM_PROFILE_FILE` for everything this worker runs: inside its own
     /// directory, never the working directory.
     pub(crate) fn profraw_pattern(&self) -> String {
-        self.target_dir
-            .with_file_name("profraw")
+        self.profraw_dir()
             .join("%p-%m.profraw")
             .display()
             .to_string()
+    }
+
+    /// The directory of [`Worker::profraw_pattern`].
+    pub(crate) fn profraw_dir(&self) -> PathBuf {
+        self.target_dir.with_file_name("profraw")
     }
 }
 

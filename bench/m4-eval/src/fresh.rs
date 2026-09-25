@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use hord_core::{NodeId, RepoPath};
@@ -36,6 +36,7 @@ use hord_verify_rust::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::disk::{self, Monitor};
 use crate::fault::{FaultKind, attempts, inject};
 use crate::prepare::{CommitFacts, Prepared};
 use crate::run::{
@@ -147,6 +148,8 @@ pub(crate) struct FreshRun<'a> {
     pub initial: CoverageRecord,
     pub in_shard: &'a (dyn Fn(usize) -> bool + Sync),
     pub over_budget: &'a (dyn Fn() -> bool + Sync),
+    /// Disk telemetry, sampled after every chain step and grade.
+    pub disk: &'a Monitor,
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -192,6 +195,7 @@ pub(crate) fn run(run: &FreshRun<'_>, chain_workers: &[Worker], graders: &[Worke
                     }
                     let facts = &run.prepared.commits[step.index];
                     let t = Instant::now();
+                    let since = SystemTime::now();
                     let result = match grade(run.ctx, worker, facts, &step) {
                         Ok(r) => r,
                         Err(err) => FreshResult {
@@ -231,6 +235,11 @@ pub(crate) fn run(run: &FreshRun<'_>, chain_workers: &[Worker], graders: &[Worke
                     if let Err(err) = write_json(&out, &result) {
                         eprintln!("[grade {}] {err:#}", step.index);
                     }
+                    // Keep the grader's target to what the next commit needs.
+                    let label = format!("grade {}", step.index);
+                    disk::prune_and_log(&label, &worker.target_dir, since);
+                    disk::clear_dir(&worker.profraw_dir());
+                    run.disk.sample(&label);
                 }
             });
         }
@@ -274,10 +283,7 @@ fn chain(
         }
     }
     let toolchain = ctx.toolchain.id()?;
-    let targets = [
-        run.work.join("coverage-target-0"),
-        run.work.join("coverage-target-1"),
-    ];
+    let targets = [coverage_target(run.work, 0), coverage_target(run.work, 1)];
     let commits = &run.prepared.commits;
     let build_options = |target: &Path| CoverageOptions {
         packages: None,
@@ -293,7 +299,8 @@ fn chain(
             let (worker, target) = (&workers[i % 2], &targets[i % 2]);
             let facts = &commits[i];
             let options = build_options(target);
-            scope.spawn(move || -> Result<Option<BuiltSuite>> {
+            let since = SystemTime::now();
+            let handle = scope.spawn(move || -> Result<Option<BuiltSuite>> {
                 worker.checkout.checkout(&facts.commit)?;
                 Ok(build_suite_with_env(
                     &VerifyCheckout {
@@ -303,7 +310,8 @@ fn chain(
                     &options,
                     &corpus_env(),
                 )?)
-            })
+            });
+            (since, handle)
         };
         let mut pending = (state.next < commits.len()).then(|| spawn_build(state.next));
         while state.next < commits.len() {
@@ -313,11 +321,17 @@ fn chain(
             let i = state.next;
             let facts = &commits[i];
             let started = Instant::now();
-            let built = match pending.take() {
-                Some(handle) => handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("build panicked"))?,
-                None => Err(anyhow::anyhow!("no build for commit {i}")),
+            let (since, built) = match pending.take() {
+                Some((since, handle)) => (
+                    since,
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("build panicked"))?,
+                ),
+                None => (
+                    SystemTime::now(),
+                    Err(anyhow::anyhow!("no build for commit {i}")),
+                ),
             };
             if i + 1 < commits.len() && !(run.over_budget)() {
                 pending = Some(spawn_build(i + 1));
@@ -380,11 +394,16 @@ fn chain(
             write_json(&dir.join(format!("{}.json", step.index)), &step)?;
             state.next += 1;
             fs::write(&state_path, hord_encoding::encode(&state)?)?;
+            // This slot builds again two commits on: keep what that build
+            // needs (ADR 0022's records are already merged).
+            let label = format!("lander {}", step.index);
+            disk::prune_and_log(&label, &targets[i % 2], since);
+            run.disk.sample(&label);
             let _ = tx.send(step);
         }
         // A build started past the budget is left to finish; its result is
         // unused.
-        if let Some(handle) = pending {
+        if let Some((_, handle)) = pending {
             let _ = handle.join();
         }
         Ok(())
@@ -785,6 +804,8 @@ pub(crate) struct ChainReport {
     /// not the lander's.
     pub grade_secs_mean: f64,
     pub misses: Vec<String>,
+    /// Peak disk use per filesystem (`chain/disk.json`), if sampled.
+    pub disk: Option<disk::DiskLog>,
 }
 
 /// Per-fault and per-commit counts (ADR 0023 amendment: faults within one
@@ -978,6 +999,7 @@ fn chain_report(work: &Path) -> (ChainReport, Vec<ChainStep>, Vec<FreshResult>) 
         initial_secs,
         grade_secs_mean: mean(&graded_secs),
         misses,
+        disk: read_json(&work.join("chain/disk.json")),
     };
     (report, steps, results)
 }
@@ -1115,10 +1137,10 @@ pub(crate) fn print(r: &FreshReport) -> String {
         md.push_str(&format!("| {k} | {v} |\n"));
     }
     println!("  fallbacks (commits): {:?}", r.fallbacks);
-    md.push_str("\n## Chains\n\n| Chain | Commits | Median share (ws <= 5) | Faults (informative) | Misses | Lander s/commit (mean, p90) | Initial run | Grading s/commit |\n|---|---|---|---|---|---|---|---|\n");
+    md.push_str("\n## Chains\n\n| Chain | Commits | Median share (ws <= 5) | Faults (informative) | Misses | Lander s/commit (mean, p90) | Initial run | Grading s/commit | Peak disk used (least free) |\n|---|---|---|---|---|---|---|---|---|\n");
     for ch in &r.chains {
         let line = format!(
-            "| {} | {}/{}{} | {} | {} ({}) | {} | {:.0}, {} | {:.1} min | {:.0} |",
+            "| {} | {}/{}{} | {} | {} ({}) | {} | {:.0}, {} | {:.1} min | {:.0} | {} |",
             if ch.chain.is_empty() { "-" } else { &ch.chain },
             ch.chained,
             ch.commits,
@@ -1132,6 +1154,7 @@ pub(crate) fn print(r: &FreshReport) -> String {
                 .map_or("n/a".into(), |v| format!("{v:.0}")),
             ch.initial_secs / 60.0,
             ch.grade_secs_mean,
+            ch.disk.as_ref().map_or("n/a".into(), peak_disk),
         );
         println!("  chain {line}");
         md.push_str(&line);
@@ -1182,6 +1205,33 @@ pub(crate) fn print(r: &FreshReport) -> String {
         ));
     }
     md
+}
+
+/// A chain's peak disk use: `/ 61.2G of 72.0G (10.8G) at lander 3`, per
+/// filesystem, and the one holding the work directory.
+fn peak_disk(log: &disk::DiskLog) -> String {
+    let peaks: Vec<String> = log
+        .peaks
+        .iter()
+        .map(|p| {
+            format!(
+                "`{}` {} of {} ({}) at {}",
+                p.mount,
+                disk::gb(p.peak_used),
+                disk::gb(p.size),
+                disk::gb(p.min_free),
+                p.at
+            )
+        })
+        .collect();
+    format!("{}; work on `{}`", peaks.join("; "), log.work_mount)
+}
+
+/// The chain's instrumented target directory for `slot` (0 or 1). The
+/// initial full run builds in slot 0, so the chain's first build there is
+/// incremental and no third instrumented target exists.
+pub(crate) fn coverage_target(work: &Path, slot: usize) -> PathBuf {
+    work.join(format!("coverage-target-{slot}"))
 }
 
 /// Where the fresh run keeps its initial record.
