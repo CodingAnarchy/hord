@@ -22,35 +22,25 @@ jobs:
         with:
           shared-key: dbg
       - name: tools
-        run: sudo apt-get install -y gdb >/dev/null && gdb --version | head -1
+        run: sudo apt-get install -y gdb strace >/dev/null && strace -V | head -1
       - name: build
         run: cargo test -p hord-txn --test gate --no-run 2>&1 | tail -3
-      - name: loop with watchdog
+      - name: loop in a PID namespace, tracing kill signals
         run: |
           bin=$(ls -t target/debug/deps/gate-* | grep -v '\.d$' | head -1)
           echo "binary: $bin"
-          for i in $(seq 1 30); do
+          for i in $(seq 1 25); do
             start=$(date +%s)
-            "$bin" > /tmp/run.log 2>&1 &
-            pid=$!
-            while kill -0 $pid 2>/dev/null; do
-              if [ $(( $(date +%s) - start )) -gt 240 ]; then
-                echo "::group::HANG on iteration $i (pid $pid)"
-                cat /tmp/run.log
-                echo "--- process tree"
-                ps -ef --forest | grep -v "ps -ef" | tail -40
-                echo "--- gate threads"
-                sudo gdb -p $pid -batch -ex "set pagination off" -ex "thread apply all bt" 2>&1 | grep -v "^\[New LWP" | head -400
-                for c in $(pgrep -P $pid) $(pgrep -f "cargo|rustc" ); do
-                  echo "--- child $c: $(tr '\0' ' ' < /proc/$c/cmdline 2>/dev/null)"
-                  sudo gdb -p $c -batch -ex "thread apply all bt" 2>&1 | grep -E "^#|^Thread" | head -60
-                done
-                echo "::endgroup::"
-                kill -9 $pid; pkill -9 -f cargo; exit 1
-              fi
-              sleep 5
-            done
-            wait $pid; rc=$?
-            echo "iteration $i rc=$rc in $(( $(date +%s) - start ))s $(grep 'test result' /tmp/run.log)"
-            [ $rc -ne 0 ] && { cat /tmp/run.log | tail -60; exit 1; }
+            sudo unshare --pid --fork --mount-proc \
+              sudo -u "$USER" --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+              strace -f -qq -e trace=kill,tkill,tgkill -o /tmp/kills.$i.log \
+              timeout 600 "$bin" > /tmp/run.$i.log 2>&1
+            rc=$?
+            echo "iteration $i rc=$rc in $(( $(date +%s) - start ))s $(grep 'test result' /tmp/run.$i.log)"
+            echo "  kill syscalls: $(wc -l < /tmp/kills.$i.log); group or broadcast kills:"
+            grep -E 'kill\(-[0-9]+|kill\(0,|kill\(-1,' /tmp/kills.$i.log | head -10 | sed 's/^/    /'
+            if [ $rc -ne 0 ]; then
+              echo "::group::iteration $i output"; tail -80 /tmp/run.$i.log; echo "::endgroup::"
+              echo "::group::iteration $i kill syscalls"; cat /tmp/kills.$i.log | head -200; echo "::endgroup::"
+            fi
           done
