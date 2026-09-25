@@ -409,6 +409,14 @@ pub(crate) fn settled(entry: &QueueEntry) -> Vec<Kind> {
     }
 }
 
+/// `Rejected` for `change` (a replay the lander would not submit).
+pub(crate) fn rejected(change: ChangeId, reason: &str) -> Kind {
+    Kind::Rejected(proto::Rejected {
+        change: wire::id(change),
+        reason: reason.into(),
+    })
+}
+
 /// `Replaying` for attempt `attempt` on `change`.
 pub(crate) fn replaying(change: ChangeId, attempt: u32, harness: &str) -> Kind {
     Kind::Replaying(proto::Replaying {

@@ -2,7 +2,7 @@ id = "m5-018"
 kind = "signature-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: signature-vs-caller #5 (resize/resize_margin)"
+made_by = "hord-eval-m5 generate v2: signature-vs-caller #5 (resize/resize_margin)"
 script = [
     "over_budget",
     "resolve",

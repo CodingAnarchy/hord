@@ -2,7 +2,7 @@ id = "m5-041"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: move-vs-edit #3 (parse_count into counts)"
+made_by = "hord-eval-m5 generate v2: move-vs-edit #3 (parse_count into counts)"
 script = [
     "wrong",
     "resolve",

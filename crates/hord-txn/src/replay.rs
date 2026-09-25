@@ -320,6 +320,8 @@ struct Inputs {
     record: ChangeRecord,
     entry: QueueEntry,
     budget: ReplayBudget,
+    /// Acceptance tests the replay must not change (ADR 0034).
+    protected: Vec<String>,
 }
 
 impl Inner {
@@ -328,6 +330,7 @@ impl Inner {
             record: self.change_record(job.change)?,
             entry: self.submitted_entry(job.change)?,
             budget: self.replay_limits()?.1,
+            protected: self.protected_test_names(job.change)?,
         })
     }
 }
@@ -444,5 +447,6 @@ fn request_message(
             .map(summary_message),
         budget: Some(budget_message(&inputs.budget)),
         note: job.note.clone().filter(|n| !n.is_empty()),
+        protected_tests: inputs.protected.clone(),
     }
 }

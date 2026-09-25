@@ -381,6 +381,7 @@ pub fn escalation_message(escalation: &Escalation) -> proto::Escalation {
                     ReplayOutcome::Killed => proto::ReplayOutcome::Killed,
                     ReplayOutcome::OverBudget => proto::ReplayOutcome::OverBudget,
                     ReplayOutcome::Failed => proto::ReplayOutcome::Failed,
+                    ReplayOutcome::Tampered => proto::ReplayOutcome::Tampered,
                 }
                 .into(),
                 change: a.change.map(wire::id),
@@ -390,6 +391,7 @@ pub fn escalation_message(escalation: &Escalation) -> proto::Escalation {
                 cost_micros: a.cost_micros,
                 model: a.model.clone(),
                 note: a.note.clone(),
+                tampered: a.tampered.iter().copied().map(wire::node_ref).collect(),
             })
             .collect(),
         candidates: escalation

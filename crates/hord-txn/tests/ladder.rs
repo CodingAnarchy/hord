@@ -34,6 +34,8 @@ enum Step {
         to: &'static str,
         cost_micros: Option<u64>,
     },
+    /// Write these whole files and propose.
+    Write(Vec<(&'static str, String)>),
     /// Give up.
     GiveUp,
 }
@@ -64,7 +66,7 @@ async fn play(
     repo: Repo,
 ) -> Result<proto::ReplayResult, String> {
     use proto::replay_result::Status;
-    let (from, to, cost_micros) = match step {
+    let (edit, writes, cost_micros) = match step {
         Step::GiveUp => {
             return Ok(proto::ReplayResult {
                 status: Some(Status::GaveUp(proto::ReplayGaveUp {
@@ -77,7 +79,8 @@ async fn play(
             from,
             to,
             cost_micros,
-        } => (from, to, cost_micros),
+        } => (Some((from, to)), Vec::new(), cost_micros),
+        Step::Write(files) => (None, files, None),
     };
     let id = request
         .workspace
@@ -87,16 +90,23 @@ async fn play(
         .open_workspace(id, actor("replayer"), None)
         .await
         .map_err(|e| e.to_string())?;
-    let file = path("src/lib.rs");
-    let text = ws
-        .read_file(&file)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("src/lib.rs is missing")?;
-    let text = String::from_utf8(text.as_slice().to_vec()).map_err(|e| e.to_string())?;
-    ws.write_file(&file, text.replacen(from, to, 1))
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Some((from, to)) = edit {
+        let file = path("src/lib.rs");
+        let text = ws
+            .read_file(&file)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("src/lib.rs is missing")?;
+        let text = String::from_utf8(text.as_slice().to_vec()).map_err(|e| e.to_string())?;
+        ws.write_file(&file, text.replacen(from, to, 1))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    for (file, text) in writes {
+        ws.write_file(&path(file), text)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let summary = request.intent.map(|i| i.summary).unwrap_or_default();
     let proposal = ws
         .propose(intent(&format!("replay: {summary}")))
@@ -987,5 +997,159 @@ async fn with_no_replays_allowed_a_conflict_parks_straight_for_arbitration() -> 
         t.repo.status(cb).await?.status,
         QueueStatus::NeedsArbitration
     );
+    Ok(())
+}
+
+fn test_file(name: &str, body: &str) -> String {
+    format!("#[test]\nfn {name}() {{\n    {body}\n}}\n")
+}
+
+/// a and b each add an acceptance test and name it in their intent; b
+/// collides with a on `beta`. Returns (a, b).
+async fn collide_with_tests(repo: &Repo) -> TestResult<(ChangeId, ChangeId)> {
+    let accepts = |summary: &str, test: &str| hord_core::Intent {
+        acceptance: vec![hord_core::Acceptance::Test { name: test.into() }],
+        ..intent(summary)
+    };
+    let mut a = begin(repo, "a").await?;
+    let mut b = begin(repo, "b").await?;
+    edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    a.write_file(
+        &path("tests/a.rs"),
+        test_file("beta_is_20", "assert_eq!(fixture::beta(), 20);"),
+    )
+    .await?;
+    edit(&mut b, "src/lib.rs", LIB, "    2\n", "    21\n").await?;
+    b.write_file(
+        &path("tests/b.rs"),
+        test_file("beta_is_21", "assert_eq!(fixture::beta(), 21);"),
+    )
+    .await?;
+    let ca = a
+        .propose(accepts("beta returns 20", "beta_is_20"))
+        .await?
+        .change;
+    repo.submit(ca).await?;
+    let cb = b
+        .propose(accepts("beta returns 21", "beta_is_21"))
+        .await?
+        .change;
+    repo.submit(cb).await?;
+    Ok((ca, cb))
+}
+
+/// ADR 0034: a replay that edits the other side's acceptance test is
+/// rejected before verification (TAMPERED) and the ladder moves on; a
+/// replay that adds a test of its own is allowed.
+#[tokio::test]
+async fn a_replay_that_changes_a_protected_test_is_tampered() -> TestResult {
+    let lib_21 = LIB.replace("    2\n", "    21\n");
+    let harness = Scripted::new([
+        // Makes beta 21 and "fixes" a's test to match: tampering.
+        Step::Write(vec![
+            ("src/lib.rs", lib_21.clone()),
+            (
+                "tests/a.rs",
+                test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
+            ),
+        ]),
+        // Makes beta 21 and adds a test of its own: allowed.
+        Step::Write(vec![
+            ("src/lib.rs", lib_21),
+            (
+                "tests/replay.rs",
+                test_file("beta_is_positive", "assert!(fixture::beta() > 0);"),
+            ),
+        ]),
+    ]);
+    let t = ladder_repo(
+        TWO_ATTEMPTS,
+        Some(Arc::new(harness.clone())),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (_, cb) = collide_with_tests(&t.repo).await?;
+    t.repo.land_local().await?;
+
+    let requests = harness.requests();
+    let protected = &requests.first().ok_or("a replay request")?.protected_tests;
+    assert!(
+        protected.contains(&"beta_is_20".to_owned())
+            && protected.contains(&"beta_is_21".to_owned()),
+        "{protected:?}"
+    );
+    let entry = t.repo.status(cb).await?;
+    assert!(
+        matches!(entry.status, QueueStatus::Replayed { .. }),
+        "{entry:#?}"
+    );
+    let attempts = &escalation(&entry)?.attempts;
+    assert_eq!(attempts.len(), 2, "{attempts:#?}");
+    assert_eq!(attempts[0].outcome, ReplayOutcome::Tampered);
+    assert!(attempts[0].change.is_none(), "not submitted");
+    let a_test = def(&mut begin(&t.repo, "r").await?, "tests/a.rs", "beta_is_20").await?;
+    assert_eq!(attempts[0].tampered, vec![a_test]);
+    assert!(
+        attempts[0]
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("beta_is_20")),
+        "{:#?}",
+        attempts[0]
+    );
+    assert_eq!(attempts[1].outcome, ReplayOutcome::Proposed);
+    // a's test is as a wrote it.
+    let a_now = file_at_head(&t.repo, "tests/a.rs")
+        .await?
+        .ok_or("tests/a.rs")?;
+    assert!(
+        a_now.contains("assert_eq!(fixture::beta(), 20);"),
+        "{a_now}"
+    );
+    let events = events(&t.repo).await?;
+    assert!(
+        events
+            .iter()
+            .any(|k| matches!(k, Kind::Rejected(r) if r.reason.contains("beta_is_20"))),
+        "{events:#?}"
+    );
+    Ok(())
+}
+
+/// ADR 0034 also holds for a replay submitted outside the ladder (`hord
+/// replay`): the lander rejects it at prepare, and the parked change
+/// records it as a tampered attempt.
+#[tokio::test]
+async fn a_manual_replay_that_changes_a_protected_test_is_rejected() -> TestResult {
+    let t = ladder_repo(TWO_ATTEMPTS, None, Arc::new(StubVerifier)).await?;
+    let (_, cb) = collide_with_tests(&t.repo).await?;
+    t.repo.land_local().await?;
+    assert_eq!(t.repo.status(cb).await?.status, QueueStatus::Conflicted);
+    let mut ws = begin(&t.repo, "replayer").await?;
+    ws.write_file(&path("src/lib.rs"), LIB.replace("    2\n", "    21\n"))
+        .await?;
+    ws.write_file(
+        &path("tests/a.rs"),
+        test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
+    )
+    .await?;
+    let proposal = ws.propose(intent("replay: beta returns 21")).await?;
+    let replay = hord_txn::as_replay(proposal.record, cb);
+    let replay_id = t.repo.store().put_object(&replay)?;
+    t.repo.submit(replay_id).await?;
+    t.repo.land_local().await?;
+    let QueueStatus::Rejected { reason } = t.repo.status(replay_id).await?.status else {
+        return Err("the tampering replay is rejected".into());
+    };
+    assert!(reason.contains("beta_is_20"), "{reason}");
+    let entry = t.repo.status(cb).await?;
+    let attempt = escalation(&entry)?
+        .attempts
+        .last()
+        .ok_or("the manual attempt")?
+        .clone();
+    assert_eq!(attempt.outcome, ReplayOutcome::Tampered, "{attempt:#?}");
+    assert_eq!(attempt.harness, "manual");
+    assert_eq!(attempt.tampered.len(), 1);
     Ok(())
 }

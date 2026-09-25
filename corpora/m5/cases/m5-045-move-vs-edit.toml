@@ -2,7 +2,7 @@ id = "m5-045"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: move-vs-edit #7 (parse_size into sizes)"
+made_by = "hord-eval-m5 generate v2: move-vs-edit #7 (parse_size into sizes)"
 script = ["resolve"]
 
 [base]

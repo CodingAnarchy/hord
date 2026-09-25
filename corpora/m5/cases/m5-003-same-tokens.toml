@@ -2,7 +2,7 @@ id = "m5-003"
 kind = "same-tokens"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: same-tokens #3 (stretch x4)"
+made_by = "hord-eval-m5 generate v2: same-tokens #3 (stretch x4)"
 script = ["resolve"]
 
 [base]

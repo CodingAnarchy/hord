@@ -2,7 +2,7 @@ id = "m5-029"
 kind = "rename-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: rename-vs-caller #3 (tally->tally_votes/tally_doubled)"
+made_by = "hord-eval-m5 generate v2: rename-vs-caller #3 (tally->tally_votes/tally_doubled)"
 script = ["resolve"]
 
 [base]

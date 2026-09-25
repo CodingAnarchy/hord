@@ -2,7 +2,7 @@ id = "m5-059"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: field-vs-literal #9 (Sensor.rate/test_sensor)"
+made_by = "hord-eval-m5 generate v2: field-vs-literal #9 (Sensor.rate/test_sensor)"
 script = [
     "sleep",
     "resolve",

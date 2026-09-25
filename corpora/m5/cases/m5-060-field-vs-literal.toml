@@ -2,7 +2,7 @@ id = "m5-060"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: field-vs-literal #10 (Report.version/empty_report)"
+made_by = "hord-eval-m5 generate v2: field-vs-literal #10 (Report.version/empty_report)"
 script = [
     "over_budget",
     "resolve",

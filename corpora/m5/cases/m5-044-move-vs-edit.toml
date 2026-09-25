@@ -2,7 +2,7 @@ id = "m5-044"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: move-vs-edit #6 (parse_score into scores)"
+made_by = "hord-eval-m5 generate v2: move-vs-edit #6 (parse_score into scores)"
 script = [
     "give_up",
     "give_up",

@@ -611,6 +611,10 @@ message ReplayRequest {
   Budget budget = 11;
   // An arbiter's note, when an arbiter asked for this replay.
   optional string note = 12;
+  // Acceptance tests the replay must not change (ADR 0034): those named by
+  // the replayed change's intent and by the intents it collided with. A
+  // replay that modifies, deletes, or renames one is rejected.
+  repeated string protected_tests = 13;
 }
 
 // The harness proposed a change.
@@ -656,6 +660,8 @@ enum ReplayOutcome {
   REPLAY_OUTCOME_OVER_BUDGET = 5;
   // The harness failed or broke the protocol.
   REPLAY_OUTCOME_FAILED = 6;
+  // Rejected: it changed an acceptance test it must satisfy (ADR 0034).
+  REPLAY_OUTCOME_TAMPERED = 7;
 }
 
 // One replay attempt (ADR 0029: one replay per attempt).
@@ -681,6 +687,8 @@ message ReplayAttempt {
   optional string model = 9;
   // The arbiter's note it ran with.
   optional string note = 10;
+  // For a tampered attempt: the protected tests it changed.
+  repeated NodeRef tampered = 11;
 }
 
 // A replay result offered to the arbiter. Attempts with equal semantic

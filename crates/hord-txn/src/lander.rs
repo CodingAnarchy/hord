@@ -59,7 +59,7 @@ use hord_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::conflict::{ConflictReport, Footprint, check};
-use crate::escalation::{Escalation, Origin};
+use crate::escalation::{Escalation, Origin, TAMPERED};
 use crate::events;
 use crate::files::{validate, validate_except};
 use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRequest};
@@ -905,6 +905,16 @@ impl Inner {
         if !self.ops_checked(entry.change)? {
             validate(self, entry.change, &record)?;
             self.store.mark_checked(entry.change)?;
+        }
+        // ADR 0034: a replay, however it was submitted, may not change the
+        // acceptance tests it must satisfy.
+        if let Some(Origin::Replay { of }) = entry.origin {
+            let touched = self.tampered_tests(of, &record)?;
+            if !touched.is_empty() {
+                return Ok(Prepared::Park(QueueStatus::Rejected {
+                    reason: format!("{TAMPERED}: {}", touched.join(", ")),
+                }));
+            }
         }
         // ADR 0026: the landing base's policy judges the change.
         let policy = self.policy_at(head.snapshot)?;

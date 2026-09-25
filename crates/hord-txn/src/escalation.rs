@@ -30,8 +30,8 @@ use std::sync::Mutex;
 
 use hord_core::sign::{self, PublicKey, SigningKey};
 use hord_core::{
-    Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, ObjectId, Provenance, RepoPath,
-    Signature, SnapshotId,
+    Acceptance, Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, NodeId, ObjectId,
+    Provenance, RepoPath, Signature, SnapshotId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,9 @@ pub enum ReplayOutcome {
     OverBudget,
     /// It failed, or broke the protocol.
     Failed,
+    /// It changed an acceptance test it must satisfy (ADR 0034); its result
+    /// was rejected before verification.
+    Tampered,
 }
 
 /// One replay attempt (ADR 0029: one replay per attempt).
@@ -98,6 +101,9 @@ pub struct ReplayAttempt {
     pub model: Option<String>,
     /// The arbiter's note it ran with, if an arbiter asked for it.
     pub note: Option<String>,
+    /// For a tampered attempt: the protected tests it changed (ADR 0034).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tampered: Vec<NodeId>,
 }
 
 /// A replay result offered to the arbiter. Attempts with equal semantic
@@ -180,6 +186,10 @@ pub struct Arbiter {
     /// [`ARBITRATION_DOMAIN`].
     pub signature: Option<Signature>,
 }
+
+/// How the lander words a replay rejected for changing a protected test
+/// (ADR 0034); a rejection reason starts with it.
+pub(crate) const TAMPERED: &str = "changes acceptance tests it must satisfy";
 
 /// Signature domain of an arbiter's decision (`hord_core::sign`).
 pub const ARBITRATION_DOMAIN: &str = "hord.arbitration";
@@ -419,6 +429,7 @@ impl Inner {
             cost_micros: None,
             model: None,
             note: note.clone(),
+            tampered: Vec::new(),
         });
         entry.status = QueueStatus::Replaying { attempt };
         self.rewrite(entry)?;
@@ -515,6 +526,32 @@ impl Inner {
             .find(|a| a.change == Some(replay.change))
         {
             Some(attempt) => attempt.detail = Some(settled.clone()),
+            None if matches!(&replay.status, QueueStatus::Rejected { reason } if reason.starts_with(TAMPERED)) =>
+            {
+                // A replay proposed outside the lander that changed a
+                // protected test (ADR 0034): rejected at prepare.
+                let attempt = u32::try_from(escalation.attempts.len() + 1).unwrap_or(u32::MAX);
+                let record = self.change_record(replay.change)?;
+                let tampered = self
+                    .protected_tests(of, record.base)?
+                    .into_iter()
+                    .map(|(node, _)| node)
+                    .filter(|node| record.write_set.contains(node))
+                    .collect();
+                escalation.attempts.push(ReplayAttempt {
+                    attempt,
+                    harness: "manual".into(),
+                    outcome: ReplayOutcome::Tampered,
+                    change: None,
+                    detail: Some(settled.clone()),
+                    elapsed_ms: 0,
+                    tokens: None,
+                    cost_micros: None,
+                    model: None,
+                    note: None,
+                    tampered,
+                });
+            }
             None => {
                 // Proposed outside the lander (`hord replay`): record it.
                 let attempt = u32::try_from(escalation.attempts.len() + 1).unwrap_or(u32::MAX);
@@ -529,6 +566,7 @@ impl Inner {
                     cost_micros: None,
                     model: None,
                     note: None,
+                    tampered: Vec::new(),
                 });
             }
         }
@@ -658,15 +696,17 @@ impl Inner {
                 attempt.model = result.model.clone();
                 match crate::replay::over_budget(&result, budget) {
                     Some(why) => (ReplayOutcome::OverBudget, why),
-                    None => match self.accept_replay(job.change, base, &result) {
-                        Ok(Ok(change)) => {
-                            attempt.change = Some(change);
-                            (ReplayOutcome::Proposed, "submitted".into())
+                    None => {
+                        match self.accept_replay(job.change, base, &result, &mut attempt.tampered) {
+                            Ok(Ok(change)) => {
+                                attempt.change = Some(change);
+                                (ReplayOutcome::Proposed, "submitted".into())
+                            }
+                            Ok(Err((outcome, why))) => (outcome, why),
+                            Err(err) if crate::lander::is_transient(&err) => return Err(err),
+                            Err(err) => (ReplayOutcome::Failed, err.to_string()),
                         }
-                        Ok(Err((outcome, why))) => (outcome, why),
-                        Err(err) if crate::lander::is_transient(&err) => return Err(err),
-                        Err(err) => (ReplayOutcome::Failed, err.to_string()),
-                    },
+                    }
                 }
             }
         };
@@ -694,6 +734,7 @@ impl Inner {
         of: ChangeId,
         base: SnapshotId,
         result: &hord_api::proto::ReplayResult,
+        tampered: &mut Vec<NodeId>,
     ) -> Result<std::result::Result<ChangeId, (ReplayOutcome, String)>> {
         use hord_api::proto::replay_result::Status;
         let proposed = match &result.status {
@@ -731,6 +772,20 @@ impl Inner {
                 ),
             )));
         }
+        // ADR 0034: a replay may not change the acceptance tests it must
+        // satisfy. Rejected before verification, like an over-budget result.
+        let protected = self.protected_tests(of, base)?;
+        let touched: Vec<(NodeId, String)> = protected
+            .into_iter()
+            .filter(|(node, _)| record.write_set.contains(node))
+            .collect();
+        if !touched.is_empty() {
+            let names: Vec<&str> = touched.iter().map(|(_, name)| name.as_str()).collect();
+            let why = format!("{TAMPERED}: {} (proposed change {id})", names.join(", "));
+            self.emit(vec![events::rejected(id, &why)])?;
+            *tampered = touched.into_iter().map(|(node, _)| node).collect();
+            return Ok(Err((ReplayOutcome::Tampered, why)));
+        }
         match record.provenance.parent_intent {
             Some(parent) if parent == of => return Ok(Ok(id)),
             Some(other) => {
@@ -749,6 +804,66 @@ impl Inner {
             self.store.mark_checked(replay_id)?;
         }
         Ok(Ok(replay_id))
+    }
+}
+
+impl Inner {
+    /// The acceptance tests a replay of `of` must not change (ADR 0034):
+    /// the `test` acceptance criteria of `of`'s intent and of the intents
+    /// of the changes it collided with, by name.
+    pub(crate) fn protected_test_names(&self, of: ChangeId) -> Result<Vec<String>> {
+        let mut changes = vec![of];
+        if let Ok(entry) = self.submitted_entry(of)
+            && let Some(report) = &entry.report
+        {
+            changes.extend(Self::colliders(report));
+        }
+        let mut names = Vec::new();
+        for change in changes {
+            let record = match self.change_record(change) {
+                Ok(record) => record,
+                Err(Error::MissingChange(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            for acceptance in &record.intent.acceptance {
+                if let Acceptance::Test { name } = acceptance
+                    && !names.contains(name)
+                {
+                    names.push(name.clone());
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Names of the protected tests (ADR 0034) that `record`, a replay of
+    /// `of`, changes: in its write set, resolved at its base.
+    pub(crate) fn tampered_tests(
+        &self,
+        of: ChangeId,
+        record: &ChangeRecord,
+    ) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .protected_tests(of, record.base)?
+            .into_iter()
+            .filter(|(node, _)| record.write_set.contains(node))
+            .map(|(_, name)| name)
+            .collect();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// [`Self::protected_test_names`] resolved to definitions in `snapshot`
+    /// (a replay's base), with their names. A name that resolves to no
+    /// definition there protects nothing (ADR 0034).
+    fn protected_tests(&self, of: ChangeId, snapshot: SnapshotId) -> Result<Vec<(NodeId, String)>> {
+        let mut out = Vec::new();
+        for name in self.protected_test_names(of)? {
+            for node in self.resolve_in(snapshot, &name)? {
+                out.push((node, name.clone()));
+            }
+        }
+        Ok(out)
     }
 }
 

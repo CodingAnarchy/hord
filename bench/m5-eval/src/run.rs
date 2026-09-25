@@ -458,6 +458,7 @@ fn attempt_outcome(outcome: proto::ReplayOutcome) -> &'static str {
         proto::ReplayOutcome::Killed => "killed",
         proto::ReplayOutcome::OverBudget => "over_budget",
         proto::ReplayOutcome::Failed => "failed",
+        proto::ReplayOutcome::Tampered => "tampered",
         proto::ReplayOutcome::Unspecified => "unknown",
     }
 }

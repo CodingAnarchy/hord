@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use crate::corpus::{Case, Step, Task};
 
 /// Written into every case's `made_by`; bump it when a template changes.
-pub const VERSION: &str = "hord-eval-m5 generate v1";
+pub const VERSION: &str = "hord-eval-m5 generate v2";
 
 /// Its own `[workspace]`, so a case built inside another workspace (such
 /// as hord's `target/`) is not taken for a member of it.
@@ -521,8 +521,9 @@ fn contradiction(i: usize) -> Draft {
 }
 
 /// What the scripted harness does for the `n`th case (from 0): mostly one
-/// resolving attempt, with some failed, killed, over-budget, and
-/// give-up-twice attempts mixed in; ambiguous cases never resolve.
+/// resolving attempt, with some failed, killed, over-budget, tampering
+/// (ADR 0034), and give-up-twice attempts mixed in; ambiguous cases never
+/// resolve.
 fn script(n: usize, ambiguous: bool) -> Vec<Step> {
     if ambiguous {
         return if n.is_multiple_of(2) {
@@ -531,7 +532,9 @@ fn script(n: usize, ambiguous: bool) -> Vec<Step> {
             vec![Step::Wrong, Step::Wrong]
         };
     }
-    if n % 11 == 10 {
+    if n % 17 == 12 {
+        vec![Step::Tamper, Step::Resolve]
+    } else if n % 11 == 10 {
         vec![Step::GiveUp, Step::GiveUp]
     } else if n % 13 == 6 {
         vec![Step::Sleep, Step::Resolve]

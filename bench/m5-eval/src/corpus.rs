@@ -98,6 +98,9 @@ pub enum Step {
     /// Write the resolution but report more tokens than the budget allows
     /// (the lander must reject it).
     OverBudget,
+    /// Write the resolution and weaken the first task's acceptance test
+    /// (the lander must reject it as tampered, ADR 0034).
+    Tamper,
 }
 
 impl Case {

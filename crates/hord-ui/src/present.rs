@@ -345,9 +345,18 @@ pub fn attempt_outcome(attempt: &proto::ReplayAttempt) -> String {
         proto::ReplayOutcome::Killed => "killed at its time budget",
         proto::ReplayOutcome::OverBudget => "over its token or cost budget",
         proto::ReplayOutcome::Failed => "harness failed",
+        proto::ReplayOutcome::Tampered => "changed an acceptance test it must satisfy (rejected)",
         proto::ReplayOutcome::Unspecified => "ended",
     };
     let mut out = words.to_owned();
+    if !attempt.tampered.is_empty() {
+        let tests: Vec<String> = attempt
+            .tampered
+            .iter()
+            .map(|n| n.name.clone().unwrap_or_else(|| n.id.clone()))
+            .collect();
+        out.push_str(&format!(" [{}]", tests.join(", ")));
+    }
     if let Some(change) = &attempt.change {
         out.push_str(&format!(" {}", short_id(change)));
     }

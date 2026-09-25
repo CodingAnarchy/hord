@@ -2,8 +2,11 @@ id = "m5-030"
 kind = "rename-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: rename-vs-caller #4 (aggregate->sum_values/aggregate_twice)"
-script = ["resolve"]
+made_by = "hord-eval-m5 generate v2: rename-vs-caller #4 (aggregate->sum_values/aggregate_twice)"
+script = [
+    "tamper",
+    "resolve",
+]
 
 [base]
 ".gitignore" = """

@@ -36,6 +36,9 @@ pub struct Summary {
     pub killed: usize,
     /// Results rejected for reporting usage over budget.
     pub over_budget: usize,
+    /// Results rejected for changing a protected acceptance test (ADR
+    /// 0034).
+    pub tampered: usize,
     /// Conflicts the lander saw, by kind (`hard`, `semantic`).
     pub observed_conflicts: BTreeMap<String, usize>,
     /// Correctness failures, each a reason the run fails.
@@ -68,6 +71,7 @@ pub fn summarize(results: &[(Case, CaseResult)], max_attempts: usize) -> Summary
             match a.outcome.as_str() {
                 "killed" => s.killed += 1,
                 "over_budget" => s.over_budget += 1,
+                "tampered" => s.tampered += 1,
                 _ => {}
             }
         }
@@ -125,7 +129,11 @@ fn scripted_expectations(
         .iter()
         .position(|s| *s == Step::Resolve)
         .map_or(played.len(), |i| i + 1);
-    for (step, outcome) in [(Step::Sleep, "killed"), (Step::OverBudget, "over_budget")] {
+    for (step, outcome) in [
+        (Step::Sleep, "killed"),
+        (Step::OverBudget, "over_budget"),
+        (Step::Tamper, "tampered"),
+    ] {
         if played[..until].contains(&step) && !r.attempts.iter().any(|a| a.outcome == outcome) {
             failures.push(format!(
                 "{}: the script's {step:?} attempt was not {outcome}: {:?}",
@@ -164,8 +172,8 @@ pub fn text(summary: &Summary, gated_share: bool) -> String {
     let _ = writeln!(out, "conflicts seen: {:?}", summary.observed_conflicts);
     let _ = writeln!(
         out,
-        "attempts: {:?}; killed at budget: {}; over budget: {}",
-        summary.attempts, summary.killed, summary.over_budget
+        "attempts: {:?}; killed at budget: {}; over budget: {}; tampered with acceptance tests: {}",
+        summary.attempts, summary.killed, summary.over_budget, summary.tampered
     );
     if summary.failures.is_empty() {
         let _ = writeln!(

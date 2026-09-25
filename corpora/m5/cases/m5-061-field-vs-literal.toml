@@ -2,7 +2,7 @@ id = "m5-061"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: field-vs-literal #11 (Session.timeout/anonymous_session)"
+made_by = "hord-eval-m5 generate v2: field-vs-literal #11 (Session.timeout/anonymous_session)"
 script = ["resolve"]
 
 [base]

@@ -256,6 +256,7 @@ fn print_escalation(escalation: &proto::Escalation) {
             proto::ReplayOutcome::Killed => "killed (over its time budget)",
             proto::ReplayOutcome::OverBudget => "over budget",
             proto::ReplayOutcome::Failed => "failed",
+            proto::ReplayOutcome::Tampered => "changed an acceptance test (rejected, ADR 0034)",
             proto::ReplayOutcome::Unspecified => "unknown",
         };
         let mut line = format!(

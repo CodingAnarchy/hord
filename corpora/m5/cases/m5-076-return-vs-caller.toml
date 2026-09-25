@@ -2,7 +2,7 @@ id = "m5-076"
 kind = "return-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: return-vs-caller #1 (parse_id/is_id)"
+made_by = "hord-eval-m5 generate v2: return-vs-caller #1 (parse_id/is_id)"
 script = ["resolve"]
 
 [base]

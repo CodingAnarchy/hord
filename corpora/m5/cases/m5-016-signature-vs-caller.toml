@@ -2,7 +2,7 @@ id = "m5-016"
 kind = "signature-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: signature-vs-caller #3 (stretch/stretch_once_more)"
+made_by = "hord-eval-m5 generate v2: signature-vs-caller #3 (stretch/stretch_once_more)"
 script = ["resolve"]
 
 [base]

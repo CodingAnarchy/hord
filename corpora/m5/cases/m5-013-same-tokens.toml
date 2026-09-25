@@ -2,8 +2,11 @@ id = "m5-013"
 kind = "same-tokens"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: same-tokens #13 (pump x14)"
-script = ["resolve"]
+made_by = "hord-eval-m5 generate v2: same-tokens #13 (pump x14)"
+script = [
+    "tamper",
+    "resolve",
+]
 
 [base]
 ".gitignore" = """

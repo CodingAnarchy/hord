@@ -190,6 +190,7 @@ pub fn run(
             .and_then(|e| e.summary.clone()),
         budget: Some(hord_txn::budget_message(&budget)),
         note: note.clone(),
+        protected_tests: protected_tests(backend.as_ref(), &record, entry.as_ref())?,
     };
     let command = CommandHarness::new(shell(&harness)).context("an empty --harness")?;
     let started = Instant::now();
@@ -260,6 +261,7 @@ pub fn run(
             proto::ReplayOutcome::Killed => "killed",
             proto::ReplayOutcome::OverBudget => "over budget",
             proto::ReplayOutcome::Failed => "failed",
+            proto::ReplayOutcome::Tampered => "changed an acceptance test (rejected)",
             proto::ReplayOutcome::Running | proto::ReplayOutcome::Unspecified => "unknown",
         };
         println!(
@@ -275,6 +277,35 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// The acceptance tests a replay must not change (ADR 0034): those the
+/// change's intent names, and those of the changes it collided with.
+fn protected_tests(
+    backend: &dyn RepoBackend,
+    record: &hord_core::ChangeRecord,
+    entry: Option<&proto::QueueEntry>,
+) -> Result<Vec<String>> {
+    let mut intents = vec![record.intent.clone()];
+    let colliders: Vec<String> = entry
+        .and_then(|e| e.report.as_ref())
+        .map(|r| r.conflicts.iter().map(|c| c.landed.clone()).collect())
+        .unwrap_or_default();
+    for landed in colliders {
+        let id = txn::parse_change(&landed)?;
+        intents.push(backend_change(backend, id)?.intent);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for intent in intents {
+        for acceptance in intent.acceptance {
+            if let hord_core::Acceptance::Test { name } = acceptance
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Record what the harness proposed as a replay of `of` (`parent_intent`,

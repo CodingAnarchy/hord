@@ -2,7 +2,7 @@ id = "m5-073"
 kind = "variant-vs-match"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: variant-vs-match #10 (Flavor::Sour/strength)"
+made_by = "hord-eval-m5 generate v2: variant-vs-match #10 (Flavor::Sour/strength)"
 script = ["resolve"]
 
 [base]

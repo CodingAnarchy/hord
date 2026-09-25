@@ -130,6 +130,15 @@ pub fn prompt(request: &ReplayRequest) -> String {
             let _ = writeln!(text, "- verification failed: {why}");
         }
     }
+    if !request.protected_tests.is_empty() {
+        let _ = writeln!(
+            text,
+            "\n## Tests you must not change\n\nThese acceptance tests belong to the intents that collided. Do not modify, delete, or rename them: a change that does is rejected. Make the code pass them as written. You may add tests of your own."
+        );
+        for test in &request.protected_tests {
+            let _ = writeln!(text, "- {test}");
+        }
+    }
     if let Some(note) = &request.note {
         let _ = writeln!(text, "\n## Note from the arbiter\n\n{note}");
     }
@@ -339,6 +348,7 @@ mod tests {
                 ..Default::default()
             }),
             note: Some("keep the doc comment".into()),
+            protected_tests: vec!["beta_is_21".into(), "beta_is_20".into()],
             ..Default::default()
         }
     }
@@ -353,6 +363,8 @@ mod tests {
             "- test: beta_is_21",
             "beta returns 20",
             "keep the doc comment",
+            "Tests you must not change",
+            "- beta_is_20",
         ] {
             assert!(text.contains(needle), "{needle:?} in {text}");
         }

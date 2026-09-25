@@ -2,7 +2,7 @@ id = "m5-051"
 kind = "field-vs-literal"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: field-vs-literal #1 (User.age/guest)"
+made_by = "hord-eval-m5 generate v2: field-vs-literal #1 (User.age/guest)"
 script = ["resolve"]
 
 [base]

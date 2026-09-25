@@ -2,7 +2,7 @@ id = "m5-036"
 kind = "rename-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v1: rename-vs-caller #10 (fold_sum->sum_folded/fold_twice)"
+made_by = "hord-eval-m5 generate v2: rename-vs-caller #10 (fold_sum->sum_folded/fold_twice)"
 script = ["resolve"]
 
 [base]
