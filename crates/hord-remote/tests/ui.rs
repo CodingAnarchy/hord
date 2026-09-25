@@ -1,0 +1,468 @@
+//! The web UI (ADR 0030) end to end: a real conflict landed and parked by
+//! `hord serve`'s lander, its event stream recorded as a flight recording,
+//! and every view rendered over the wire.
+//!
+//! - The UI router runs over `RemoteRepo` and `RemoteChanges`, wrapped in
+//!   `hord_ui::audit::Audited`: the M5 check that the UI calls no RPC
+//!   outside `hord.proto`.
+//! - `hord serve` mounts the same router at `/` and `/r/<name>/`.
+//! - The recording plays back to the end on the landing strip.
+
+use std::env;
+use std::fs;
+use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use axum::body::{self, Body};
+use hord_api::proto::event::Kind;
+use hord_api::recording::Recorder;
+use hord_api::{ChangesBackend, RepoBackend, proto, wire};
+use hord_core::{Actor, Bytes, ChangeId, Intent, RepoPath};
+use hord_remote::RemoteRepo;
+use hord_server::{Hosts, ServeOptions, Server, ServerConfig, save_recording};
+use hord_txn::{BeginOptions, Repo, RepoOptions};
+use hord_ui::audit::{AuditLog, Audited, unlisted};
+use hord_ui::{SingleRepo, UiRepo};
+use http_body_util::{BodyExt, Empty};
+use hyper::client::conn::http1::handshake;
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
+use tokio_stream::StreamExt;
+use tower::ServiceExt;
+
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const LIB: &str = "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    2\n}\n";
+
+struct Dir(PathBuf);
+
+impl Drop for Dir {
+    /// A failed removal is reported, not raised: a drop cannot return it.
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_dir_all(&self.0)
+            && err.kind() != ErrorKind::NotFound
+        {
+            eprintln!("remove temp dir {}: {err}", self.0.display());
+        }
+    }
+}
+
+fn temp(tag: &str) -> std::io::Result<Dir> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let path = env::temp_dir().join(format!(
+        "hord-ui-{tag}-{}-{}",
+        process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    if path.exists() {
+        fs::remove_dir_all(&path)?;
+    }
+    fs::create_dir_all(&path)?;
+    Ok(Dir(path))
+}
+
+fn agent(id: &str) -> Actor {
+    Actor::Agent {
+        id: id.into(),
+        model: "test-model".into(),
+        model_hash: Bytes::new(Vec::new()),
+        harness: "ui-test".into(),
+    }
+}
+
+fn path(p: &str) -> TestResult<RepoPath> {
+    Ok(p.parse()?)
+}
+
+/// A running server: its address and the handle that stops it.
+struct Running {
+    addr: SocketAddr,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Running {
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    async fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+async fn serve(root: &Path) -> TestResult<Running> {
+    let hosts = Hosts::open_repo(
+        root,
+        RepoOptions {
+            verifier: Some(Arc::new(hord_txn::StubVerifier)),
+            ..RepoOptions::default()
+        },
+    )
+    .await?;
+    let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
+    let addr = listener.local_addr()?;
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = Server::new(hosts, ServerConfig::default());
+    let task = tokio::spawn(async move {
+        server
+            .serve(listener, async {
+                let _ = stopped.await;
+            })
+            .await
+            .expect("serve the test server");
+    });
+    Ok(Running {
+        addr,
+        stop: Some(stop),
+        task: Some(task),
+    })
+}
+
+/// The scenario: two agents change `two` from the same base; the first
+/// lands, the second is parked on a hard merge conflict.
+struct Scenario {
+    dir: Dir,
+    running: Running,
+    landed: String,
+    parked: String,
+    recording: String,
+}
+
+async fn propose(repo: &Repo, who: &str, body: &str, summary: &str) -> TestResult<ChangeId> {
+    let mut ws = repo.begin(BeginOptions::at_head(agent(who))).await?;
+    ws.write_file(&path("src/lib.rs")?, LIB.replace("    2\n", body))
+        .await?;
+    let mut intent = Intent::from_summary(summary);
+    intent.body = format!("{who} needs `two` to return a different value.");
+    Ok(ws.propose(intent).await?.change)
+}
+
+fn names(envelope: &proto::EventEnvelope, change: &str) -> Option<&'static str> {
+    match envelope.event.as_ref()?.kind.as_ref()? {
+        Kind::Landed(l) if l.change == change || l.submitted.as_deref() == Some(change) => {
+            Some("landed")
+        }
+        Kind::Parked(p) if p.change == change => Some("parked"),
+        Kind::Rejected(r) if r.change == change => Some("rejected"),
+        _ => None,
+    }
+}
+
+async fn scenario() -> TestResult<Scenario> {
+    let dir = temp("scenario")?;
+    let (a, b) = {
+        let repo = Repo::create(&dir.0).await?;
+        repo.bootstrap(
+            vec![(path("src/lib.rs")?, LIB.as_bytes().to_vec())],
+            Intent::from_summary("seed"),
+            Actor::Human { id: "seed".into() },
+        )
+        .await?;
+        let a = propose(&repo, "agent-a", "    20\n", "Make two return twenty").await?;
+        let b = propose(&repo, "agent-b", "    22\n", "Make two return twenty-two").await?;
+        (wire::id(a), wire::id(b))
+    };
+
+    // Run the lander with a flight recorder on the event stream.
+    let running = serve(&dir.0).await?;
+    let remote = RemoteRepo::connect(&running.url()).await?;
+    let mut stream = remote
+        .events(proto::EventsRequest { from: Some(0) })
+        .await?;
+    let mut recorder = Recorder::new(
+        Vec::new(),
+        proto::RecordingHeader {
+            repo: "ui-test".into(),
+            description: "two agents, one conflict".into(),
+            ..Default::default()
+        },
+    )?;
+    remote
+        .submit(proto::SubmitRequest { change: a.clone() })
+        .await?;
+    remote
+        .submit(proto::SubmitRequest { change: b.clone() })
+        .await?;
+    let mut settled = (None, None);
+    while settled.0.is_none() || settled.1.is_none() {
+        let next = timeout(Duration::from_secs(60), stream.next())
+            .await?
+            .ok_or("the event stream ended")??;
+        recorder.record(&next)?;
+        settled.0 = settled.0.or(names(&next, &a));
+        settled.1 = settled.1.or(names(&next, &b));
+    }
+    assert_eq!(settled, (Some("landed"), Some("parked")), "{a} then {b}");
+    drop(stream);
+    running.stop().await;
+
+    // Store the recording in the repository, then serve it again.
+    let recording = {
+        let repo = Repo::open(&dir.0).await?;
+        save_recording(&repo, recorder.finish()?)?
+    };
+    let running = serve(&dir.0).await?;
+    Ok(Scenario {
+        dir,
+        running,
+        landed: a,
+        parked: b,
+        recording: wire::id(recording),
+    })
+}
+
+async fn get(router: &axum::Router, uri: &str) -> TestResult<(u16, String)> {
+    let response = router
+        .clone()
+        .oneshot(http::Request::get(uri).body(Body::empty())?)
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await?.to_bytes();
+    Ok((status, String::from_utf8(body.to_vec())?))
+}
+
+async fn post(router: &axum::Router, uri: &str, form: &str) -> TestResult<(u16, String)> {
+    let response = router
+        .clone()
+        .oneshot(
+            http::Request::post(uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_owned()))?,
+        )
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await?.to_bytes();
+    Ok((status, String::from_utf8(body.to_vec())?))
+}
+
+fn has(page: &str, needle: &str) -> TestResult {
+    if page.contains(needle) {
+        Ok(())
+    } else {
+        Err(format!("page lacks {needle:?}:\n{page}").into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_view_renders_over_the_wire_and_calls_only_listed_rpcs() -> TestResult {
+    let sc = scenario().await?;
+    let remote = RemoteRepo::connect(&sc.running.url()).await?;
+    let log = AuditLog::new();
+    let router = hord_ui::router(Arc::new(SingleRepo(UiRepo {
+        backend: Arc::new(Audited::new(Arc::new(remote.clone()), log.clone())),
+        changes: Arc::new(Audited::new(Arc::new(remote.changes()), log.clone())),
+        review: None,
+        name: "ui-test".into(),
+        base: String::new(),
+    })));
+
+    // View 1: the strip, labeled by intent and actor, with both outcomes.
+    let (status, strip) = get(&router, "/").await?;
+    assert_eq!(status, 200, "{strip}");
+    has(&strip, "Make two return twenty-two")?;
+    has(&strip, "agent:agent-a (test-model)")?;
+    has(&strip, "stage-landed")?;
+    has(&strip, "collide with a landed change")?;
+    has(&strip, &format!("/arbitrate/{}", sc.parked))?;
+
+    // View 2: intent first, then ops on named definitions, evidence,
+    // provenance, sets, history; the text diff is the secondary tab.
+    let (status, change) = get(&router, &format!("/changes/{}", sc.landed)).await?;
+    assert_eq!(status, 200, "{change}");
+    has(&change, "Make two return twenty")?;
+    has(&change, "agent-a needs `two` to return a different value.")?;
+    has(&change, "replace two (src/lib.rs)")?;
+    has(&change, "-    2\n+    20")?;
+    has(&change, "harness")?;
+    has(&change, "landed at #")?;
+    has(&change, "Review signing is not available")?;
+    let intent_at = change.find("Operations").ok_or("ops section")?;
+    let diff_at = change.find("+    20").ok_or("diff")?;
+    assert!(intent_at < diff_at, "the text diff is not the default view");
+
+    // View 3: why it was parked, both intents, the contested definition
+    // with both sides' ops, and the ladder.
+    let (status, bench) = get(&router, &format!("/arbitrate/{}", sc.parked)).await?;
+    assert_eq!(status, 200, "{bench}");
+    has(&bench, "hard merge conflict")?;
+    has(&bench, "Make two return twenty-two")?;
+    has(&bench, "Make two return twenty<")?;
+    has(&bench, "replace two (src/lib.rs)")?;
+    has(&bench, "conflict check")?;
+    // Actions go through Arbitrate; until the ladder ships it, the
+    // workbench says so rather than failing.
+    let (status, acted) = post(
+        &router,
+        &format!("/arbitrate/{}", sc.parked),
+        "action=replay&note=keep+both",
+    )
+    .await?;
+    assert_eq!(status, 200, "{acted}");
+    has(&acted, "class=\"flash\"")?;
+    let (_, ws) = post(
+        &router,
+        &format!("/arbitrate/{}", sc.parked),
+        "action=workspace",
+    )
+    .await?;
+    has(&ws, "hord ws new --base")?;
+
+    // Playback: the recording is listed, and scrubbing to the end shows
+    // what the live strip shows.
+    let (_, list) = get(&router, "/recordings").await?;
+    has(&list, "two agents, one conflict")?;
+    let (status, player) = get(&router, &format!("/recordings/{}", sc.recording)).await?;
+    assert_eq!(status, 200, "{player}");
+    let total: usize = player
+        .split("data-total=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .ok_or("data-total")?
+        .parse()?;
+    assert!(total >= 4, "{total} events");
+    let (_, start) = get(
+        &router,
+        &format!("/recordings/{}/frames?at=0", sc.recording),
+    )
+    .await?;
+    assert!(!start.contains("<li class=\"row"), "{start}");
+    let end = router
+        .clone()
+        .oneshot(
+            http::Request::get(format!(
+                "/recordings/{}/frames?at={total}&speed=4",
+                sc.recording
+            ))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert!(end.headers().contains_key("hord-next-delay"));
+    let end = String::from_utf8(end.into_body().collect().await?.to_bytes().to_vec())?;
+    has(&end, "Make two return twenty-two")?;
+    has(&end, "stage-landed")?;
+    has(&end, "stage-arbitration")?;
+    let (status, _) = get(
+        &router,
+        &format!("/recordings/{}/frames?at=1&speed=0", sc.recording),
+    )
+    .await?;
+    assert_eq!(status, 400, "speed 0 is refused");
+
+    // The M5 check: every call was an RPC of hord.proto, and the views
+    // used both services.
+    let calls = log.calls();
+    assert!(unlisted(&log).is_empty(), "{:?}", unlisted(&log));
+    for rpc in [
+        "hord.v1.RepoBackend/Queue",
+        "hord.v1.RepoBackend/Head",
+        "hord.v1.RepoBackend/Arbitrate",
+        "hord.v1.Changes/GetChange",
+        "hord.v1.Changes/ChangeDiff",
+        "hord.v1.Changes/ListRecordings",
+        "hord.v1.Changes/GetRecording",
+    ] {
+        assert!(calls.iter().any(|c| c == rpc), "{rpc} in {calls:?}");
+    }
+    sc.running.stop().await;
+    drop(sc.dir);
+    Ok(())
+}
+
+/// A plain HTTP/1.1 GET on the server; with `first_frame`, returns only the
+/// first body frame (for an SSE stream that never ends).
+async fn http1(addr: SocketAddr, uri: &str, first_frame: bool) -> TestResult<(u16, String)> {
+    let stream = TcpStream::connect(addr).await?;
+    let (mut sender, conn) = handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(conn);
+    let request = http::Request::get(uri)
+        .header("host", addr.to_string())
+        .body(Empty::<body::Bytes>::new())?;
+    let response = sender.send_request(request).await?;
+    let status = response.status().as_u16();
+    let mut body = response.into_body();
+    let text = if first_frame {
+        let frame = timeout(Duration::from_secs(10), body.frame())
+            .await?
+            .ok_or("no frame")??;
+        let data = frame.into_data().map_err(|_| "not a data frame")?;
+        String::from_utf8(data.to_vec())?
+    } else {
+        String::from_utf8(body.collect().await?.to_bytes().to_vec())?
+    };
+    Ok((status, text))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hord_serve_mounts_the_ui_beside_the_grpc_services() -> TestResult {
+    let sc = scenario().await?;
+    let addr = sc.running.addr;
+    let name = sc
+        .dir
+        .0
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("dir name")?
+        .to_owned();
+
+    let (status, strip) = http1(addr, "/", false).await?;
+    assert_eq!(status, 200, "{strip}");
+    has(&strip, "data-live=\"/events\"")?;
+    // The same page under the repository's prefix links under it.
+    let (status, prefixed) = http1(addr, &format!("/r/{name}/"), false).await?;
+    assert_eq!(status, 200, "{prefixed}");
+    has(
+        &prefixed,
+        &format!("href=\"/r/{name}/changes/{}\"", sc.landed),
+    )?;
+    let (status, _) = http1(
+        addr,
+        &format!("/r/{name}/recordings/{}/frames?at=2", sc.recording),
+        false,
+    )
+    .await?;
+    assert_eq!(status, 200);
+    let (status, css) = http1(addr, "/static/hord.css", false).await?;
+    assert_eq!(status, 200);
+    has(&css, "prefers-color-scheme")?;
+    let (status, _) = http1(addr, "/changes/not-an-id", false).await?;
+    assert_eq!(status, 400);
+
+    // The live region: SSE, starting with every row.
+    let (status, first) = http1(addr, "/events", true).await?;
+    assert_eq!(status, 200);
+    has(&first, "event: reset")?;
+    has(&first, "Make two return twenty")?;
+
+    // gRPC still answers on the same port, and so does Changes.
+    let remote = RemoteRepo::connect(&sc.running.url()).await?;
+    let view = ChangesBackend::get_change(
+        &remote.changes(),
+        proto::GetChangeRequest {
+            change: sc.parked.clone(),
+        },
+    )
+    .await?;
+    assert_eq!(
+        view.queue.as_ref().map(proto::QueueEntry::status),
+        Some(proto::QueueStatus::Conflicted)
+    );
+    assert!(view.history.iter().any(|e| matches!(
+        e.event.as_ref().and_then(|e| e.kind.as_ref()),
+        Some(Kind::Parked(_))
+    )));
+    sc.running.stop().await;
+    Ok(())
+}

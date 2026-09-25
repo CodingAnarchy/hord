@@ -33,6 +33,8 @@ use hord_api::{RepoBackend, proto, wire};
 use hord_core::{ChangeId, RepoPath};
 use hord_remote::{RemoteRepo, open_cache, push_change};
 use hord_txn::Repo;
+use hord_ui::playback::Playback;
+use hord_ui::strip::Stage;
 use serde::Serialize;
 use tokio_stream::StreamExt;
 
@@ -307,10 +309,12 @@ pub(crate) async fn run(
     if done.len() != config.agents {
         bail!("the queue has {} of {} changes", done.len(), config.agents);
     }
-    let recording_id = repo.store().put_object(&hord_core::Blob::new(recording))?;
+    // Stored as a Blob and registered under `.hord/recordings/`, where the
+    // web UI lists and plays it (ADR 0030).
+    let recording_id = hord_server::save_recording(&repo, recording)?;
     repo.store().flush()?;
     let stored: hord_core::Blob = repo.store().get_object(recording_id)?;
-    let (_, events) = hord_api::recording::parse(stored.bytes.as_slice())?;
+    let (header, events) = hord_api::recording::parse(stored.bytes.as_slice())?;
     // The recording replays: it names every landed change of the queue,
     // and every parked or rejected one.
     let mut recorded_landed = HashSet::new();
@@ -344,7 +348,35 @@ pub(crate) async fn run(
     if !missing.is_empty() {
         eprintln!("[server] recording lacks the outcome of {missing:?}");
     }
-    let recording_replays = events.len() == recorded_events && missing.is_empty();
+    // The recording plays back on the landing strip end to end (M5 demo):
+    // scrubbed to its last event, every change's row shows its outcome.
+    let played = Playback::new(header, events.clone());
+    let end = played.strip_at(played.len());
+    let mut misplayed = Vec::new();
+    for entry in &done {
+        let stage = end.row(&wire::id(entry.change)).map(|r| &r.stage);
+        let ok = matches!(
+            (&entry.status, stage),
+            (
+                hord_txn::QueueStatus::Landed { .. },
+                Some(Stage::Landed { .. })
+            ) | (
+                hord_txn::QueueStatus::Rejected { .. },
+                Some(Stage::Rejected { .. })
+            ) | (
+                hord_txn::QueueStatus::Conflicted | hord_txn::QueueStatus::Parked { .. },
+                Some(Stage::Parked { .. } | Stage::Arbitrated { .. }),
+            )
+        );
+        if !ok {
+            misplayed.push(wire::id(entry.change));
+        }
+    }
+    if !misplayed.is_empty() {
+        eprintln!("[server] playback ends with the wrong stage for {misplayed:?}");
+    }
+    let recording_replays =
+        events.len() == recorded_events && missing.is_empty() && misplayed.is_empty();
     let sim = sim::analyze(
         &repo,
         &snapshot,
