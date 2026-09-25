@@ -40,3 +40,5 @@ ADR 0024 server-foundation dependencies (`hord-api`, `hord-server`, `hord-remote
 - `toml` 1 (hord-server, hord-cli; already a workspace dependency): `server.toml` and `.hord/remotes.toml`.
 
 `rustc-demangle` 0.1 (hord-verify-rust only, ADR 0022): demangles the Rust symbol names in `llvm-cov export` so a test's own function maps to its definition. It is the demangler the standard library uses, and AGENTS.md forbids a hand-rolled parser.
+
+`askama` 0.16 (hord-ui only): compiled, HTML-escaping templates for the server-rendered web UI. Spec §10.4 names it (DECIDED stack), so the views need no frontend build pipeline and no hand-rolled HTML escaping.

@@ -18,6 +18,7 @@ members = [
     "crates/hord-policy",
     "crates/hord-verify",
     "crates/hord-verify-rust",
+    "crates/hord-ui",
     "bench/m0-eval",
     "bench/m1-eval",
     "bench/m2-eval",
@@ -33,6 +34,7 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
+askama = "0.16"
 async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
@@ -60,6 +62,7 @@ hord-server = { path = "crates/hord-server" }
 hord-policy = { path = "crates/hord-policy" }
 hord-store = { path = "crates/hord-store" }
 hord-txn = { path = "crates/hord-txn" }
+hord-ui = { path = "crates/hord-ui" }
 hord-verify = { path = "crates/hord-verify" }
 hord-verify-rust = { path = "crates/hord-verify-rust" }
 ignore = "0.4"

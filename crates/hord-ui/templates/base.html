@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} · hord</title>
+<link rel="stylesheet" href="{{ base }}/static/hord.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="{{ base }}/">hord</a>
+  <nav><a href="{{ base }}/">landing strip</a> <a href="{{ base }}/recordings">recordings</a></nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+{% block scripts %}{% endblock %}
+</body>
+</html>
