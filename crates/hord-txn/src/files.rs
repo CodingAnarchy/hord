@@ -9,7 +9,7 @@
 //! less the `Move`s that re-parent its top-level definitions from the source
 //! root to the target root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, Op, RepoPath, TreeOpKind};
@@ -32,6 +32,10 @@ pub(crate) struct FileChange {
     pub moved_from: Option<RepoPath>,
     /// For the source of a file move, the target path.
     pub moved_to: Option<RepoPath>,
+    /// Definitions a `Move` brings into this file from another file that
+    /// stays (ADR 0033). The file's own ops insert them, so the `Move`s are
+    /// left out of its replay.
+    pub moved_in: BTreeSet<NodeId>,
 }
 
 impl FileChange {
@@ -43,13 +47,17 @@ impl FileChange {
 
     /// Structural ops to apply to the base content: for a move target, the
     /// re-parenting `Move`s from the source root are left out (the rename
-    /// itself does that).
+    /// itself does that), and so are the `Move`s of definitions arriving
+    /// from another file (ADR 0033: the file's `Insert` adds them).
     pub fn applicable(&self) -> Vec<Op> {
         let from_root = self.moved_from.as_ref().map(NodeId::file_root);
         self.structural()
-            .filter(
-                |op| !matches!(op, Op::Move { from_parent, .. } if Some(*from_parent) == from_root),
-            )
+            .filter(|op| match op {
+                Op::Move {
+                    node, from_parent, ..
+                } => Some(*from_parent) != from_root && !self.moved_in.contains(node),
+                _ => true,
+            })
             .cloned()
             .collect()
     }
@@ -85,6 +93,7 @@ pub(crate) fn file_changes(inner: &Inner, record: &ChangeRecord) -> Result<Vec<F
             ops: Vec::new(),
             moved_from: None,
             moved_to: None,
+            moved_in: BTreeSet::new(),
         })
         .collect();
     let by_path: BTreeMap<RepoPath, usize> = changes
@@ -135,6 +144,15 @@ pub(crate) fn file_changes(inner: &Inner, record: &ChangeRecord) -> Result<Vec<F
             Op::Blob { path, .. } | Op::Tree { path, .. } => by_path.get(path).copied(),
             _ => owner_of(op, &owners, &sides),
         };
+        if let (Some(i), Op::Move { node, .. }) = (target, op)
+            && !sides[i]
+                .base
+                .as_ref()
+                .is_some_and(|t| t.ids.values().any(|id| id == node))
+            && changes[i].moved_from.is_none()
+        {
+            changes[i].moved_in.insert(*node);
+        }
         match target {
             Some(i) => changes[i].ops.push(op.clone()),
             // A Tree op on a directory has no file of its own.
@@ -172,7 +190,16 @@ fn owner_of(op: &Op, owners: &BTreeMap<NodeId, Vec<usize>>, sides: &[Sides]) -> 
         };
         side.as_ref().is_some_and(|t| t.tree.contains(oid))
     };
+    // A definition moved to another file (ADR 0033) is in one file's base
+    // and another's result: it is deleted from the one whose base has it.
+    let in_base = |i: &&usize| {
+        sides[**i]
+            .base
+            .as_ref()
+            .is_some_and(|t| t.ids.values().any(|id| *id == key))
+    };
     let pick = match op {
+        Op::Delete { .. } => candidates.iter().find(in_base),
         Op::Replace { from, .. } => candidates.iter().find(|i| holds(i, *from, false)),
         Op::Insert { node, .. } => candidates.iter().find(|i| holds(i, *node, true)),
         _ => None,

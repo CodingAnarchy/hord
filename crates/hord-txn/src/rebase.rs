@@ -224,7 +224,7 @@ fn reapply(
     let landed_writes = own.landed;
     let path = &file.path;
     let root = NodeId::file_root(path);
-    let ops: Vec<Op> = file.structural().cloned().collect();
+    let ops: Vec<Op> = file.applicable();
     if ops.is_empty() || file.from.is_none() || file.to.is_none() {
         return Ok(None);
     }

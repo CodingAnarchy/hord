@@ -104,7 +104,7 @@ impl Edit {
 
 /// Everything `propose` accumulates across files.
 #[derive(Default)]
-struct Build {
+struct Build<'a> {
     ops: Vec<Op>,
     /// Derivations carrying recorded (births and deaths come from
     /// [`sets_between`]).
@@ -112,6 +112,20 @@ struct Build {
     tree: BTreeMap<RepoPath, Option<ObjectId>>,
     identity: IdentityEdits,
     written: Vec<Written>,
+    /// Parsed results whose identity is stored once every file is
+    /// identified: a definition moved between files keeps its id
+    /// ([`carry_across_files`], ADR 0033).
+    pending: Vec<Pending<'a>>,
+}
+
+/// A parsed result file, identified on its own, before ADR 0033's pass.
+struct Pending<'a> {
+    adapter: &'a dyn hord_lang::LangAdapter,
+    path: RepoPath,
+    blob: ObjectId,
+    tree: IdentifiedTree,
+    /// Its entry in [`Build::written`].
+    written: usize,
 }
 
 /// Build the record. With `store`, store it and remember it as checked;
@@ -155,6 +169,21 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
             build.identity.insert(edits[*i].path.clone(), None);
         }
     }
+    let bases: Vec<(RepoPath, Arc<IdentifiedTree>)> = edits
+        .iter()
+        .filter_map(|e| {
+            e.base_parsed()
+                .map(|p| (e.path.clone(), Arc::clone(&p.tree)))
+        })
+        .collect();
+    carry_across_files(&mut build, &bases);
+    for pending in std::mem::take(&mut build.pending) {
+        let tree = Arc::new(pending.tree);
+        let identity =
+            inner.put_file_identity(pending.adapter, &pending.path, pending.blob, &tree)?;
+        build.identity.insert(pending.path.clone(), identity);
+        build.written[pending.written].result = Some(tree);
+    }
 
     let result = inner.commit_snapshot(base, &build.tree, &build.identity)?;
     let (write_set, deltas) = sets_between(inner, base, result, &build.ops, &build.declared)?;
@@ -197,7 +226,12 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
 }
 
 /// One changed file that is not part of a move.
-fn propose_file(inner: &Inner, base: SnapshotId, edit: &Edit, build: &mut Build) -> Result<()> {
+fn propose_file<'a>(
+    inner: &'a Inner,
+    base: SnapshotId,
+    edit: &Edit,
+    build: &mut Build<'a>,
+) -> Result<()> {
     let path = &edit.path;
     let (base_blob, result_blob) = (edit.base_blob(), edit.blob);
     build.tree.insert(path.clone(), result_blob);
@@ -245,17 +279,18 @@ fn propose_file(inner: &Inner, base: SnapshotId, edit: &Edit, build: &mut Build)
             check_reproduces(adapter, path, base_ref, &file_ops, &result_tree, bytes)?;
             build.declared.extend(declared(&mapping.deltas));
             build.ops.extend(file_ops);
-            let result_tree = Arc::new(IdentifiedTree::new(
-                (*result_tree).clone(),
-                mapping.nodes.clone(),
-            ));
-            let identity = inner.put_file_identity(adapter, path, blob, &result_tree)?;
-            build.identity.insert(path.clone(), identity);
+            build.pending.push(Pending {
+                adapter,
+                path: path.clone(),
+                blob,
+                tree: IdentifiedTree::new((*result_tree).clone(), mapping.nodes.clone()),
+                written: build.written.len(),
+            });
             build.written.push(Written {
                 path: path.clone(),
                 rust: adapter.lang().as_str() == hord_lang_rust::LANG,
                 base: base_tree,
-                result: Some(result_tree),
+                result: None,
             });
         }
         None => {
@@ -287,12 +322,12 @@ fn propose_file(inner: &Inner, base: SnapshotId, edit: &Edit, build: &mut Build)
 /// `Rename`, and each carried top-level definition `Move`s from the old
 /// file root to the new one. The remaining ops are the structural diff of
 /// the old file's content to the new file's.
-fn propose_move(
-    inner: &Inner,
+fn propose_move<'a>(
+    inner: &'a Inner,
     base: SnapshotId,
     from: &Edit,
     to: &Edit,
-    build: &mut Build,
+    build: &mut Build<'a>,
 ) -> Result<()> {
     let (Some(old), Some(bytes), Some(blob)) = (from.base_parsed(), &to.result, to.blob) else {
         return Err(Error::NotParsed(to.path.clone()));
@@ -331,15 +366,111 @@ fn propose_move(
     build.ops.extend(file_ops);
     build.declared.extend(declared(&mapping.deltas));
     build.tree.insert(path.clone(), Some(blob));
-    let identity = inner.put_file_identity(adapter, path, blob, &result_tree)?;
-    build.identity.insert(path.clone(), identity);
+    build.pending.push(Pending {
+        adapter,
+        path: path.clone(),
+        blob,
+        tree: (*result_tree).clone(),
+        written: build.written.len(),
+    });
     build.written.push(Written {
         path: path.clone(),
         rust: adapter.lang().as_str() == hord_lang_rust::LANG,
         base: Some(Arc::clone(&old.tree)),
-        result: Some(result_tree),
+        result: None,
     });
     Ok(())
+}
+
+/// A definition identified in one file of the change that no longer holds
+/// it, or born in one: a candidate end of a cross-file move (ADR 0033).
+struct End {
+    node: NodeId,
+    /// Its parent: the enclosing definition, or the file root.
+    parent: NodeId,
+}
+
+/// Per `normalized` hash: the deaths, and the births as (pending file
+/// index, site).
+type Ends = (Vec<End>, Vec<(usize, Site)>);
+
+/// ADR 0033: a definition moved unchanged to another file keeps its id.
+/// Among the definitions this change removed from one file (`bases`: every
+/// changed file's base tree) and added to another, pair a death with a
+/// birth when they have the same `normalized` hash and no other death or
+/// birth shares it. The birth takes the dead id, and a `Move` from the old
+/// parent to the new one is emitted unless the parent moved with it. The
+/// files' own `Delete` and `Insert` ops stay: each file still reproduces
+/// on its own (the `Move` is left out of per-file replay).
+fn carry_across_files(build: &mut Build<'_>, bases: &[(RepoPath, Arc<IdentifiedTree>)]) {
+    let result_ids: BTreeSet<NodeId> = build
+        .pending
+        .iter()
+        .flat_map(|p| p.tree.ids.values().copied())
+        .collect();
+    let base_ids: BTreeSet<NodeId> = bases
+        .iter()
+        .flat_map(|(_, t)| t.ids.values().copied())
+        .collect();
+    let hash = |tree: &IdentifiedTree, site: &Site| {
+        hord_lang::oid_at(&tree.tree, site)
+            .and_then(|oid| tree.tree.get(oid))
+            .map(|node| node.normalized)
+    };
+    let mut by_hash: BTreeMap<ObjectId, Ends> = BTreeMap::new();
+    for (path, tree) in bases {
+        for (site, node) in &tree.ids {
+            if result_ids.contains(node) {
+                continue;
+            }
+            let Some(h) = hash(tree, site) else {
+                continue;
+            };
+            let parent = enclosing_site(&tree.ids, site)
+                .and_then(|s| tree.ids.get(s).copied())
+                .unwrap_or_else(|| NodeId::file_root(path));
+            by_hash.entry(h).or_default().0.push(End {
+                node: *node,
+                parent,
+            });
+        }
+    }
+    for (i, pending) in build.pending.iter().enumerate() {
+        for (site, node) in &pending.tree.ids {
+            if base_ids.contains(node) {
+                continue;
+            }
+            if let Some(h) = hash(&pending.tree, site) {
+                by_hash.entry(h).or_default().1.push((i, site.clone()));
+            }
+        }
+    }
+    // Unique pairs only: duplicated bodies stay births and deaths.
+    let mut moved: Vec<(usize, Site, End)> = Vec::new();
+    for (_, (mut deaths, mut births)) in by_hash {
+        if let ([_], [_]) = (deaths.as_slice(), births.as_slice())
+            && let (Some(death), Some((i, site))) = (deaths.pop(), births.pop())
+        {
+            moved.push((i, site, death));
+        }
+    }
+    for (i, site, death) in &moved {
+        build.pending[*i].tree.ids.insert(site.clone(), death.node);
+    }
+    for (i, site, death) in moved {
+        let pending = &build.pending[i];
+        let to_parent = enclosing_site(&pending.tree.ids, &site)
+            .and_then(|s| pending.tree.ids.get(s).copied())
+            .unwrap_or_else(|| NodeId::file_root(&pending.path));
+        if to_parent != death.parent {
+            build.ops.push(Op::Move {
+                node: death.node,
+                from_parent: death.parent,
+                to_parent,
+                index: site.last().copied().unwrap_or(0),
+            });
+        }
+    }
 }
 
 /// Deltas carrying recorded besides births and deaths.

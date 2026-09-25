@@ -465,3 +465,138 @@ async fn a_rebased_record_that_fails_verification_is_not_stored() -> TestResult 
     assert!(repo.store().contains(pb)?, "the submitted record stays");
     Ok(())
 }
+
+const LIB33: &str = "mod util;\n\npub fn keep() -> u32 {\n    1\n}\n\npub fn parse(s: &str) -> Option<u32> {\n    s.parse().ok()\n}\n";
+const UTIL33: &str = "pub fn other() -> u32 {\n    2\n}\n";
+const PARSE33: &str = "pub fn parse(s: &str) -> Option<u32> {\n    s.parse().ok()\n}\n";
+
+fn moves_of(record: &ChangeRecord, node: NodeId) -> Vec<(NodeId, NodeId)> {
+    record
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Move {
+                node: n,
+                from_parent,
+                to_parent,
+                ..
+            } if *n == node => Some((*from_parent, *to_parent)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// ADR 0033: a definition moved unchanged into a new file keeps its NodeId
+/// and emits `Op::Move` from the old file root to the new one; the record
+/// validates and lands, and history follows it.
+#[tokio::test]
+async fn a_definition_moved_unchanged_to_a_new_file_keeps_its_id() -> TestResult {
+    let t = repo(&[("src/lib.rs", LIB33), ("src/util.rs", UTIL33)]).await?;
+    let repo = &t.repo;
+    let parse = head_ids(repo, "src/lib.rs").await?["parse"];
+    let mut ws = begin(repo, "x").await?;
+    ws.write_file(
+        &path("src/lib.rs"),
+        LIB33.replace(&format!("\n{PARSE33}"), "").replace(
+            "mod util;",
+            "mod util;\nmod parsing;\n\npub use parsing::parse;",
+        ),
+    )
+    .await?;
+    ws.write_file(&path("src/parsing.rs"), PARSE33).await?;
+    let proposal = ws.propose(intent("move parse into parsing")).await?;
+    let record = &proposal.record;
+    assert!(!births(record).contains(&parse) && !deaths(record).contains(&parse));
+    assert_eq!(
+        moves_of(record, parse),
+        vec![(
+            NodeId::file_root(&path("src/lib.rs")),
+            NodeId::file_root(&path("src/parsing.rs"))
+        )]
+    );
+    assert!(record.write_set.contains(&parse));
+    repo.submit(proposal.change).await?;
+    repo.land_local().await?;
+    landed(repo, proposal.change).await?;
+    assert_eq!(head_ids(repo, "src/parsing.rs").await?["parse"], parse);
+    assert!(!head_ids(repo, "src/lib.rs").await?.contains_key("parse"));
+    let history = repo.store().node_history(parse)?;
+    assert_eq!(history.last(), Some(&proposal.change));
+    Ok(())
+}
+
+/// ADR 0033: also into a file that already existed.
+#[tokio::test]
+async fn a_definition_moved_unchanged_to_an_existing_file_keeps_its_id() -> TestResult {
+    let t = repo(&[("src/lib.rs", LIB33), ("src/util.rs", UTIL33)]).await?;
+    let repo = &t.repo;
+    let parse = head_ids(repo, "src/lib.rs").await?["parse"];
+    let mut ws = begin(repo, "x").await?;
+    ws.write_file(
+        &path("src/lib.rs"),
+        LIB33
+            .replace(&format!("\n{PARSE33}"), "")
+            .replace("mod util;", "mod util;\n\npub use util::parse;"),
+    )
+    .await?;
+    ws.write_file(&path("src/util.rs"), format!("{UTIL33}\n{PARSE33}"))
+        .await?;
+    let proposal = ws.propose(intent("move parse into util")).await?;
+    assert!(!births(&proposal.record).contains(&parse));
+    assert_eq!(moves_of(&proposal.record, parse).len(), 1);
+    repo.submit(proposal.change).await?;
+    repo.land_local().await?;
+    landed(repo, proposal.change).await?;
+    assert_eq!(head_ids(repo, "src/util.rs").await?["parse"], parse);
+    Ok(())
+}
+
+/// ADR 0033: an ambiguous match (the body lands in two files) is not
+/// carried: a death and two births, the same on every run.
+#[tokio::test]
+async fn an_ambiguous_cross_file_move_stays_births_and_deaths() -> TestResult {
+    let t = repo(&[("src/lib.rs", LIB33), ("src/util.rs", UTIL33)]).await?;
+    let repo = &t.repo;
+    let parse = head_ids(repo, "src/lib.rs").await?["parse"];
+    let propose = || async {
+        let mut ws = begin(repo, "x").await?;
+        ws.write_file(
+            &path("src/lib.rs"),
+            LIB33.replace(&format!("\n{PARSE33}"), ""),
+        )
+        .await?;
+        ws.write_file(&path("src/one.rs"), PARSE33).await?;
+        ws.write_file(&path("src/two.rs"), PARSE33).await?;
+        Ok::<_, Box<dyn std::error::Error>>(ws.preview(intent("copy parse twice")).await?.record)
+    };
+    let record = propose().await?;
+    assert!(deaths(&record).contains(&parse));
+    assert_eq!(births(&record).len(), 2, "{:?}", record.identity_deltas);
+    assert!(moves_of(&record, parse).is_empty());
+    let again = propose().await?;
+    assert_eq!(births(&again), births(&record));
+    Ok(())
+}
+
+/// ADR 0033: moved and edited in one change is a birth and a death.
+#[tokio::test]
+async fn a_moved_and_edited_definition_is_a_birth_and_a_death() -> TestResult {
+    let t = repo(&[("src/lib.rs", LIB33), ("src/util.rs", UTIL33)]).await?;
+    let repo = &t.repo;
+    let parse = head_ids(repo, "src/lib.rs").await?["parse"];
+    let mut ws = begin(repo, "x").await?;
+    ws.write_file(
+        &path("src/lib.rs"),
+        LIB33.replace(&format!("\n{PARSE33}"), ""),
+    )
+    .await?;
+    ws.write_file(
+        &path("src/parsing.rs"),
+        PARSE33.replace("s.parse()", "s.trim().parse()"),
+    )
+    .await?;
+    let record = ws.preview(intent("move and edit parse")).await?.record;
+    assert!(deaths(&record).contains(&parse));
+    assert!(moves_of(&record, parse).is_empty());
+    Ok(())
+}
