@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [ns-stripped, nons-stripped, ns-fullenv]
+        variant: [direct-fullenv, setsid-fullenv]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -35,16 +35,16 @@ jobs:
         run: |
           bin=$(ls -t target/debug/deps/gate-* | grep -v '[.]d$' | head -1)
           case "${{ matrix.variant }}" in
-            ns-stripped)   pre="sudo unshare --pid --fork --mount-proc sudo -u $USER --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME" ;;
-            nons-stripped) pre="sudo -u $USER --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME" ;;
-            ns-fullenv)    pre="sudo --preserve-env unshare --pid --fork --mount-proc sudo --preserve-env -u $USER" ;;
+            direct-fullenv) pre="" ;;
+            setsid-fullenv) pre="setsid -w" ;;
           esac
-          echo "prefix: $pre"
-          for i in $(seq 1 15); do
+          echo "prefix: [$pre] kill binary: $(command -v kill) $(readlink -f $(command -v kill))"
+          for i in $(seq 1 20); do
             start=$(date +%s)
-            $pre strace -f -qq -e trace=kill,tkill,tgkill -o /tmp/kills.$i.log timeout 600 "$bin" > /tmp/run.$i.log 2>&1
+            $pre strace -f -qq -e trace=kill,tkill,tgkill -e signal=none -o /tmp/kills.$i.log timeout 600 "$bin" > /tmp/run.$i.log 2>&1
             rc=$?
             echo "ITER $i rc=$rc $(( $(date +%s) - start ))s $(grep 'test result' /tmp/run.$i.log)"
-            sed 's/^/   KILL /' /tmp/kills.$i.log | head -8
-            [ $rc -ne 0 ] && tail -40 /tmp/run.$i.log
+            sed 's/^/   KILL /' /tmp/kills.$i.log | head -20
+            if [ $rc -ne 0 ]; then tail -40 /tmp/run.$i.log; fi
           done
+          echo done-all
