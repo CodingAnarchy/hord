@@ -13,11 +13,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use hord_api::RepoBackend;
 use hord_api::proto::replay_result::Status;
 use hord_api::{proto, wire};
-use hord_core::ReplayBudget;
+use hord_core::{Blob, ObjectId, ReplayBudget, Snapshot, Tree, TreeEntry};
+use hord_policy::POLICY_PATH;
 use hord_txn::{CommandHarness, ReplayHarness, RepoOptions};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::output;
 use crate::session::{Session, Target};
@@ -58,20 +61,23 @@ pub fn lander_options(root: &Path) -> Result<RepoOptions> {
     })
 }
 
-/// Budget flags.
+/// Budget flags; each one left out is head's (ADR 0028).
 pub struct Limits {
-    pub wall_time_secs: u64,
+    pub wall_time_secs: Option<u64>,
     pub tokens: Option<u64>,
     pub cost_usd: Option<f64>,
 }
 
 impl Limits {
-    fn budget(&self) -> Result<ReplayBudget> {
-        if self.wall_time_secs == 0 {
-            bail!("--wall-time-secs must be at least 1");
-        }
+    /// `head`'s budget with the flags given replacing its fields.
+    fn budget(&self, head: ReplayBudget) -> Result<ReplayBudget> {
+        let wall_time_ms = match self.wall_time_secs {
+            None => head.wall_time_ms,
+            Some(0) => bail!("--wall-time-secs must be at least 1"),
+            Some(secs) => secs.saturating_mul(1_000),
+        };
         let cost_micros = match self.cost_usd {
-            None => None,
+            None => head.cost_micros,
             Some(usd) => {
                 let micros = (usd * 1_000_000.0).round();
                 if !micros.is_finite() || micros < 0.0 || micros >= u64::MAX as f64 {
@@ -82,11 +88,43 @@ impl Limits {
             }
         };
         Ok(ReplayBudget {
-            wall_time_ms: self.wall_time_secs.saturating_mul(1_000),
-            tokens: self.tokens,
+            wall_time_ms,
+            tokens: self.tokens.or(head.tokens),
             cost_micros,
         })
     }
+}
+
+/// Read and decode object `id` through `backend`.
+fn backend_object<T: DeserializeOwned>(backend: &dyn RepoBackend, id: ObjectId) -> Result<T> {
+    let reply = block_on(backend.get_objects(proto::GetObjectsRequest {
+        ids: vec![wire::id(id)],
+    }))?;
+    let object = reply
+        .objects
+        .into_iter()
+        .next()
+        .with_context(|| format!("no object {id}"))?;
+    hord_encoding::decode(&object.cbor).with_context(|| format!("decode object {id}"))
+}
+
+/// Head's `[replay] budget` (ADR 0028): the `.hord-policy.toml` at the root
+/// of head's snapshot, or the default when there is none (ADR 0026).
+pub fn head_budget(backend: &dyn RepoBackend) -> Result<ReplayBudget> {
+    let Some((_, snapshot)) = txn::backend_head(backend)? else {
+        return Ok(ReplayBudget::default());
+    };
+    let snapshot: Snapshot = backend_object(backend, snapshot)?;
+    let root: Tree = backend_object(backend, snapshot.root())?;
+    let Some(TreeEntry::Blob(blob)) = root.entries.get(POLICY_PATH) else {
+        return Ok(ReplayBudget::default());
+    };
+    let blob: Blob = backend_object(backend, *blob)?;
+    let text = std::str::from_utf8(blob.bytes.as_slice())
+        .with_context(|| format!("head's {} is not UTF-8", POLICY_PATH))?;
+    let policy = hord_policy::parse(text)
+        .with_context(|| format!("head's {} does not parse", POLICY_PATH))?;
+    Ok(policy.replay().budget.clone())
 }
 
 /// `cmd` run by the platform shell.
@@ -107,7 +145,6 @@ pub fn run(
     note: Option<String>,
 ) -> Result<()> {
     let id = txn::parse_change(&change)?;
-    let budget = limits.budget()?;
     let root = crate::repo::discover_root()?;
     let session = Session::open(target)?;
     if matches!(session, Session::Direct { .. }) {
@@ -117,6 +154,7 @@ pub fn run(
         );
     }
     let backend = session.backend();
+    let budget = limits.budget(head_budget(backend.as_ref())?)?;
     let record = backend_change(backend.as_ref(), id)?;
     let entry = block_on(backend.queue(proto::QueueQuery {
         change: Some(change.clone()),
@@ -242,7 +280,7 @@ pub fn run(
 /// Record what the harness proposed as a replay of `of` (`parent_intent`,
 /// spec §6.6) and submit it. Returns the replay's id.
 fn submit_replay(
-    backend: &dyn hord_api::RepoBackend,
+    backend: &dyn RepoBackend,
     of: hord_core::ChangeId,
     base: &str,
     proposed: &str,

@@ -256,9 +256,10 @@ pub enum Command {
         /// line on stdin and writes a ReplayResult line on stdout.
         #[arg(long, value_name = "CMD")]
         harness: String,
-        /// Wall-clock budget; the harness is killed past it.
-        #[arg(long, value_name = "SECS", default_value_t = 600)]
-        wall_time_secs: u64,
+        /// Wall-clock budget; the harness is killed past it. Default: head's
+        /// `[replay] budget` (ADR 0028), like each budget flag.
+        #[arg(long, value_name = "SECS")]
+        wall_time_secs: Option<u64>,
         /// Token budget; a result reporting more is rejected.
         #[arg(long, value_name = "N")]
         tokens: Option<u64>,
@@ -278,6 +279,9 @@ pub enum Command {
         change: String,
         /// `ours` (keep what landed), `theirs` (take the parked change), or
         /// a change id that resolves it, such as a replay candidate.
+        /// `theirs` is whole-file: every file the parked change touched gets
+        /// the parked change's version, including edits that landed in
+        /// those files since its base. For a finer resolution, use `--edit`.
         #[arg(long, value_name = "ours|theirs|CHANGE")]
         pick: Option<String>,
         /// Open a workspace on head to resolve it by hand, then `hord
