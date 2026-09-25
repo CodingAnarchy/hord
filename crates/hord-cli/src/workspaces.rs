@@ -20,7 +20,7 @@ use hord_remote::RemoteRepo;
 use hord_store::WorkspaceId;
 use hord_txn::{Base, BeginOptions, Materialization, MaterializeMode, Repo};
 
-use crate::session::Signer;
+use crate::session::{self, Signer};
 use crate::txn::{self, Names, block_on, hex};
 use crate::{intent, repo};
 
@@ -351,8 +351,20 @@ fn propose(
     request: &proto::ProposeRequest,
 ) -> Result<proto::ProposeResponse> {
     let (mut actor, session) = caller(request.caller.as_ref())?;
-    // The server sets provenance from the token (spec §10.5.4): author as
-    // the logged-in actor.
+    // Against a true remote the record is signed here, before it is pushed
+    // (spec §10.5.4): with the logged-in actor's key, else this user's own.
+    // Served by a daemon, the CLI signs the record it gets back
+    // (`cmd::propose`), so the daemon never holds a private key.
+    let local;
+    let signer = match (signer, remote) {
+        (Some(signer), _) => Some(signer),
+        (None, Some(_)) => {
+            local = session::local_signer()?;
+            Some(&local)
+        }
+        (None, None) => None,
+    };
+    // The server sets provenance from the token: author as the signer.
     if let Some(signer) = signer {
         actor = signer.actor.clone();
     }

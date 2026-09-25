@@ -504,3 +504,117 @@ fn a_review_carries_across_a_clean_rebase() -> TestResult {
     assert_eq!(ok["verified"], true, "{ok:#}");
     Ok(())
 }
+
+/// `hord` through the repository's per-repo daemon (ADR 0021), started on
+/// demand, as the identity whose `~/.hord` is `home`.
+fn daemon_json(dir: &Path, home: &Path, args: &[&str]) -> TestResult<serde_json::Value> {
+    let mut args = args.to_vec();
+    args.push("--json");
+    let out = hord(dir, home, &args)
+        .env_remove("HORD_NO_DAEMON")
+        .env("HORD_DAEMON_IDLE_SECS", "10")
+        .output()?;
+    assert!(out.status.success(), "hord {args:?}: {}", describe(&out));
+    let text = String::from_utf8(out.stdout)?;
+    serde_json::from_str(&text).map_err(|err| format!("{args:?}: {err}\n{text}").into())
+}
+
+/// Spec §10.5.4: a proposal made through the local daemon (or
+/// `--no-daemon`) is signed with the user's key in `~/.hord/keys/`,
+/// created on first use; the signature verifies with that key only, and
+/// the daemon accepts the signed change and lands it.
+#[test]
+fn daemon_proposals_are_signed_with_the_users_key() -> TestResult {
+    let home = TempDir::new("hord-auth-daemon-home")?;
+    let repo = TempDir::new("hord-auth-daemon")?;
+    let dir = &repo.0;
+    fs::create_dir_all(dir.join("src"))?;
+    fs::write(dir.join("src/lib.rs"), LIB)?;
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::write(dir.join(".gitignore"), "target/\n*.md\n")?;
+    git(dir, &["init", "-q", "-b", "main"])?;
+    git(dir, &["add", "."])?;
+    git(dir, &["commit", "-q", "-m", "fixture"])?;
+    let git_path = dir.to_str().ok_or("temp path is UTF-8")?;
+    daemon_json(dir, &home.0, &["init", "--from-git", git_path])?;
+    let key_file = home.0.join("keys/tester.pem");
+    assert!(!key_file.exists());
+
+    let propose = |no_daemon: bool, from: &str, to: &str, summary: &str| -> TestResult<String> {
+        let mut extra: Vec<&str> = Vec::new();
+        if no_daemon {
+            extra.push("--no-daemon");
+        }
+        let with = |args: &[&str]| -> Vec<String> {
+            extra.iter().chain(args).map(|a| (*a).to_owned()).collect()
+        };
+        let args = with(&["ws", "new"]);
+        let ws = daemon_json(
+            dir,
+            &home.0,
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        let id = str_field(&ws, "id")?.to_owned();
+        let lib = PathBuf::from(str_field(&ws, "materialization")?).join("src/lib.rs");
+        fs::write(&lib, fs::read_to_string(&lib)?.replacen(from, to, 1))?;
+        let intent = dir.join(format!("{summary}.md"));
+        fs::write(&intent, format!("---\nsummary: {summary}\n---\nWhy.\n"))?;
+        let intent = intent.to_str().ok_or("intent path is UTF-8")?;
+        let args = with(&["propose", "-w", &id, "--intent", intent]);
+        let proposed = daemon_json(
+            dir,
+            &home.0,
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        Ok(str_field(&proposed, "change")?.to_owned())
+    };
+
+    // Through the daemon: the key is created, and the signature verifies
+    // with it and not with another key.
+    let change = propose(false, "    1\n", "    10\n", "alpha")?;
+    assert!(key_file.exists(), "no key at {}", key_file.display());
+    let shown = daemon_json(dir, &home.0, &["key", "show"])?;
+    let key = str_field(&shown, "keyId")?.to_owned();
+    let verified = daemon_json(dir, &home.0, &["key", "verify", &change, "--key", &key])?;
+    assert_eq!(verified["verified"], true, "{verified:#}");
+    assert_eq!(verified["kind"], "change");
+    let other = hord_core::sign::SigningKey::generate()?.public().key_id();
+    let out = hord(
+        dir,
+        &home.0,
+        &["key", "verify", &change, "--key", &other, "--json"],
+    )
+    .env_remove("HORD_NO_DAEMON")
+    .output()?;
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+
+    // The daemon accepts the signed change and lands it.
+    daemon_json(dir, &home.0, &["submit", &change])?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let queue = daemon_json(dir, &home.0, &["queue"])?;
+        let entry = queue["entries"]
+            .as_array()
+            .and_then(|e| e.iter().rfind(|e| e["change"] == change.as_str()))
+            .cloned()
+            .ok_or_else(|| format!("{change} is queued: {queue:#}"))?;
+        if entry["status"] == LANDED {
+            break;
+        }
+        assert!(entry["status"] == "QUEUE_STATUS_QUEUED", "{entry:#}");
+        assert!(
+            Instant::now() < deadline,
+            "{change} never landed: {entry:#}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // `--no-daemon` signs with the same key.
+    let direct = propose(true, "    2\n", "    20\n", "beta")?;
+    let verified = daemon_json(dir, &home.0, &["key", "verify", &direct, "--key", &key])?;
+    assert_eq!(verified["verified"], true, "{verified:#}");
+    Ok(())
+}
