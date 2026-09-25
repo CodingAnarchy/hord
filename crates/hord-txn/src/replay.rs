@@ -335,9 +335,20 @@ pub(crate) fn spawn_replay(repo: &Repo, job: ReplayJob) {
         return;
     }
     let repo = repo.clone();
-    tokio::spawn(async move {
+    let tasks = repo.inner.tasks.clone();
+    tasks.spawn(async move {
         while let Some(job) = repo.inner.replays.next(change) {
-            match run_attempt(&repo, harness.as_ref(), &job).await {
+            // Closing the repository stops the attempt: dropping it kills
+            // the harness, and the entry stays replaying for the next start
+            // to resume (`resume_ladders`).
+            let attempt = tokio::select! {
+                () = repo.inner.closing.cancelled() => {
+                    while repo.inner.replays.next(change).is_some() {}
+                    break;
+                }
+                attempt = run_attempt(&repo, harness.as_ref(), &job) => attempt,
+            };
+            match attempt {
                 Ok(more) => {
                     for job in more {
                         repo.inner.replays.start(job);
