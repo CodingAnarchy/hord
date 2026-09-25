@@ -188,6 +188,7 @@ mod tests {
             cost_ms: 0,
             produced_by: hord_core::Actor::Human { id: "ada".into() },
             produced_at: hord_core::Timestamp::from_millis(0),
+            signature: None,
         }
     }
 

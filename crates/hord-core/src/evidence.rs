@@ -39,6 +39,12 @@ pub struct Evidence {
     pub produced_by: Actor,
     /// When this evidence was produced.
     pub produced_at: Timestamp,
+    /// The producer's signature over the rest of this object (spec
+    /// §10.5.4, [`crate::sign::sign_evidence`]), as `ChangeRecord` carries
+    /// its author's. Omitted from the encoding when `None`, so unsigned
+    /// evidence keeps its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<crate::Signature>,
 }
 
 /// Kind of [`Evidence`] (spec §3.6).
@@ -115,6 +121,7 @@ mod tests {
             cost_ms: 12,
             produced_by: Actor::Human { id: "ada".into() },
             produced_at: Timestamp::from_millis(1),
+            signature: None,
         }
     }
 

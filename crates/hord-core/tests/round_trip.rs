@@ -183,6 +183,7 @@ fn sample_evidence() -> Evidence {
             harness: "hord-cli".into(),
         },
         produced_at: Timestamp::from_millis(1),
+        signature: None,
     }
 }
 

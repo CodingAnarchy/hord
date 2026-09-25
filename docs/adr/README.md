@@ -40,3 +40,8 @@ ADR 0024 server-foundation dependencies (`hord-api`, `hord-server`, `hord-remote
 - `toml` 1 (hord-server, hord-cli; already a workspace dependency): `server.toml` and `.hord/remotes.toml`.
 
 `rustc-demangle` 0.1 (hord-verify-rust only, ADR 0022): demangles the Rust symbol names in `llvm-cov export` so a test's own function maps to its definition. It is the demangler the standard library uses, and AGENTS.md forbids a hand-rolled parser.
+
+M5 identity and authorization dependencies (spec §10.5.4):
+
+- `ed25519-dalek` 3 (hord-core, feature `pem`): Ed25519 signatures on `ChangeRecord.signature`, `Evidence.signature`, and other signed hord messages, with PKCS#8 PEM key files. It is the maintained dalek-cryptography implementation (RustCrypto `signature` traits); AGENTS.md forbids a hand-rolled format, and PKCS#8 is the standard one for private keys.
+- `getrandom` 0.4 (hord-core, hord-server; already in the tree): the OS random source for key seeds and bearer tokens, without pulling in a `rand` stack.
