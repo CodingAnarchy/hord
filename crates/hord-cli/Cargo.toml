@@ -32,6 +32,9 @@ tokio = { workspace = true, features = ["signal", "time"] }
 tokio-stream.workspace = true
 toml.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 hord-identity.workspace = true
 hord-lang.workspace = true

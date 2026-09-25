@@ -13,7 +13,7 @@
 //! demand), `--no-daemon`, or `--remote` / the default upstream
 //! ([`session`]).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod cli;
 mod cmd;

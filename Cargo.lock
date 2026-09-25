@@ -1785,6 +1785,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "windows-sys",
 ]
 
 [[package]]

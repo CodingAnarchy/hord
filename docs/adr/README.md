@@ -15,6 +15,8 @@ Dependency additions (one line each):
 
 `reflink-copy` 0.1 (hord-txn only, ADR 0016): safe wrapper over `clonefile(2)` / `FICLONE` for copy-on-write workspace checkouts, so no hord crate needs `unsafe` outside `hord-vfs`.
 
+`windows-sys` 0.61 (hord-cli, Windows only, feature `Win32_Foundation`, ADR 0027): `SetHandleInformation`, so the daemon does not inherit the CLI's stdio.
+
 `ignore` 0.4 (hord-txn only, ADR 0016): git's `.gitignore` matching semantics (anchoring, `**`, negation, directory-only patterns) for walking a `Directory` checkout, plus its parallel directory walker for the propose `lstat` pass. It is ripgrep's crate; AGENTS.md forbids a hand-rolled glob parser.
 
 `globset` 0.4 (hord-policy only): compiles the `paths` globs of policy rules (spec §7.2). It is ripgrep's glob crate, already in the tree under `ignore`; AGENTS.md forbids a hand-rolled glob parser. `toml` 1 is also used by `hord-policy` to parse `policy.toml`, with spans for line and column errors.

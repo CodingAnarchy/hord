@@ -129,6 +129,32 @@ fn detach(command: &mut std::process::Command) {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    keep_stdio_from_children();
+}
+
+/// Stop children from inheriting this process's stdio (ADR 0027): a
+/// daemon holding a caller's output pipe would keep the caller waiting
+/// until the daemon exits. A child's own `Stdio` is unaffected (std hands
+/// it over through its own inheritable duplicates).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn keep_stdio_from_children() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for handle in handles {
+        // SAFETY: the handles are this process's std handles, borrowed for
+        // the call; clearing their inherit flag does not close or move them.
+        // A missing or invalid handle only makes the call fail, which is
+        // ignored: there is then nothing to leak.
+        unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
 }
 
 /// Run as the daemon for `root` until idle, asked to stop, or orphaned.
