@@ -82,11 +82,9 @@ fn run(dir: &Path, args: &[&str]) -> TestResult<Output> {
         .current_dir(dir)
         .env("HORD_ACTOR", "tester")
         .env("HORD_NO_DAEMON", "1")
-        // `hord arbitrate` signs with a key under `HORD_HOME/keys/`.
-        .env(
-            "HORD_HOME",
-            std::env::temp_dir().join(format!("hord-m3-home-{}", std::process::id())),
-        )
+        // `hord arbitrate` signs with a key under `HORD_HOME/keys/`: kept in
+        // the test's repository directory, which its `TempDir` removes.
+        .env("HORD_HOME", dir.join(".hord-home"))
         .env_remove("HORD_AGENT_MODEL")
         .output()
         .map_err(|err| format!("run hord {args:?}: {err}"))?)
