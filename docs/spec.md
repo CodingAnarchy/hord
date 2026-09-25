@@ -824,9 +824,9 @@ Each should become an ADR. Listed roughly in the order they will block progress.
 3. rust-analyzer as Tier 2 backend: decided by ADR 0009 (do not embed the crates).
 4. Read-set collection fidelity: how much to trust access logs vs. adapter references vs. declarations; whether to require declarations from agents. Blocks M3.
 5. Test selection for Rust below crate granularity (§4.2). Blocks M4 efficiency target.
-6. Policy language beyond TOML (§7.2). Decide by M5.
+6. Policy language beyond TOML (§7.2): decided by ADR 0028 (declarative TOML through M5).
 7. Remote protocol (§8.2). Decide by M4.
-8. Replay nondeterminism: how to compare two replays of the same intent; whether to run N replays and vote. Blocks M5.
+8. Replay nondeterminism: decided by ADR 0029 (one replay per attempt, judged by evidence; attempts go to arbitration as candidates).
 9. Macro handling beyond opacity: whether stored expansions ever pay for themselves. M7.
 10. Large generated files (bindings, protobuf output): store as blobs, or parse and pay the cost? Decide at M1 with a size cutoff.
 11. Comments as first-class nodes with their own identity (for doc-blame)? M7.
