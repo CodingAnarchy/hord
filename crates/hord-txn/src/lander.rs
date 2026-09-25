@@ -511,12 +511,13 @@ impl Inner {
         let seq = self
             .store
             .queue_push(&hord_encoding::encode(&stored)?, &[change], checked)?;
-        self.wake.notify_one();
+        // Emit before waking the lander, so `submitted` precedes its events.
         self.emit(vec![events::submitted(
             seq,
             change,
             &record.provenance.actor,
         )])?;
+        self.wake.notify_one();
         Ok(QueueEntry::from_stored(seq, stored))
     }
 
