@@ -42,3 +42,7 @@ Option 2. Selection safety is graded on 500 real cargo commits with one seeded f
   - The report gives per-fault and per-commit counts, because faults within one commit are correlated. The gate stays zero misses.
 - **It runs on CI, not on a developer machine.** It uses standard GitHub runners, split into enough chains (about 15 chains of 10 commits) that each job stays well under the 6-hour job limit. It runs nightly or on demand, and a merge job combines the chains into one report and verdict.
 - Efficiency is unchanged: the median selected share for write sets ≤ 5, from the chains' selections.
+
+## Amendments (2026-09-25, after the first CI gate run)
+
+- **Chain windows start after cargo `89e13501a` (2026-01-03).** Before it, cargo's test support names every test's scratch directory `cit/t0` in a fresh process, so the per-test processes of instrumented runs collide; 15 chains 35 first-parent commits apart (525 commits) fit between it and the pinned corpus head.

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use hord_core::NodeId;
+use hord_core::{NodeId, RepoPath};
 use serde::{Deserialize, Serialize};
 
 use crate::{ChangeFacts, Result};
@@ -21,6 +21,13 @@ pub trait ReferenceGraph {
     /// not cross from one known package into another when
     /// [`ImpactBound::package_boundary`] is set.
     fn package(&self, node: NodeId) -> Option<String>;
+
+    /// File that contains `node`, if known. Selection uses it to confine a
+    /// non-function edit in a test module to that module (ADR 0022, R2); an
+    /// unknown path keeps the package fallback.
+    fn path(&self, _node: NodeId) -> Option<RepoPath> {
+        None
+    }
 }
 
 /// How far the impact set follows dependents (spec §6.5; policy may
@@ -57,6 +64,10 @@ pub struct ImpactSet {
     /// caller has no file-level facts; a verifier then selects
     /// conservatively.
     pub facts: ChangeFacts,
+    /// The file of each impacted node the graph knows
+    /// ([`ReferenceGraph::path`]).
+    #[serde(default)]
+    pub paths: BTreeMap<NodeId, RepoPath>,
 }
 
 impl ImpactSet {
@@ -147,10 +158,15 @@ pub fn impact_set(
             queue.push_back(dependent);
         }
     }
+    let paths = nodes
+        .keys()
+        .filter_map(|n| Some((*n, graph.path(*n)?)))
+        .collect();
     Ok(ImpactSet {
         write_set: write_set.clone(),
         nodes,
         facts,
+        paths,
     })
 }
 
@@ -211,6 +227,42 @@ mod tests {
         assert_eq!(set.node_set(), ids(&[1, 2, 3, 6]));
         assert_eq!(set.nodes[&NodeId::from_u128(3)], 2);
         assert_eq!(set.write_set, ids(&[1]));
+    }
+
+    #[test]
+    fn the_impact_set_records_the_files_the_graph_knows() {
+        struct WithPaths(Graph);
+        impl ReferenceGraph for WithPaths {
+            fn dependents(&self, node: NodeId) -> Result<Vec<NodeId>> {
+                self.0.dependents(node)
+            }
+            fn package(&self, node: NodeId) -> Option<String> {
+                self.0.package(node)
+            }
+            fn path(&self, node: NodeId) -> Option<RepoPath> {
+                (node.as_u128() != 3)
+                    .then(|| RepoPath::new(vec![format!("f{}.rs", node.as_u128())]))
+            }
+        }
+        let set = impact_set(
+            &WithPaths(chain()),
+            &ids(&[1]),
+            ImpactBound::default(),
+            ChangeFacts::default(),
+        )
+        .expect("impact set");
+        let known: BTreeSet<NodeId> = set.paths.keys().copied().collect();
+        assert_eq!(known, ids(&[1, 2, 6]), "3's file is unknown");
+        assert_eq!(set.paths[&NodeId::from_u128(2)].components(), ["f2.rs"]);
+        // A graph without paths records none.
+        let bare = impact_set(
+            &chain(),
+            &ids(&[1]),
+            ImpactBound::default(),
+            ChangeFacts::default(),
+        )
+        .expect("impact set");
+        assert!(bare.paths.is_empty());
     }
 
     #[test]

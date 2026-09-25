@@ -26,6 +26,7 @@ pub mod libtest;
 pub mod narrow;
 mod runner;
 mod select;
+mod test_module;
 mod verifier;
 
 pub use cargo::{CargoWorkspace, Package, Target};

@@ -286,6 +286,10 @@ impl ReferenceGraph for SnapshotGraph<'_> {
         Ok(out)
     }
 
+    fn path(&self, node: NodeId) -> Option<RepoPath> {
+        self.index.nodes.get(&node).map(|(path, _)| path.clone())
+    }
+
     fn package(&self, node: NodeId) -> Option<String> {
         let (path, _) = self.index.nodes.get(&node)?;
         let parts = path.components();

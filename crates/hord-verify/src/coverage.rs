@@ -159,19 +159,31 @@ impl CoverageRecord {
             .collect()
     }
 
-    /// Whether `test` is stale under `drift` (ADR 0022, staleness checked
-    /// run by run): for some run r among its runs, a definition r executed
-    /// changed since r's own snapshot. A run whose snapshot the chain does
-    /// not know counts as stale. Coverage selection, by contrast, uses the
+    /// Whether `test` is stale under `drift` (ADR 0022, staleness ends once
+    /// the test re-ran on the change): some run r executed a definition
+    /// that changed after r's snapshot, and no later run of the test has a
+    /// snapshot at or after that change.
+    ///
+    /// Runs are in landing order, so a change is unexcused exactly when it
+    /// came after the newest run: the test is stale when anything changed
+    /// since its newest run's snapshot intersects what *any* of its runs
+    /// executed (the nondeterministic path seen only in an older run still
+    /// counts). Changes between its runs are excused, since the newest run
+    /// already ran on them. A newest run whose snapshot the chain does not
+    /// know counts as stale. Coverage selection, by contrast, uses the
     /// union of the runs ([`Self::tests_covering`]).
     #[must_use]
     pub fn is_stale(&self, test: &TestCoverage, drift: &crate::Drift) -> bool {
-        self.runs(test).iter().any(
-            |(snapshot, executed)| match drift.changed_since(*snapshot) {
-                None => true,
-                Some(changed) => !executed.is_disjoint(&changed),
-            },
-        )
+        let runs = self.runs(test);
+        let Some((newest, _)) = runs.last() else {
+            return true;
+        };
+        match drift.changed_since(*newest) {
+            None => true,
+            Some(changed) => runs
+                .iter()
+                .any(|(_, executed)| !executed.is_disjoint(&changed)),
+        }
     }
 
     /// The snapshot `test`'s coverage was taken on.
@@ -440,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn staleness_is_checked_run_by_run() {
+    fn a_change_before_the_run_that_executed_it_is_not_stale() {
         use crate::Drift;
         let tc = ObjectId::from_bytes([2; 32]);
         let snap = |n: u8| ObjectId::from_bytes([n; 32]);
@@ -479,6 +491,51 @@ mod tests {
         quiet.push(snap(12), [n(9)].into_iter().collect());
         assert!(!ledger.is_stale(x, &quiet));
         // A run on a snapshot the chain does not know is stale.
+        assert!(ledger.is_stale(x, &Drift::new(snap(99))));
+    }
+
+    #[test]
+    fn staleness_ends_once_the_test_re_ran_on_the_change() {
+        use crate::Drift;
+        let tc = ObjectId::from_bytes([2; 32]);
+        let snap = |n: u8| ObjectId::from_bytes([n; 32]);
+        let run = |s: u8, covers: &[u128]| {
+            CoverageRecord::new(
+                snap(s),
+                tc,
+                BTreeSet::new(),
+                vec![(t("x"), None, covers.iter().copied().map(n).collect(), false)],
+            )
+        };
+        // Run 1 at s10 executed f(1) and core(5); run 2 at s12 executed
+        // only core(5).
+        let ledger = run(10, &[1, 5]).merge(&run(12, &[5]));
+        let x = &ledger.tests[0];
+        let chain = |writes: &[(u8, &[u128])]| {
+            let mut d = Drift::new(snap(10));
+            for (s, w) in writes {
+                d.push(snap(*s), w.iter().copied().map(n).collect());
+            }
+            d
+        };
+        // Dropped: core(5) changed at s11 and the test re-ran on it at s12.
+        // Run by run (the earlier reading), run 1 would keep it stale until
+        // it aged out.
+        assert!(!ledger.is_stale(x, &chain(&[(11, &[5]), (12, &[])])));
+        // Dropped: the nondeterministic path f(1) changed at s11, before the
+        // test passed again at s12 without entering it.
+        assert!(!ledger.is_stale(x, &chain(&[(11, &[1]), (12, &[])])));
+        // Kept: f(1), seen only in run 1, changes after the newest run.
+        assert!(ledger.is_stale(x, &chain(&[(11, &[]), (12, &[]), (13, &[1])])));
+        // Kept: core(5) changes after the newest run.
+        assert!(ledger.is_stale(x, &chain(&[(11, &[]), (12, &[]), (13, &[5])])));
+        // Not stale: what changed after the newest run, nothing ran.
+        assert!(!ledger.is_stale(x, &chain(&[(11, &[]), (12, &[]), (13, &[9])])));
+        // An older run the chain does not know is excused by the newest run.
+        let unknown_older = run(3, &[1]).merge(&run(12, &[5]));
+        let y = &unknown_older.tests[0];
+        assert!(!unknown_older.is_stale(y, &chain(&[(11, &[1]), (12, &[])])));
+        // A newest run the chain does not know is stale.
         assert!(ledger.is_stale(x, &Drift::new(snap(99))));
     }
 
