@@ -347,6 +347,10 @@ impl ReferenceGraph for Files {
         Ok(out)
     }
 
+    fn path(&self, node: NodeId) -> Option<RepoPath> {
+        self.names.get(&node).map(|(path, _)| path.clone())
+    }
+
     fn package(&self, node: NodeId) -> Option<String> {
         let (path, _) = self.names.get(&node)?;
         self.package_of(path)

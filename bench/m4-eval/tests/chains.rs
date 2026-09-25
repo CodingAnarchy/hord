@@ -105,7 +105,11 @@ fn chains_faults_sample_and_merge() -> TestResult {
     let bin = env!("CARGO_BIN_EXE_hord-eval-m4");
     let common = |work: &Path| {
         let mut cmd = Command::new(bin);
-        cmd.arg("--cache")
+        // The eval refuses these (cargo's UI tests strip them); a developer
+        // shell may set them.
+        cmd.env_remove("CARGO_TERM_COLOR")
+            .env_remove("CARGO_TERM_HYPERLINKS")
+            .arg("--cache")
             .arg(&corpora)
             .arg("--work")
             .arg(work)
@@ -185,6 +189,29 @@ fn chains_faults_sample_and_merge() -> TestResult {
     assert_eq!(report["sample"].as_array().map(Vec::len), Some(1));
     let summary = fs::read_to_string(&md)?;
     assert!(summary.contains("## Chains"), "{summary}");
+    // Disk telemetry: every chain sampled `/` and its work dir at the start,
+    // after the initial run and after each lander step and grade.
+    for chain in chains {
+        let disk = &chain["disk"];
+        assert!(disk["samples"].as_u64().is_some_and(|n| n >= 6), "{disk:#}");
+        assert!(
+            disk["peaks"][0]["peak_used"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+            "{disk:#}"
+        );
+    }
+    assert!(summary.contains("Peak disk used"), "{summary}");
+    // Cargo's per-test scratch trees are pruned after each step.
+    for dir in &dirs {
+        for slot in ["coverage-target-0", "coverage-target-1", "w2/target"] {
+            assert!(!dir.join(slot).join("tmp/cit").exists(), "{slot}");
+        }
+        assert!(
+            !dir.join("coverage-target").exists(),
+            "the initial run builds in slot 0"
+        );
+    }
     // Each chain's window is the era its index names.
     let meta1: serde_json::Value =
         serde_json::from_slice(&fs::read(dirs[1].join("chain/meta.json"))?)?;

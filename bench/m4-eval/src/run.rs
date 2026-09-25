@@ -77,6 +77,81 @@ pub(crate) fn corpus_env() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Variables cargo's UI tests set on their own command and then strip if
+/// the parent environment has them (`cargo_ui()` sets them before
+/// `test_env()` removes every `CARGO_*` key found in the parent). Inherited,
+/// they uncolor the output and every `.term.svg` snapshot fails.
+const STRIPPED_BY_CARGO_UI_TESTS: [&str; 2] = ["CARGO_TERM_COLOR", "CARGO_TERM_HYPERLINKS"];
+
+/// Refuse to run the corpus with an environment that makes its tests fail
+/// for reasons unrelated to the commit. The eval cannot remove them itself
+/// (`remove_var` is unsafe), so the caller has to.
+pub(crate) fn check_corpus_env(vars: impl IntoIterator<Item = (String, String)>) -> Result<()> {
+    let set: Vec<String> = vars
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| STRIPPED_BY_CARGO_UI_TESTS.contains(&k.as_str()))
+        .collect();
+    anyhow::ensure!(
+        set.is_empty(),
+        "unset {} before running the cargo corpus: cargo's UI tests strip inherited \
+         CARGO_* variables after setting their own, so their `.term.svg` snapshots fail",
+        set.join(" and ")
+    );
+    Ok(())
+}
+
+/// Up to `max_tests` failing tests' output from libtest's `failures:`
+/// section, one per top-level module first, each cut to `max_lines` lines:
+/// enough to diagnose environment failures from a CI log.
+pub(crate) fn failure_excerpts(
+    stdout: &str,
+    max_tests: usize,
+    max_lines: usize,
+) -> Vec<(String, String)> {
+    let mut blocks: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in stdout.lines() {
+        let header = line
+            .strip_prefix("---- ")
+            .and_then(|l| l.strip_suffix(" stdout ----"));
+        if let Some(name) = header {
+            blocks.extend(current.take());
+            current = Some((name.to_owned(), Vec::new()));
+        } else if line == "failures:" || line.starts_with("test result:") {
+            blocks.extend(current.take());
+        } else if let Some((_, lines)) = &mut current {
+            lines.push(line);
+        }
+    }
+    blocks.extend(current);
+    let module = |name: &str| name.split("::").next().unwrap_or_default().to_owned();
+    let mut picked: Vec<usize> = Vec::new();
+    let mut modules = BTreeSet::new();
+    for (i, (name, _)) in blocks.iter().enumerate() {
+        if picked.len() < max_tests && modules.insert(module(name)) {
+            picked.push(i);
+        }
+    }
+    for i in 0..blocks.len() {
+        if picked.len() < max_tests && !picked.contains(&i) {
+            picked.push(i);
+        }
+    }
+    picked.sort_unstable();
+    picked
+        .into_iter()
+        .map(|i| {
+            let (name, lines) = &blocks[i];
+            let mut text: Vec<&str> = lines.iter().take(max_lines).copied().collect();
+            if lines.len() > max_lines {
+                text.push("[...]");
+            }
+            (name.clone(), text.join("\n"))
+        })
+        .collect()
+}
+
 /// Where one worker builds and runs.
 pub(crate) struct Worker {
     pub checkout: Checkout,
@@ -95,11 +170,15 @@ impl Worker {
     /// `LLVM_PROFILE_FILE` for everything this worker runs: inside its own
     /// directory, never the working directory.
     pub(crate) fn profraw_pattern(&self) -> String {
-        self.target_dir
-            .with_file_name("profraw")
+        self.profraw_dir()
             .join("%p-%m.profraw")
             .display()
             .to_string()
+    }
+
+    /// The directory of [`Worker::profraw_pattern`].
+    pub(crate) fn profraw_dir(&self) -> PathBuf {
+        self.target_dir.with_file_name("profraw")
     }
 }
 
@@ -939,13 +1018,22 @@ pub(crate) fn elapsed(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Run the literal full suite on an unmutated commit (ADR 0023 sample) and
-/// return the failing tests and the elapsed milliseconds.
-pub(crate) fn full_suite(
-    worker: &Worker,
-    commit: &str,
-    timeout: Duration,
-) -> Result<(Vec<String>, u64, bool)> {
+/// The literal full suite on one unmutated commit.
+pub(crate) struct FullSuite {
+    pub failed: Vec<String>,
+    pub elapsed_ms: u64,
+    pub timed_out: bool,
+    /// A few failing tests' output (see [`failure_excerpts`]).
+    pub excerpts: Vec<(String, String)>,
+}
+
+/// Failing tests whose output a sample keeps.
+const SAMPLE_EXCERPTS: usize = 5;
+/// Lines kept per excerpt.
+const SAMPLE_EXCERPT_LINES: usize = 60;
+
+/// Run the literal full suite on an unmutated commit (ADR 0023 sample).
+pub(crate) fn full_suite(worker: &Worker, commit: &str, timeout: Duration) -> Result<FullSuite> {
     worker.checkout.checkout(commit)?;
     let runner = CargoRunner {
         target_dir: Some(worker.target_dir.clone()),
@@ -964,11 +1052,12 @@ pub(crate) fn full_suite(
             ]),
         )
         .context("full cargo test")?;
-    Ok((
-        out.report.failed.into_iter().collect(),
-        elapsed(start),
-        out.timed_out,
-    ))
+    Ok(FullSuite {
+        failed: out.report.failed.into_iter().collect(),
+        elapsed_ms: elapsed(start),
+        timed_out: out.timed_out,
+        excerpts: failure_excerpts(&out.stdout, SAMPLE_EXCERPTS, SAMPLE_EXCERPT_LINES),
+    })
 }
 
 pub(crate) fn worker(root: &Path, corpus: &Path, id: usize) -> Result<Worker> {
@@ -994,6 +1083,45 @@ mod tests {
             },
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn corpus_env_refuses_what_cargo_ui_tests_strip() {
+        let vars = |keys: &[&str]| -> Vec<(String, String)> {
+            keys.iter()
+                .map(|k| ((*k).to_owned(), "x".to_owned()))
+                .collect()
+        };
+        assert!(check_corpus_env(vars(&["CARGO_HOME", "CI", "TERM"])).is_ok());
+        let err = check_corpus_env(vars(&["CARGO_TERM_COLOR", "CARGO_TERM_HYPERLINKS"]))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("CARGO_TERM_COLOR and CARGO_TERM_HYPERLINKS"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn failure_excerpts_prefer_distinct_modules_and_cut_long_output() {
+        let stdout = "running 4 tests\n\
+            test a::one ... FAILED\n\n\
+            failures:\n\n\
+            ---- a::one stdout ----\nline 1\nline 2\nline 3\n\n\
+            ---- a::two stdout ----\nother\n\n\
+            ---- b::three stdout ----\nb out\n\n\
+            failures:\n    a::one\n    a::two\n    b::three\n\n\
+            test result: FAILED. 1 passed; 3 failed\n";
+        let two = failure_excerpts(stdout, 2, 2);
+        let names: Vec<&str> = two.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["a::one", "b::three"], "one per module first");
+        assert_eq!(two[0].1, "line 1\nline 2\n[...]");
+        assert_eq!(two[1].1, "b out\n");
+        let all = failure_excerpts(stdout, 5, 10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[1].0, "a::two");
+        assert!(failure_excerpts("test result: ok.\n", 5, 10).is_empty());
     }
 
     fn workspace() -> CargoWorkspace {

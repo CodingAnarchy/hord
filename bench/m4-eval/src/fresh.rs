@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use hord_core::{NodeId, RepoPath};
@@ -36,6 +36,7 @@ use hord_verify_rust::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::disk::{self, Monitor};
 use crate::fault::{FaultKind, attempts, inject};
 use crate::prepare::{CommitFacts, Prepared};
 use crate::run::{
@@ -147,6 +148,8 @@ pub(crate) struct FreshRun<'a> {
     pub initial: CoverageRecord,
     pub in_shard: &'a (dyn Fn(usize) -> bool + Sync),
     pub over_budget: &'a (dyn Fn() -> bool + Sync),
+    /// Disk telemetry, sampled after every chain step and grade.
+    pub disk: &'a Monitor,
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -192,6 +195,7 @@ pub(crate) fn run(run: &FreshRun<'_>, chain_workers: &[Worker], graders: &[Worke
                     }
                     let facts = &run.prepared.commits[step.index];
                     let t = Instant::now();
+                    let since = SystemTime::now();
                     let result = match grade(run.ctx, worker, facts, &step) {
                         Ok(r) => r,
                         Err(err) => FreshResult {
@@ -231,6 +235,11 @@ pub(crate) fn run(run: &FreshRun<'_>, chain_workers: &[Worker], graders: &[Worke
                     if let Err(err) = write_json(&out, &result) {
                         eprintln!("[grade {}] {err:#}", step.index);
                     }
+                    // Keep the grader's target to what the next commit needs.
+                    let label = format!("grade {}", step.index);
+                    disk::prune_and_log(&label, &worker.target_dir, since);
+                    disk::clear_dir(&worker.profraw_dir());
+                    run.disk.sample(&label);
                 }
             });
         }
@@ -274,10 +283,7 @@ fn chain(
         }
     }
     let toolchain = ctx.toolchain.id()?;
-    let targets = [
-        run.work.join("coverage-target-0"),
-        run.work.join("coverage-target-1"),
-    ];
+    let targets = [coverage_target(run.work, 0), coverage_target(run.work, 1)];
     let commits = &run.prepared.commits;
     let build_options = |target: &Path| CoverageOptions {
         packages: None,
@@ -294,7 +300,8 @@ fn chain(
             let (worker, target) = (&workers[i % 2], &targets[i % 2]);
             let facts = &commits[i];
             let options = build_options(target);
-            scope.spawn(move || -> Result<Option<BuiltSuite>> {
+            let since = SystemTime::now();
+            let handle = scope.spawn(move || -> Result<Option<BuiltSuite>> {
                 worker.checkout.checkout(&facts.commit)?;
                 Ok(build_suite_with_env(
                     &VerifyCheckout {
@@ -304,7 +311,8 @@ fn chain(
                     &options,
                     &corpus_env(),
                 )?)
-            })
+            });
+            (since, handle)
         };
         let mut pending = (state.next < commits.len()).then(|| spawn_build(state.next));
         while state.next < commits.len() {
@@ -314,11 +322,17 @@ fn chain(
             let i = state.next;
             let facts = &commits[i];
             let started = Instant::now();
-            let built = match pending.take() {
-                Some(handle) => handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("build panicked"))?,
-                None => Err(anyhow::anyhow!("no build for commit {i}")),
+            let (since, built) = match pending.take() {
+                Some((since, handle)) => (
+                    since,
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("build panicked"))?,
+                ),
+                None => (
+                    SystemTime::now(),
+                    Err(anyhow::anyhow!("no build for commit {i}")),
+                ),
             };
             if i + 1 < commits.len() && !(run.over_budget)() {
                 pending = Some(spawn_build(i + 1));
@@ -381,11 +395,16 @@ fn chain(
             write_json(&dir.join(format!("{}.json", step.index)), &step)?;
             state.next += 1;
             fs::write(&state_path, hord_encoding::encode(&state)?)?;
+            // This slot builds again two commits on: keep what that build
+            // needs (ADR 0022's records are already merged).
+            let label = format!("lander {}", step.index);
+            disk::prune_and_log(&label, &targets[i % 2], since);
+            run.disk.sample(&label);
             let _ = tx.send(step);
         }
         // A build started past the budget is left to finish; its result is
         // unused.
-        if let Some(handle) = pending {
+        if let Some((_, handle)) = pending {
             let _ = handle.join();
         }
         Ok(())
@@ -771,6 +790,9 @@ pub(crate) struct ChainReport {
     pub small_commits: usize,
     /// Median share of the suite selected, over commits with write set <= 5.
     pub efficiency_median_small: Option<f64>,
+    /// The same, with the merged quarantine left out of the selection and
+    /// the suite (see [`share_quarantined`]).
+    pub efficiency_median_small_quarantined: Option<f64>,
     pub efficiency_median_all: Option<f64>,
     pub counts: Counts,
     /// Commits each fallback kind fired on.
@@ -787,6 +809,8 @@ pub(crate) struct ChainReport {
     /// not the lander's.
     pub grade_secs_mean: f64,
     pub misses: Vec<String>,
+    /// Peak disk use per filesystem (`chain/disk.json`), if sampled.
+    pub disk: Option<disk::DiskLog>,
 }
 
 /// Per-fault and per-commit counts (ADR 0023 amendment: faults within one
@@ -844,7 +868,12 @@ pub(crate) struct FreshReport {
     pub errors: usize,
     pub complete: bool,
     pub small_commits: usize,
+    /// As selected by the chains, which ran with only the seed quarantine.
     pub efficiency_median_small: Option<f64>,
+    /// Re-graded with the merged quarantine (seed and sample failures): what
+    /// the efficiency gate uses, since quarantined tests are skipped in (a)
+    /// and (b) alike (ADR 0023).
+    pub efficiency_median_small_quarantined: Option<f64>,
     pub efficiency_median_all: Option<f64>,
     pub counts: Counts,
     pub fallbacks: BTreeMap<String, usize>,
@@ -892,6 +921,45 @@ fn percentile(mut v: Vec<f64>, p: f64) -> Option<f64> {
 
 fn share(s: &ChainStep) -> f64 {
     s.selected as f64 / s.suite.max(1) as f64
+}
+
+/// A step's share with the quarantined tests out of both the selection and
+/// the suite. `in_suite` is how many quarantined names the chain's suite has.
+/// Only tests the selection names individually are taken out of it (a
+/// package filter may run more), so this never understates the share.
+fn share_quarantined(s: &ChainStep, quarantine: &BTreeSet<String>, in_suite: usize) -> f64 {
+    let selected_quarantined = s
+        .units
+        .iter()
+        .filter(|u| matches!(u, Unit::Test(t) if quarantine.contains(&t.name)))
+        .count();
+    let selected = s.selected.saturating_sub(selected_quarantined);
+    selected as f64 / s.suite.saturating_sub(in_suite).max(1) as f64
+}
+
+/// The test names of a chain's suite: `chain/suite.json` (written after the
+/// initial run), or for older work dirs every name its steps mention.
+fn suite_names(work: &Path, steps: &[ChainStep]) -> BTreeSet<String> {
+    if let Some(names) = read_json::<BTreeSet<String>>(&work.join("chain/suite.json")) {
+        return names;
+    }
+    steps
+        .iter()
+        .flat_map(|s| {
+            s.units
+                .iter()
+                .filter_map(|u| match u {
+                    Unit::Test(t) => Some(t.name.clone()),
+                    _ => None,
+                })
+                .chain(s.unmutated_failed.iter().cloned())
+        })
+        .collect()
+}
+
+/// Where the fresh run lists its suite's test names.
+pub(crate) fn suite_path(work: &Path) -> PathBuf {
+    work.join("chain/suite.json")
 }
 
 fn fallback_counts<'a>(steps: impl Iterator<Item = &'a ChainStep>) -> BTreeMap<String, usize> {
@@ -970,6 +1038,8 @@ fn chain_report(work: &Path) -> (ChainReport, Vec<ChainStep>, Vec<FreshResult>) 
         complete: steps.len() >= commits && results.len() >= commits,
         small_commits: small.len(),
         efficiency_median_small: median(small.iter().map(|s| share(s)).collect()),
+        // Filled in by `report` once the merged quarantine is known.
+        efficiency_median_small_quarantined: None,
         efficiency_median_all: median(ok.iter().map(|s| share(s)).collect()),
         counts,
         fallbacks: fallback_counts(ok.iter().copied()),
@@ -980,6 +1050,7 @@ fn chain_report(work: &Path) -> (ChainReport, Vec<ChainStep>, Vec<FreshResult>) 
         initial_secs,
         grade_secs_mean: mean(&graded_secs),
         misses,
+        disk: read_json(&work.join("chain/disk.json")),
     };
     (report, steps, results)
 }
@@ -989,11 +1060,13 @@ fn chain_report(work: &Path) -> (ChainReport, Vec<ChainStep>, Vec<FreshResult>) 
 pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshReport {
     let mut chains = Vec::new();
     let mut steps = Vec::new();
+    let mut chain_steps: Vec<(PathBuf, Vec<ChainStep>)> = Vec::new();
     let mut results = Vec::new();
     let mut sample: Vec<crate::SampleResult> = Vec::new();
     for dir in dirs {
         if dir.join("chain").is_dir() {
             let (c, s, r) = chain_report(dir);
+            chain_steps.push((dir.clone(), s.clone()));
             steps.extend(s);
             results.extend(r.into_iter().map(|r| (c.chain.clone(), r)));
             chains.push(c);
@@ -1010,6 +1083,21 @@ pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshRe
     sample.dedup_by(|a, b| a.commit == b.commit);
     let mut quarantine: BTreeSet<String> = quarantine.clone();
     quarantine.extend(sample.iter().flat_map(|s| s.failed.iter().cloned()));
+    // Re-grade each chain's small commits with the merged quarantine.
+    let mut small_quarantined = Vec::new();
+    for (chain, (dir, chain_steps)) in chains.iter_mut().zip(&chain_steps) {
+        let in_suite = suite_names(dir, chain_steps)
+            .intersection(&quarantine)
+            .count();
+        let shares: Vec<f64> = chain_steps
+            .iter()
+            .filter(|s| s.error.is_none() && s.write_set <= 5)
+            .map(|s| share_quarantined(s, &quarantine, in_suite))
+            .collect();
+        chain.efficiency_median_small_quarantined = median(shares.clone());
+        small_quarantined.extend(shares);
+    }
+    let efficiency_median_small_quarantined = median(small_quarantined);
     let ok: Vec<&ChainStep> = steps.iter().filter(|s| s.error.is_none()).collect();
     let small: Vec<&&ChainStep> = ok.iter().filter(|s| s.write_set <= 5).collect();
     let mut counts = Counts::default();
@@ -1030,11 +1118,12 @@ pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshRe
         complete: !chains.is_empty() && chains.iter().all(|c| c.complete),
         small_commits: small.len(),
         efficiency_median_small,
+        efficiency_median_small_quarantined,
         efficiency_median_all: median(ok.iter().map(|s| share(s)).collect()),
         fallbacks: fallback_counts(ok.iter().copied()),
         lander_secs_mean: mean(&lander),
         safety_gate: counts.fault_misses == 0,
-        efficiency_gate: efficiency_median_small.is_some_and(|m| m <= 0.20),
+        efficiency_gate: efficiency_median_small_quarantined.is_some_and(|m| m <= 0.20),
         counts,
         misses,
         quarantine: quarantine.into_iter().collect(),
@@ -1075,8 +1164,17 @@ pub(crate) fn print(r: &FreshReport) -> String {
             ),
         ),
         (
-            "Efficiency, median share (write set <= 5)",
-            format!("{} (n={})", pct(r.efficiency_median_small), r.small_commits),
+            "Efficiency, median share (write set <= 5), merged quarantine out (gated)",
+            format!(
+                "{} (n={}, {} quarantined)",
+                pct(r.efficiency_median_small_quarantined),
+                r.small_commits,
+                r.quarantine.len()
+            ),
+        ),
+        (
+            "Efficiency, median share (write set <= 5), as selected",
+            pct(r.efficiency_median_small),
         ),
         (
             "Efficiency, median share (all)",
@@ -1117,14 +1215,15 @@ pub(crate) fn print(r: &FreshReport) -> String {
         md.push_str(&format!("| {k} | {v} |\n"));
     }
     println!("  fallbacks (commits): {:?}", r.fallbacks);
-    md.push_str("\n## Chains\n\n| Chain | Commits | Median share (ws <= 5) | Faults (informative) | Misses | Lander s/commit (mean, p90) | Initial run | Grading s/commit |\n|---|---|---|---|---|---|---|---|\n");
+    md.push_str("\n## Chains\n\n| Chain | Commits | Median share (ws <= 5; quarantine out, as selected) | Faults (informative) | Misses | Lander s/commit (mean, p90) | Initial run | Grading s/commit | Peak disk used (least free) |\n|---|---|---|---|---|---|---|---|---|\n");
     for ch in &r.chains {
         let line = format!(
-            "| {} | {}/{}{} | {} | {} ({}) | {} | {:.0}, {} | {:.1} min | {:.0} |",
+            "| {} | {}/{}{} | {}, {} | {} ({}) | {} | {:.0}, {} | {:.1} min | {:.0} | {} |",
             if ch.chain.is_empty() { "-" } else { &ch.chain },
             ch.chained,
             ch.commits,
             if ch.complete { "" } else { " (incomplete)" },
+            pct(ch.efficiency_median_small_quarantined),
             pct(ch.efficiency_median_small),
             ch.counts.faults,
             ch.counts.informative_faults,
@@ -1134,10 +1233,34 @@ pub(crate) fn print(r: &FreshReport) -> String {
                 .map_or("n/a".into(), |v| format!("{v:.0}")),
             ch.initial_secs / 60.0,
             ch.grade_secs_mean,
+            ch.disk.as_ref().map_or("n/a".into(), peak_disk),
         );
         println!("  chain {line}");
         md.push_str(&line);
         md.push('\n');
+    }
+    if !r.sample.is_empty() {
+        md.push_str("\n## Full-suite sample (literal `cargo test`, not gated)\n\n| Commit | Failed | Minutes |\n|---|---|---|\n");
+        for s in &r.sample {
+            md.push_str(&format!(
+                "| {} | {}{} | {:.0} |\n",
+                &s.commit[..10.min(s.commit.len())],
+                s.failed.len(),
+                if s.timed_out { " (timed out)" } else { "" },
+                s.elapsed_ms as f64 / 60_000.0
+            ));
+        }
+        // One commit's failure excerpts: enough to diagnose an environment.
+        if let Some(s) = r.sample.iter().find(|s| !s.failure_output.is_empty()) {
+            md.push_str(&format!(
+                "\n<details><summary>Failure output, {}</summary>\n\n",
+                &s.commit[..10.min(s.commit.len())]
+            ));
+            for (test, output) in &s.failure_output {
+                md.push_str(&format!("`{test}`\n\n```text\n{output}\n```\n\n"));
+            }
+            md.push_str("</details>\n");
+        }
     }
     md.push_str("\n## Fallback kinds (commits fired)\n\n| Kind | Commits |\n|---|---|\n");
     for (k, n) in &r.fallbacks {
@@ -1186,6 +1309,33 @@ pub(crate) fn print(r: &FreshReport) -> String {
     md
 }
 
+/// A chain's peak disk use: `/ 61.2G of 72.0G (10.8G) at lander 3`, per
+/// filesystem, and the one holding the work directory.
+fn peak_disk(log: &disk::DiskLog) -> String {
+    let peaks: Vec<String> = log
+        .peaks
+        .iter()
+        .map(|p| {
+            format!(
+                "`{}` {} of {} ({}) at {}",
+                p.mount,
+                disk::gb(p.peak_used),
+                disk::gb(p.size),
+                disk::gb(p.min_free),
+                p.at
+            )
+        })
+        .collect();
+    format!("{}; work on `{}`", peaks.join("; "), log.work_mount)
+}
+
+/// The chain's instrumented target directory for `slot` (0 or 1). The
+/// initial full run builds in slot 0, so the chain's first build there is
+/// incremental and no third instrumented target exists.
+pub(crate) fn coverage_target(work: &Path, slot: usize) -> PathBuf {
+    work.join(format!("coverage-target-{slot}"))
+}
+
 /// Where the fresh run keeps its initial record.
 pub(crate) fn initial_path(work: &Path) -> PathBuf {
     work.join("chain/initial.cbor")
@@ -1201,6 +1351,34 @@ mod tests {
         let order = fault_order(vec![(2, P), (2, D), (2, F), (0, F), (0, P), (1, D)]);
         assert_eq!(order, vec![(2, P), (0, F), (1, D), (2, D), (0, P), (2, F)]);
         assert!(fault_order(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn quarantined_tests_leave_both_the_selection_and_the_suite() {
+        let test = |name: &str| {
+            Unit::Test(hord_verify::TestRef {
+                package: "cargo".into(),
+                target: hord_verify::TestTarget {
+                    kind: "test".into(),
+                    name: "testsuite".into(),
+                },
+                name: name.into(),
+            })
+        };
+        let step = ChainStep {
+            selected: 4,
+            suite: 10,
+            units: vec![test("a"), test("q1"), test("q2"), test("b")],
+            ..ChainStep::default()
+        };
+        let quarantine: BTreeSet<String> = ["q1", "q2", "q3"].map(String::from).into();
+        // Three quarantined tests in the suite, two of them selected.
+        assert!((share_quarantined(&step, &quarantine, 3) - 2.0 / 7.0).abs() < 1e-9);
+        assert!((share_quarantined(&step, &BTreeSet::new(), 0) - 0.4).abs() < 1e-9);
+        // Without chain/suite.json, the suite is every name the steps mention.
+        let dir = std::env::temp_dir().join(format!("hord-m4-suite-{}", std::process::id()));
+        let names = suite_names(&dir, std::slice::from_ref(&step));
+        assert_eq!(names.len(), 4);
     }
 
     #[test]

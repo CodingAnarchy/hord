@@ -18,15 +18,21 @@ async fn workspace_creation_is_under_5ms() -> TestResult {
     let t = repo(&fixture()).await?;
     // First begin loads head; every later one is a pointer copy.
     begin(&t.repo, "warm").await?;
-    let mut worst = Duration::ZERO;
+    let mut took = Vec::with_capacity(200);
     for i in 0..200 {
         let started = Instant::now();
         let ws = begin(&t.repo, &format!("agent-{i}")).await?;
-        worst = worst.max(started.elapsed());
+        took.push(started.elapsed());
         drop(ws);
     }
-    eprintln!("[begin] worst of 200: {worst:?}");
-    assert!(worst < Duration::from_millis(5), "begin took {worst:?}");
+    took.sort();
+    // Gate on the 95th percentile: on a shared CI runner one scheduling
+    // stall can make the single worst call slow without saying anything
+    // about `begin`. The worst is still reported.
+    let p95 = took[took.len() * 95 / 100];
+    let worst = took[took.len() - 1];
+    eprintln!("[begin] of 200: p95 {p95:?}, worst {worst:?}");
+    assert!(p95 < Duration::from_millis(5), "begin p95 took {p95:?}");
     Ok(())
 }
 
