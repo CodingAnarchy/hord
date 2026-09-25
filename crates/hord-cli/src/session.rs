@@ -12,15 +12,60 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow};
 use hord_api::{RepoBackend, WorkspacesBackend};
+use hord_core::Actor;
+use hord_core::sign::SigningKey;
 use hord_remote::RemoteRepo;
 use hord_txn::{LocalRepo, Repo};
 
+use crate::identity::{self, Credential, Credentials};
 use crate::remotes::Remotes;
-use crate::txn::block_on;
+use crate::txn::{self, block_on};
 use crate::workspaces::LocalWorkspaces;
 use crate::{daemon, repo};
+
+/// An actor and the key that signs for them (spec §10.5.4).
+#[derive(Clone, Debug)]
+pub struct Signer {
+    /// Who.
+    pub actor: Actor,
+    /// Their key.
+    pub key: Arc<SigningKey>,
+}
+
+/// Connect to the remote `name` at `url`, with the token `hord login`
+/// stored for it, if any.
+pub fn connect(name: &str, url: &str) -> Result<(RemoteRepo, Option<Credential>)> {
+    let credential = Credentials::for_url(url)?;
+    let remote = match &credential {
+        Some(credential) => block_on(RemoteRepo::connect_with_token(url, &credential.token)),
+        None => block_on(RemoteRepo::connect(url)),
+    }
+    .with_context(|| format!("connect to remote {name}"))?;
+    Ok((remote, credential))
+}
+
+/// The remote a command that only makes sense against a server targets:
+/// `--remote`, else the clone's default upstream, else `name` given on the
+/// command line as a name or an `http://` address. Returns its name and
+/// address.
+pub fn remote_url(target: &Target, name: Option<&str>) -> Result<(String, String)> {
+    if let Some(url) = name.filter(|n| n.starts_with("http://")) {
+        return Ok((url.to_owned(), url.to_owned()));
+    }
+    let root = repo::discover_root()?;
+    let remotes = Remotes::load(&root.join(hord_store::HORD_DIR))?;
+    let name = name
+        .map(str::to_owned)
+        .or_else(|| target.remote.clone())
+        .or_else(|| remotes.default.clone())
+        .ok_or_else(|| anyhow!("no remote: name one, or pass --remote"))?;
+    let url = remotes.url(&name)?.to_owned();
+    Ok((name, url))
+}
 
 /// Global flags that pick the target.
 #[derive(Clone, Debug, Default)]
@@ -60,6 +105,9 @@ pub enum Session {
         remote: RemoteRepo,
         /// The clone's store, reading from `remote`.
         cache: Repo,
+        /// What `hord login` stored for it, if anything: the token sent
+        /// and the key that signs.
+        credential: Option<Credential>,
     },
 }
 
@@ -95,14 +143,40 @@ impl Session {
     fn remote(root: &Path, remotes: &Remotes, name: &str) -> Result<Self> {
         let url = remotes.url(name)?.to_owned();
         daemon::stop(root)?;
-        let remote = block_on(RemoteRepo::connect(&url))
-            .with_context(|| format!("connect to remote {name}"))?;
+        let (remote, credential) = connect(name, &url)?;
         let cache = block_on(hord_remote::open_cache(
             root,
             remote.clone(),
             hord_txn::RepoOptions::default(),
         ))?;
-        Ok(Self::Remote { remote, cache })
+        Ok(Self::Remote {
+            remote,
+            cache,
+            credential,
+        })
+    }
+
+    /// Who acts in this session, and the key that signs for them: the
+    /// logged-in actor for a remote with a stored token, else this
+    /// process's actor ([`txn::actor`]) and their key in `~/.hord/keys/`,
+    /// created if missing.
+    pub fn signer(&self) -> Result<Signer> {
+        if let Self::Remote {
+            credential: Some(credential),
+            ..
+        } = self
+        {
+            return Ok(Signer {
+                actor: credential.actor(),
+                key: Arc::new(credential.key()?),
+            });
+        }
+        let actor = txn::actor();
+        let key = identity::load_or_create_key(&identity::key_path(actor.id())?)?;
+        Ok(Signer {
+            actor,
+            key: Arc::new(key),
+        })
     }
 
     /// The repository backend.
@@ -120,8 +194,22 @@ impl Session {
         match self {
             Self::Daemon { remote, .. } => Box::new(remote.workspaces()),
             Self::Direct { repo } => Box::new(LocalWorkspaces::local(repo.clone(), None)),
-            Self::Remote { remote, cache, .. } => {
-                Box::new(LocalWorkspaces::remote(cache.clone(), remote.clone()))
+            Self::Remote {
+                remote,
+                cache,
+                credential,
+            } => {
+                let signer = credential.as_ref().and_then(|c| {
+                    Some(Signer {
+                        actor: c.actor(),
+                        key: Arc::new(c.key().ok()?),
+                    })
+                });
+                Box::new(LocalWorkspaces::remote(
+                    cache.clone(),
+                    remote.clone(),
+                    signer,
+                ))
             }
         }
     }

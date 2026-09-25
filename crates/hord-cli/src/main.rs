@@ -3,7 +3,8 @@
 //! Commands: `init`, `ws new|list|rm|gc`, `status`, `verify`, `propose`, `submit`,
 //! `queue`, `land --local`, `conflicts`, `log`, `blame`, `query`, `watch`,
 //! `remote add|rm|list|set-default`, `serve`, `git import`, `git export`,
-//! `policy check`.
+//! `policy check`, `review`, `login`, `token mint`, `user add`, `key
+//! show|verify`.
 //!
 //! `--json` is the canonical agent output: the protobuf JSON mapping of the
 //! command's `hord.proto` message (ADR 0024). Human-oriented text is
@@ -19,6 +20,7 @@ mod cli;
 mod cmd;
 mod daemon;
 mod git_bridge;
+mod identity;
 mod intent;
 mod output;
 mod remotes;
@@ -31,7 +33,10 @@ mod workspaces;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use cli::{Cli, Command, GitCommand, PolicyCommand, RemoteCommand, WsCommand};
+use cli::{
+    Cli, Command, GitCommand, KeyCommand, PolicyCommand, RemoteCommand, TokenCommand, UserCommand,
+    WsCommand,
+};
 use session::Target;
 
 #[tokio::main]
@@ -50,11 +55,12 @@ async fn run(cli: Cli) -> Result<()> {
         root,
         bind,
         insecure_bind,
+        auth,
         config,
         daemon,
     } = cli.command
     {
-        return cmd::serve::run(repo, root, bind, insecure_bind, config, daemon).await;
+        return cmd::serve::run(repo, root, bind, insecure_bind, auth, config, daemon).await;
     }
     tokio::task::spawn_blocking(move || run_blocking(cli))
         .await
@@ -125,6 +131,69 @@ fn run_blocking(cli: Cli) -> Result<()> {
         Command::Git { command } => match command {
             GitCommand::Import { git_ref } => cmd::git::run_import(json, git_ref),
             GitCommand::Export { hord_ref } => cmd::git::run_export(json, hord_ref),
+        },
+        Command::Review {
+            change,
+            kind,
+            approve,
+            reject: _,
+            message,
+        } => cmd::review::run(
+            json,
+            &target,
+            cmd::review::Review {
+                change,
+                kind,
+                approve,
+                message,
+            },
+        ),
+        Command::Login {
+            remote,
+            user,
+            password_stdin,
+            token,
+            key_file,
+        } => {
+            let method = match (token, key_file) {
+                (Some(token), Some(key_file)) => cmd::login::Method::Token { token, key_file },
+                _ => cmd::login::Method::Password {
+                    user,
+                    stdin: password_stdin,
+                },
+            };
+            cmd::login::run(json, &target, remote, method)
+        }
+        Command::Token { command } => match command {
+            TokenCommand::Mint {
+                agent,
+                model,
+                harness,
+                scopes,
+                key_out,
+            } => cmd::token::run_mint(
+                json,
+                &target,
+                cmd::token::Mint {
+                    agent,
+                    model,
+                    harness,
+                    scopes,
+                    key_out,
+                },
+            ),
+        },
+        Command::User { command } => match command {
+            UserCommand::Add {
+                name,
+                auth_file,
+                scopes,
+                password_stdin,
+            } => cmd::user::run_add(json, name, auth_file, scopes, password_stdin),
+        },
+        Command::Key { command } => match command {
+            KeyCommand::Show { name } => cmd::key::run_show(json, name),
+            KeyCommand::Verify { object, key } => cmd::key::run_verify(json, &target, object, key),
         },
         Command::Policy { command } => match command {
             PolicyCommand::Check { workspace, policy } => {
