@@ -25,7 +25,7 @@ M3 decisions that constrain later work: read sets (ADR 0012), lander merge mode 
 
 - Rust edition 2024. MSRV = current stable; bump freely.
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` gate every landing.
-- `#![forbid(unsafe_code)]` in every crate except `hord-vfs`.
+- `#![forbid(unsafe_code)]` in every crate except `hord-vfs`. One exception: `hord-cli` denies it and allows one Windows-only function that keeps the CLI's stdio out of the daemon (ADR 0027).
 - Property tests (`proptest`) for encoding round-trip, parse/project losslessness, `apply(base, diff(base, result)) == result`, and specified merge commutativity.
 - Every public type documented. `cargo doc` warnings are errors.
 - Errors: `thiserror` in libraries, `anyhow` only in `hord-cli`.
