@@ -139,7 +139,8 @@ fn the_daemon_serves_workspaces_and_lands_on_submit() -> TestResult {
     let ws = json(dir, &["ws", "new"])?;
     assert!(
         store_held(dir),
-        "ws new started a daemon that owns the store"
+        "ws new started a daemon that owns the store; daemon.log:\n{}",
+        fs::read_to_string(dir.join(".hord").join("daemon.log")).unwrap_or_default()
     );
     let id = str_field(&ws, "id")?.to_owned();
     let checkout = PathBuf::from(str_field(&ws, "materialization")?);
