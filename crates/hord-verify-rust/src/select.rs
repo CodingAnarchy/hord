@@ -360,9 +360,10 @@ pub fn select_ignoring(input: SelectInput<'_>, ignore: &BTreeSet<&str>) -> Selec
             .or_default()
             .insert(test.name.clone());
     }
-    // Coverage is fresh per test, and staleness is checked run by run: a test
-    // is selected when one of its last runs executed code that changed since
-    // that run's own snapshot (or a snapshot the chain does not know).
+    // Coverage is fresh per test, and staleness ends once the test re-ran on
+    // the change (ADR 0022, R1): a test is selected when code any of its
+    // last runs executed changed after its newest run (or that run's
+    // snapshot is unknown to the chain).
     if let Some(drift) = input.drift {
         for t in &coverage.tests {
             if coverage.is_stale(t, drift) {
@@ -681,6 +682,54 @@ mod tests {
             drift: Some(&drift),
         });
         assert!(exact(&sel).is_empty(), "{:?}", sel.exact);
+    }
+
+    #[test]
+    fn a_test_that_re_ran_on_a_core_change_is_not_selected_again() {
+        use hord_verify::Drift;
+        let (s0, s1, s2) = (
+            ObjectId::from_bytes([10; 32]),
+            ObjectId::from_bytes([11; 32]),
+            ObjectId::from_bytes([12; 32]),
+        );
+        let run = |s, covers: &[u128]| {
+            CoverageRecord::new(
+                s,
+                tc(),
+                BTreeSet::new(),
+                vec![(
+                    t("a", "testsuite", "m::t"),
+                    None,
+                    covers.iter().copied().map(n).collect(),
+                    false,
+                )],
+            )
+        };
+        // core(1) changed at s1 and every test that runs it re-ran there
+        // (run 2). The next commit, at s2, writes an unrelated h(7).
+        let ledger = run(s0, &[1]).merge(&run(s1, &[1]));
+        let mut drift = Drift::new(s0);
+        drift.push(s1, [n(1)].into_iter().collect());
+        drift.push(s2, [n(7)].into_iter().collect());
+        let ws = sample();
+        let i7 = impact(&[7], &[], vec![]);
+        let input = |drift| SelectInput {
+            coverage: Some(&ledger),
+            toolchain: tc(),
+            workspace: &ws,
+            impact: &i7,
+            max_impact: None,
+            drift: Some(drift),
+        };
+        // Dropped: run 1 predates the change, but run 2 already ran on it.
+        assert!(exact(&select(input(&drift))).is_empty());
+        // Kept: core(1) changes again after the newest run.
+        let mut later = drift.clone();
+        later.push(ObjectId::from_bytes([13; 32]), [n(1)].into_iter().collect());
+        assert_eq!(
+            exact(&select(input(&later))),
+            ["m::t".to_owned()].into_iter().collect()
+        );
     }
 
     #[test]
