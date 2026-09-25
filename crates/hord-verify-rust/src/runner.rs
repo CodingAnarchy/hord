@@ -79,7 +79,24 @@ impl RunOutput {
             return None;
         }
         if self.timed_out {
-            return Some("timed out".to_owned());
+            // Name what the command was doing when it was killed (for
+            // example cargo "Blocking waiting for file lock on ...").
+            let source = if self.stderr.trim().is_empty() {
+                &self.stdout
+            } else {
+                &self.stderr
+            };
+            let tail: Vec<&str> = source
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            let last = &tail[tail.len().saturating_sub(5)..];
+            return Some(if last.is_empty() {
+                "timed out".to_owned()
+            } else {
+                format!("timed out; last output: {}", last.join(" | "))
+            });
         }
         if self.build_failed {
             let first = self
@@ -136,13 +153,20 @@ pub struct CargoRunner {
     pub actor: Actor,
 }
 
+/// Default limit on one verification command: a stuck command must fail
+/// the change, never wedge the lander.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Default limit on a command printing nothing (libtest prints a line per
+/// finished test, cargo a line per compiled crate).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 impl Default for CargoRunner {
     fn default() -> Self {
         Self {
             env: BTreeMap::new(),
             target_dir: None,
-            timeout: None,
-            idle_timeout: None,
+            timeout: Some(DEFAULT_TIMEOUT),
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             actor: Actor::Agent {
                 id: "hord-verify-rust".into(),
                 model: String::new(),
@@ -415,6 +439,13 @@ mod tests {
         let out = runner.run(&root, &slow).expect("run the shell check");
         assert!(out.timed_out && !out.success());
         assert_eq!(out.failure_summary().as_deref(), Some("timed out"));
+        // A killed command that printed something names its last output.
+        let noisy = sh("echo Blocking waiting for file lock; sleep 5");
+        let out = runner.run(&root, &noisy).expect("run the shell check");
+        assert_eq!(
+            out.failure_summary().as_deref(),
+            Some("timed out; last output: Blocking waiting for file lock")
+        );
     }
 
     #[test]
