@@ -175,7 +175,10 @@ fn stage_label(stage: &Stage) -> (&'static str, String) {
         Stage::Arbitrated { result } => {
             ("arbitrated", format!("arbitrated → {}", short_id(result)))
         }
-        Stage::Landed { position } => ("landed", format!("landed at #{position}")),
+        Stage::Landed {
+            position: Some(position),
+        } => ("landed", format!("landed at #{position}")),
+        Stage::Landed { position: None } => ("landed", "landed".into()),
         Stage::Rejected { reason } => ("rejected", format!("rejected: {reason}")),
     }
 }
@@ -340,8 +343,12 @@ pub struct ChangePage {
     pub writes: Vec<NodeView>,
     /// Text diff (the secondary tab), when available.
     pub diff: Option<String>,
+    /// Its path through the lander and the ladder, oldest first.
+    pub history: Vec<RungView>,
     /// Whether the review form is shown.
     pub reviewable: bool,
+    /// Why the review form is not shown, when it is not.
+    pub review_note: Option<String>,
     /// Outcome of a review just submitted, in words.
     pub flash: Option<String>,
 }
@@ -380,8 +387,8 @@ pub struct ArbitrationPage {
     pub base: String,
     /// Why it was parked, in words.
     pub reason: String,
-    /// Ours: what landed.
-    pub ours: ChangeSide,
+    /// Ours: the landed changes it collided with.
+    pub ours: Vec<ChangeSide>,
     /// Theirs: the parked change.
     pub theirs: ChangeSide,
     /// Contested definitions.
@@ -390,8 +397,49 @@ pub struct ArbitrationPage {
     pub paths: Vec<String>,
     /// Ladder history, oldest first.
     pub ladder: Vec<RungView>,
+    /// Head at render time, for the workspace instructions.
+    pub head: Option<String>,
+    /// Whether to show how to resolve in a workspace.
+    pub show_workspace: bool,
     /// Outcome of an action just taken, in words.
     pub flash: Option<String>,
+}
+
+/// One registered recording.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordingRow {
+    /// Blob ObjectId.
+    pub id: String,
+    /// What was recorded.
+    pub description: String,
+    /// Repository it came from.
+    pub repo: String,
+    /// Number of events.
+    pub events: u64,
+}
+
+/// The recordings under `.hord/recordings/`.
+#[derive(Template, Debug)]
+#[template(path = "recordings.html")]
+pub struct RecordingsPage {
+    /// Page title.
+    pub title: String,
+    /// URL prefix of this repository's pages.
+    pub base: String,
+    /// Recordings, in id order.
+    pub recordings: Vec<RecordingRow>,
+}
+
+/// An error page.
+#[derive(Template, Debug)]
+#[template(path = "error.html")]
+pub struct ErrorPage {
+    /// Page title.
+    pub title: String,
+    /// URL prefix of this repository's pages.
+    pub base: String,
+    /// What went wrong.
+    pub message: String,
 }
 
 #[cfg(test)]
@@ -450,7 +498,9 @@ mod tests {
             reads: Vec::new(),
             writes: Vec::new(),
             diff: Some("-a\n+b".into()),
+            history: Vec::new(),
             reviewable: true,
+            review_note: None,
             flash: None,
         }
         .render()?;
@@ -463,7 +513,7 @@ mod tests {
             title: "t".into(),
             base: "/r/x".into(),
             reason: "parked".into(),
-            ours: side.clone(),
+            ours: vec![side.clone()],
             theirs: side,
             contested: Vec::new(),
             paths: vec!["Cargo.lock".into()],
@@ -472,10 +522,18 @@ mod tests {
                 rung: "replay #1 (ref)".into(),
                 outcome: "failed".into(),
             }],
+            head: Some("h".into()),
+            show_workspace: true,
             flash: None,
         }
         .render()?;
-        for action in ["pick_ours", "pick_theirs", "replay", "workspace"] {
+        for action in [
+            "pick_ours",
+            "pick_theirs",
+            "replay",
+            "workspace",
+            "resolved",
+        ] {
             assert!(arb.contains(&format!("value=\"{action}\"")), "{action}");
         }
         assert!(arb.contains("/r/x/arbitrate/c"));

@@ -16,6 +16,8 @@
     <ul class="evidence">{% for ev in evidence %}<li class="ev ev-{{ ev.class }}" title="{{ ev.id }}">{{ ev.kind }}: {{ ev.result }}</li>{% endfor %}</ul>
     <h2>Provenance</h2>
     <dl class="provenance">{% for (k, v) in provenance %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl>
+    <h2>Lander history</h2>
+    <ol class="ladder">{% for r in history %}<li><span class="at">{{ r.at }}</span> <strong>{{ r.rung }}</strong>: {{ r.outcome }}</li>{% endfor %}</ol>
     <h2>Read and write sets</h2>
     <div class="sets">
       <div><h3>reads</h3><ul>{% for n in reads %}<li title="{{ n.id }}">{{ n.label }}{% if let Some(p) = n.path %} <small>{{ p }}</small>{% endif %}</li>{% endfor %}</ul></div>
@@ -33,5 +35,6 @@
   <button name="verdict" value="approve">approve</button>
   <button name="verdict" value="reject">reject</button>
 </form>
+{% else %}{% if let Some(note) = review_note %}<p class="legend">{{ note }}</p>{% endif %}
 {% endif %}
 {% endblock %}

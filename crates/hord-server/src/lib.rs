@@ -9,6 +9,10 @@
 //!   batched object service and the resumable event stream;
 //! - `hord.v1.Schema/GetSchema` and `GET /schema.json`: the descriptor set
 //!   and the JSON Schema generated from it;
+//! - `hord.v1.Changes`: read-only change views and flight recordings
+//!   (ADR 0030);
+//! - the web UI at `/` (and `/r/<name>/`), `hord-ui`'s routes over the same
+//!   backends (ADR 0030);
 //! - optional webhooks from `server.toml`: the JSON-mapped event POSTed to
 //!   each URL, filtered by kind.
 //!
@@ -30,6 +34,7 @@ mod local;
 mod route;
 mod server;
 mod service;
+mod ui;
 mod webhook;
 
 pub use activity::Activity;

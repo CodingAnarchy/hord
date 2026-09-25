@@ -17,6 +17,7 @@ hord-api.workspace = true
 hord-core.workspace = true
 hord-store.workspace = true
 hord-txn.workspace = true
+hord-ui.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper-util.workspace = true

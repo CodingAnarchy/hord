@@ -18,6 +18,7 @@ use crate::config::ServerConfig;
 use crate::hosts::Hosts;
 use crate::route::RepoPrefixLayer;
 use crate::service::{GrpcRepoBackend, GrpcSchema};
+use crate::ui::HostedUi;
 use crate::{Error, Result};
 
 /// How long shutdown waits for open calls (such as event streams) to end.
@@ -91,7 +92,8 @@ impl Server {
         Ok(TcpListener::bind(addr).await?)
     }
 
-    /// Every route: the two gRPC services and `GET /schema.json`.
+    /// Every route: the gRPC services, `GET /schema.json`, and the web UI
+    /// (ADR 0030).
     #[must_use]
     pub fn routes(&self) -> Routes {
         let backend = RepoBackendServer::new(GrpcRepoBackend::new(Arc::clone(&self.hosts)))
@@ -114,7 +116,10 @@ impl Server {
         let router = routes
             .into_axum_router()
             .layer(tonic_web::GrpcWebLayer::new())
-            .route("/schema.json", get(schema_json));
+            .route("/schema.json", get(schema_json))
+            .merge(hord_ui::router(Arc::new(HostedUi::new(Arc::clone(
+                &self.hosts,
+            )))));
         Routes::from(router)
     }
 

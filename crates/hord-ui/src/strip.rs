@@ -39,8 +39,9 @@ pub enum Stage {
     },
     /// Appended to the log.
     Landed {
-        /// Position in the landing log.
-        position: u64,
+        /// Position in the landing log, when known (a `Landed` event
+        /// carries it; a queue entry does not).
+        position: Option<u64>,
     },
     /// Not landed and not replayable as is.
     Rejected {
@@ -213,6 +214,62 @@ impl Strip {
         }
     }
 
+    /// Seed or refresh a row from a lander queue entry (`Queue` RPC): its
+    /// stage, summary, and author. The live strip starts from the queue and
+    /// then follows events, which carry no summary.
+    pub fn seed(&mut self, entry: &proto::QueueEntry) {
+        let i = self.row_for(&entry.change);
+        if let Some(landed) = entry.landed.as_ref().filter(|l| **l != entry.change) {
+            self.index.insert(landed.clone(), i);
+        }
+        let row = &mut self.rows[i];
+        row.submission = Some(entry.seq);
+        row.landed = entry.landed.clone().filter(|l| *l != entry.change);
+        if !entry.summary.is_empty() {
+            row.summary = Some(entry.summary.clone());
+        }
+        if entry.actor.is_some() {
+            row.actor.clone_from(&entry.actor);
+        }
+        row.at_ms = row.at_ms.max(entry.updated_at_ms);
+        row.stage =
+            match entry.status() {
+                proto::QueueStatus::Landed => Stage::Landed {
+                    position: match row.stage {
+                        Stage::Landed { position } => position,
+                        _ => None,
+                    },
+                },
+                proto::QueueStatus::Conflicted => Stage::Parked {
+                    reason: if entry
+                        .report
+                        .as_ref()
+                        .is_some_and(|r| r.verification.is_some())
+                    {
+                        proto::ParkReason::VerificationFailed
+                    } else {
+                        proto::ParkReason::MergeConflict
+                    },
+                    detail: String::new(),
+                },
+                proto::QueueStatus::Parked => Stage::Parked {
+                    reason: if entry.report.as_ref().is_some_and(|r| {
+                        r.policy.iter().any(|p| p.requirement.starts_with("review"))
+                    }) {
+                        proto::ParkReason::NeedsReview
+                    } else {
+                        proto::ParkReason::Policy
+                    },
+                    detail: String::new(),
+                },
+                proto::QueueStatus::Rejected => Stage::Rejected {
+                    reason: entry.reason.clone().unwrap_or_default(),
+                },
+                // Queued: keep what events said (verifying, replaying).
+                proto::QueueStatus::Queued | proto::QueueStatus::Unspecified => row.stage.clone(),
+            };
+    }
+
     /// Changes whose rows have no summary yet, in row order.
     #[must_use]
     pub fn unlabeled(&self) -> Vec<&str> {
@@ -304,7 +361,7 @@ impl Strip {
                 }
                 let row = &mut self.rows[i];
                 row.stage = Stage::Landed {
-                    position: l.position,
+                    position: Some(l.position),
                 };
                 for id in &l.evidence {
                     row.add_evidence(EvidenceItem {
@@ -452,7 +509,7 @@ mod tests {
         ));
         let row = strip.row("l1").expect("the landed id names the row");
         assert_eq!(row.change, "s1");
-        assert_eq!(row.stage, Stage::Landed { position: 0 });
+        assert_eq!(row.stage, Stage::Landed { position: Some(0) });
         assert!(row.plan.is_some());
         let ids: Vec<_> = row.evidence.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["e1", "e2"]);
@@ -501,6 +558,52 @@ mod tests {
         assert_eq!(row.replays.len(), 2);
         assert_eq!(row.stage, Stage::Arbitrated { result: "r".into() });
         assert!(row.stage.settled());
+    }
+
+    #[test]
+    fn queue_entries_seed_rows_that_events_then_advance() {
+        let mut strip = Strip::new();
+        strip.seed(&proto::QueueEntry {
+            seq: 4,
+            change: "s".into(),
+            status: proto::QueueStatus::Queued.into(),
+            summary: "Add a flag".into(),
+            actor: Some(agent("a")),
+            ..Default::default()
+        });
+        strip.seed(&proto::QueueEntry {
+            seq: 5,
+            change: "p".into(),
+            status: proto::QueueStatus::Parked.into(),
+            report: Some(proto::ConflictReport {
+                policy: vec![proto::PolicyViolation {
+                    requirement: "review:human".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(strip.rows()[0].summary.as_deref(), Some("Add a flag"));
+        assert!(matches!(
+            strip.rows()[1].stage,
+            Stage::Parked {
+                reason: proto::ParkReason::NeedsReview,
+                ..
+            }
+        ));
+        strip.apply(&env(
+            9,
+            Kind::Landed(proto::Landed {
+                change: "l".into(),
+                position: 3,
+                submitted: Some("s".into()),
+                evidence: Vec::new(),
+            }),
+        ));
+        let row = strip.row("l").expect("landed id is indexed");
+        assert_eq!(row.stage, Stage::Landed { position: Some(3) });
+        assert_eq!(row.summary.as_deref(), Some("Add a flag"));
     }
 
     #[test]

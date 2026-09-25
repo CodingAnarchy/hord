@@ -1,6 +1,6 @@
 [package]
 name = "hord-ui"
-description = "The web UI (spec §10.4): askama templates and static assets for the landing strip, semantic change, arbitration workbench, and flight-recorder playback"
+description = "The web UI (spec §10.4, ADR 0030): landing strip, semantic change, arbitration workbench, and flight-recorder playback, rendered on the server as a client of hord.proto"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -10,5 +10,15 @@ workspace = true
 
 [dependencies]
 askama.workspace = true
+async-trait.workspace = true
+axum = { workspace = true, features = ["form", "query"] }
 hord-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+http-body-util.workspace = true

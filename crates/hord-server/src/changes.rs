@@ -3,7 +3,9 @@
 //! flight recordings registered under `.hord/recordings/`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,6 +16,7 @@ use hord_core::{
     SnapshotId,
 };
 use hord_txn::{LocalRepo, Repo};
+use tokio::task::spawn_blocking;
 use tonic::{Request, Response, Status};
 
 use crate::hosts::Hosts;
@@ -37,8 +40,8 @@ pub fn save_recording(repo: &Repo, bytes: Vec<u8>) -> ApiResult<ObjectId> {
         .put_object(&Blob::new(bytes))
         .map_err(|e| ApiError::Internal(format!("store recording: {e}")))?;
     let dir = store.hord_dir().join(RECORDINGS_DIR);
-    std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(dir.join(id.to_hex()), b""))
+    fs::create_dir_all(&dir)
+        .and_then(|()| fs::write(dir.join(id.to_hex()), b""))
         .map_err(|e| ApiError::Internal(format!("register recording: {e}")))?;
     Ok(id)
 }
@@ -66,7 +69,7 @@ impl LocalChanges {
         f: impl FnOnce(Repo) -> ApiResult<T> + Send + 'static,
     ) -> ApiResult<T> {
         let repo = self.repo().clone();
-        tokio::task::spawn_blocking(move || f(repo))
+        spawn_blocking(move || f(repo))
             .await
             .map_err(|e| ApiError::Internal(format!("task: {e}")))?
     }
@@ -157,7 +160,7 @@ impl ChangesBackend for LocalChanges {
         self.blocking(|repo| {
             let dir = repo.store().hord_dir().join(RECORDINGS_DIR);
             let mut ids = Vec::new();
-            match std::fs::read_dir(&dir) {
+            match fs::read_dir(&dir) {
                 Ok(entries) => {
                     for entry in entries {
                         let entry = entry.map_err(|e| io_err(&dir, &e))?;
@@ -171,7 +174,7 @@ impl ChangesBackend for LocalChanges {
                         }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(e) => return Err(io_err(&dir, &e)),
             }
             ids.sort();
@@ -304,8 +307,8 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
 }
 
-fn io_err(dir: &std::path::Path, e: &std::io::Error) -> ApiError {
-    ApiError::Internal(format!("{}: {e}", PathBuf::from(dir).display()))
+fn io_err(dir: &Path, e: &io::Error) -> ApiError {
+    ApiError::Internal(format!("{}: {e}", dir.display()))
 }
 
 fn load_recording(
@@ -352,7 +355,7 @@ fn intent_view(record: &ChangeRecord) -> proto::IntentView {
 /// One file's unified diff; binary when either side is not UTF-8.
 fn file_diff(path: &RepoPath, before: Option<&[u8]>, after: Option<&[u8]>) -> proto::FileDiff {
     fn text(bytes: Option<&[u8]>) -> Option<&str> {
-        bytes.map_or(Some(""), |b| std::str::from_utf8(b).ok())
+        bytes.map_or(Some(""), |b| str::from_utf8(b).ok())
     }
     match (text(before), text(after)) {
         (Some(old), Some(new)) => {

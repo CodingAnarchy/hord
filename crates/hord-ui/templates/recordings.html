@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Flight recordings</h1>
+{% if recordings.is_empty() %}<p>No recordings under <code>.hord/recordings/</code>.</p>{% endif %}
+<ul class="recordings">
+{% for r in recordings %}<li><a href="{{ base }}/recordings/{{ r.id }}">{{ r.description }}</a> <small>{{ r.repo }} · {{ r.events }} events · <code>{{ r.id }}</code></small></li>
+{% endfor %}
+</ul>
+{% endblock %}

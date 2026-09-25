@@ -6,13 +6,18 @@
 <div class="sides">
   <section class="side ours">
     <h2>Ours (landed)</h2>
-    <p><a href="{{ base }}/changes/{{ ours.change }}">{{ ours.summary }}</a> · {{ ours.actor }}</p>
-    {% if !ours.body.is_empty() %}<pre class="intent">{{ ours.body }}</pre>{% endif %}
+    {% for side in ours %}
+    <p><a href="{{ base }}/changes/{{ side.change }}">{{ side.summary }}</a> · {{ side.actor }}</p>
+    {% if !side.body.is_empty() %}<pre class="intent">{{ side.body }}</pre>{% endif %}
+    {% else %}
+    <p>No landed change is named in the conflict report.</p>
+    {% endfor %}
   </section>
   <section class="side theirs">
     <h2>Theirs (parked)</h2>
     <p><a href="{{ base }}/changes/{{ theirs.change }}">{{ theirs.summary }}</a> · {{ theirs.actor }}</p>
     {% if !theirs.body.is_empty() %}<pre class="intent">{{ theirs.body }}</pre>{% endif %}
+    {% if !theirs.acceptance.is_empty() %}<ul class="acceptance">{% for a in theirs.acceptance %}<li>{{ a }}</li>{% endfor %}</ul>{% endif %}
   </section>
 </div>
 <h2>Contested definitions</h2>
@@ -24,7 +29,7 @@
     <td>{{ c.why }}</td>
     <td><ul class="ops">{% for op in c.ours %}<li class="op op-{{ op.op }}">{{ op.text }}</li>{% endfor %}</ul></td>
     <td><ul class="ops">{% for op in c.theirs %}<li class="op op-{{ op.op }}">{{ op.text }}</li>{% endfor %}</ul></td>
-  </tr>{% endfor %}
+  </tr>{% else %}<tr><td colspan="4">No definition is contested.</td></tr>{% endfor %}
   </tbody>
 </table>
 {% if !paths.is_empty() %}<p>Files in contention: {% for p in paths %}<code>{{ p }}</code> {% endfor %}</p>{% endif %}
@@ -32,10 +37,23 @@
 <ol class="ladder">{% for r in ladder %}<li><span class="at">{{ r.at }}</span> <strong>{{ r.rung }}</strong>: {{ r.outcome }}</li>{% endfor %}</ol>
 <form class="arbitrate" method="post" action="{{ base }}/arbitrate/{{ theirs.change }}">
   <h2>Decide</h2>
-  <textarea name="note" rows="3" placeholder="note (for a replay)"></textarea>
+  <textarea name="note" rows="3" placeholder="note for the replay harness"></textarea>
   <button name="action" value="pick_ours">pick ours</button>
   <button name="action" value="pick_theirs">pick theirs</button>
-  <button name="action" value="workspace">open a workspace to edit</button>
   <button name="action" value="replay">re-run replay with the note</button>
+  <button name="action" value="workspace">open a workspace to edit</button>
 </form>
+{% if show_workspace %}
+<section class="workspace">
+  <h2>Resolve in a workspace</h2>
+  <p>Start a workspace at head, make the edit both intents need, and propose it:</p>
+  <pre>hord ws new{% if let Some(head) = head %} --base {{ head }}{% endif %}
+# edit, then
+hord propose --intent intent.md</pre>
+  <form class="arbitrate" method="post" action="{{ base }}/arbitrate/{{ theirs.change }}">
+    <label>resolving change <input name="resolved" size="66" placeholder="ChangeId"></label>
+    <button name="action" value="resolved">resolve with this change</button>
+  </form>
+</section>
+{% endif %}
 {% endblock %}

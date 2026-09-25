@@ -9,19 +9,29 @@
 //!   scrubber;
 //! - [`view`]: display-ready view models and the page templates (landing
 //!   strip, semantic change, arbitration workbench, playback);
-//! - [`assets`]: the stylesheet and the two small scripts, embedded.
+//! - [`present`]: API messages mapped to view models;
+//! - [`assets`]: the stylesheet and the two small scripts, embedded;
+//! - [`router`]: the routes `hord serve` mounts (ADR 0030);
+//! - [`audit`]: the M5 check that every call is an RPC of `hord.proto`.
 //!
-//! Per §10.4 the UI has no privileged data path: it depends only on
-//! `hord-api`, and reads and acts through `hord.proto` alone.
+//! Per §10.4 and ADR 0030 the UI has no privileged data path: it renders
+//! on the server as a client of `hord.proto`, through the [`UiRepo`]
+//! backends it is handed, and depends on no other hord crate than
+//! `hord-api`.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+mod app;
 pub mod assets;
+pub mod audit;
 pub mod playback;
+pub mod present;
 pub mod strip;
 pub mod view;
+
+pub use app::{MAX_ROWS, ReviewBackend, SingleRepo, UiHosts, UiRepo, router};
 
 use hord_api::ApiError;
 

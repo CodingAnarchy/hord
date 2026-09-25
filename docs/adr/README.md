@@ -42,3 +42,5 @@ ADR 0024 server-foundation dependencies (`hord-api`, `hord-server`, `hord-remote
 `rustc-demangle` 0.1 (hord-verify-rust only, ADR 0022): demangles the Rust symbol names in `llvm-cov export` so a test's own function maps to its definition. It is the demangler the standard library uses, and AGENTS.md forbids a hand-rolled parser.
 
 `askama` 0.16 (hord-ui only): compiled, HTML-escaping templates for the server-rendered web UI. Spec §10.4 names it (DECIDED stack), so the views need no frontend build pipeline and no hand-rolled HTML escaping.
+
+`axum` 0.8 with `form` and `query`, `serde`, `serde_json`, `tokio`, `tokio-stream`, `async-trait` (hord-ui; all already in the tree) and `diffy` (hord-server; already a workspace dependency, AGENTS.md prefers it): the web UI's routes, form and query decoding, the SSE relay, and the `Changes` service's text diff (ADR 0030).
