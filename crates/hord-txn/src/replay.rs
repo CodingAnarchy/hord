@@ -153,9 +153,10 @@ impl ReplayHarness for CommandHarness {
     }
 }
 
-/// Kills a harness's process group when dropped: its budget ran out, or
-/// it exited and left children behind. A no-op off Unix, where
-/// `kill_on_drop` kills the process itself.
+/// Kills a harness and everything it started when dropped: its budget ran
+/// out, or it exited and left children behind. Its process group on Unix,
+/// its process tree on Windows (`kill_on_drop` alone kills only the
+/// harness, and a surviving child could outlive the budget).
 struct ProcessGroup(Option<u32>);
 
 impl Drop for ProcessGroup {
@@ -166,6 +167,15 @@ impl Drop for ProcessGroup {
             // group that is gone already is not an error.
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", "--", &format!("-{pid}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(windows)]
+        if let Some(pid) = self.0 {
+            // A tree that is gone already is not an error.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();

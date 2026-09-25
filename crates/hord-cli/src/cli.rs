@@ -314,7 +314,7 @@ pub enum TokenCommand {
         /// Harness that runs it.
         #[arg(long, value_name = "HARNESS")]
         harness: String,
-        /// Scope to grant (repeat): read, propose, review:<kind>,
+        /// Scope to grant (repeat): read, propose, review:KIND,
         /// arbitrate, admin.
         #[arg(long = "scope", value_name = "SCOPE", required = true)]
         scopes: Vec<Scope>,
