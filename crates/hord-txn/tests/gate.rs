@@ -12,11 +12,11 @@ use common::*;
 use hord_core::{Actor, Evidence, EvidenceKind, EvidenceResult, SnapshotId, Timestamp};
 use hord_policy::EvidenceState;
 use hord_txn::{
-    EngineVerifier, LocalRepo, QueueStatus, Repo, RepoOptions, Verdict, Verifier, VerifierFactory,
-    VerifyFuture, VerifyRequest,
+    Built, EngineVerifier, LocalRepo, QueueStatus, Repo, RepoOptions, Verdict, Verifier,
+    VerifierFactory, VerifyFuture, VerifyRequest,
 };
 use hord_verify::{
-    Check, Checkout, CoverageRecord, EvidenceFields, EvidenceIndex, ImpactSet, Toolchain,
+    Check, Checkout, CoverageRecord, Drift, EvidenceFields, EvidenceIndex, ImpactSet, Toolchain,
     VerifyPlan, VerifyPolicy,
 };
 
@@ -120,11 +120,15 @@ impl VerifierFactory for FakeFactory {
         &self,
         _checkout: &Checkout,
         _coverage: Option<Arc<CoverageRecord>>,
-    ) -> hord_verify::Result<Box<dyn hord_verify::Verifier>> {
-        Ok(Box::new(FakeRunner {
-            toolchain: self.toolchain().unwrap(),
-            runs: Arc::clone(&self.runs),
-        }))
+        _drift: Option<Arc<Drift>>,
+    ) -> hord_verify::Result<Built> {
+        Ok(Built {
+            verifier: Box::new(FakeRunner {
+                toolchain: self.toolchain().unwrap(),
+                runs: Arc::clone(&self.runs),
+            }),
+            instrumented: None,
+        })
     }
 }
 

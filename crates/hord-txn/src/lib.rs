@@ -61,9 +61,9 @@ pub use conflict::{
 };
 pub use error::{Error, Result};
 pub use gate::{
-    EngineVerifier, FailClosedVerifier, PolicySource, RustFactory, StubVerifier, Verdict, Verifier,
-    VerifierFactory, VerifyContext, VerifyFuture, VerifyRequest, WorkspaceVerification,
-    applicable_requirements, unverified_overlap,
+    Built, EngineVerifier, FailClosedVerifier, InstrumentedTests, PolicySource, RustFactory,
+    StubVerifier, Verdict, Verifier, VerifierFactory, VerifyContext, VerifyFuture, VerifyRequest,
+    WorkspaceVerification, applicable_requirements, unverified_overlap,
 };
 pub use hord_store::{EdgeKind, WorkspaceId};
 pub use lander::{Lander, QueueEntry, QueueStatus, SPECULATIVE_WINDOW};

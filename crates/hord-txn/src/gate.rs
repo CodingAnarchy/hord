@@ -29,9 +29,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hord_core::{ChangeId, ChangeRecord, Evidence, NodeId, RepoPath, SnapshotId};
 use hord_policy::{CompiledPolicy, Decision, EvidenceFact, Facts, POLICY_PATH, TouchedDefinition};
 use hord_verify::{
-    Checkout, CoverageRecord, EvidenceIndex, ImpactBound, ImpactSet, Toolchain, VerifyPlan,
+    Checkout, CoverageRecord, Drift, EvidenceIndex, ImpactBound, ImpactSet, Toolchain, VerifyPlan,
     VerifyPolicy,
 };
+use hord_verify_rust::{DefinitionIndex, InstrumentedRun};
 
 use crate::conflict::ConflictReport;
 use crate::repo::{Inner, fs_path, lock};
@@ -45,15 +46,21 @@ pub use hord_verify::Verdict;
 /// What a [`Verifier`] may ask for, lazily: nothing is computed or checked
 /// out unless the verifier needs it.
 pub trait VerifyContext: Send + Sync {
-    /// The change's impact set under `bound`. Its facts cover everything
-    /// that changed between `since` (a coverage record's snapshot, ADR 0022
-    /// amendment "coverage drift") and the snapshot being verified; `None`
-    /// is the change's own base.
-    fn impact(
-        &self,
-        bound: ImpactBound,
-        since: Option<SnapshotId>,
-    ) -> hord_verify::Result<ImpactSet>;
+    /// The change's impact set under `bound` (ADR 0022, amendments after
+    /// the 50-commit measurement): its own facts (base to result), seeded
+    /// by the writes coverage cannot attribute
+    /// ([`hord_verify::impact_set_attributable`]).
+    fn impact(&self, bound: ImpactBound) -> hord_verify::Result<ImpactSet>;
+
+    /// The landed changes up to the change's base, each with its write set,
+    /// for per-test coverage freshness ([`hord_verify::Drift`]). `None`
+    /// when the chain is unknown (selection then treats every recorded
+    /// test as stale).
+    fn drift(&self) -> hord_verify::Result<Option<Arc<Drift>>>;
+
+    /// The definitions of the snapshot being verified, by file and line,
+    /// to attribute coverage to.
+    fn definitions(&self) -> hord_verify::Result<Arc<DefinitionIndex>>;
 
     /// A directory holding exactly the snapshot being verified.
     fn checkout(&self) -> hord_verify::Result<Checkout>;
@@ -186,23 +193,73 @@ pub trait VerifierFactory: Send + Sync {
     /// available (the engine then fails closed).
     fn toolchain(&self) -> Option<Toolchain>;
 
-    /// The verifier for `checkout`, selecting tests with `coverage`.
+    /// The verifier for `checkout`, selecting tests with `coverage` and
+    /// per-test freshness under `drift`.
     fn build(
         &self,
         checkout: &Checkout,
         coverage: Option<Arc<CoverageRecord>>,
-    ) -> hord_verify::Result<Box<dyn hord_verify::Verifier>>;
+        drift: Option<Arc<Drift>>,
+    ) -> hord_verify::Result<Built>;
+}
+
+/// What a [`VerifierFactory`] builds for one checkout.
+pub struct Built {
+    /// Plans and runs every requirement.
+    pub verifier: Box<dyn hord_verify::Verifier>,
+    /// Runs the test requirements under coverage instead (ADR 0022: every
+    /// verification run is instrumented and refreshes the tests it ran);
+    /// `None`: tests run through `verifier`, and coverage is not refreshed.
+    pub instrumented: Option<Box<dyn InstrumentedTests>>,
+}
+
+impl std::fmt::Debug for Built {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Built")
+            .field("instrumented", &self.instrumented.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Test requirements run one test per process under coverage (ADR 0022,
+/// amendments after the 50-commit measurement).
+pub trait InstrumentedTests: Send + Sync {
+    /// Whether the tests for `impact` would run in full (a selection
+    /// fallback, or `full`): the evidence then has no scope.
+    fn runs_everything(&self, impact: &ImpactSet, policy: &VerifyPolicy, full: bool) -> bool;
+
+    /// Run the selected tests (every test with `full`) under coverage in
+    /// `checkout`, with `defs` the checkout's definitions; logs go to
+    /// `index`. The evidence is returned, not indexed.
+    fn run(
+        &self,
+        checkout: &Checkout,
+        impact: &ImpactSet,
+        policy: &VerifyPolicy,
+        full: bool,
+        defs: &DefinitionIndex,
+        index: &dyn EvidenceIndex,
+    ) -> hord_verify::Result<InstrumentedRun>;
+
+    /// Who the coverage evidence is produced by.
+    fn actor(&self) -> hord_core::Actor;
 }
 
 /// Cargo (`hord-verify-rust`, ADR 0022): `check`, `test:selected`,
-/// `test:full`, `lint`, and `bench` on the affected packages. The toolchain
-/// is detected once, on first use.
+/// `test:full`, `lint`, and `bench` on the affected packages, tests run
+/// under coverage. The toolchain is detected once, on first use.
 #[derive(Debug)]
 pub struct RustFactory {
     probe: PathBuf,
     toolchain: OnceLock<Option<Toolchain>>,
     /// How commands run (target directory, timeouts).
     pub runner: hord_verify_rust::CargoRunner,
+    /// Tests run at once under coverage.
+    pub coverage_jobs: usize,
+    /// Kill a single test under coverage after this long (it fails).
+    pub test_timeout: std::time::Duration,
+    /// Quarantined tests, never run.
+    pub quarantine: BTreeSet<hord_verify::TestRef>,
 }
 
 impl RustFactory {
@@ -213,6 +270,9 @@ impl RustFactory {
             probe,
             toolchain: OnceLock::new(),
             runner: hord_verify_rust::CargoRunner::default(),
+            coverage_jobs: std::thread::available_parallelism().map_or(4, usize::from),
+            test_timeout: std::time::Duration::from_secs(600),
+            quarantine: BTreeSet::new(),
         }
     }
 }
@@ -228,16 +288,82 @@ impl VerifierFactory for RustFactory {
         &self,
         checkout: &Checkout,
         coverage: Option<Arc<CoverageRecord>>,
-    ) -> hord_verify::Result<Box<dyn hord_verify::Verifier>> {
+        drift: Option<Arc<Drift>>,
+    ) -> hord_verify::Result<Built> {
         let toolchain = self.toolchain().ok_or_else(|| hord_verify::Error::Tool {
             tool: "rustc".into(),
             message: "no toolchain".into(),
         })?;
         let workspace = hord_verify_rust::CargoWorkspace::load(&checkout.root)?;
-        let mut verifier =
-            hord_verify_rust::RustVerifier::new(toolchain, workspace)?.with_coverage(coverage);
+        let mut verifier = hord_verify_rust::RustVerifier::new(toolchain, workspace)?
+            .with_coverage(coverage)
+            .with_drift(drift);
         verifier.runner = self.runner.clone();
-        Ok(Box::new(verifier))
+        verifier.quarantine = self.quarantine.clone();
+        // Instrumented builds use other flags: their own target directory,
+        // kept in the slot (`target/` survives a slot reset) or beside the
+        // runner's shared one.
+        let target_dir = match &self.runner.target_dir {
+            Some(dir) => dir.join("hord-coverage"),
+            None => checkout.root.join("target").join("hord-coverage"),
+        };
+        let instrumented = RustInstrumented {
+            verifier: verifier.clone(),
+            options: hord_verify_rust::CoverageOptions {
+                packages: None,
+                target_dir,
+                jobs: self.coverage_jobs.max(1),
+                test_timeout: self.test_timeout,
+                skip: BTreeSet::new(),
+                only: None,
+                lines_of_interest: BTreeMap::new(),
+            },
+        };
+        Ok(Built {
+            verifier: Box::new(verifier),
+            instrumented: Some(Box::new(instrumented)),
+        })
+    }
+}
+
+/// [`InstrumentedTests`] with `RustVerifier::run_instrumented`.
+struct RustInstrumented {
+    verifier: hord_verify_rust::RustVerifier,
+    options: hord_verify_rust::CoverageOptions,
+}
+
+impl RustInstrumented {
+    /// The verifier for `full`: without a coverage record, selection runs
+    /// everything.
+    fn for_run(&self, full: bool) -> std::borrow::Cow<'_, hord_verify_rust::RustVerifier> {
+        if full {
+            std::borrow::Cow::Owned(self.verifier.clone().with_coverage(None))
+        } else {
+            std::borrow::Cow::Borrowed(&self.verifier)
+        }
+    }
+}
+
+impl InstrumentedTests for RustInstrumented {
+    fn runs_everything(&self, impact: &ImpactSet, policy: &VerifyPolicy, full: bool) -> bool {
+        full || self.verifier.selection(impact, policy).full
+    }
+
+    fn run(
+        &self,
+        checkout: &Checkout,
+        impact: &ImpactSet,
+        policy: &VerifyPolicy,
+        full: bool,
+        defs: &DefinitionIndex,
+        index: &dyn EvidenceIndex,
+    ) -> hord_verify::Result<InstrumentedRun> {
+        self.for_run(full)
+            .run_instrumented(checkout, impact, policy, defs, &self.options, index)
+    }
+
+    fn actor(&self) -> hord_core::Actor {
+        self.verifier.runner.actor.clone()
     }
 }
 
@@ -245,6 +371,12 @@ impl VerifierFactory for RustFactory {
 /// finds the newest coverage record, computes the impact set, plans with
 /// reuse (evidence already indexed for the same key is not re-run), runs
 /// the rest in a checkout of the candidate, and indexes the new evidence.
+///
+/// Test requirements run under coverage when the factory can
+/// ([`Built::instrumented`], ADR 0022 amendments): the run's per-test
+/// records are merged into the newest record and stored as coverage
+/// evidence on the candidate's snapshot, so the next landing selects from
+/// fresh records.
 ///
 /// With no requirements, or no toolchain, it fails closed like
 /// [`FailClosedVerifier`]; so does a pass that verified nothing on a
@@ -307,6 +439,15 @@ fn engine_verify(factory: &dyn VerifierFactory, request: &VerifyRequest) -> Verd
     }
 }
 
+/// The test requirements [`InstrumentedTests`] answers.
+const TEST_REQUIREMENTS: [&str; 2] = [
+    hord_verify_rust::requirement::TEST_SELECTED,
+    hord_verify_rust::requirement::TEST_FULL,
+];
+
+/// `Check::program` of instrumented test evidence.
+const COVERAGE_PROGRAM: &str = "hord-coverage";
+
 fn engine_run(
     factory: &dyn VerifierFactory,
     toolchain: &Toolchain,
@@ -314,34 +455,176 @@ fn engine_run(
 ) -> hord_verify::Result<Verdict> {
     let context = &request.context;
     let index = context.index();
-    let coverage = hord_verify::find_coverage(index, context.history(), toolchain.id()?)?;
-    let since = match &coverage {
-        Some((id, _)) => Some(hord_verify::get_evidence(index, *id)?.snapshot),
-        None => None,
-    };
-    let impact = context.impact(request.policy.bound, since)?;
+    let toolchain_id = toolchain.id()?;
+    let coverage = hord_verify::find_coverage(index, context.history(), toolchain_id)?;
+    let impact = context.impact(request.policy.bound)?;
     let checkout = context.checkout()?;
-    let verifier = factory.build(&checkout, coverage.map(|(_, record)| Arc::new(record)))?;
-    let plan = hord_verify::plan_with_reuse(
-        verifier.as_ref(),
-        index,
-        checkout.snapshot,
-        &impact,
-        &request.policy,
-    )?;
-    context.planned(&plan);
-    if request.plan_only {
-        return Ok(Verdict::Pass {
-            evidence: plan.reused.iter().map(|r| r.evidence).collect(),
-        });
-    }
-    hord_verify::verify(
-        verifier.as_ref(),
-        index,
+    let drift = context.drift()?;
+    let built = factory.build(
         &checkout,
-        &impact,
-        &request.policy,
-    )
+        coverage.map(|(_, record)| Arc::new(record)),
+        drift,
+    )?;
+    let verifier = built.verifier.as_ref();
+    let tests_required = TEST_REQUIREMENTS.iter().any(|r| request.policy.requires(r));
+    let instrumented = match built.instrumented {
+        Some(instrumented) if tests_required => instrumented,
+        _ => {
+            let plan = hord_verify::plan_with_reuse(
+                verifier,
+                index,
+                checkout.snapshot,
+                &impact,
+                &request.policy,
+            )?;
+            context.planned(&plan);
+            if request.plan_only {
+                return Ok(Verdict::Pass {
+                    evidence: plan.reused.iter().map(|r| r.evidence).collect(),
+                });
+            }
+            return hord_verify::verify(verifier, index, &checkout, &impact, &request.policy);
+        }
+    };
+
+    // Tests under coverage; everything else as planned.
+    let full = request
+        .policy
+        .requires(hord_verify_rust::requirement::TEST_FULL);
+    let scope =
+        (!instrumented.runs_everything(&impact, &request.policy, full)).then(|| impact.node_set());
+    let reused_tests = reusable_tests(index, checkout.snapshot, toolchain_id, &scope, &impact)?;
+    let mut plan =
+        hord_verify::plan_with_reuse(verifier, index, checkout.snapshot, &impact, &request.policy)?;
+    if !reused_tests.is_empty() {
+        plan.checks
+            .retain(|c| !TEST_REQUIREMENTS.contains(&c.requirement.as_str()));
+        plan.notes.push(format!(
+            "tests: {} instrumented evidence reused",
+            reused_tests.len()
+        ));
+    } else {
+        plan.notes
+            .push("tests run one per process under coverage (ADR 0022)".into());
+    }
+    context.planned(&plan);
+    let rest = VerifyPolicy {
+        require: request
+            .policy
+            .require
+            .iter()
+            .filter(|r| !TEST_REQUIREMENTS.contains(&r.as_str()))
+            .cloned()
+            .collect(),
+        ..request.policy.clone()
+    };
+    if request.plan_only {
+        let mut evidence: Vec<_> = plan
+            .reused
+            .iter()
+            .filter(|r| !TEST_REQUIREMENTS.contains(&r.check.requirement.as_str()))
+            .map(|r| r.evidence)
+            .collect();
+        evidence.extend(reused_tests.iter().map(|(id, _)| *id));
+        return Ok(Verdict::Pass { evidence });
+    }
+
+    index.put_raw(&hord_encoding::encode(toolchain)?)?;
+    let (mut evidence, mut failures) = if rest.require.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        match hord_verify::verify(verifier, index, &checkout, &impact, &rest)? {
+            Verdict::Pass { evidence } => (evidence, Vec::new()),
+            Verdict::Fail { evidence, reason } => (evidence, vec![reason]),
+        }
+    };
+    if reused_tests.is_empty() {
+        let defs = context.definitions()?;
+        let run = instrumented.run(&checkout, &impact, &request.policy, full, &defs, index)?;
+        evidence.extend(index.put_evidence_batch(&run.evidence)?);
+        failures.extend(run.evidence.iter().filter_map(|ev| match &ev.result {
+            hord_core::EvidenceResult::Fail { summary } => {
+                Some(format!("{}: {summary}", ev.command))
+            }
+            _ => None,
+        }));
+        store_coverage(
+            index,
+            context.history(),
+            toolchain_id,
+            run.coverage,
+            instrumented.actor(),
+        )?;
+    } else {
+        for (id, ev) in &reused_tests {
+            evidence.push(*id);
+            if let hord_core::EvidenceResult::Fail { summary } = &ev.result {
+                failures.push(format!("{} (reused): {summary}", ev.command));
+            }
+        }
+    }
+    Ok(if failures.is_empty() {
+        Verdict::Pass { evidence }
+    } else {
+        Verdict::Fail {
+            evidence,
+            reason: failures.join("\n"),
+        }
+    })
+}
+
+/// Test evidence already indexed for `snapshot` by an instrumented run
+/// with this toolchain and `scope` (its doctests, scoped to the impact
+/// set, with it); empty when there is none, and the tests must run.
+fn reusable_tests(
+    index: &dyn EvidenceIndex,
+    snapshot: SnapshotId,
+    toolchain: hord_core::ObjectId,
+    scope: &Option<BTreeSet<NodeId>>,
+    impact: &ImpactSet,
+) -> hord_verify::Result<Vec<(hord_core::ObjectId, Evidence)>> {
+    let mut tests = Vec::new();
+    let mut instrumented = false;
+    let docs = Some(impact.node_set());
+    for id in index.evidence_at(snapshot)? {
+        let ev = hord_verify::get_evidence(index, id)?;
+        if ev.kind != hord_core::EvidenceKind::Test || ev.toolchain != toolchain {
+            continue;
+        }
+        let coverage = ev
+            .command
+            .split_whitespace()
+            .next()
+            .is_some_and(|program| program == COVERAGE_PROGRAM);
+        if coverage && ev.scope == *scope {
+            instrumented = true;
+            tests.push((id, ev));
+        } else if !coverage && ev.scope == docs {
+            tests.push((id, ev));
+        }
+    }
+    if !instrumented {
+        tests.clear();
+    }
+    Ok(tests)
+}
+
+/// Merge `run`'s per-test records into the newest record (each test keeps
+/// its last runs, `CoverageRecord::merge`) and store the result as coverage
+/// evidence on the run's snapshot (ADR 0022: every verification run
+/// refreshes the tests it ran). The newest record is looked up again: a
+/// candidate ahead in the window may have stored one since selection.
+fn store_coverage(
+    index: &dyn EvidenceIndex,
+    history: Vec<SnapshotId>,
+    toolchain: hord_core::ObjectId,
+    mut run: hord_verify_rust::CoverageRun,
+    actor: hord_core::Actor,
+) -> hord_verify::Result<hord_core::ObjectId> {
+    if let Some((_, ledger)) = hord_verify::find_coverage(index, history, toolchain)? {
+        run.record = ledger.merge(&run.record);
+    }
+    hord_verify_rust::coverage::record_evidence(&run, index, actor)
 }
 
 // ------------------------------------------------------------ policy
@@ -524,31 +807,7 @@ impl Inner {
         let mut facts = hord_verify::ChangeFacts::default();
         for delta in self.changed_paths(from, to)? {
             let path = delta.path;
-            let side = |snapshot| -> Result<Option<(Vec<u8>, Vec<hord_verify::Definition>)>> {
-                let Some(view) = self.file_view(snapshot, &path)? else {
-                    return Ok(None);
-                };
-                let defs = match &view.parsed {
-                    Some(parsed) if parsed.lang.as_str() == hord_lang_rust::LANG => {
-                        match self.adapter_for(&path, parsed.lang) {
-                            Some(adapter) => definitions(adapter, &path, &parsed.tree)
-                                .into_iter()
-                                .map(|d| hord_verify::Definition {
-                                    node: d.node,
-                                    path: d.path,
-                                    kind: d.kind,
-                                    name: d.name,
-                                    span: d.span,
-                                    parent: d.parent,
-                                })
-                                .collect(),
-                            None => return Ok(None),
-                        }
-                    }
-                    _ => return Ok(None),
-                };
-                Ok(Some((view.bytes.as_slice().to_vec(), defs)))
-            };
+            let side = |snapshot| self.rust_definitions(snapshot, &path);
             let rust = path.components().last().is_some_and(|n| n.ends_with(".rs"));
             let (older, newer) = if rust {
                 (side(from)?, side(to)?)
@@ -568,6 +827,126 @@ impl Inner {
             hord_verify_rust::diff_rust_file(&mut facts, &path, version(&older), version(&newer));
         }
         Ok(facts)
+    }
+
+    /// A Rust file of `snapshot` with its definitions; `None` when absent,
+    /// not parsed as Rust, or no adapter claims it.
+    fn rust_definitions(
+        &self,
+        snapshot: SnapshotId,
+        path: &RepoPath,
+    ) -> Result<Option<(Vec<u8>, Vec<hord_verify::Definition>)>> {
+        let Some(view) = self.file_view(snapshot, path)? else {
+            return Ok(None);
+        };
+        let Some(parsed) = &view.parsed else {
+            return Ok(None);
+        };
+        if parsed.lang.as_str() != hord_lang_rust::LANG {
+            return Ok(None);
+        }
+        let Some(adapter) = self.adapter_for(path, parsed.lang) else {
+            return Ok(None);
+        };
+        let defs = definitions(adapter, path, &parsed.tree)
+            .into_iter()
+            .map(|d| hord_verify::Definition {
+                node: d.node,
+                path: d.path,
+                kind: d.kind,
+                name: d.name,
+                span: d.span,
+                parent: d.parent,
+            })
+            .collect();
+        Ok(Some((view.bytes.as_slice().to_vec(), defs)))
+    }
+
+    /// The definitions of every Rust file of `snapshot`, to attribute
+    /// coverage to. The last index built is kept and brought to the next
+    /// snapshot by the files that differ.
+    pub(crate) fn definition_index(&self, snapshot: SnapshotId) -> Result<Arc<DefinitionIndex>> {
+        let cached = lock(&self.definition_index).clone();
+        let index = match cached {
+            Some((at, index)) if at == snapshot => return Ok(index),
+            Some((at, index)) => {
+                let mut index = index.as_ref().clone();
+                for delta in self.changed_paths(at, snapshot)? {
+                    match self.rust_definitions(snapshot, &delta.path)? {
+                        Some((bytes, defs)) => index.set_file(&delta.path, &bytes, &defs),
+                        None => index.remove_file(&delta.path),
+                    }
+                }
+                index
+            }
+            None => {
+                let mut index = DefinitionIndex::new();
+                for (path, _) in self.list_files(snapshot)? {
+                    if !path.components().last().is_some_and(|n| n.ends_with(".rs")) {
+                        continue;
+                    }
+                    if let Some((bytes, defs)) = self.rust_definitions(snapshot, &path)? {
+                        index.add_file(&path, &bytes, &defs);
+                    }
+                }
+                index
+            }
+        };
+        let index = Arc::new(index);
+        *lock(&self.definition_index) = Some((snapshot, Arc::clone(&index)));
+        Ok(index)
+    }
+
+    /// The landed changes up to `base`, then `pending` (changes ahead in
+    /// the speculative window, not landed yet), each with its write set
+    /// (ADR 0022: per-test coverage freshness). The chain holds at most
+    /// [`MAX_DRIFT_STEPS`] landings; a test whose coverage is older is
+    /// treated as stale.
+    pub(crate) fn drift(
+        &self,
+        base: SnapshotId,
+        pending: &[(SnapshotId, BTreeSet<NodeId>)],
+    ) -> Result<Drift> {
+        let chain = self.landed_chain()?;
+        let mut steps: &[LandedStep] = &chain;
+        // A base behind head (a workspace's): the chain up to it.
+        if let Some(at) = steps.iter().rposition(|(_, result, _)| *result == base) {
+            steps = &steps[..=at];
+        } else if let Some(at) = steps.iter().position(|(from, _, _)| *from == base) {
+            steps = &steps[..at];
+        }
+        let mut drift = Drift::new(steps.first().map_or(base, |(from, _, _)| *from));
+        for (_, result, written) in steps {
+            drift.push(*result, written.as_ref().clone());
+        }
+        for (result, written) in pending {
+            drift.push(*result, written.clone());
+        }
+        Ok(drift)
+    }
+
+    /// `(base, result, write set)` of the latest landings, oldest first,
+    /// brought up to date with the landing log.
+    fn landed_chain(&self) -> Result<Vec<LandedStep>> {
+        let mut chain = lock(&self.landed_chain);
+        let len = self.store.log_len()?;
+        if len < chain.seen {
+            *chain = LandedChain::default();
+        }
+        let start = chain.seen.max(len.saturating_sub(MAX_DRIFT_STEPS));
+        for change in self.store.log_since(start)? {
+            let record = self.change_record(change)?;
+            chain.steps.push_back((
+                record.base,
+                record.result,
+                Arc::new(record.write_set.iter().copied().collect()),
+            ));
+            if chain.steps.len() > MAX_DRIFT_STEPS {
+                chain.steps.pop_front();
+            }
+        }
+        chain.seen = len;
+        Ok(chain.steps.iter().cloned().collect())
     }
 
     /// Landed results, newest first, then `first` ahead of them: where to
@@ -630,6 +1009,22 @@ fn definition_facts(
         }
     }
     out.into_iter().map(Option::unwrap_or_default).collect()
+}
+
+/// Landings a [`Drift`] chain reaches back (ADR 0022). Coverage taken
+/// before them selects its test again.
+pub(crate) const MAX_DRIFT_STEPS: usize = 1024;
+
+/// One landing: `(base, result, write set)`.
+pub(crate) type LandedStep = (SnapshotId, SnapshotId, Arc<BTreeSet<NodeId>>);
+
+/// The latest landings' write sets, cached from the landing log.
+#[derive(Debug, Default)]
+pub(crate) struct LandedChain {
+    /// Log entries read.
+    seen: usize,
+    /// `(base, result, write set)`, oldest first.
+    steps: std::collections::VecDeque<LandedStep>,
 }
 
 // ------------------------------------------------------------ checkouts
@@ -755,6 +1150,10 @@ pub(crate) struct CandidateContext {
     /// Coverage search order; empty: the landing base, then landed results
     /// newest first.
     pub history: Vec<SnapshotId>,
+    /// Candidates ahead in the speculative window, oldest first: the
+    /// snapshot each will land as and its write set (the drift between
+    /// head and this candidate's base).
+    pub pending: Vec<(SnapshotId, BTreeSet<NodeId>)>,
     /// Emit `Verifying` events (the lander) or record the plan.
     pub emit: bool,
     pub plan: Mutex<Option<VerifyPlan>>,
@@ -769,18 +1168,28 @@ fn verify_err(err: Error) -> hord_verify::Error {
 }
 
 impl VerifyContext for CandidateContext {
-    fn impact(
-        &self,
-        bound: ImpactBound,
-        since: Option<SnapshotId>,
-    ) -> hord_verify::Result<ImpactSet> {
+    fn impact(&self, bound: ImpactBound) -> hord_verify::Result<ImpactSet> {
         let facts = self
             .inner
-            .verify_facts(since.unwrap_or(self.record.base), self.record.result)
+            .verify_facts(self.record.base, self.record.result)
             .map_err(verify_err)?;
         let graph = crate::graph::SnapshotGraph::new(&self.inner, self.record.result)
             .map_err(verify_err)?;
-        hord_verify::impact_set(&graph, &self.record.write_set, bound, facts)
+        hord_verify::impact_set_attributable(&graph, &self.record.write_set, bound, facts)
+    }
+
+    fn drift(&self) -> hord_verify::Result<Option<Arc<Drift>>> {
+        let drift = self
+            .inner
+            .drift(self.record.base, &self.pending)
+            .map_err(verify_err)?;
+        Ok(Some(Arc::new(drift)))
+    }
+
+    fn definitions(&self) -> hord_verify::Result<Arc<DefinitionIndex>> {
+        self.inner
+            .definition_index(self.record.result)
+            .map_err(verify_err)
     }
 
     fn checkout(&self) -> hord_verify::Result<Checkout> {
@@ -954,6 +1363,7 @@ impl crate::Repo {
             change: proposal.change,
             record: Arc::clone(&record),
             history: Vec::new(),
+            pending: Vec::new(),
             emit: false,
             plan: Mutex::new(None),
             slot: Mutex::new(None),
