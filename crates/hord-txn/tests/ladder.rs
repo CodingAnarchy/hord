@@ -15,11 +15,15 @@ use hord_api::proto::event::Kind;
 use hord_core::sign::SigningKey;
 use hord_core::{Bytes, ChangeId};
 use hord_txn::{
-    Arbiter, Arbitration, CommandHarness, QueueEntry, QueueStatus, ReplayFuture, ReplayHarness,
-    ReplayOutcome, Repo, RepoOptions, StubVerifier, Verdict, Verifier, VerifyFuture, VerifyRequest,
+    Arbiter, Arbitration, QueueEntry, QueueStatus, ReplayFuture, ReplayHarness, ReplayOutcome,
+    Repo, RepoOptions, StubVerifier, Verdict, Verifier, VerifyFuture, VerifyRequest,
     sign_arbitration, verify_arbitration,
 };
 use tokio_stream::StreamExt;
+
+// Only the Unix-only harness test starts a real command.
+#[cfg(unix)]
+use hord_txn::CommandHarness;
 
 /// One scripted harness answer.
 #[derive(Clone, Debug)]
