@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -278,6 +279,29 @@ pub(crate) fn now() -> Timestamp {
 /// On Unix the command runs in its own process group and a kill takes the
 /// whole group, so a hung grandchild (a test binary under `cargo test`)
 /// dies too instead of holding the pipes open.
+/// How long the output readers get after the command exits or is killed.
+/// A descendant that escaped the kill (on Windows, one whose parent chain
+/// `taskkill /T` cannot follow) can hold the pipes open indefinitely; the
+/// run keeps what was read by then instead of waiting for it.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+/// Output read from one of the command's pipes, on its own thread.
+struct PipeReader {
+    buf: Arc<Mutex<Vec<u8>>>,
+    finished: Receiver<()>,
+}
+
+impl PipeReader {
+    /// The output, once the pipe closes or `deadline` passes.
+    fn collect(self, deadline: Instant) -> String {
+        let _ = self
+            .finished
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let buf = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
 pub(crate) fn run_captured(
     mut cmd: Command,
     timeout: Option<Duration>,
@@ -289,20 +313,26 @@ pub(crate) fn run_captured(
     let mut child = cmd.spawn()?;
     let last_output = Arc::new(AtomicU64::new(0));
     let reader = |pipe: Option<Box<dyn Read + Send>>, last: Arc<AtomicU64>| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = mpsc::channel();
+        let shared = Arc::clone(&buf);
         thread::spawn(move || {
-            let mut buf = Vec::new();
             if let Some(mut p) = pipe {
                 let mut chunk = [0u8; 8192];
                 while let Ok(n) = p.read(&mut chunk) {
                     if n == 0 {
                         break;
                     }
-                    buf.extend_from_slice(&chunk[..n]);
+                    shared
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend_from_slice(&chunk[..n]);
                     last.store(millis(start.elapsed()), Ordering::Relaxed);
                 }
             }
-            buf
-        })
+            let _ = done.send(());
+        });
+        PipeReader { buf, finished }
     };
     let out_reader = reader(
         child
@@ -339,8 +369,9 @@ pub(crate) fn run_captured(
         #[cfg(unix)]
         signal_group(child.id());
     }
-    let stdout = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
+    let drained = Instant::now() + PIPE_GRACE;
+    let stdout = out_reader.collect(drained);
+    let stderr = err_reader.collect(drained);
     let report = TestReport::parse(&stdout);
     let code = if timed_out { None } else { status.code() };
     let build_failed = code != Some(0)
