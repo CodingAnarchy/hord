@@ -677,6 +677,7 @@ async fn evidence(backend: &dyn RepoBackend, fx: &Fixture, b: ObjectId) -> Outco
         cost_ms: 0,
         produced_by: actor(),
         produced_at: Timestamp::from_millis(2),
+        signature: None,
     };
     let good = hord_encoding::encode(&make(*fx.snapshots.get(&b).check("b's snapshot")?))
         .check("encode")?;

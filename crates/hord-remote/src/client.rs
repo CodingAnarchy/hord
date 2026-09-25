@@ -42,6 +42,17 @@ impl RemoteRepo {
         Ok(Self::from_transport(Transport::new(channel, prefix), url))
     }
 
+    /// Connect to `url` as [`Self::connect`] does, sending `token` as a
+    /// bearer token on every call (spec §10.5.4).
+    pub async fn connect_with_token(url: &str, token: &str) -> Result<Self, Error> {
+        let remote = Self::connect(url).await?;
+        let transport = remote
+            .transport
+            .with_token(token)
+            .ok_or(Error::InvalidToken)?;
+        Ok(Self::from_transport(transport, url))
+    }
+
     /// Connect to the daemon serving the repository at `repo_root` on its
     /// local endpoint ([`hord_api::local::endpoint`], ADR 0021).
     pub async fn connect_local(repo_root: &Path) -> Result<Self, Error> {
@@ -77,6 +88,12 @@ impl RemoteRepo {
             handle: tokio::runtime::Handle::current(),
             address: Arc::from(address),
         }
+    }
+
+    /// The `Auth` service on the same connection (spec §10.5.4).
+    #[must_use]
+    pub fn auth(&self) -> crate::RemoteAuth {
+        crate::RemoteAuth::new(self.transport.clone())
     }
 
     /// The `Workspaces` service on the same connection: served by a

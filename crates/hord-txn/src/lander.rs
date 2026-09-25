@@ -981,6 +981,7 @@ impl Inner {
                 harness: "hord-txn".into(),
             },
             produced_at: record.provenance.created_at,
+            signature: None,
         }
     }
 

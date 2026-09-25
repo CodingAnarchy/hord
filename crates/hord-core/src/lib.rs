@@ -22,6 +22,7 @@ mod identity;
 mod intern;
 mod node;
 mod policy;
+pub mod sign;
 mod snapshot;
 mod tree;
 

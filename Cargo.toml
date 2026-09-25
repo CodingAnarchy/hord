@@ -33,6 +33,7 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = "0.6"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
 async-trait = "0.1"
 blake3 = "1"
@@ -40,6 +41,8 @@ bytes = "1"
 cbor2 = "1.1"
 clap = { version = "4", features = ["derive"] }
 diffy = "0.4"
+ed25519-dalek = { version = "3", features = ["pem"] }
+getrandom = "0.4"
 gix = "0.87"
 globset = "0.4"
 hex = "0.4"
