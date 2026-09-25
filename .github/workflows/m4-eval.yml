@@ -88,8 +88,8 @@ jobs:
       - &corpus-setup
         name: prepare /mnt, toolchain, corpus
         run: |
-          sudo mkdir -p /mnt/corpora /mnt/m4
-          sudo chown -R "$USER" /mnt/corpora /mnt/m4
+          sudo mkdir -p /mnt/corpora /mnt/m4 /mnt/bin
+          sudo chown -R "$USER" /mnt/corpora /mnt/m4 /mnt/bin
           rustup toolchain install stable --profile minimal --component llvm-tools-preview
           rustup default stable
       - &corpus-cache
