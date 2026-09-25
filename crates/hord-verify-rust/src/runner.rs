@@ -232,12 +232,7 @@ fn millis(d: Duration) -> u64 {
 /// grandchild cannot keep holding the output pipes.
 fn kill_group(child: &mut std::process::Child) {
     #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-9", &format!("-{}", child.id())])
-            .stderr(Stdio::null())
-            .status();
-    }
+    signal_group(child.id());
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
@@ -247,6 +242,26 @@ fn kill_group(child: &mut std::process::Child) {
             .status();
     }
     let _ = child.kill();
+}
+
+/// `kill` arguments that send SIGKILL to the process group `pgid`.
+///
+/// The `--` is required: without it, Linux's `kill` (procps) parses
+/// `-2844` as options and signals process group `2`, and a PID starting
+/// with `1` becomes `kill(-1, SIGKILL)`, which kills every process the
+/// user owns. On CI that killed the GitHub runner itself.
+#[cfg(unix)]
+fn group_kill_args(pgid: u32) -> [String; 3] {
+    ["-9".to_owned(), "--".to_owned(), format!("-{pgid}")]
+}
+
+/// SIGKILL the process group `pgid` (a child spawned as a group leader).
+#[cfg(unix)]
+fn signal_group(pgid: u32) {
+    let _ = Command::new("kill")
+        .args(group_kill_args(pgid))
+        .stderr(Stdio::null())
+        .status();
 }
 
 pub(crate) fn now() -> Timestamp {
@@ -322,12 +337,7 @@ pub(crate) fn run_captured(
     // holds the pipes.
     if !timed_out {
         #[cfg(unix)]
-        {
-            let _ = Command::new("kill")
-                .args(["-9", &format!("-{}", child.id())])
-                .stderr(Stdio::null())
-                .status();
-        }
+        signal_group(child.id());
     }
     let stdout = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned();
     let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
@@ -453,5 +463,22 @@ mod tests {
         let tc = detect_toolchain(Path::new(env!("CARGO_MANIFEST_DIR"))).expect("detect toolchain");
         assert!(tc.components["rustc"].starts_with("rustc "));
         assert!(tc.components["cargo"].starts_with("cargo "));
+    }
+
+    /// Regression: without `--`, procps `kill -9 -12345` signalled group 1,
+    /// that is every process the user owns, and killed the CI runner.
+    #[cfg(unix)]
+    #[test]
+    fn group_kill_separates_the_negative_pgid_from_options() {
+        assert_eq!(group_kill_args(12345), ["-9", "--", "-12345"]);
+        // A real group dies and nothing else is signalled.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30 & wait"]);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().expect("spawn a process group");
+        std::thread::sleep(Duration::from_millis(200));
+        signal_group(child.id());
+        let status = child.wait().expect("wait for the killed group leader");
+        assert!(!status.success(), "the group leader was killed");
     }
 }
