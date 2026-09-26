@@ -69,6 +69,7 @@ The daemon follows the repository's event stream and exports each landing when i
    # The mirror: a git URL, with no credentials in it.
    remote = "https://github.com/owner/hord.git"
    # The GitHub token (step 1). Used for git over HTTPS and the REST API.
+   # A relative path is relative to this file.
    token_file = "/etc/hord/github-token"
    # Pull request polling, in seconds (default 60).
    poll_secs = 60

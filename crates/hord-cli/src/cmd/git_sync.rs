@@ -5,7 +5,8 @@
 //!
 //! ```toml
 //! remote = "https://github.com/owner/hord.git"  # the mirror; no credentials
-//! token_file = "/etc/hord/github-token"         # outside the repository
+//! token_file = "/etc/hord/github-token"         # outside the repository;
+//!                                               # relative to this file
 //! poll_secs = 60                                # pull request polling
 //! check_secs = 3600                             # divergence checks
 //! work_dir = "/var/lib/hord/bridge"             # default .hord/bridge
@@ -96,7 +97,7 @@ pub fn run(
     let config: Config = toml::from_str(&text)
         .with_context(|| format!("parse the bridge config {}", config_path.display()))?;
     let token = match &config.token_file {
-        Some(file) => Some(read_token(file, root.as_deref())?),
+        Some(file) => Some(read_token(&beside(&config_path, file), root.as_deref())?),
         None => None,
     };
     let work_dir = match (&config.work_dir, &root) {
@@ -231,6 +232,15 @@ fn backend(
     }
 }
 
+/// `file` as the config at `config` names it: a relative path is relative
+/// to the config file's directory, not to wherever the bridge was started.
+fn beside(config: &Path, file: &Path) -> PathBuf {
+    match config.parent() {
+        Some(dir) if file.is_relative() => dir.join(file),
+        _ => file.to_owned(),
+    }
+}
+
 /// The token in `file`, which must not be in the repository's tracked
 /// tree (ADR 0036: the token is the host's, never the repository's).
 fn read_token(file: &Path, root: Option<&Path>) -> Result<String> {
@@ -318,4 +328,22 @@ fn print_report(json: bool, report: &SyncReport) -> Result<()> {
         println!("{verdict}: {}", check.detail);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::beside;
+
+    #[test]
+    fn a_relative_token_file_is_beside_the_config() {
+        let config = Path::new("/etc/hord/bridge.toml");
+        assert_eq!(
+            beside(config, Path::new("github-token")),
+            PathBuf::from("/etc/hord/github-token")
+        );
+        let absolute = std::env::temp_dir().join("token");
+        assert_eq!(beside(config, &absolute), absolute);
+    }
 }
