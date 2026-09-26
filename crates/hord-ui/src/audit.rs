@@ -218,15 +218,24 @@ impl<T: ChangesBackend + ?Sized> ChangesBackend for Audited<T> {
         audited!(self, "hord.v1.Changes/GetRecording", get_recording, request)
     }
 
-    async fn node_lineage(&self, request: proto::NodeLineageRequest) -> ApiResult<proto::NodeLineageResponse> {
+    async fn node_lineage(
+        &self,
+        request: proto::NodeLineageRequest,
+    ) -> ApiResult<proto::NodeLineageResponse> {
         audited!(self, "hord.v1.Changes/NodeLineage", node_lineage, request)
     }
 
-    async fn change_trace(&self, request: proto::ChangeTraceRequest) -> ApiResult<proto::ChangeTraceResponse> {
+    async fn change_trace(
+        &self,
+        request: proto::ChangeTraceRequest,
+    ) -> ApiResult<proto::ChangeTraceResponse> {
         audited!(self, "hord.v1.Changes/ChangeTrace", change_trace, request)
     }
 
-    async fn list_tree(&self, request: proto::ListTreeRequest) -> ApiResult<proto::ListTreeResponse> {
+    async fn list_tree(
+        &self,
+        request: proto::ListTreeRequest,
+    ) -> ApiResult<proto::ListTreeResponse> {
         audited!(self, "hord.v1.Changes/ListTree", list_tree, request)
     }
 
@@ -234,7 +243,10 @@ impl<T: ChangesBackend + ?Sized> ChangesBackend for Audited<T> {
         audited!(self, "hord.v1.Changes/GetFile", get_file, request)
     }
 
-    async fn node_edges(&self, request: proto::NodeEdgesRequest) -> ApiResult<proto::NodeEdgesResponse> {
+    async fn node_edges(
+        &self,
+        request: proto::NodeEdgesRequest,
+    ) -> ApiResult<proto::NodeEdgesResponse> {
         audited!(self, "hord.v1.Changes/NodeEdges", node_edges, request)
     }
 }

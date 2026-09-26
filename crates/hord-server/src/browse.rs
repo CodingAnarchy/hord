@@ -409,10 +409,7 @@ fn trace_steps(
     landed: Option<&proto::ChangeView>,
 ) -> Vec<proto::TraceStep> {
     let mut steps = Vec::new();
-    let created = submitted
-        .provenance
-        .as_ref()
-        .map_or(0, |p| p.created_at_ms);
+    let created = submitted.provenance.as_ref().map_or(0, |p| p.created_at_ms);
     let intent = submitted.intent.clone().unwrap_or_default();
     steps.push(proto::TraceStep {
         at_ms: created,
@@ -452,7 +449,11 @@ fn trace_steps(
         match kind_of(envelope) {
             Some(Kind::Submitted(s)) => {
                 step.stage = proto::TraceStage::Submitted.into();
-                step.text = format!("submitted as #{} by {}", s.submission, actor_label(s.actor.as_ref()));
+                step.text = format!(
+                    "submitted as #{} by {}",
+                    s.submission,
+                    actor_label(s.actor.as_ref())
+                );
                 step.change = Some(s.change.clone());
             }
             Some(Kind::ConflictCheck(c)) => {
@@ -488,7 +489,8 @@ fn trace_steps(
             Some(Kind::EvidenceAttached(_) | Kind::HeadMoved(_)) | None => continue,
             Some(Kind::Replaying(r)) => {
                 step.stage = proto::TraceStage::Replay.into();
-                let attempt = escalation.and_then(|e| e.attempts.iter().find(|a| a.attempt == r.attempt));
+                let attempt =
+                    escalation.and_then(|e| e.attempts.iter().find(|a| a.attempt == r.attempt));
                 step.text = match attempt {
                     Some(a) => {
                         let mut spent = vec![format!("{:.1}s", a.elapsed_ms as f64 / 1000.0)];
@@ -504,8 +506,9 @@ fn trace_steps(
                         step.change = a.change.clone();
                         step.outcome = match a.outcome() {
                             proto::ReplayOutcome::Proposed => Some("pass".into()),
-                            proto::ReplayOutcome::Running
-                            | proto::ReplayOutcome::Unspecified => None,
+                            proto::ReplayOutcome::Running | proto::ReplayOutcome::Unspecified => {
+                                None
+                            }
                             _ => Some("fail".into()),
                         };
                         let note = a

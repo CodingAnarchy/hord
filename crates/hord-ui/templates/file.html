@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<h1><a href="{{ base }}/tree/{{ snapshot }}">/</a>{% for c in crumbs %}{% if loop.last %}{{ c.name }}{% else %}<a href="{{ base }}/tree/{{ snapshot }}?path={{ c.path }}">{{ c.name }}</a>/{% endif %}{% endfor %}</h1>
+<p class="legend">snapshot <code>{{ snapshot }}</code> · blob <code>{{ blob }}</code> · {{ size }} bytes</p>
+<div class="browse">
+<section class="defs">
+  <h2>Definitions</h2>
+  <ul class="defs">
+  {% for d in definitions %}<li style="padding-left: {{ d.depth }}em"><a href="#L{{ d.start }}">{{ d.node.label }}</a> <small>{{ d.kind }} · {{ d.start }}–{{ d.end }}</small> <a href="{{ base }}/graph/{{ snapshot }}/{{ d.node.id }}">graph</a> <a href="{{ base }}/nodes/{{ d.node.id }}">lineage</a></li>
+  {% else %}<li>No definitions: no adapter parses this file.</li>
+  {% endfor %}
+  </ul>
+</section>
+<section class="source">
+{% if binary %}<p>Binary file, not shown.</p>{% else %}
+<table class="source"><tbody>
+{% for l in lines %}<tr id="L{{ l.number }}"><td class="ln">{{ l.number }}</td><td><code>{{ l.text }}</code></td></tr>
+{% endfor %}
+</tbody></table>{% endif %}
+</section>
+</div>
+{% endblock %}

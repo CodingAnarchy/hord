@@ -44,8 +44,10 @@ pub trait ChangesBackend: Send + Sync {
     ) -> ApiResult<proto::ChangeTraceResponse>;
     /// One directory of a snapshot. A path with nothing under it is
     /// [`crate::ApiError::NotFound`].
-    async fn list_tree(&self, request: proto::ListTreeRequest)
-    -> ApiResult<proto::ListTreeResponse>;
+    async fn list_tree(
+        &self,
+        request: proto::ListTreeRequest,
+    ) -> ApiResult<proto::ListTreeResponse>;
     /// One file of a snapshot. A missing file is
     /// [`crate::ApiError::NotFound`].
     async fn get_file(&self, request: proto::GetFileRequest) -> ApiResult<proto::GetFileResponse>;

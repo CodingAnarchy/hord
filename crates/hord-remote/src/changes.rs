@@ -51,15 +51,24 @@ impl ChangesBackend for RemoteChanges {
         call!(self, get_recording, request)
     }
 
-    async fn node_lineage(&self, request: proto::NodeLineageRequest) -> ApiResult<proto::NodeLineageResponse> {
+    async fn node_lineage(
+        &self,
+        request: proto::NodeLineageRequest,
+    ) -> ApiResult<proto::NodeLineageResponse> {
         call!(self, node_lineage, request)
     }
 
-    async fn change_trace(&self, request: proto::ChangeTraceRequest) -> ApiResult<proto::ChangeTraceResponse> {
+    async fn change_trace(
+        &self,
+        request: proto::ChangeTraceRequest,
+    ) -> ApiResult<proto::ChangeTraceResponse> {
         call!(self, change_trace, request)
     }
 
-    async fn list_tree(&self, request: proto::ListTreeRequest) -> ApiResult<proto::ListTreeResponse> {
+    async fn list_tree(
+        &self,
+        request: proto::ListTreeRequest,
+    ) -> ApiResult<proto::ListTreeResponse> {
         call!(self, list_tree, request)
     }
 
@@ -67,7 +76,10 @@ impl ChangesBackend for RemoteChanges {
         call!(self, get_file, request)
     }
 
-    async fn node_edges(&self, request: proto::NodeEdgesRequest) -> ApiResult<proto::NodeEdgesResponse> {
+    async fn node_edges(
+        &self,
+        request: proto::NodeEdgesRequest,
+    ) -> ApiResult<proto::NodeEdgesResponse> {
         call!(self, node_edges, request)
     }
 }

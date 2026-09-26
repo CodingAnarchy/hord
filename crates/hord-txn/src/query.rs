@@ -110,7 +110,10 @@ impl Query {
         snapshot: SnapshotId,
         nodes: BTreeSet<NodeId>,
     ) -> Result<BTreeMap<NodeId, DefinitionInfo>> {
-        blocking(&self.repo.inner, move |inner| inner.locate(snapshot, &nodes)).await
+        blocking(&self.repo.inner, move |inner| {
+            inner.locate(snapshot, &nodes)
+        })
+        .await
     }
 
     /// `References(x, node)` in `snapshot`: the definitions that name
@@ -375,7 +378,7 @@ impl Inner {
         let def = Definition {
             node: def.node,
             path: def.path.clone(),
-            kind: def.kind.clone(),
+            kind: def.kind,
             name: def.name.clone(),
             span: def.span.clone(),
             parent: def.parent,
@@ -391,7 +394,8 @@ impl Inner {
             None => false,
         };
         // The adapter heuristic: a test names what it tests.
-        let dependents: BTreeSet<NodeId> = self.referenced_by(snapshot, node)?.into_iter().collect();
+        let dependents: BTreeSet<NodeId> =
+            self.referenced_by(snapshot, node)?.into_iter().collect();
         for (id, def) in self.locate(snapshot, &dependents)? {
             if self.is_test(snapshot, &def)? {
                 out.tested_by.insert(id);
@@ -408,8 +412,8 @@ impl Inner {
         // Observed edges: the newest coverage record on this snapshot or an
         // older landed one (ADR 0022).
         let history = self.snapshot_history(snapshot, COVERAGE_HISTORY)?;
-        if let Some((_, record)) = newest_coverage(&self.store, history, None)
-            .map_err(|e| Error::Verify(e.to_string()))?
+        if let Some((_, record)) =
+            newest_coverage(&self.store, history, None).map_err(|e| Error::Verify(e.to_string()))?
         {
             for t in &record.tests {
                 if t.node == Some(node) {
