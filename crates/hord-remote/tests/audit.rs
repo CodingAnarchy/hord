@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hord_api::auth::Scope;
+use hord_api::bridge::sign_bridge_check;
 use hord_api::proto::{AuditCriterion, AuditOrigin};
 use hord_api::{AuditBackend, RepoBackend, proto, wire};
 use hord_core::sign::{self, SigningKey};
@@ -420,7 +421,7 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
         key: SigningKey::from_pem(&ci.private_key_pem)?,
     };
 
-    let check = |diverged: bool| proto::BridgeChecked {
+    let unsigned = |diverged: bool| proto::BridgeChecked {
         remote: "file:///mirror.git".into(),
         diverged,
         expected: Some("e".repeat(40)),
@@ -428,8 +429,16 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
         trigger: proto::BridgeCheckTrigger::Hourly.into(),
         detail: if diverged { "diverged" } else { "in sync" }.into(),
         head: None,
-        recorder: Some(bridge.key_id.clone()),
+        recorder: None,
+        signature: None,
     };
+    let signed_by = |key: &SigningKey, diverged: bool| -> TestResult<proto::BridgeChecked> {
+        let mut check = unsigned(diverged);
+        sign_bridge_check(&mut check, key)?;
+        Ok(check)
+    };
+    let bridge_signing = SigningKey::from_pem(&bridge.private_key_pem)?;
+    let check = |diverged: bool| signed_by(&bridge_signing, diverged);
 
     // A signed agent change, and a pull request the bridge vouches for.
     let bot_actor = Actor::Agent {
@@ -448,7 +457,7 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     .await?;
     sign::sign_change(&mut signed, &bot_key)?;
     let signed = land(&bot_remote, &ci, &signed).await?;
-    bridge_remote.record_bridge_check(check(false)).await?;
+    bridge_remote.record_bridge_check(check(false)?).await?;
 
     let mut vouched = propose(
         &bridge_remote,
@@ -468,7 +477,7 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
 
     // More checks, all passing, well inside the gap.
     for _ in 0..3 {
-        bridge_remote.record_bridge_check(check(false)).await?;
+        bridge_remote.record_bridge_check(check(false)?).await?;
     }
     let steady_until = now_ms()? + 1;
     let audit_window = |until_ms: u64| proto::AuditRequest {
@@ -495,7 +504,7 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     );
 
     // A diverged check fails, on its own.
-    bridge_remote.record_bridge_check(check(true)).await?;
+    bridge_remote.record_bridge_check(check(true)?).await?;
     let now = now_ms()? + 1;
     let report = root.audit().audit_log(audit_window(now)).await?;
     let criteria: Vec<AuditCriterion> = report.violations.iter().map(|v| v.criterion()).collect();
@@ -520,27 +529,30 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     assert!(report.violations[0].detail.contains(&"d".repeat(40)));
     assert_eq!(report.bridge.unwrap_or_default().diverged, 1);
 
-    // With tokens, a check names its recorder: the bridge's own key
-    // (ADR 0038).
-    let unnamed = bridge_remote
-        .record_bridge_check(proto::BridgeChecked {
-            recorder: None,
-            ..check(false)
-        })
-        .await;
-    assert!(
-        matches!(unnamed, Err(hord_api::ApiError::InvalidArgument(_))),
-        "{unnamed:?}"
+    // With tokens, a check is signed by its recorder, the bridge's own key
+    // (ADR 0038 as amended).
+    let refused = |result: Result<proto::RecordBridgeCheckResponse, hord_api::ApiError>| {
+        assert!(
+            matches!(result, Err(hord_api::ApiError::PermissionDenied(_))),
+            "{result:?}"
+        );
+    };
+    refused(bridge_remote.record_bridge_check(unsigned(false)).await);
+    // Signed by another actor's key.
+    let bot_signing = SigningKey::from_pem(&bot.private_key_pem)?;
+    refused(
+        bridge_remote
+            .record_bridge_check(signed_by(&bot_signing, false)?)
+            .await,
     );
-    let borrowed = bridge_remote
-        .record_bridge_check(proto::BridgeChecked {
-            recorder: Some(bot.key_id.clone()),
-            ..check(false)
-        })
-        .await;
-    assert!(
-        matches!(borrowed, Err(hord_api::ApiError::PermissionDenied(_))),
-        "{borrowed:?}"
+    // Signed by the bridge, but naming another recorder.
+    refused(
+        bridge_remote
+            .record_bridge_check(proto::BridgeChecked {
+                recorder: Some(bot.key_id.clone()),
+                ..check(false)?
+            })
+            .await,
     );
 
     // Release the store before the directory is removed.
@@ -549,23 +561,27 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     serving.await??;
 
     // Where no token is checked (the local endpoint), a check can name any
-    // key; the audit counts only those by a key bound to a bridge token.
+    // key, even the bridge's; the audit counts only checks signed by a key
+    // bound to a bridge token.
     let local = LocalRepo::without_lander(Repo::open(&repo_dir).await?);
     local
         .record_bridge_check(proto::BridgeChecked {
-            recorder: Some(bot.key_id.clone()),
-            ..check(false)
+            recorder: Some(bridge.key_id.clone()),
+            ..unsigned(false)
         })
+        .await?;
+    local
+        .record_bridge_check(signed_by(&bot_signing, false)?)
         .await?;
     let audit = LocalAudit::new(Arc::new(local), Some(Arc::new(AuthStore::open(&auth)?)));
     let report = audit.audit_log(audit_window(now_ms()? + 1)).await?;
     let bridge_report = report.bridge.unwrap_or_default();
-    assert_eq!(bridge_report.checks, 5, "the bot's check is not counted");
+    assert_eq!(bridge_report.checks, 5, "neither forged check is counted");
     assert!(
         report
             .notes
             .iter()
-            .any(|n| n.detail.starts_with("1 bridge check(s)")),
+            .any(|n| n.detail.starts_with("2 bridge check(s)")),
         "{:#?}",
         report.notes
     );

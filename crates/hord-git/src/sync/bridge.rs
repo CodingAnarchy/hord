@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hord_api::bridge::sign_bridge_check;
 use hord_api::proto::event::Kind;
 use hord_api::proto::{BridgeCheckTrigger, QueueStatus};
 use hord_api::{ApiError, EventStream, RepoBackend, proto, wire};
+use hord_core::sign::SigningKey;
 use hord_core::{ChangeId, Intent, IntentRef};
 use tokio::fs;
 use tokio::runtime::Handle;
@@ -49,6 +51,10 @@ pub struct BridgeOptions {
     /// request's proposal (ADR 0037). Unset against a repository without
     /// auth.
     pub voucher: Option<String>,
+    /// The bridge's signing key (the key of its login, whose id is
+    /// [`Self::voucher`]): it signs every divergence check it records
+    /// (ADR 0038). Unset against a repository without auth.
+    pub signer: Option<Arc<SigningKey>>,
     /// How often pull requests are polled.
     pub poll: Duration,
     /// How often `main` is checked for divergence (ADR 0036: hourly).
@@ -69,6 +75,7 @@ impl fmt::Debug for BridgeOptions {
             .field("token", &self.token.as_ref().map(|_| "…"))
             .field("work_dir", &self.work_dir)
             .field("voucher", &self.voucher)
+            .field("signer", &self.signer.as_ref().map(|k| k.public().key_id()))
             .field("poll", &self.poll)
             .field("check_every", &self.check_every)
             .field("shared", &self.shared)
@@ -91,6 +98,7 @@ impl BridgeOptions {
             check_every: Duration::from_secs(60 * 60),
             shared: false,
             insecure: false,
+            signer: None,
         }
     }
 }
@@ -451,7 +459,7 @@ impl Bridge {
                 }
             }
         };
-        let event = proto::BridgeChecked {
+        let mut event = proto::BridgeChecked {
             remote: self.mirror.display_url(),
             diverged,
             expected: expected.map(|c| c.to_string()),
@@ -459,10 +467,17 @@ impl Bridge {
             trigger: trigger.into(),
             detail: detail.clone(),
             head: head.map(wire::id),
-            // The bridge's key vouches for the check, as for its pull
-            // requests (ADR 0038).
-            recorder: self.options.voucher.clone(),
+            recorder: None,
+            signature: None,
         };
+        // The bridge's key records and signs the check, as it vouches for
+        // its pull requests (ADR 0038).
+        if let Some(signer) = &self.options.signer {
+            sign_bridge_check(&mut event, signer).map_err(|err| SyncError::Command {
+                command: "sign the check".into(),
+                detail: err.to_string(),
+            })?;
+        }
         let recorded = match self.backend.record_bridge_check(event).await {
             Ok(reply) => Some(reply.cursor),
             Err(ApiError::Unimplemented(_)) => None,

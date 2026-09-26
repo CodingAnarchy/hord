@@ -25,6 +25,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use hord_api::proto::{self, BridgeCheckTrigger};
 use hord_api::{RepoBackend, wire};
+use hord_core::sign::SigningKey;
 use hord_git::sync::{
     Bridge, BridgeOptions, Check, GitHub, GitHubOptions, PullRequests, SyncReport,
 };
@@ -104,7 +105,7 @@ pub fn run(
         (None, None) => bail!("set work_dir in {}", config_path.display()),
     };
 
-    let (backend, voucher) = backend(target, config.follow.as_deref())?;
+    let (backend, key) = backend(target, config.follow.as_deref())?;
     let pulls: Option<Arc<dyn PullRequests>> = match &config.github {
         Some(github) => {
             let token = token
@@ -127,7 +128,8 @@ pub fn run(
     let mut options = BridgeOptions::new(config.remote.clone(), work_dir);
     options.token = token;
     options.insecure = insecure;
-    options.voucher = voucher;
+    options.voucher = key.as_ref().map(|k| k.public().key_id());
+    options.signer = key.map(Arc::new);
     if let Some(secs) = config.poll_secs {
         options.poll = Duration::from_secs(secs.max(1));
     }
@@ -169,31 +171,26 @@ pub fn run(
     }
 }
 
-/// The repository to follow, and the key id that vouches for pull
-/// requests (ADR 0037): the logged-in credential's, against a remote.
+/// The repository to follow, and the key that vouches for pull requests
+/// (ADR 0037) and signs bridge checks (ADR 0038): the logged-in
+/// credential's, against a remote.
 fn backend(
     target: &Target,
     follow: Option<&str>,
-) -> Result<(Arc<dyn RepoBackend>, Option<String>)> {
+) -> Result<(Arc<dyn RepoBackend>, Option<SigningKey>)> {
     if follow.is_some() || target.remote.is_some() {
         let (name, url) = session::remote_url(target, follow)?;
         let (remote, credential) = session::connect(&name, &url)?;
-        let voucher = match credential {
-            Some(credential) => Some(credential.key()?.public().key_id()),
-            None => None,
-        };
-        return Ok((Arc::new(remote), voucher));
+        let key = credential.map(|c| c.key()).transpose()?;
+        return Ok((Arc::new(remote), key));
     }
     let backend: Arc<dyn RepoBackend> = match Session::open(target)? {
         Session::Daemon { remote } => Arc::new(remote),
         Session::Remote {
             remote, credential, ..
         } => {
-            let voucher = match credential {
-                Some(credential) => Some(credential.key()?.public().key_id()),
-                None => None,
-            };
-            return Ok((Arc::new(remote), voucher));
+            let key = credential.map(|c| c.key()).transpose()?;
+            return Ok((Arc::new(remote), key));
         }
         // No daemon: land here, so pull requests do not wait for one.
         Session::Direct { repo } => Arc::new(LocalRepo::new(repo)?),
@@ -235,6 +232,7 @@ fn check_message(check: &Check) -> proto::BridgeChecked {
         detail: check.detail.clone(),
         head: check.head.map(wire::id),
         recorder: None,
+        signature: None,
     }
 }
 

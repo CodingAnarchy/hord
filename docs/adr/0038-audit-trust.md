@@ -32,3 +32,10 @@ The M6 quality review found four ways the audit's verdict can be wrong or unreac
 - The M6 window can pass after a key is revoked, and it can't be cleared by evidence attached later.
 - Nothing that isn't in the log can pass an audit: every landing, arbitration and bridge check carries a verifiable signature.
 - All proto changes are additive. Events recorded earlier are audited with the fallbacks above, and the audit report says which fallback applied.
+
+## Amendment (2026-09-26): bridge checks are signed
+
+A recorder key id alone can be borrowed: on `hord serve`'s local endpoint, which takes no tokens, any process of the `hord` OS user could record a passing check naming the bridge's key. So the bridge now signs each `BridgeChecked` with that key (`signature`, domain `hord.bridge-check`, over every other field).
+
+- **Server:** with tokens, it refuses a check whose signature does not verify against the recorder key, or whose recorder is not bound to the token's actor. Without tokens, a signature that is present must verify.
+- **Audit:** with an auth file, it counts only checks that are signed by their recorder and whose key belonged to a `bridge` token's actor at the time. An unsigned check, including one recorded before this amendment, is left out and counted in the report's notes.

@@ -2209,6 +2209,10 @@ message BridgeChecked {
   // requires it. The audit counts only checks recorded by a key bound to
   // a `bridge` token.
   optional string recorder = 8;
+  // The recorder's Ed25519 signature over every other field (domain
+  // `hord.bridge-check`; ADR 0038 as amended). With tokens, the server
+  // requires it, and the audit counts only signed checks.
+  optional bytes signature = 9;
 }
 
 // The recorded check.

@@ -196,6 +196,7 @@ async fn a_bridge_token_lands_a_pull_request_as_its_git_author_and_nothing_else(
     let pulls = Arc::new(ScriptedPulls::new());
     let mut options = BridgeOptions::new(mirror.display().to_string(), dir.0.join("bridge"));
     options.voucher = Some(bridge_key.clone());
+    options.signer = Some(Arc::new(SigningKey::from_pem(&minted.private_key_pem)?));
     let backend: Arc<dyn RepoBackend> = Arc::new(bridge_remote.clone());
     let source: Arc<dyn PullRequests> = pulls.clone();
     let mut bridge = Bridge::open(backend, Some(source), options).await?;

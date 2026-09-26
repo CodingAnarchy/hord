@@ -249,7 +249,7 @@ pub fn judge(facts: &AuditFacts) -> proto::AuditReport {
             AuditCriterion::BridgeGap,
             None,
             format!(
-                "{} bridge check(s) in the window were not recorded by a key bound to a \
+                "{} bridge check(s) in the window were not signed by a key bound to a \
                  bridge token, and were not counted",
                 facts.uncounted_bridge_checks
             ),
@@ -485,7 +485,7 @@ pub fn span(ms: u64) -> String {
 /// The divergence check an event records, if it is one: a `BridgeChecked`
 /// event (ADR 0036). With none in the window the report says "no bridge
 /// checks recorded".
-fn bridge_check(envelope: &proto::EventEnvelope) -> Option<(BridgeCheck, Option<String>)> {
+fn bridge_check(envelope: &proto::EventEnvelope) -> Option<(BridgeCheck, &proto::BridgeChecked)> {
     let Some(proto::event::Kind::BridgeChecked(c)) = envelope.kind() else {
         return None;
     };
@@ -500,7 +500,7 @@ fn bridge_check(envelope: &proto::EventEnvelope) -> Option<(BridgeCheck, Option<
             commit(&c.expected)
         ),
     };
-    Some((check, c.recorder.clone()))
+    Some((check, c))
 }
 
 /// Verify an `Arbitrated` event's signature over the decision it carries
@@ -716,13 +716,15 @@ pub async fn gather(
     let mut bridge_checks = Vec::new();
     let mut uncounted_bridge_checks = 0u32;
     for envelope in &events {
-        if let Some((check, recorder)) = bridge_check(envelope)
+        if let Some((check, recorded)) = bridge_check(envelope)
             && within(envelope.at_ms)
         {
-            // With an auth file, only a bridge's own checks count.
-            let counted = match (auth, recorder) {
-                (None, _) => true,
-                (Some(auth), Some(key)) => auth.bridge_key_at(&key, envelope.at_ms),
+            // With an auth file, only a bridge's own checks count: signed
+            // by a key bound to a bridge token (ADR 0038 as amended).
+            let verified = hord_api::bridge::verify_bridge_check(recorded).is_ok();
+            let counted = match (auth, &recorded.recorder) {
+                (None, _) => verified || recorded.signature.is_none(),
+                (Some(auth), Some(key)) => verified && auth.bridge_key_at(key, envelope.at_ms),
                 (Some(_), None) => false,
             };
             if counted {

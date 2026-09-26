@@ -102,17 +102,30 @@ pub(crate) async fn check_arbitration(
     .await
 }
 
-/// Check a bridge check before it is recorded (ADR 0038): with a
-/// principal, it names as its recorder a key bound to the token's actor.
-/// Without auth (a daemon, a local endpoint) it is recorded as given.
+/// Check a bridge check before it is recorded (ADR 0038 as amended): with
+/// a principal, it names as its recorder a key bound to the token's actor
+/// and is signed by it. Without auth (a daemon, a local endpoint), a
+/// signature that is present must verify.
 pub(crate) async fn check_bridge_check(
     auth: Option<Arc<AuthStore>>,
     principal: Option<Principal>,
     check: &proto::BridgeChecked,
 ) -> Result<(), Status> {
+    let signed = check.signature.is_some();
+    let verified = hord_api::bridge::verify_bridge_check(check);
     let (Some(auth), Some(principal)) = (auth, principal) else {
-        return Ok(());
+        return match verified {
+            Err(err) if signed => Err(Status::invalid_argument(format!(
+                "bad bridge check signature: {err}"
+            ))),
+            _ => Ok(()),
+        };
     };
+    if let Err(err) = verified {
+        return Err(Status::permission_denied(format!(
+            "a bridge check is signed by its recorder's key: {err}"
+        )));
+    }
     let Some(recorder) = check.recorder.clone() else {
         return Err(Status::invalid_argument(
             "a bridge check names the key of the bridge that recorded it (recorder)",

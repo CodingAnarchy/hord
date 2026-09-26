@@ -19,7 +19,7 @@ The git bridge keeps a git remote, normally the GitHub repository, as a mirror o
   - A pull request that does not branch from a commit of `main` gets an error status and a comment asking for a rebase.
 - **Divergence** means `main` names a commit that the export of the log does not reach, for example after a manual push.
   - The bridge checks after every push it makes, every hour, and on demand with `--check`.
-  - It records every check, passing or not, as a `BridgeChecked` event in the repository's event log, naming its own key (the key of its login) as the recorder. `hord watch` and `hord audit` read them there. Against a server with tokens, the recorder must be bound to the bridge token's actor, and `hord audit` counts only checks recorded by a bridge's key (ADR 0038).
+  - It records every check, passing or not, as a `BridgeChecked` event in the repository's event log, naming its own key (the key of its login) as the recorder and signed with it. `hord watch` and `hord audit` read them there. Against a server with tokens, the recorder must be bound to the bridge token's actor, and `hord audit` counts only checks signed by a bridge's key (ADR 0038).
   - The bridge never repairs `main` on its own. If `main` only lags the log (it names an earlier export), that is not divergence: the next push catches up.
 
 ## Modes

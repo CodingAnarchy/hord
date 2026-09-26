@@ -28,6 +28,7 @@
 mod audit;
 pub mod auth;
 mod backend;
+pub mod bridge;
 mod changes;
 #[cfg(feature = "conformance")]
 pub mod conformance;
