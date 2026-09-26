@@ -21,7 +21,9 @@ mod store;
 pub mod sync;
 
 pub use error::Error;
-pub use export::{ExportCache, export_change, export_tree, git_tree_sha, snapshot_root};
+pub use export::{
+    ExportCache, export_change, export_changes, export_tree, git_tree_sha, snapshot_root,
+};
 pub use import::{import_git, import_git_ref, import_git_window, propose_git_commit};
 pub use oid::GitOid;
 pub use store::{MemoryStore, Store};
