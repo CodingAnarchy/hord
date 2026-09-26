@@ -1,7 +1,6 @@
 //! Tiny git fixture: import then export must reproduce every tree SHA.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::objs::tree::EntryKind;
@@ -11,32 +10,9 @@ use hord_git::{
     import_git_window, snapshot_root,
 };
 
+use common::TempDir;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> std::io::Result<Self> {
-        let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("hord-git-{prefix}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct Fixture {
     repo: gix::Repository,
