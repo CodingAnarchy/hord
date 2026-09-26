@@ -757,7 +757,14 @@ mod tests {
         let linked = linked_paths(&page.render()?);
         assert_eq!(
             linked,
-            ["src", "src/a b+c", "src/+page.svelte", "a&b=c.md", "notes #1.md", "100%.txt"]
+            [
+                "src",
+                "src/a b+c",
+                "src/+page.svelte",
+                "a&b=c.md",
+                "notes #1.md",
+                "100%.txt"
+            ]
         );
         Ok(())
     }
