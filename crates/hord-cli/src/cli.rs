@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum, value_parser};
 use hord_api::auth::Scope;
 
 /// Semantic VCS.
@@ -320,7 +320,7 @@ pub enum Command {
         until: Option<String>,
         /// The longest allowed time between bridge checks, in minutes
         /// (default: 65, hourly with slack).
-        #[arg(long, value_name = "MINUTES")]
+        #[arg(long, value_name = "MINUTES", value_parser = value_parser!(u64).range(1..))]
         max_bridge_gap: Option<u64>,
         /// Fail when no bridge check was recorded in the window.
         #[arg(long)]

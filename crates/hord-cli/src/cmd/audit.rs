@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use hord_api::proto::{self, AuditCriterion, AuditOrigin};
 use hord_api::{AuditBackend, wire};
-use hord_server::{AuthStore, LocalAudit, ServerConfig};
+use hord_server::{AuthStore, LocalAudit, ServerConfig, span};
 use hord_txn::LocalRepo;
 use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime, Time};
@@ -123,10 +123,10 @@ fn print_report(report: &proto::AuditReport) {
         println!("bridge: no bridge checks recorded");
     } else {
         println!(
-            "bridge: {} checks, {} diverged, longest gap {} min",
+            "bridge: {} checks, {} diverged, longest gap {}",
             bridge.checks,
             bridge.diverged,
-            bridge.longest_gap_ms / 60_000
+            span(bridge.longest_gap_ms)
         );
     }
     for change in &report.changes {

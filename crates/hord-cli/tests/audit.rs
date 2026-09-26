@@ -113,5 +113,12 @@ fn audit_fails_on_the_import_and_passes_after_it() -> TestResult {
 
     let bad = hord(&repo, &home, &["audit", "--since", "last week"])?;
     assert!(!bad.status.success());
+    // A zero gap would silently mean the default.
+    let zero = hord(
+        &repo,
+        &home,
+        &["audit", "--since", "2999-01-01", "--max-bridge-gap", "0"],
+    )?;
+    assert!(!zero.status.success(), "{}", describe(&zero));
     Ok(())
 }

@@ -408,13 +408,17 @@ fn judge_bridge(
     bridge
 }
 
-/// `ms` in words: seconds under a minute, else whole minutes.
-fn span(ms: u64) -> String {
+/// `ms` in words: seconds under a minute, else minutes and any whole
+/// seconds, so a gap just over the limit does not read as the limit.
+#[must_use]
+pub fn span(ms: u64) -> String {
     if ms < 60_000 {
         // Tenths of a second, in integers: no float formatting to round.
         format!("{}.{} s", ms / 1_000, ms % 1_000 / 100)
-    } else {
+    } else if ms % 60_000 < 1_000 {
         format!("{} min", ms / 60_000)
+    } else {
+        format!("{} min {} s", ms / 60_000, ms % 60_000 / 1_000)
     }
 }
 
@@ -1055,6 +1059,8 @@ mod tests {
         assert_eq!(span(1_500), "1.5 s");
         assert_eq!(span(59_999), "59.9 s");
         assert_eq!(span(65 * 60 * 1000), "65 min");
+        // Just over the limit does not read as the limit.
+        assert_eq!(span(65 * 60 * 1000 + 30_000), "65 min 30 s");
         let facts = AuditFacts {
             max_bridge_gap_ms: 1_500,
             ..clean()
