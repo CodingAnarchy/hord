@@ -1420,6 +1420,22 @@ service Changes {
   rpc ListRecordings(ListRecordingsRequest) returns (ListRecordingsResponse);
   // One flight recording, parsed.
   rpc GetRecording(GetRecordingRequest) returns (GetRecordingResponse);
+
+  // Views 4–6 (spec §10.4, M6).
+  // One definition's history: every landed change that touched its
+  // NodeId, with where it was before and after, the ops and identity
+  // deltas that name it, and evidence (semantic blame; `hord blame` is the
+  // CLI counterpart).
+  rpc NodeLineage(NodeLineageRequest) returns (NodeLineageResponse);
+  // One change's story as a timeline, with the messages it is built from.
+  rpc ChangeTrace(ChangeTraceRequest) returns (ChangeTraceResponse);
+  // One directory of a snapshot.
+  rpc ListTree(ListTreeRequest) returns (ListTreeResponse);
+  // One file of a snapshot (its projection) with its definitions.
+  rpc GetFile(GetFileRequest) returns (GetFileResponse);
+  // A definition's neighbourhood in a snapshot: References and Tests
+  // edges in both directions, and the definitions it contains.
+  rpc NodeEdges(NodeEdgesRequest) returns (NodeEdgesResponse);
 }
 
 // Arguments to GetChange.
@@ -1565,6 +1581,229 @@ message GetRecordingResponse {
   RecordingHeader header = 1;
   // Its events, in cursor order.
   repeated EventEnvelope events = 2;
+}
+
+// Arguments to NodeLineage.
+message NodeLineageRequest {
+  // The NodeId.
+  string node = 1;
+}
+
+// An identity delta (spec §3.4, §3.5) that names a definition.
+message IdentityDeltaView {
+  // birth, death, derived_from, split_into, or merged_from.
+  string kind = 1;
+  // The delta's `node`.
+  NodeRef node = 2;
+  // The other side: `from` (derived_from, merged_from) or `into`
+  // (split_into).
+  repeated NodeRef others = 3;
+  // One line, with names where known.
+  string text = 4;
+}
+
+// One landed change in a definition's lineage.
+message LineageEntry {
+  // The landed change.
+  ChangeSummary change = 1;
+  // The definition in the change's base; unset when it was not there.
+  NodeRef before = 2;
+  // The definition in the change's result; unset when it is gone.
+  NodeRef after = 3;
+  // Its adapter kind in the result, else in the base.
+  optional string kind = 4;
+  // The change's ops that name the definition, with names.
+  repeated OpView ops = 5;
+  // The change's identity deltas that name it.
+  repeated IdentityDeltaView identity = 6;
+  // Evidence: the author's, then what is indexed for the result snapshot.
+  repeated ChangeEvidence evidence = 7;
+}
+
+// A definition's history.
+message NodeLineageResponse {
+  // The definition: at head's result when it is there, else where its
+  // history last placed it.
+  NodeRef node = 1;
+  // Whether head's result still has it.
+  bool live = 2;
+  // Landed changes that touched it, in landing order.
+  repeated LineageEntry entries = 3;
+}
+
+// Arguments to ChangeTrace.
+message ChangeTraceRequest {
+  // The ChangeId (submitted or landed).
+  string change = 1;
+}
+
+// Stages of a provenance trace, in the order a change meets them.
+enum TraceStage {
+  TRACE_STAGE_UNSPECIFIED = 0;
+  // The intent the author wrote.
+  TRACE_STAGE_INTENT = 1;
+  // The change record was built (`hord propose`).
+  TRACE_STAGE_PROPOSED = 2;
+  // It entered the lander queue.
+  TRACE_STAGE_SUBMITTED = 3;
+  // The serializability check and structural rebase.
+  TRACE_STAGE_CONFLICT = 4;
+  // It was parked.
+  TRACE_STAGE_PARKED = 5;
+  // A replay attempt (spec §6.4 rung 2).
+  TRACE_STAGE_REPLAY = 6;
+  // Verification started.
+  TRACE_STAGE_VERIFY = 7;
+  // Evidence about its snapshot other than a review.
+  TRACE_STAGE_EVIDENCE = 8;
+  // A review.
+  TRACE_STAGE_REVIEW = 9;
+  // An arbiter resolved it (spec §6.4 rung 3).
+  TRACE_STAGE_ARBITRATED = 10;
+  // It landed.
+  TRACE_STAGE_LANDED = 11;
+  // It was rejected.
+  TRACE_STAGE_REJECTED = 12;
+}
+
+// One step of a provenance trace.
+message TraceStep {
+  // When it happened.
+  uint64 at_ms = 1;
+  // Its stage.
+  TraceStage stage = 2;
+  // What happened, in one line.
+  string text = 3;
+  // pass, fail, or skip, when the step has a result.
+  optional string outcome = 4;
+  // The change the step produced or names: a replay's proposal, a
+  // resolution, the landed id.
+  optional string change = 5;
+  // Why it was parked (parked steps).
+  optional ParkReason park = 6;
+  // Who acted, when not the author.
+  Actor actor = 7;
+  // Cursor of the event it comes from, when it comes from one.
+  optional uint64 cursor = 8;
+}
+
+// One change's provenance trace. `steps` is derived from the other
+// fields; the JSON export is this message in the canonical JSON mapping.
+message ChangeTraceResponse {
+  // The ChangeId asked for.
+  string change = 1;
+  // The change as submitted: record, queue entry with its escalation, and
+  // the events that name it.
+  ChangeView submitted = 2;
+  // The record it landed as, when that is another record (a rebase, a
+  // replay, or an arbiter's resolution).
+  ChangeView landed = 3;
+  // Replay proposals, in attempt order.
+  repeated ChangeView replays = 4;
+  // The timeline, oldest first.
+  repeated TraceStep steps = 5;
+}
+
+// Arguments to ListTree.
+message ListTreeRequest {
+  // SnapshotId; empty: head's result.
+  string snapshot = 1;
+  // Directory; empty: the root.
+  string path = 2;
+}
+
+// One entry of a directory.
+message TreeItem {
+  // Basename.
+  string name = 1;
+  // Full path.
+  string path = 2;
+  // Whether it is a directory.
+  bool dir = 3;
+  // ObjectId of the file's Blob; unset for a directory.
+  optional string blob = 4;
+}
+
+// One directory of a snapshot.
+message ListTreeResponse {
+  // The snapshot listed.
+  string snapshot = 1;
+  // The directory; empty for the root.
+  string path = 2;
+  // Its entries: directories first, each group in name order.
+  repeated TreeItem entries = 3;
+}
+
+// Arguments to GetFile.
+message GetFileRequest {
+  // SnapshotId; empty: head's result.
+  string snapshot = 1;
+  // The file.
+  string path = 2;
+}
+
+// A definition in a file.
+message FileDefinition {
+  // The definition, with its qualified name.
+  NodeRef node = 1;
+  // Adapter kind, e.g. `function_item`.
+  string kind = 2;
+  // First line, from 1, attached trivia included.
+  uint32 start_line = 3;
+  // Last line.
+  uint32 end_line = 4;
+  // NodeId of the nearest enclosing definition.
+  optional string parent = 5;
+}
+
+// One file of a snapshot.
+message GetFileResponse {
+  // The snapshot.
+  string snapshot = 1;
+  // The file.
+  string path = 2;
+  // ObjectId of its Blob.
+  string blob = 3;
+  // Its projection, when UTF-8 text.
+  string text = 4;
+  // Whether it is not UTF-8 text (then `text` is empty).
+  bool binary = 5;
+  // Its size in bytes.
+  uint64 size = 6;
+  // Definitions, in source order; empty when no adapter parses it.
+  repeated FileDefinition definitions = 7;
+}
+
+// Arguments to NodeEdges.
+message NodeEdgesRequest {
+  // SnapshotId; empty: head's result.
+  string snapshot = 1;
+  // The NodeId.
+  string node = 2;
+}
+
+// A definition's neighbourhood (spec §3.8), each list in id order.
+message NodeEdgesResponse {
+  // The snapshot.
+  string snapshot = 1;
+  // The definition.
+  NodeRef node = 2;
+  // Its adapter kind, when the snapshot has it.
+  optional string kind = 3;
+  // References(node, x): what its body names.
+  repeated NodeRef references = 4;
+  // References(x, node): what names it.
+  repeated NodeRef referenced_by = 5;
+  // Tests(t, node): tests that exercise it, by the adapter's heuristic (a
+  // test that names it) and by recorded coverage.
+  repeated NodeRef tested_by = 6;
+  // Tests(node, x): when it is a test, what it exercises.
+  repeated NodeRef tests = 7;
+  // Contains(node, x): definitions nested in it.
+  repeated NodeRef contains = 8;
+  // Tests that exercise it by recorded coverage but map to no definition,
+  // by the runner's name.
+  repeated string covered_by_tests = 9;
 }
 
 // ---------------------------------------------------------------- recordings

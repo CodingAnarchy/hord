@@ -35,6 +35,7 @@ mod activity;
 mod auth;
 mod auth_service;
 mod authz;
+mod browse;
 mod changes;
 mod config;
 mod error;

@@ -41,7 +41,7 @@ pub use change::{
 };
 pub use coverage::{
     COVERAGE_KIND, CoverageRecord, RUNS_PER_RECORD, TestCoverage, TestRef, TestRun, TestTarget,
-    find_coverage,
+    find_coverage, newest_coverage,
 };
 pub use drift::Drift;
 pub use error::{Error, Result};

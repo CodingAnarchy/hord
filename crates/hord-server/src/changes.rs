@@ -1,6 +1,7 @@
 //! [`LocalChanges`]: the read-only `Changes` service (ADR 0030) over a
-//! local repository: a change decoded with names, its text diff, and the
-//! flight recordings registered under `.hord/recordings/`.
+//! local repository: a change decoded with names, its text diff, the
+//! flight recordings registered under `.hord/recordings/`, and views 4–6
+//! ([`crate::browse`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -49,7 +50,7 @@ pub fn save_recording(repo: &Repo, bytes: Vec<u8>) -> ApiResult<ObjectId> {
 /// The `Changes` service over one [`LocalRepo`].
 #[derive(Clone, Debug)]
 pub struct LocalChanges {
-    local: Arc<LocalRepo>,
+    pub(crate) local: Arc<LocalRepo>,
 }
 
 impl LocalChanges {
@@ -59,12 +60,12 @@ impl LocalChanges {
         Self { local }
     }
 
-    fn repo(&self) -> &Repo {
+    pub(crate) fn repo(&self) -> &Repo {
         self.local.repo()
     }
 
     /// Run blocking store work off the async threads.
-    async fn blocking<T: Send + 'static>(
+    pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         f: impl FnOnce(Repo) -> ApiResult<T> + Send + 'static,
     ) -> ApiResult<T> {
@@ -206,10 +207,42 @@ impl ChangesBackend for LocalChanges {
         })
         .await
     }
+
+    async fn node_lineage(
+        &self,
+        request: proto::NodeLineageRequest,
+    ) -> ApiResult<proto::NodeLineageResponse> {
+        self.lineage(request).await
+    }
+
+    async fn change_trace(
+        &self,
+        request: proto::ChangeTraceRequest,
+    ) -> ApiResult<proto::ChangeTraceResponse> {
+        self.trace(request).await
+    }
+
+    async fn list_tree(
+        &self,
+        request: proto::ListTreeRequest,
+    ) -> ApiResult<proto::ListTreeResponse> {
+        self.tree(request).await
+    }
+
+    async fn get_file(&self, request: proto::GetFileRequest) -> ApiResult<proto::GetFileResponse> {
+        self.file(request).await
+    }
+
+    async fn node_edges(
+        &self,
+        request: proto::NodeEdgesRequest,
+    ) -> ApiResult<proto::NodeEdgesResponse> {
+        self.neighbourhood(request).await
+    }
 }
 
 impl LocalChanges {
-    async fn change(&self, id: ChangeId) -> ApiResult<ChangeRecord> {
+    pub(crate) async fn change(&self, id: ChangeId) -> ApiResult<ChangeRecord> {
         self.blocking(move |repo| {
             if !repo.store().contains(id).map_err(internal)? {
                 return Err(ApiError::NotFound(format!("change {id}")));
@@ -223,7 +256,7 @@ impl LocalChanges {
 
     /// The author's evidence, then what is indexed for the record's result
     /// and, when it landed as another record, for that record's result.
-    async fn evidence(
+    pub(crate) async fn evidence(
         &self,
         record: &ChangeRecord,
         landed: Option<SnapshotId>,
@@ -303,7 +336,7 @@ pub fn names_any(envelope: &proto::EventEnvelope, ids: &BTreeSet<String>) -> boo
     named.into_iter().any(|id| ids.contains(id))
 }
 
-fn internal(e: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
 }
 
@@ -381,12 +414,12 @@ fn file_diff(path: &RepoPath, before: Option<&[u8]>, after: Option<&[u8]>) -> pr
 
 /// Names for the definitions in the files a record touches, looked up in
 /// its base and result.
-struct Names {
+pub(crate) struct Names {
     known: BTreeMap<NodeId, (Option<String>, RepoPath)>,
 }
 
 impl Names {
-    async fn for_records(repo: &Repo, records: &[&ChangeRecord]) -> ApiResult<Self> {
+    pub(crate) async fn for_records(repo: &Repo, records: &[&ChangeRecord]) -> ApiResult<Self> {
         let mut paths = BTreeSet::new();
         let mut snapshots = BTreeSet::new();
         for record in records {
@@ -414,7 +447,7 @@ impl Names {
         Ok(Self { known })
     }
 
-    fn view(&self, node: NodeId) -> proto::NodeRef {
+    pub(crate) fn view(&self, node: NodeId) -> proto::NodeRef {
         let known = self.known.get(&node);
         proto::NodeRef {
             id: node.to_string(),
@@ -423,7 +456,7 @@ impl Names {
         }
     }
 
-    fn text(&self, node: NodeId) -> String {
+    pub(crate) fn text(&self, node: NodeId) -> String {
         let view = self.view(node);
         match (view.name, view.path) {
             (Some(name), Some(path)) => format!("{name} ({path})"),
@@ -435,7 +468,7 @@ impl Names {
 
 /// An op flattened for display, with names (the same shape `hord status`
 /// prints).
-fn op_view(op: &Op, names: &Names) -> proto::OpView {
+pub(crate) fn op_view(op: &Op, names: &Names) -> proto::OpView {
     let mut view = proto::OpView::default();
     match op {
         Op::Insert {
@@ -561,6 +594,41 @@ impl GrpcTrait for GrpcChanges {
         request: Request<proto::GetRecordingRequest>,
     ) -> Result<Response<proto::GetRecordingResponse>, Status> {
         changes_call!(self, request, get_recording)
+    }
+
+    async fn node_lineage(
+        &self,
+        request: Request<proto::NodeLineageRequest>,
+    ) -> Result<Response<proto::NodeLineageResponse>, Status> {
+        changes_call!(self, request, node_lineage)
+    }
+
+    async fn change_trace(
+        &self,
+        request: Request<proto::ChangeTraceRequest>,
+    ) -> Result<Response<proto::ChangeTraceResponse>, Status> {
+        changes_call!(self, request, change_trace)
+    }
+
+    async fn list_tree(
+        &self,
+        request: Request<proto::ListTreeRequest>,
+    ) -> Result<Response<proto::ListTreeResponse>, Status> {
+        changes_call!(self, request, list_tree)
+    }
+
+    async fn get_file(
+        &self,
+        request: Request<proto::GetFileRequest>,
+    ) -> Result<Response<proto::GetFileResponse>, Status> {
+        changes_call!(self, request, get_file)
+    }
+
+    async fn node_edges(
+        &self,
+        request: Request<proto::NodeEdgesRequest>,
+    ) -> Result<Response<proto::NodeEdgesResponse>, Status> {
+        changes_call!(self, request, node_edges)
     }
 }
 
