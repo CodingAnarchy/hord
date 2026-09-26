@@ -907,8 +907,9 @@ async fn a_failed_close_is_retried_without_repeating_the_comment() -> TestResult
     let (_, change) = *report.proposed.first().ok_or("the pull was proposed")?;
     t.settle(&wire::id(change)).await?;
 
+    // The pass reports the failed close, whether or not its later steps
+    // already retried it.
     assert!(bridge.sync_once().await.is_err(), "the close failed");
-    assert!(t.pulls.is_open(7));
     bridge.sync_once().await?;
     assert!(!t.pulls.is_open(7), "closed on the retry");
     let reported = t.pulls.reported_on(7);
@@ -965,5 +966,66 @@ async fn the_remote_is_shown_without_credentials() -> TestResult {
     let bridge = Bridge::open(backend, None, options).await?;
     assert_eq!(bridge.remote(), "https://github.com/o/r.git");
     assert!(!format!("{bridge:?}").contains("s3cret"));
+    Ok(())
+}
+
+/// A pull request host that refuses every status on one pull request.
+struct RefusesStatusOn {
+    inner: Arc<ScriptedPulls>,
+    pull: u64,
+}
+
+#[async_trait::async_trait]
+impl PullRequests for RefusesStatusOn {
+    async fn open_pulls(&self) -> Result<Vec<PullRequest>, SyncError> {
+        self.inner.open_pulls().await
+    }
+    async fn set_status(
+        &self,
+        pull: u64,
+        sha: &str,
+        state: StatusState,
+        description: &str,
+    ) -> Result<(), SyncError> {
+        if pull == self.pull {
+            return Err(SyncError::Pulls("POST …/statuses: 422".into()));
+        }
+        self.inner.set_status(pull, sha, state, description).await
+    }
+    async fn comment(&self, pull: u64, body: &str) -> Result<(), SyncError> {
+        self.inner.comment(pull, body).await
+    }
+    async fn close(&self, pull: u64) -> Result<(), SyncError> {
+        self.inner.close(pull).await
+    }
+}
+
+/// One pull request the host keeps refusing holds up no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_failing_pull_request_does_not_hold_up_the_others() -> TestResult {
+    let t = Setup::new("isolate").await?;
+    let backend: Arc<dyn RepoBackend> = t.backend.clone();
+    let pulls: Arc<dyn PullRequests> = Arc::new(RefusesStatusOn {
+        inner: t.pulls.clone(),
+        pull: 1,
+    });
+    let mut bridge = Bridge::open(backend, Some(pulls), t.options()).await?;
+    bridge.sync_once().await?;
+    let main = t.main()?.ok_or("main after the first sync")?;
+    let one = t.push_commit(main, "notes.txt", "one\n", "one\n", "refs/pull/1/head")?;
+    let two = t.push_commit(main, "README.md", "two\n", "two\n", "refs/pull/2/head")?;
+    t.pulls.open(t.pull(1, one, "One"));
+    t.pulls.open(t.pull(2, two, "Two"));
+
+    let report = bridge.sync_once().await;
+    let proposed = t.backend.queue(proto::QueueQuery::default()).await?.entries;
+    for entry in &proposed {
+        t.settle(&entry.change).await?;
+    }
+    assert!(proposed.len() >= 2, "both proposed: {report:?}");
+    // Both landed: pull request 1's report fails, and 2 is still closed.
+    assert!(bridge.sync_once().await.is_err(), "pull request 1 fails");
+    assert!(t.pulls.is_open(1));
+    assert!(!t.pulls.is_open(2), "{:?}", t.pulls.reported_on(2));
     Ok(())
 }

@@ -204,12 +204,16 @@ impl Bridge {
 
     /// Export and push what landed, report outcomes on pull requests, and
     /// submit new or updated pull requests: `hord git sync --once`.
+    /// Each step runs even when an earlier one failed (a pull request the
+    /// host will not take a comment on holds up nothing else); the first
+    /// failure is the result.
     pub async fn sync_once(&mut self) -> Result<SyncReport, SyncError> {
         let mut report = SyncReport::default();
-        self.sync_exports(&mut report).await?;
-        self.report_outcomes(&mut report).await?;
-        self.sync_pulls(&mut report).await?;
-        self.report_outcomes(&mut report).await?;
+        let exported = self.sync_exports(&mut report).await;
+        let reported = self.report_outcomes(&mut report).await;
+        let proposed = self.sync_pulls(&mut report).await;
+        let reported_again = self.report_outcomes(&mut report).await;
+        exported.and(reported).and(proposed).and(reported_again)?;
         Ok(report)
     }
 
@@ -525,65 +529,81 @@ impl Bridge {
         let numbers: BTreeSet<u64> = open.iter().map(|p| p.number).collect();
         // Closed elsewhere: forget it.
         self.state.pulls.retain(|n, _| numbers.contains(n));
+        let mut failed = None;
         for pull in open {
-            let tracked = self.state.pulls.get(&pull.number).cloned();
-            if let Some(tracked) = &tracked {
-                if tracked.head == pull.head_sha {
-                    continue;
-                }
-                if let Some(change) = &tracked.change
-                    && self.pending(change).await?
-                {
-                    continue;
-                }
+            // One pull request's failure does not hold up the others.
+            if let Err(err) = self.sync_pull(pulls.as_ref(), &pull, report).await {
+                failed.get_or_insert(err);
             }
-            match self.propose(&pull).await {
-                Ok((change, head)) => {
-                    report.proposed.push((pull.number, change));
-                    if let Some(old) = tracked.as_ref().and_then(|t| t.change.as_deref()) {
-                        let text = format!(
-                            "The new push supersedes proposal `{}`; submitted `{}` to the hord \
-                             lander.",
-                            short(old),
-                            short(&wire::id(change))
-                        );
-                        pulls.comment(pull.number, &text).await?;
-                    }
-                    self.state.pulls.insert(
-                        pull.number,
-                        PullState {
-                            head,
-                            change: Some(wire::id(change)),
-                            reported: None,
-                            closed: false,
-                        },
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::sync_pulls`] for one open pull request.
+    async fn sync_pull(
+        &mut self,
+        pulls: &dyn PullRequests,
+        pull: &PullRequest,
+        report: &mut SyncReport,
+    ) -> Result<(), SyncError> {
+        let tracked = self.state.pulls.get(&pull.number).cloned();
+        if let Some(tracked) = &tracked {
+            if tracked.head == pull.head_sha {
+                return Ok(());
+            }
+            if let Some(change) = &tracked.change
+                && self.pending(change).await?
+            {
+                return Ok(());
+            }
+        }
+        match self.propose(pull).await {
+            Ok((change, head)) => {
+                report.proposed.push((pull.number, change));
+                self.state.pulls.insert(
+                    pull.number,
+                    PullState {
+                        head,
+                        change: Some(wire::id(change)),
+                        reported: None,
+                        closed: false,
+                    },
+                );
+                self.save().await?;
+                if let Some(old) = tracked.as_ref().and_then(|t| t.change.as_deref()) {
+                    let text = format!(
+                        "The new push supersedes proposal `{}`; submitted `{}` to the hord \
+                         lander.",
+                        short(old),
+                        short(&wire::id(change))
                     );
-                }
-                Err(err) if reportable(&err) => {
-                    let text = format!("The hord bridge could not submit this pull request: {err}");
-                    pulls
-                        .set_status(
-                            pull.number,
-                            &pull.head_sha,
-                            StatusState::Error,
-                            &clip(&text),
-                        )
-                        .await?;
                     pulls.comment(pull.number, &text).await?;
-                    report.reported.push((pull.number, "error".into()));
-                    self.state.pulls.insert(
-                        pull.number,
-                        PullState {
-                            head: pull.head_sha.clone(),
-                            change: None,
-                            reported: Some("error".into()),
-                            closed: false,
-                        },
-                    );
                 }
-                Err(err) => return Err(err),
             }
-            self.save().await?;
+            Err(err) if reportable(&err) => {
+                let text = format!("The hord bridge could not submit this pull request: {err}");
+                pulls
+                    .set_status(
+                        pull.number,
+                        &pull.head_sha,
+                        StatusState::Error,
+                        &clip(&text),
+                    )
+                    .await?;
+                pulls.comment(pull.number, &text).await?;
+                report.reported.push((pull.number, "error".into()));
+                self.state.pulls.insert(
+                    pull.number,
+                    PullState {
+                        head: pull.head_sha.clone(),
+                        change: None,
+                        reported: Some("error".into()),
+                        closed: false,
+                    },
+                );
+                self.save().await?;
+            }
+            Err(err) => return Err(err),
         }
         Ok(())
     }
@@ -678,64 +698,84 @@ impl Bridge {
             .iter()
             .map(|(n, s)| (*n, s.clone()))
             .collect();
+        let mut failed = None;
         for (number, pull) in tracked {
-            let Some(change) = pull.change.as_deref() else {
-                continue;
+            // One pull request's failure does not hold up the others.
+            let step = self
+                .report_outcome(pulls.as_ref(), number, &pull, &mut heads, report)
+                .await;
+            if let Err(err) = step {
+                failed.get_or_insert(err);
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::report_outcomes`] for one tracked pull request.
+    async fn report_outcome(
+        &mut self,
+        pulls: &dyn PullRequests,
+        number: u64,
+        pull: &PullState,
+        heads: &mut Option<BTreeMap<u64, String>>,
+        report: &mut SyncReport,
+    ) -> Result<(), SyncError> {
+        let Some(change) = pull.change.as_deref() else {
+            return Ok(());
+        };
+        let Some(entry) = self.entry(change).await? else {
+            return Ok(());
+        };
+        let Some(mut outcome) = self.outcome(change, &entry).await? else {
+            return Ok(());
+        };
+        let fresh = pull.reported.as_deref() != Some(outcome.key);
+        // Reported, but the close failed: only the close is left.
+        if !fresh && !(outcome.close && !pull.closed) {
+            return Ok(());
+        }
+        if outcome.close {
+            let heads = match heads {
+                Some(heads) => heads,
+                None => heads.insert(
+                    pulls
+                        .open_pulls()
+                        .await?
+                        .into_iter()
+                        .map(|p| (p.number, p.head_sha))
+                        .collect(),
+                ),
             };
-            let Some(entry) = self.entry(change).await? else {
-                continue;
-            };
-            let Some(mut outcome) = self.outcome(change, &entry).await? else {
-                continue;
-            };
-            let fresh = pull.reported.as_deref() != Some(outcome.key);
-            // Reported, but the close failed: only the close is left.
-            if !fresh && !(outcome.close && !pull.closed) {
-                continue;
+            if heads.get(&number).is_some_and(|head| *head != pull.head) {
+                outcome.close = false;
+                outcome.comment = Some(format!(
+                    "{}. A newer push to this pull request supersedes it: the bridge \
+                     proposes that next.",
+                    outcome.status
+                ));
             }
-            if outcome.close {
-                let heads = match &mut heads {
-                    Some(heads) => heads,
-                    None => heads.insert(
-                        pulls
-                            .open_pulls()
-                            .await?
-                            .into_iter()
-                            .map(|p| (p.number, p.head_sha))
-                            .collect(),
-                    ),
-                };
-                if heads.get(&number).is_some_and(|head| *head != pull.head) {
-                    outcome.close = false;
-                    outcome.comment = Some(format!(
-                        "{}. A newer push to this pull request supersedes it: the bridge \
-                         proposes that next.",
-                        outcome.status
-                    ));
-                }
+        }
+        // Each step is saved once done, so a failed later step is retried
+        // without repeating the earlier ones.
+        if fresh {
+            pulls
+                .set_status(number, &pull.head, outcome.state, &clip(&outcome.status))
+                .await?;
+            if let Some(text) = &outcome.comment {
+                pulls.comment(number, text).await?;
             }
-            // Each step is saved once done, so a failed later step is
-            // retried without repeating the earlier ones.
-            if fresh {
-                pulls
-                    .set_status(number, &pull.head, outcome.state, &clip(&outcome.status))
-                    .await?;
-                if let Some(text) = &outcome.comment {
-                    pulls.comment(number, text).await?;
-                }
-                report.reported.push((number, outcome.key.to_owned()));
-                if let Some(state) = self.state.pulls.get_mut(&number) {
-                    state.reported = Some(outcome.key.to_owned());
-                }
-                self.save().await?;
+            report.reported.push((number, outcome.key.to_owned()));
+            if let Some(state) = self.state.pulls.get_mut(&number) {
+                state.reported = Some(outcome.key.to_owned());
             }
-            if outcome.close {
-                pulls.close(number).await?;
-                if let Some(state) = self.state.pulls.get_mut(&number) {
-                    state.closed = true;
-                }
-                self.save().await?;
+            self.save().await?;
+        }
+        if outcome.close {
+            pulls.close(number).await?;
+            if let Some(state) = self.state.pulls.get_mut(&number) {
+                state.closed = true;
             }
+            self.save().await?;
         }
         Ok(())
     }
