@@ -315,7 +315,10 @@ fn write_commit<S: Store>(
     Ok(commit_id)
 }
 
-fn lookup_exported(repo: &gix::Repository, change_id: ChangeId) -> Option<gix::ObjectId> {
+pub(crate) fn lookup_exported(
+    repo: &gix::Repository,
+    change_id: ChangeId,
+) -> Option<gix::ObjectId> {
     let name = format!("refs/hord/changes/{change_id}");
     let reference = repo.find_reference(name.as_str()).ok()?;
     let id = reference.id();
@@ -375,7 +378,7 @@ fn parse_git_author(id: &str) -> (String, String) {
     (id.to_owned(), "unknown@hord".to_owned())
 }
 
-fn open_or_init(path: &Path) -> Result<gix::Repository, Error> {
+pub(crate) fn open_or_init(path: &Path) -> Result<gix::Repository, Error> {
     if let Ok(mut repo) = open_repo(path) {
         repo.object_cache_size_if_unset(4 * 1024 * 1024);
         return Ok(repo);

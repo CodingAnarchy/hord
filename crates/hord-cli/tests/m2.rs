@@ -411,6 +411,7 @@ impl Draft {
                 created_at: Timestamp::from_millis(self.at),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: self.read.into_iter().collect(),
             write_set: self.write.into_iter().collect(),

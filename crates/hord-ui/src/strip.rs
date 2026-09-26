@@ -488,6 +488,7 @@ mod tests {
                 submission: cursor,
                 change: change.into(),
                 actor: Some(agent("a")),
+                voucher: None,
             }),
         )
     }

@@ -280,6 +280,7 @@ pub fn provenance_message(record: &ChangeRecord) -> proto::ChangeProvenance {
         created_at_ms: p.created_at.as_millis(),
         session: p.session.clone(),
         parent_intent: p.parent_intent.map(wire::id),
+        voucher: p.voucher.clone(),
     }
 }
 

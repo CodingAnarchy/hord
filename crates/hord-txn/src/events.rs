@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use hord_api::proto::event::Kind;
 use hord_api::{ApiError, EventCursor, EventStream, proto, wire};
-use hord_core::{Actor, ChangeId, Evidence, ObjectId};
+use hord_core::{ChangeId, Evidence, ObjectId, Provenance};
 use prost::Message;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use tokio::sync::{broadcast, mpsc};
@@ -320,11 +320,12 @@ impl Inner {
 }
 
 /// `Submitted` for a new queue entry.
-pub(crate) fn submitted(seq: u64, change: ChangeId, actor: &Actor) -> Kind {
+pub(crate) fn submitted(seq: u64, change: ChangeId, provenance: &Provenance) -> Kind {
     Kind::Submitted(proto::Submitted {
         submission: seq,
         change: wire::id(change),
-        actor: Some(wire::actor(actor)),
+        actor: Some(wire::actor(&provenance.actor)),
+        voucher: provenance.voucher.clone(),
     })
 }
 

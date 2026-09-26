@@ -9,14 +9,15 @@ use std::sync::Arc;
 use hord_api::auth::Scope;
 use hord_api::{RepoBackend, proto, wire};
 use hord_core::sign::{self, PublicKey, SignError};
-use hord_core::{Actor, ChangeRecord, Evidence, EvidenceKind, Signature};
+use hord_core::{Actor, ChangeRecord, Evidence, EvidenceKind, IntentRef, Signature};
 use tonic::Status;
 
 use crate::auth::{AuthStore, Principal, same_actor};
 
 /// Check the change `change` names before it is submitted: with a
 /// principal, authored by the token's actor and signed with a key bound to
-/// it. A change that cannot be read is left for the backend to report.
+/// it, or vouched for by a `bridge` token ([`bridge_vouched`], ADR 0037).
+/// A change that cannot be read is left for the backend to report.
 pub(crate) async fn check_submit(
     backend: &dyn RepoBackend,
     auth: Option<Arc<AuthStore>>,
@@ -44,6 +45,11 @@ pub(crate) async fn check_submit(
         let verify = |key: &PublicKey| sign::verify_change(&record, key);
         match (auth, principal) {
             (Some(auth), Some(principal)) => {
+                // A token that may propose submits its own changes; a
+                // voucher, or a token that may only bridge, is the bridge's.
+                if record.provenance.voucher.is_some() || !principal.has(&Scope::Propose) {
+                    return bridge_vouched(&auth, &principal, &record);
+                }
                 claimed_by(&record.provenance.actor, &principal, "a change authored by")?;
                 signed_by(&auth, &principal, record.signature.as_ref(), verify)
             }
@@ -146,6 +152,64 @@ fn check_evidence(
     }
     claimed_by(&evidence.produced_by, principal, "evidence produced by")?;
     signed_by(auth, principal, evidence.signature.as_ref(), verify)
+}
+
+/// What a `bridge` token may submit (ADR 0037): a pull request's
+/// unsigned change whose actor is a human (its git author), whose intent
+/// names a git commit (the pull request's head), and whose provenance names
+/// as voucher a key bound to the token's actor. Nothing else.
+fn bridge_vouched(
+    auth: &AuthStore,
+    principal: &Principal,
+    record: &ChangeRecord,
+) -> Result<(), Status> {
+    let who = describe(&principal.actor);
+    if !principal.has(&Scope::Bridge) {
+        return Err(Status::permission_denied(format!(
+            "only a bridge token may submit a change vouched for on another's behalf; \
+             the token of {who} lacks scope bridge"
+        )));
+    }
+    let provenance = &record.provenance;
+    if !matches!(provenance.actor, Actor::Human { .. }) {
+        return Err(Status::permission_denied(format!(
+            "the bridge token of {who} may submit only a git author's change, not {}",
+            describe(&provenance.actor)
+        )));
+    }
+    if record.signature.is_some() {
+        return Err(Status::permission_denied(
+            "a change the bridge vouches for is unsigned; a signed change is submitted by its author",
+        ));
+    }
+    if !record
+        .intent
+        .refs
+        .iter()
+        .any(|r| matches!(r, IntentRef::GitCommit { .. }))
+    {
+        return Err(Status::permission_denied(
+            "a change the bridge vouches for names its pull request's head (a git commit ref)",
+        ));
+    }
+    let Some(voucher) = &provenance.voucher else {
+        return Err(Status::permission_denied(
+            "a change the bridge submits names the bridge's key as its voucher",
+        ));
+    };
+    let bound = auth
+        .key_actor(voucher)
+        .map_err(|err| Status::internal(err.to_string()))?;
+    match bound {
+        Some(actor) if same_actor(&actor, &principal.actor) => Ok(()),
+        Some(actor) => Err(Status::permission_denied(format!(
+            "voucher key {voucher} is bound to {}, not {who}",
+            describe(&actor)
+        ))),
+        None => Err(Status::permission_denied(format!(
+            "voucher key {voucher} is not bound to any actor on this server"
+        ))),
+    }
 }
 
 /// The claimed actor must be the token's.
