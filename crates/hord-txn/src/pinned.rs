@@ -262,10 +262,12 @@ fn parse(output: &str) -> Vec<(String, String, Ran)> {
         let plain = strip_ansi(line);
         let line = plain.trim();
         if let Some(rest) = line.strip_prefix("Running ") {
+            // Cargo prints the target's path with the platform's separator
+            // (`tests\m5_a.rs` on Windows); compare it as a repository path.
             target = rest
                 .rsplit_once(" (")
                 .map_or(rest, |(name, _)| name)
-                .to_owned();
+                .replace('\\', "/");
             continue;
         }
         let Some(rest) = line.strip_prefix("test ") else {
@@ -314,6 +316,16 @@ mod tests {
                 ("tests/m5_b.rs".into(), "beta_is_21".into(), Ran::Failed),
                 ("tests/m5_b.rs".into(), "slow".into(), Ran::Ignored),
             ]
+        );
+        // Windows prints the target with backslashes.
+        let windows = "     Running tests\\m5_a.rs (target\\debug\\deps\\m5_a-2.exe)\ntest beta_at_least_20 ... ok\n";
+        assert_eq!(
+            parse(windows),
+            vec![(
+                "tests/m5_a.rs".into(),
+                "beta_at_least_20".into(),
+                Ran::Passed
+            )]
         );
         // CI sets CARGO_TERM_COLOR=always; colored output reads the same.
         let colored = "\u{1b}[1m\u{1b}[92m     Running\u{1b}[0m tests/m5_a.rs (target/debug/deps/m5_a-2)\ntest beta_at_least_20 ... \u{1b}[32mok\u{1b}[0m\n";
