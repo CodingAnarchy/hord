@@ -1,6 +1,6 @@
 //! The bridge: export, pull requests, and divergence checks (ADR 0036).
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -624,11 +624,15 @@ impl Bridge {
     }
 
     /// Report each proposal's lander outcome on its pull request, once per
-    /// outcome, and close a pull request whose change is on `main`.
+    /// outcome, and close a pull request whose change is on `main`, unless
+    /// it has been pushed to since: [`Self::sync_pulls`] proposes that push
+    /// next.
     async fn report_outcomes(&mut self, report: &mut SyncReport) -> Result<(), SyncError> {
         let Some(pulls) = self.pulls.clone() else {
             return Ok(());
         };
+        // Each open pull request's head, listed once, when one is to close.
+        let mut heads: Option<BTreeMap<u64, String>> = None;
         let tracked: Vec<(u64, PullState)> = self
             .state
             .pulls
@@ -642,9 +646,30 @@ impl Bridge {
             let Some(entry) = self.entry(change).await? else {
                 continue;
             };
-            let Some(outcome) = self.outcome(change, &entry).await? else {
+            let Some(mut outcome) = self.outcome(change, &entry).await? else {
                 continue;
             };
+            if outcome.close {
+                let heads = match &mut heads {
+                    Some(heads) => heads,
+                    None => heads.insert(
+                        pulls
+                            .open_pulls()
+                            .await?
+                            .into_iter()
+                            .map(|p| (p.number, p.head_sha))
+                            .collect(),
+                    ),
+                };
+                if heads.get(&number).is_some_and(|head| *head != pull.head) {
+                    outcome.close = false;
+                    outcome.comment = Some(format!(
+                        "{}. A newer push to this pull request supersedes it: the bridge \
+                         proposes that next.",
+                        outcome.status
+                    ));
+                }
+            }
             if pull.reported.as_deref() == Some(outcome.key) {
                 continue;
             }

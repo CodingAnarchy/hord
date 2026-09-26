@@ -631,3 +631,45 @@ async fn a_push_the_remote_refuses_is_an_error() -> TestResult {
     assert_eq!(t.main()?, None, "nothing was pushed");
     Ok(())
 }
+
+/// A push to a pull request while its earlier proposal is in the lander is
+/// not lost when that proposal lands: the pull request stays open, and the
+/// newer push is proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_newer_push_survives_its_earlier_proposal_landing() -> TestResult {
+    let t = Setup::new("newer").await?;
+    let mut bridge = t.bridge().await?;
+    bridge.sync_once().await?;
+    let main = t.main()?.ok_or("main after the first sync")?;
+    let first = t.push_commit(
+        main,
+        "notes.txt",
+        "alpha\nbeta (fixed)\ngamma\n",
+        "fix beta\n",
+        "refs/pull/7/head",
+    )?;
+    t.pulls.open(t.pull(7, first, "Fix the notes"));
+    let report = bridge.sync_once().await?;
+    let (_, earlier) = *report.proposed.first().ok_or("the pull was proposed")?;
+
+    // The author pushes again; then the earlier proposal lands.
+    let second = t.push_commit(
+        first,
+        "notes.txt",
+        "alpha\nbeta (fixed)\ngamma (fixed)\n",
+        "fix gamma too\n",
+        "refs/pull/7/head",
+    )?;
+    t.pulls.open(t.pull(7, second, "Fix the notes"));
+    t.settle(&wire::id(earlier)).await?;
+
+    let report = bridge.sync_once().await?;
+    assert!(t.pulls.is_open(7), "{:?}", t.pulls.reported_on(7));
+    let (number, newer) = *report
+        .proposed
+        .first()
+        .ok_or("the newer push was proposed")?;
+    assert_eq!(number, 7);
+    assert_ne!(newer, earlier);
+    Ok(())
+}
