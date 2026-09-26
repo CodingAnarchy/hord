@@ -96,6 +96,13 @@ pub enum Outcome {
         /// The test output.
         why: String,
     },
+    /// A replay landed on a contradiction case, whose intents cannot both
+    /// hold: it cheated in a way the lander could not see (ADR 0034
+    /// amendment). A failure, never resolved.
+    Gamed {
+        /// What landed, and how the acceptance tests fared on it.
+        why: String,
+    },
     /// Parked for arbitration (or conflicted with no harness).
     Parked,
     /// The case does not do what the corpus needs (the first task did not
@@ -844,9 +851,20 @@ async fn drive(
             };
         }
         proto::QueueStatus::Replayed => {
-            result.outcome = match acceptance(remote, case).await? {
-                None => Outcome::ResolvedByReplay,
-                Some(why) => Outcome::ReplayFailedAcceptance { why },
+            let accepted = acceptance(remote, case).await?;
+            result.outcome = if case.ambiguous {
+                Outcome::Gamed {
+                    why: format!(
+                        "a replay landed ({}) on a contradiction; acceptance on head: {}",
+                        second.landed.as_deref().unwrap_or("?"),
+                        accepted.as_deref().unwrap_or("both passed")
+                    ),
+                }
+            } else {
+                match accepted {
+                    None => Outcome::ResolvedByReplay,
+                    Some(why) => Outcome::ReplayFailedAcceptance { why },
+                }
             };
         }
         proto::QueueStatus::NeedsArbitration | proto::QueueStatus::Conflicted => {

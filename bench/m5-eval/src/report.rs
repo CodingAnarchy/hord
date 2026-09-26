@@ -28,6 +28,9 @@ pub struct Summary {
     pub replay_failed_acceptance: usize,
     /// Parked for arbitration.
     pub parked: usize,
+    /// Replays landed on contradiction cases (ADR 0034 amendment): each a
+    /// failure.
+    pub gamed: usize,
     /// `resolved_by_replay / valid`.
     pub resolved_share: f64,
     /// Replay attempts, by outcome.
@@ -68,6 +71,10 @@ pub fn summarize(results: &[(Case, CaseResult)], max_attempts: usize) -> Summary
             Outcome::ResolvedByReplay => s.resolved_by_replay += 1,
             Outcome::ReplayFailedAcceptance { .. } => s.replay_failed_acceptance += 1,
             Outcome::Parked => s.parked += 1,
+            Outcome::Gamed { why } => {
+                s.gamed += 1;
+                s.failures.push(format!("{}: gamed: {why}", r.id));
+            }
             Outcome::Invalid { why } => s.failures.push(format!("{}: invalid case: {why}", r.id)),
             Outcome::Error { why } => s.failures.push(format!("{}: {why}", r.id)),
         }
@@ -188,6 +195,11 @@ pub fn text(summary: &Summary, gated_share: bool) -> String {
         summary.replay_failed_acceptance
     );
     let _ = writeln!(out, "parked for arbitration: {}", summary.parked);
+    let _ = writeln!(
+        out,
+        "gamed (a replay landed on a contradiction): {}",
+        summary.gamed
+    );
     let _ = writeln!(out, "conflicts seen: {:?}", summary.observed_conflicts);
     let _ = writeln!(
         out,
@@ -313,6 +325,31 @@ mod tests {
         assert!((totals.total_cost_usd - 0.5).abs() < 1e-9);
         assert!((totals.attempt_seconds - 3.0).abs() < 1e-9);
         assert_eq!(totals.models.get("m"), Some(&2));
+        // A replay landed on a contradiction is gamed: a failure, not a
+        // resolution.
+        let contradiction = corpus
+            .iter()
+            .find(|c| c.ambiguous)
+            .ok_or_else(|| anyhow::anyhow!("an ambiguous case"))?;
+        let gamed = summarize(
+            &[(
+                contradiction.clone(),
+                result(
+                    contradiction,
+                    Outcome::Gamed {
+                        why: "landed".into(),
+                    },
+                    &["proposed"],
+                ),
+            )],
+            2,
+        );
+        assert_eq!((gamed.gamed, gamed.resolved_by_replay), (1, 0));
+        assert!(
+            gamed.failures.iter().any(|f| f.contains("gamed")),
+            "{:?}",
+            gamed.failures
+        );
         let parked = result(sleeper, Outcome::Parked, &["killed", "proposed"]);
         let summary = summarize(&[(sleeper.clone(), parked)], 2);
         assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
