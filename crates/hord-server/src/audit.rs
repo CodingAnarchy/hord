@@ -115,7 +115,7 @@ pub struct LandedFacts {
     pub origin: AuditOrigin,
     /// For [`AuditOrigin::Signed`] or an unsigned record: the submitted
     /// record's signature, checked against its author. For
-    /// [`AuditOrigin::BridgeVouched`]: the voucher ([`check_voucher`]).
+    /// [`AuditOrigin::BridgeVouched`]: its voucher, checked as ingest checks it.
     pub key: KeyCheck,
     /// Its evidence.
     pub evidence: Vec<EvidenceFacts>,
