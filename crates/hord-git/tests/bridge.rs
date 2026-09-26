@@ -684,6 +684,8 @@ async fn a_newer_push_survives_its_earlier_proposal_landing() -> TestResult {
 struct Flaky {
     inner: Arc<LocalRepo>,
     fail: std::sync::Mutex<Option<String>>,
+    /// Refuse every event subscription.
+    no_events: bool,
 }
 
 #[async_trait::async_trait]
@@ -759,6 +761,9 @@ impl RepoBackend for Flaky {
         self.inner.attach_evidence(request).await
     }
     async fn events(&self, request: proto::EventsRequest) -> ApiResult<EventStream> {
+        if self.no_events {
+            return Err(ApiError::Unavailable("no event stream".into()));
+        }
         self.inner.events(request).await
     }
     async fn record_bridge_check(
@@ -778,6 +783,7 @@ async fn a_backend_failure_while_proposing_is_retried_not_reported() -> TestResu
     let flaky = Arc::new(Flaky {
         inner: t.backend.clone(),
         fail: std::sync::Mutex::new(None),
+        no_events: false,
     });
     let backend: Arc<dyn RepoBackend> = flaky.clone();
     let pulls: Arc<dyn PullRequests> = t.pulls.clone();
@@ -813,5 +819,34 @@ async fn a_backend_failure_while_proposing_is_retried_not_reported() -> TestResu
     assert_eq!(t.pulls.reported_on(7), [], "and not the pull request's");
     let report = bridge.sync_once().await?;
     assert_eq!(report.proposed.len(), 1, "retried: {report:?}");
+    Ok(())
+}
+
+/// The daemon stops when asked even while it waits to subscribe to the
+/// event stream again, however long its polling interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_stops_while_waiting_for_the_event_stream() -> TestResult {
+    let t = Setup::new("stop").await?;
+    let backend: Arc<dyn RepoBackend> = Arc::new(Flaky {
+        inner: t.backend.clone(),
+        fail: std::sync::Mutex::new(None),
+        no_events: true,
+    });
+    let mut options = t.options();
+    options.poll = Duration::from_secs(3600);
+    let mut bridge = Bridge::open(backend, None, options).await?;
+    let (stop, stopped) = oneshot::channel::<()>();
+    let stopper = tokio::spawn(async move {
+        sleep(Duration::from_millis(200)).await;
+        let _ = stop.send(());
+    });
+    timeout(
+        Duration::from_secs(10),
+        bridge.run(async {
+            let _ = stopped.await;
+        }),
+    )
+    .await??;
+    stopper.await?;
     Ok(())
 }

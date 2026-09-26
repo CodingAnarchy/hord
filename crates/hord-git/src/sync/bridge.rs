@@ -224,8 +224,12 @@ impl Bridge {
                     }
                     None => {
                         // The stream ended or was never opened: resubscribe
-                        // from the saved cursor after a pause.
-                        sleep(self.options.poll).await;
+                        // from the saved cursor after a pause, which a
+                        // shutdown cuts short.
+                        tokio::select! {
+                            () = &mut shutdown => return Ok(()),
+                            () = sleep(self.options.poll) => {}
+                        }
                         events = self.subscribe().await;
                     }
                 },
