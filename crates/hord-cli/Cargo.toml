@@ -40,3 +40,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 hord-identity.workspace = true
 hord-lang.workspace = true
 hord-lang-rust.workspace = true
+rcgen.workspace = true
