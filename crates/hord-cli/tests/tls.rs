@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::TempDir;
+use common::{TempDir, git_command};
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -75,7 +75,7 @@ fn utf8(path: &Path) -> TestResult<&str> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")

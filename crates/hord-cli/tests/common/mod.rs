@@ -7,6 +7,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Remove `path` and everything under it, if it exists. Directory
@@ -83,4 +84,22 @@ impl Drop for TempDir {
         // A daemon exits once `.hord/` is gone.
         drop_tree(&self.0);
     }
+}
+
+/// `git`, isolated from the user's and the system's configuration (a
+/// global `commit.gpgsign`, hooks, a default branch name), so tests behave
+/// the same on every machine and on CI.
+pub fn git_command() -> Command {
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    command
+}
+
+/// Isolate `command`, and any `git` it runs, from the user's and the
+/// system's git configuration. Git (for Windows too) reads `/dev/null` as
+/// an empty file.
+pub fn isolate_git(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
 }

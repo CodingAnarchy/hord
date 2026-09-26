@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::TempDir;
+use common::{TempDir, git_command};
 
 use std::collections::HashSet;
 use std::fs;
@@ -41,7 +41,7 @@ fn describe(out: &Output) -> String {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")

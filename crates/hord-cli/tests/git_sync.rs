@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::TempDir;
+use common::{TempDir, git_command, isolate_git};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,8 @@ fn describe(out: &Output) -> String {
 }
 
 fn hord(dir: &Path, args: &[&str]) -> TestResult<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_hord"))
+    // `hord git sync` runs git itself.
+    Ok(isolate_git(&mut Command::new(env!("CARGO_BIN_EXE_hord")))
         .arg("--no-daemon")
         .args(args)
         .current_dir(dir)
@@ -34,7 +35,7 @@ fn hord(dir: &Path, args: &[&str]) -> TestResult<Output> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")
@@ -135,5 +136,18 @@ fn once_check_and_repair() -> TestResult {
     let out = hord(&repo, &["git", "sync", "--help"])?;
     let help = String::from_utf8(out.stdout)?;
     assert!(help.contains("FORCE-PUSH"), "{help}");
+    Ok(())
+}
+
+/// Test git never reads the user's or the system's configuration.
+#[test]
+fn test_git_ignores_the_users_config() -> TestResult {
+    let dir = TempDir::new("hord-git-config")?;
+    let out = git_command()
+        .args(["config", "--list", "--show-origin"])
+        .current_dir(&dir.0)
+        .output()?;
+    let listed = String::from_utf8(out.stdout)?;
+    assert_eq!(listed.trim(), "", "{listed}");
     Ok(())
 }

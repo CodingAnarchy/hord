@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::TempDir;
+use common::{TempDir, git_command};
 
 use std::fs;
 use std::path::Path;
@@ -201,7 +201,7 @@ fn git_import_without_repo_fails() -> TestResult {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    git_command()
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -219,7 +219,7 @@ fn init_git_fixture(dir: &Path) -> TestResult {
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .output()

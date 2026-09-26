@@ -18,7 +18,7 @@ fn cargo_git() -> Option<PathBuf> {
 }
 
 fn git(git_dir: &std::path::Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)
@@ -59,4 +59,22 @@ fn cargo_git_toml_lossless() -> Result<(), Box<dyn std::error::Error>> {
         "expected at least one .toml file in cargo.git HEAD"
     );
     Ok(())
+}
+
+/// `git`, isolated from the user's and the system's configuration (a
+/// global `commit.gpgsign`, hooks, a default branch name), so tests behave
+/// the same on every machine and on CI.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    command
+}
+
+/// Isolate `command`, and any `git` it runs, from the user's and the
+/// system's git configuration. Git (for Windows too) reads `/dev/null` as
+/// an empty file.
+fn isolate_git(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
 }

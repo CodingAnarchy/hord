@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::TempDir;
+use common::{TempDir, git_command};
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -99,7 +99,7 @@ fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> TestResult<&'a str> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")

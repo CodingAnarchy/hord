@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use hord_diff::{ConflictKind, MergeMode, apply, diff, merge};
 use hord_lang::{IdentifiedTree, LangAdapter, default_identify};
 
-use common::{identify_result, parse_identified, rust, toml};
+use common::{git_command, identify_result, parse_identified, rust, toml};
 
 fn merge_identified<A: LangAdapter>(
     adapter: &A,
@@ -131,7 +131,7 @@ fn overlapping_edits_inside_one_function_keep_both() -> Result<(), Box<dyn std::
     let got = adapter.project(&merged.tree.tree);
     // The merge commit mixes both sides of one conflict hunk. That is a manual
     // resolution. Landing-order auto-resolution is `git merge-file --ours`.
-    let favor = std::process::Command::new("git")
+    let favor = git_command()
         .args(["merge-file", "-p", "--ours"])
         .arg(root.join("ours.rs"))
         .arg(root.join("base.rs"))
