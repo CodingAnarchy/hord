@@ -781,7 +781,7 @@ Accept:
 - Replay budget enforcement: no replay exceeds its cost budget.
 - **Arbitration round-trip:** every parked case in the conflict corpus can be resolved from the workbench, and the resolution lands as a change with both parents and a signed `Arbitrated` event.
 - **Review round-trip:** a policy rule requiring `review:human` blocks landing until a human signs from the UI or `hord review`; the resulting `Evidence` is verifiable with the signer's public key.
-- **Demo:** the M4 flight-recorder log plays back on the landing strip end-to-end, and a person unfamiliar with hord can explain from the UI alone why a given change was parked (usability check, 5 participants).
+- **Demo:** the M4 flight-recorder log plays back on the landing strip end-to-end. (The usability check moved to M6, ADR 0035.)
 - The UI issues no request that is not in `/api/v1/schema.json` (enforced by a proxy in the UI test suite).
 
 ### M6 — Self-hosting
@@ -793,6 +793,7 @@ Accept:
 - Every change in that window has an intent, provenance, and passing evidence.
 - Every human review and arbitration in that window was performed through the UI or CLI against the server, not by editing the store.
 - Bridge sync never diverges (checked hourly).
+- **Usability (from M5, ADR 0035):** a person unfamiliar with hord can explain from the UI alone why a given change was parked, on the self-hosted server (5 participants).
 
 ### M7 — Scale and breadth (OPEN, sequenced by need)
 
