@@ -10,16 +10,23 @@ Semantic VCS. The spec is the contract: `docs/spec.md`.
 
 ## Current target
 
-M0–M3 acceptance is green. Current work is **M4** (verification and policy: `hord-verify`, `hord-verify-rust`, `hord-policy`, and the server foundation `hord-api`, `hord-remote`, `hord-server`). Do not start M5+ crates except as a documented, required dependency of an M4 deliverable.
+M0–M4 acceptance is green. Current work is **M5** (replay, arbitration, and the human loop: `hord-replay-ref`, the arbitration queue and workbench, token auth and scopes, `hord-ui` views 1–3, and the M5 conflict corpus). Do not start M6+ work except as a documented, required dependency of an M5 deliverable.
 
 Acceptance harnesses (release mode; corpora in `$HORD_CORPORA` or `~/.cache/hord/corpora`) must stay green:
 
 - M0: `cargo run -p hord-eval --release`
 - M1: `cargo run -p hord-eval-m1 --release`
 - M2: `cargo run -p hord-eval-m2 --release`
-- M3: `cargo run -p hord-eval-m3 --release` (100-agent concurrency simulation, workspaces, `Cargo.lock`)
+- M3: `cargo run -p hord-eval-m3 --release` (100-agent concurrency simulation, workspaces, `Cargo.lock`), also with `--server`, `--policy`, and `--server --policy`. CI runs these with `--report-throughput`, because shared runners are too noisy to gate the 20 changes/s target; that gate is checked on an idle machine without the flag.
+- M4: the selection gate is the `M4 selection gate` workflow (`.github/workflows/m4-eval.yml`), dispatched on CI only (15 chains of 10 cargo commits plus full-suite samples, several hours). Do not run it locally. It passes on zero *confirmed* misses and a median selected share of at most 20% for write sets of 5 or fewer (ADR 0023 as amended).
 
-M3 decisions that constrain later work: read sets (ADR 0012), lander merge mode (0014), file-root ids and content-derived write sets (0015), copy-on-write directory workspaces (0016), and the `Cargo.lock` bridge living in `hord-lang-rust` (0013). Language-specific logic belongs only in its language adapter crate.
+M4 was accepted on 2026-09-26:
+- Gate run 36214480176 on main `12cbd88`: 0 confirmed misses in 163 graded faults, and a 3.1% median selected share for write sets of 5 or fewer.
+- Idle-machine throughput: 35.8–47.6 changes/s across the six M3 variants, against a target of 20.
+
+Decisions that constrain later work:
+- M3: read sets (ADR 0012), lander merge mode (0014), file-root ids and content-derived write sets (0015), copy-on-write directory workspaces (0016), and the `Cargo.lock` bridge living in `hord-lang-rust` (0013). Language-specific logic belongs only in its language adapter crate.
+- M4: coverage-derived test selection with conservative fallbacks (ADR 0022; its 2026-09-25 amendments end staleness once a test re-ran on the change and scope test-file edits to their module), the selection safety harness (0023; a miss is a confirmed miss), gRPC with `hord.proto` as the one schema and the per-repo daemon (0024, 0021), evidence beside snapshots and the verifier contract (0025), the policy file and evidence qualifiers (0026), and the Windows daemon stdio exception to `forbid(unsafe_code)` (0027).
 
 ## Engineering (spec §11.1)
 
