@@ -411,6 +411,13 @@ async fn arbitration_is_scoped_and_signed_by_the_arbiter() -> TestResult {
         arbitrated.by,
         Some(wire::actor(&Actor::Human { id: "ann".into() }))
     );
+    // The event carries the decision the signature covers (ADR 0038).
+    assert_eq!(
+        arbitrated.action,
+        Some(proto::Arbitration {
+            action: Some(proto::arbitration::Action::PickTheirs(true)),
+        })
+    );
     let signature = hord_core::Signature {
         key_id: arbitrated.key_id.ok_or("key id")?,
         bytes: Bytes::new(arbitrated.signature.ok_or("signature")?),

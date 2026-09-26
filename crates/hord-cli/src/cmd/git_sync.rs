@@ -226,6 +226,7 @@ fn check_message(check: &Check) -> proto::BridgeChecked {
         trigger: check.trigger.into(),
         detail: check.detail.clone(),
         head: check.head.map(wire::id),
+        recorder: None,
     }
 }
 

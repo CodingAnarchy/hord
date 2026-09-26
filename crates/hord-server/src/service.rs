@@ -14,7 +14,7 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{AuthStore, Principal};
 use crate::hosts::Hosts;
-use crate::ingest::{check_arbitration, check_evidence_async, check_submit};
+use crate::ingest::{check_arbitration, check_bridge_check, check_evidence_async, check_submit};
 use crate::route::RepoName;
 
 type GrpcResult<T> = Result<Response<T>, Status>;
@@ -234,6 +234,8 @@ impl GrpcTrait for GrpcRepoBackend {
         request: Request<proto::BridgeChecked>,
     ) -> GrpcResult<proto::RecordBridgeCheckResponse> {
         let backend = self.backend(&request)?;
+        let principal = request.extensions().get::<Principal>().cloned();
+        check_bridge_check(self.auth.clone(), principal, request.get_ref()).await?;
         let reply = backend.record_bridge_check(request.into_inner()).await?;
         Ok(Response::new(reply))
     }

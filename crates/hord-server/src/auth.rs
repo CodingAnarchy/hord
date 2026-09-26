@@ -386,6 +386,24 @@ impl AuthStore {
         Ok(find_key(&state, key_id))
     }
 
+    /// Whether `key_id` was a bridge's key at `at_ms` (ADR 0038): bound
+    /// then, and its actor then held a `bridge` token. As this process
+    /// last read the file: no I/O.
+    #[must_use]
+    pub fn bridge_key_at(&self, key_id: &str, at_ms: u64) -> bool {
+        let state = self.lock();
+        let Some(key) = state.keys.iter().find(|k| k.id == key_id) else {
+            return false;
+        };
+        let live = |revoked_at: Option<&str>| revoked_ms(revoked_at).is_none_or(|r| at_ms < r);
+        live(key.revoked_at.as_deref())
+            && state.tokens.iter().any(|t| {
+                t.actor == key.actor
+                    && live(t.revoked_at.as_deref())
+                    && t.scopes.iter().any(|s| s == "bridge")
+            })
+    }
+
     /// Whether `key_id` is a lander key the file lists (ADR 0038), as this
     /// process last read it: no I/O.
     #[must_use]

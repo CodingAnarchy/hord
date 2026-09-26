@@ -428,6 +428,7 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
         trigger: proto::BridgeCheckTrigger::Hourly.into(),
         detail: if diverged { "diverged" } else { "in sync" }.into(),
         head: None,
+        recorder: Some(bridge.key_id.clone()),
     };
 
     // A signed agent change, and a pull request the bridge vouches for.
@@ -470,13 +471,13 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
         bridge_remote.record_bridge_check(check(false)).await?;
     }
     let steady_until = now_ms()? + 1;
-    let audit = |until_ms: u64| proto::AuditRequest {
+    let audit_window = |until_ms: u64| proto::AuditRequest {
         since_ms: since,
         until_ms: Some(until_ms),
         max_bridge_gap_ms: GAP_MS,
         require_bridge: true,
     };
-    let report = root.audit().audit_log(audit(steady_until)).await?;
+    let report = root.audit().audit_log(audit_window(steady_until)).await?;
     assert!(report.ok, "{:#?}", report.violations);
     let bridge_report = report.bridge.unwrap_or_default();
     assert_eq!((bridge_report.checks, bridge_report.diverged), (4, 0));
@@ -496,7 +497,7 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     // A diverged check fails, on its own.
     bridge_remote.record_bridge_check(check(true)).await?;
     let now = now_ms()? + 1;
-    let report = root.audit().audit_log(audit(now)).await?;
+    let report = root.audit().audit_log(audit_window(now)).await?;
     let criteria: Vec<AuditCriterion> = report.violations.iter().map(|v| v.criterion()).collect();
     assert_eq!(
         criteria,
@@ -505,7 +506,10 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
         report.violations
     );
     // A window that ends twice the gap after the last check has a gap.
-    let report = root.audit().audit_log(audit(now + 2 * GAP_MS)).await?;
+    let report = root
+        .audit()
+        .audit_log(audit_window(now + 2 * GAP_MS))
+        .await?;
     let criteria: Vec<AuditCriterion> = report.violations.iter().map(|v| v.criterion()).collect();
     assert_eq!(
         criteria,
@@ -516,10 +520,55 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     assert!(report.violations[0].detail.contains(&"d".repeat(40)));
     assert_eq!(report.bridge.unwrap_or_default().diverged, 1);
 
+    // With tokens, a check names its recorder: the bridge's own key
+    // (ADR 0038).
+    let unnamed = bridge_remote
+        .record_bridge_check(proto::BridgeChecked {
+            recorder: None,
+            ..check(false)
+        })
+        .await;
+    assert!(
+        matches!(unnamed, Err(hord_api::ApiError::InvalidArgument(_))),
+        "{unnamed:?}"
+    );
+    let borrowed = bridge_remote
+        .record_bridge_check(proto::BridgeChecked {
+            recorder: Some(bot.key_id.clone()),
+            ..check(false)
+        })
+        .await;
+    assert!(
+        matches!(borrowed, Err(hord_api::ApiError::PermissionDenied(_))),
+        "{borrowed:?}"
+    );
+
     // Release the store before the directory is removed.
     drop((root, bridge_remote, bot_remote, ci));
     let _ = stop.send(());
     serving.await??;
+
+    // Where no token is checked (the local endpoint), a check can name any
+    // key; the audit counts only those by a key bound to a bridge token.
+    let local = LocalRepo::without_lander(Repo::open(&repo_dir).await?);
+    local
+        .record_bridge_check(proto::BridgeChecked {
+            recorder: Some(bot.key_id.clone()),
+            ..check(false)
+        })
+        .await?;
+    let audit = LocalAudit::new(Arc::new(local), Some(Arc::new(AuthStore::open(&auth)?)));
+    let report = audit.audit_log(audit_window(now_ms()? + 1)).await?;
+    let bridge_report = report.bridge.unwrap_or_default();
+    assert_eq!(bridge_report.checks, 5, "the bot's check is not counted");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.detail.starts_with("1 bridge check(s)")),
+        "{:#?}",
+        report.notes
+    );
     Ok(())
 }
 

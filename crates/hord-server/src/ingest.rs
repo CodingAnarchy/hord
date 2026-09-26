@@ -102,6 +102,45 @@ pub(crate) async fn check_arbitration(
     .await
 }
 
+/// Check a bridge check before it is recorded (ADR 0038): with a
+/// principal, it names as its recorder a key bound to the token's actor.
+/// Without auth (a daemon, a local endpoint) it is recorded as given.
+pub(crate) async fn check_bridge_check(
+    auth: Option<Arc<AuthStore>>,
+    principal: Option<Principal>,
+    check: &proto::BridgeChecked,
+) -> Result<(), Status> {
+    let (Some(auth), Some(principal)) = (auth, principal) else {
+        return Ok(());
+    };
+    let Some(recorder) = check.recorder.clone() else {
+        return Err(Status::invalid_argument(
+            "a bridge check names the key of the bridge that recorded it (recorder)",
+        ));
+    };
+    let bound = blocking_value(move || auth.key_actor(&recorder).map(|a| (a, recorder))).await?;
+    match bound {
+        (Some(actor), _) if same_actor(&actor, &principal.actor) => Ok(()),
+        (Some(actor), recorder) => Err(Status::permission_denied(format!(
+            "recorder key {recorder} is bound to {}, not {}",
+            describe(&actor),
+            describe(&principal.actor)
+        ))),
+        (None, recorder) => Err(Status::permission_denied(format!(
+            "recorder key {recorder} is not bound to any actor on this server"
+        ))),
+    }
+}
+
+async fn blocking_value<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, crate::auth::AuthError> + Send + 'static,
+) -> Result<T, Status> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .map_err(|err| Status::internal(err.to_string()))
+}
+
 /// [`check_evidence`] on the blocking pool (it may read the auth file).
 pub(crate) async fn check_evidence_async(
     auth: Option<Arc<AuthStore>>,

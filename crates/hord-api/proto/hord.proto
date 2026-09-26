@@ -997,6 +997,11 @@ message Arbitrated {
   optional string key_id = 4;
   // The arbiter's signature over the decision, as given to Arbitrate.
   optional bytes signature = 5;
+  // The decision the signature covers (ADR 0038), so it can be verified
+  // from the event alone. Unset on events recorded before.
+  Arbitration action = 6;
+  // With `replay`: the note the signature covers.
+  optional string note = 7;
 }
 
 // A change landed.
@@ -2199,6 +2204,11 @@ message BridgeChecked {
   string detail = 6;
   // ChangeId of the log's head that was exported; unset on an empty log.
   optional string head = 7;
+  // Key id of the bridge that recorded the check (ADR 0038): the key of
+  // its login, bound to the bridge token's actor. With tokens, the server
+  // requires it. The audit counts only checks recorded by a key bound to
+  // a `bridge` token.
+  optional string recorder = 8;
 }
 
 // The recorded check.

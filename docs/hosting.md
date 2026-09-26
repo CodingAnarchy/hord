@@ -228,9 +228,9 @@ It checks:
 
 - every landed change has an intent and provenance: a record signed by its author with a key bound to them, vouched for by the bridge, replayed by the harness, or resolved by an arbiter;
 - every landed change has passing evidence, and head's policy at its landing base allows it when judged again, both on exactly the evidence the lander counted when it landed (its `Landed` event lists it, ADR 0038), so evidence attached later changes nothing;
-- every review and arbitration is signed by a key bound to the actor who made it;
+- every review and arbitration is signed by a key bound to the actor who made it, and not revoked when it was made; an arbitration's signature is verified over the decision its `Arbitrated` event carries;
 - nothing is in the log without the lander's `Landed` event, and every `Landed` event is signed by the repository's lander key (ADR 0038);
-- the bridge's divergence checks all passed, with none more than 65 minutes apart (`--max-bridge-gap`).
+- the bridge's divergence checks all passed, with none more than 65 minutes apart (`--max-bridge-gap`). With an auth file, only checks recorded by a key bound to a `bridge` token count; the report notes any others.
 
 A landing recorded before `Landed` listed its evidence is judged on the evidence attached before it landed, and the report's fallbacks say so.
 

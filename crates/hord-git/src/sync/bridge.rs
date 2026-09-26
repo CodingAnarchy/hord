@@ -450,6 +450,9 @@ impl Bridge {
             trigger: trigger.into(),
             detail: detail.clone(),
             head: head.map(wire::id),
+            // The bridge's key vouches for the check, as for its pull
+            // requests (ADR 0038).
+            recorder: self.options.voucher.clone(),
         };
         let recorded = match self.backend.record_bridge_check(event).await {
             Ok(reply) => Some(reply.cursor),

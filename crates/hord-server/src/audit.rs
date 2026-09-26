@@ -136,9 +136,12 @@ pub struct ArbitrationFacts {
     pub change: String,
     /// The arbiter.
     pub by: Option<Actor>,
-    /// The decision's signature, checked against the arbiter. (The server
-    /// verified the signature itself at ingest; this checks the binding.)
+    /// The decision's signature, verified over the decision the event
+    /// carries and checked against the arbiter.
     pub key: KeyCheck,
+    /// Whether the event predates ADR 0038 and carries no decision, so only
+    /// the key's binding was checked.
+    pub fallback: bool,
 }
 
 /// One divergence check of the git bridge (ADR 0036).
@@ -174,6 +177,9 @@ pub struct AuditFacts {
     pub unrecorded: Vec<(String, u64)>,
     /// Bridge checks in the window, in time order.
     pub bridge_checks: Vec<BridgeCheck>,
+    /// Bridge checks in the window not counted: with an auth file, those
+    /// not recorded by a key bound to a `bridge` token (ADR 0038).
+    pub uncounted_bridge_checks: u32,
 }
 
 fn finding(criterion: AuditCriterion, change: Option<&str>, detail: String) -> proto::AuditFinding {
@@ -238,6 +244,17 @@ pub fn judge(facts: &AuditFacts) -> proto::AuditReport {
         ));
     }
     let bridge = judge_bridge(facts, &mut violations, &mut notes);
+    if facts.uncounted_bridge_checks > 0 {
+        notes.push(finding(
+            AuditCriterion::BridgeGap,
+            None,
+            format!(
+                "{} bridge check(s) in the window were not recorded by a key bound to a \
+                 bridge token, and were not counted",
+                facts.uncounted_bridge_checks
+            ),
+        ));
+    }
     if !facts.bindings_checked {
         notes.push(finding(
             AuditCriterion::Unspecified,
@@ -266,6 +283,14 @@ pub fn judge(facts: &AuditFacts) -> proto::AuditReport {
 /// words.
 fn fallbacks(facts: &AuditFacts) -> Vec<String> {
     let mut out = Vec::new();
+    let arbitrations = facts.arbitrations.iter().filter(|a| a.fallback).count();
+    if arbitrations > 0 {
+        out.push(format!(
+            "{arbitrations} arbitration{} recorded before Arbitrated carried the decision: \
+             only the signing key's binding was checked",
+            if arbitrations == 1 { "" } else { "s" }
+        ));
+    }
     let evidence = facts.changes.iter().filter(|c| c.evidence_fallback).count();
     if evidence > 0 {
         out.push(format!(
@@ -460,12 +485,12 @@ pub fn span(ms: u64) -> String {
 /// The divergence check an event records, if it is one: a `BridgeChecked`
 /// event (ADR 0036). With none in the window the report says "no bridge
 /// checks recorded".
-fn bridge_check(envelope: &proto::EventEnvelope) -> Option<BridgeCheck> {
+fn bridge_check(envelope: &proto::EventEnvelope) -> Option<(BridgeCheck, Option<String>)> {
     let Some(proto::event::Kind::BridgeChecked(c)) = envelope.kind() else {
         return None;
     };
     let commit = |c: &Option<String>| c.as_deref().unwrap_or("none").to_owned();
-    Some(BridgeCheck {
+    let check = BridgeCheck {
         at_ms: envelope.at_ms,
         diverged: c.diverged,
         detail: format!(
@@ -474,7 +499,31 @@ fn bridge_check(envelope: &proto::EventEnvelope) -> Option<BridgeCheck> {
             commit(&c.actual),
             commit(&c.expected)
         ),
-    })
+    };
+    Some((check, c.recorder.clone()))
+}
+
+/// Verify an `Arbitrated` event's signature over the decision it carries
+/// (ADR 0038), as the server did at ingest. An event recorded before it
+/// carries no decision and passes here: only its key's binding is checked.
+fn verify_decision(event: &proto::Arbitrated) -> Result<(), String> {
+    if event.action.is_none() {
+        return Ok(());
+    }
+    let request = proto::ArbitrateRequest {
+        change: event.change.clone(),
+        action: event.action.clone(),
+        arbiter: event.by.clone(),
+        note: event.note.clone(),
+        key_id: event.key_id.clone(),
+        signature: event.signature.clone(),
+    };
+    let (change, action, arbiter) =
+        hord_txn::arbitrate_request(&request).map_err(|err| err.to_string())?;
+    let signature = arbiter.signature.ok_or("unsigned")?;
+    let key = sign::signer(&signature).map_err(|err| err.to_string())?;
+    hord_txn::verify_arbitration(change, &action, &signature, &key)
+        .map_err(|err| format!("the signature does not cover the decision: {err}"))
 }
 
 /// Who vouched for an unsigned submitted change, if the git bridge did
@@ -665,11 +714,22 @@ pub async fn gather(
     let mut submitted = BTreeMap::new();
     let mut arbitrations = Vec::new();
     let mut bridge_checks = Vec::new();
+    let mut uncounted_bridge_checks = 0u32;
     for envelope in &events {
-        if let Some(check) = bridge_check(envelope)
+        if let Some((check, recorder)) = bridge_check(envelope)
             && within(envelope.at_ms)
         {
-            bridge_checks.push(check);
+            // With an auth file, only a bridge's own checks count.
+            let counted = match (auth, recorder) {
+                (None, _) => true,
+                (Some(auth), Some(key)) => auth.bridge_key_at(&key, envelope.at_ms),
+                (Some(_), None) => false,
+            };
+            if counted {
+                bridge_checks.push(check);
+            } else {
+                uncounted_bridge_checks += 1;
+            }
         }
         let Some(kind) = envelope.kind() else {
             continue;
@@ -695,15 +755,20 @@ pub async fn gather(
                     .as_ref()
                     .map(|a| wire::actor_from("by", a))
                     .transpose()?;
+                let fallback = event.action.is_none();
                 let key = match (&by, &event.key_id, &event.signature) {
-                    (Some(by), Some(key_id), Some(_)) => bound(auth, by, key_id, envelope.at_ms),
                     (None, _, _) => KeyCheck::Bad("no arbiter recorded".into()),
+                    (Some(by), Some(key_id), Some(_)) => match verify_decision(event) {
+                        Ok(()) => bound(auth, by, key_id, envelope.at_ms),
+                        Err(reason) => KeyCheck::Bad(reason),
+                    },
                     _ => KeyCheck::Unsigned,
                 };
                 arbitrations.push(ArbitrationFacts {
                     change: event.change.clone(),
                     by,
                     key,
+                    fallback,
                 });
             }
             _ => {}
@@ -824,6 +889,7 @@ pub async fn gather(
         arbitrations,
         unrecorded,
         bridge_checks,
+        uncounted_bridge_checks,
     })
 }
 
@@ -1096,6 +1162,7 @@ mod tests {
                 change: "parked".into(),
                 by: Some(ada()),
                 key: KeyCheck::Bound,
+                fallback: false,
             }],
             unrecorded: Vec::new(),
             bridge_checks: (0..=5)
@@ -1105,6 +1172,7 @@ mod tests {
                     detail: String::new(),
                 })
                 .collect(),
+            uncounted_bridge_checks: 0,
         }
     }
 
@@ -1295,6 +1363,75 @@ mod tests {
         assert!(report.ok);
         assert_eq!(report.fallbacks.len(), 1, "{:?}", report.fallbacks);
         assert!(report.fallbacks[0].starts_with("2 landings"));
+    }
+
+    #[test]
+    fn an_arbitration_is_verified_over_the_decision_it_carries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key = sign::SigningKey::generate()?;
+        let parked = ObjectId::from_canonical(b"parked");
+        let action = hord_txn::Arbitration::Replay {
+            note: Some("keep the fast path".into()),
+        };
+        let signature = hord_txn::sign_arbitration(parked, &action, &key)?;
+        let event = proto::Arbitrated {
+            change: wire::id(parked),
+            by: Some(wire::actor(&ada())),
+            result: wire::id(ObjectId::from_canonical(b"result")),
+            key_id: Some(signature.key_id.clone()),
+            signature: Some(signature.bytes.to_vec()),
+            action: Some(proto::Arbitration {
+                action: Some(proto::arbitration::Action::Replay(true)),
+            }),
+            note: Some("keep the fast path".into()),
+        };
+        verify_decision(&event)?;
+        // Another note, or another action, is not what was signed.
+        let other_note = proto::Arbitrated {
+            note: Some("drop it".into()),
+            ..event.clone()
+        };
+        assert!(verify_decision(&other_note).is_err());
+        let other_action = proto::Arbitrated {
+            action: Some(proto::Arbitration {
+                action: Some(proto::arbitration::Action::PickOurs(true)),
+            }),
+            ..event.clone()
+        };
+        assert!(verify_decision(&other_action).is_err());
+        // An event from before ADR 0038 carries no decision: the fallback.
+        let older = proto::Arbitrated {
+            action: None,
+            note: None,
+            ..event
+        };
+        verify_decision(&older)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_report_names_the_arbitration_fallback_and_uncounted_checks() {
+        let mut facts = clean();
+        facts.arbitrations[0].fallback = true;
+        facts.uncounted_bridge_checks = 2;
+        let report = judge(&facts);
+        assert!(report.ok, "{:#?}", report.violations);
+        assert!(
+            report
+                .fallbacks
+                .iter()
+                .any(|f| f.starts_with("1 arbitration")),
+            "{:?}",
+            report.fallbacks
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.detail.starts_with("2 bridge check(s)")),
+            "{:?}",
+            report.notes
+        );
     }
 
     #[test]

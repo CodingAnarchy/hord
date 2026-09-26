@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::conflict::{ConflictReport, MergeSeverity};
-use crate::escalation::Arbiter;
+use crate::escalation::{Arbiter, SignedDecision};
 use crate::lander::{QueueEntry, QueueStatus};
 use crate::repo::{Inner, lock};
 use crate::{Error, Result};
@@ -436,9 +436,30 @@ pub(crate) fn needs_arbitration(change: ChangeId, detail: String) -> Kind {
     })
 }
 
-/// `Arbitrated`: `change` was resolved by `arbiter`, landing as `result`.
-pub(crate) fn arbitrated(change: ChangeId, arbiter: &Arbiter, result: ChangeId) -> Kind {
+/// `Arbitrated`: `change` was resolved by `arbiter`, landing as `result`,
+/// with the `decision` the arbiter signed (ADR 0038).
+pub(crate) fn arbitrated(
+    change: ChangeId,
+    arbiter: &Arbiter,
+    decision: Option<&SignedDecision>,
+    result: ChangeId,
+) -> Kind {
+    use proto::arbitration::Action;
+    let action = decision.and_then(|d| {
+        let action = match d.action.as_str() {
+            "pick_ours" => Action::PickOurs(true),
+            "pick_theirs" => Action::PickTheirs(true),
+            "replay" => Action::Replay(true),
+            "resolved" => Action::Resolved(wire::id(d.resolved?)),
+            _ => return None,
+        };
+        Some(proto::Arbitration {
+            action: Some(action),
+        })
+    });
     Kind::Arbitrated(proto::Arbitrated {
+        action,
+        note: decision.and_then(|d| d.note.clone()),
         change: wire::id(change),
         by: Some(wire::actor(&arbiter.actor)),
         result: wire::id(result),
