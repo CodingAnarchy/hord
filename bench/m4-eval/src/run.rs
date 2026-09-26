@@ -605,6 +605,12 @@ impl Grader<'_> {
         batch: Vec<Unit>,
         stop: &dyn Fn(&BTreeSet<Unit>) -> bool,
     ) -> Result<()> {
+        // A read-only test that failed in an earlier command left its
+        // scratch tree unwritable; open it up so this command's runs of the
+        // same tests start clean (and a clean re-run means something).
+        if let Some(target) = &self.runner.target_dir {
+            crate::disk::restore_permissions(&crate::disk::scratch_dir(target));
+        }
         // Group, keeping the batch's order of first appearance.
         let mut groups: Vec<(String, Vec<Unit>)> = Vec::new();
         for u in batch {
