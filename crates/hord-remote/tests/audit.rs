@@ -395,14 +395,13 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
     let url = format!("http://{}", listener.local_addr()?);
     let server = Server::new(hosts, ServerConfig::default()).with_auth(AuthStore::open(&auth)?);
-    let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
         server
             .serve(listener, async {
                 let _ = stopped.await;
             })
             .await
-            .expect("serve the test server");
     });
     let root_token = RemoteRepo::connect(&url)
         .await?
@@ -542,6 +541,11 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     );
     assert!(report.violations[0].detail.contains(&"d".repeat(40)));
     assert_eq!(report.bridge.unwrap_or_default().diverged, 1);
+
+    // Release the store before the directory is removed.
+    drop((root, bridge_remote, bot_remote, ci));
+    let _ = stop.send(());
+    serving.await??;
     Ok(())
 }
 
