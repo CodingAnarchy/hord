@@ -58,6 +58,10 @@ service RepoBackend {
 
   // The event stream (spec §10.5.3), resumable from a cursor.
   rpc Events(EventsRequest) returns (stream EventEnvelope);
+
+  // Record one git bridge divergence check (ADR 0036) as a `BridgeChecked`
+  // event in the repository's event log.
+  rpc RecordBridgeCheck(BridgeChecked) returns (RecordBridgeCheckResponse);
 }
 
 // Workspace commands, served only by a repository's local daemon (ADR 0024
@@ -871,6 +875,8 @@ message Event {
     Rejected rejected = 9;
     // Head moved.
     HeadMoved head_moved = 10;
+    // The git bridge compared the mirror's `main` with the log's export.
+    BridgeChecked bridge_checked = 11;
   }
 }
 
@@ -1730,4 +1736,46 @@ message KeyVerifyResult {
   optional string reason = 5;
   // The key's actor, when the server knows it.
   Actor actor = 6;
+}
+
+// ---------------------------------------------------------------- git bridge
+
+// What made the git bridge check the mirror (ADR 0036).
+enum BridgeCheckTrigger {
+  BRIDGE_CHECK_TRIGGER_UNSPECIFIED = 0;
+  // The hourly check.
+  BRIDGE_CHECK_TRIGGER_HOURLY = 1;
+  // A push the bridge made.
+  BRIDGE_CHECK_TRIGGER_PUSH = 2;
+  // `hord git sync --check`.
+  BRIDGE_CHECK_TRIGGER_CHECK = 3;
+  // `hord git sync --repair`, after its force-push.
+  BRIDGE_CHECK_TRIGGER_REPAIR = 4;
+}
+
+// The git bridge compared the mirror's `main` with the export of the log
+// (ADR 0036). Recorded for every check, passing or not.
+message BridgeChecked {
+  // The mirror's URL, without credentials.
+  string remote = 1;
+  // Whether `main` is not exactly the export: a commit the bridge did not
+  // push. A `main` that only lags the log (an earlier export) has not
+  // diverged.
+  bool diverged = 2;
+  // Commit the export of the log's head is; unset on an empty log.
+  optional string expected = 3;
+  // Commit the mirror's `main` names; unset when it has no `main`.
+  optional string actual = 4;
+  // What made the bridge check.
+  BridgeCheckTrigger trigger = 5;
+  // The outcome in words.
+  string detail = 6;
+  // ChangeId of the log's head that was exported; unset on an empty log.
+  optional string head = 7;
+}
+
+// The recorded check.
+message RecordBridgeCheckResponse {
+  // EventCursor of the `BridgeChecked` event.
+  uint64 cursor = 1;
 }

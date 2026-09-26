@@ -408,6 +408,8 @@ impl Strip {
                 self.head = Some(h.to.clone());
                 None
             }
+            // Not a change: the strip shows no git bridge checks.
+            Kind::BridgeChecked(_) => None,
         };
         if let Some(i) = touched {
             self.rows[i].cursor = envelope.cursor;

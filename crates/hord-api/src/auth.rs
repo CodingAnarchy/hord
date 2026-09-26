@@ -139,6 +139,8 @@ const TABLE: &[(&str, Req)] = &[
     ("/hord.v1.RepoBackend/ResolveName", Req::Read),
     ("/hord.v1.RepoBackend/AttachEvidence", Req::Evidence),
     ("/hord.v1.RepoBackend/Events", Req::Read),
+    // Git bridge (ADR 0036; scope provisional, docs/adr/_open-bridge.md).
+    ("/hord.v1.RepoBackend/RecordBridgeCheck", Req::Admin),
     // Workspaces: a repository's daemon only (ADR 0024 amendment).
     ("/hord.v1.Workspaces/WsNew", Req::Propose),
     ("/hord.v1.Workspaces/WsList", Req::Read),

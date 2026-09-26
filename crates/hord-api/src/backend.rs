@@ -136,4 +136,19 @@ pub trait RepoBackend: Send + Sync {
     /// only. Cursors are persisted, so a client resumes after a disconnect
     /// or a restart by passing the last cursor it saw.
     async fn events(&self, request: proto::EventsRequest) -> ApiResult<EventStream>;
+
+    // ------------------------------------------------------------ git bridge
+
+    /// Record one git bridge divergence check (ADR 0036) as a
+    /// [`proto::BridgeChecked`] event, and return its cursor. Backends that
+    /// keep no event log return [`crate::ApiError::Unimplemented`].
+    async fn record_bridge_check(
+        &self,
+        request: proto::BridgeChecked,
+    ) -> ApiResult<proto::RecordBridgeCheckResponse> {
+        let _ = request;
+        Err(crate::ApiError::Unimplemented(
+            "this backend does not record git bridge checks".to_owned(),
+        ))
+    }
 }
