@@ -126,6 +126,8 @@ pub fn run(json: bool, target: &Target, mode: Mode, config: Option<PathBuf>) -> 
     if let Some(secs) = config.check_secs {
         options.check_every = Duration::from_secs(secs.max(1));
     }
+    // A check saves no state: it may run beside the daemon.
+    options.shared = matches!(mode, Mode::Check);
 
     let mut bridge = block_on(Bridge::open(backend, pulls, options))?;
     match mode {

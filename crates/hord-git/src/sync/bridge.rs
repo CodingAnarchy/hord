@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::{self, Write as _};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +49,9 @@ pub struct BridgeOptions {
     pub poll: Duration,
     /// How often `main` is checked for divergence (ADR 0036: hourly).
     pub check_every: Duration,
+    /// Open the work directory without its lock, beside a bridge that
+    /// holds it: only for [`Bridge::check`], which saves no state.
+    pub shared: bool,
 }
 
 impl fmt::Debug for BridgeOptions {
@@ -59,6 +63,7 @@ impl fmt::Debug for BridgeOptions {
             .field("voucher", &self.voucher)
             .field("poll", &self.poll)
             .field("check_every", &self.check_every)
+            .field("shared", &self.shared)
             .finish()
     }
 }
@@ -75,6 +80,7 @@ impl BridgeOptions {
             voucher: None,
             poll: Duration::from_secs(60),
             check_every: Duration::from_secs(60 * 60),
+            shared: false,
         }
     }
 }
@@ -125,6 +131,9 @@ pub struct Bridge {
     state: State,
     state_path: PathBuf,
     options: BridgeOptions,
+    /// The work directory's lock, held while the bridge is open (unless
+    /// [`BridgeOptions::shared`]).
+    _lock: Option<File>,
 }
 
 impl fmt::Debug for Bridge {
@@ -152,6 +161,14 @@ impl Bridge {
                 path: work.clone(),
                 source,
             })?;
+        // Two bridges on one work directory would both report outcomes and
+        // overwrite each other's state.
+        let lock = if options.shared {
+            None
+        } else {
+            let path = work.join("lock");
+            Some(blocking(move || lock_work_dir(&path)).await?)
+        };
         let git_dir = work.join("export.git");
         let init = git_dir.clone();
         blocking(move || Ok(open_or_init(&init).map(drop)?)).await?;
@@ -165,6 +182,7 @@ impl Bridge {
             state,
             state_path,
             options,
+            _lock: lock,
         })
     }
 
@@ -916,6 +934,26 @@ async fn next_event(
     match events {
         Some(stream) => stream.next().await,
         None => None,
+    }
+}
+
+/// Take the exclusive lock on `path`, created if needed; it is released
+/// when the file is closed, including when the process dies.
+fn lock_work_dir(path: &Path) -> Result<File, SyncError> {
+    let io = |source| SyncError::Io {
+        path: path.to_owned(),
+        source,
+    };
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(SyncError::Busy(path.to_owned())),
+        Err(TryLockError::Error(err)) => Err(io(err)),
     }
 }
 

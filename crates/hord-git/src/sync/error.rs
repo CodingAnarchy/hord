@@ -32,6 +32,12 @@ pub enum SyncError {
         #[source]
         source: std::io::Error,
     },
+    /// Another bridge holds the work directory's lock.
+    #[error(
+        "another hord git sync is using this work directory (it holds {0}); stop it first, \
+         or run only --check beside it"
+    )]
+    Busy(PathBuf),
     /// The bridge's state file does not parse.
     #[error("bridge state {path}: {reason}")]
     State {

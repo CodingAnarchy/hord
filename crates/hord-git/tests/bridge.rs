@@ -931,3 +931,25 @@ async fn a_failed_close_is_retried_without_repeating_the_comment() -> TestResult
     assert_eq!((landed_comments, successes), (1, 1), "{reported:?}");
     Ok(())
 }
+
+/// One bridge at a time owns a work directory; a check may run beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_bridge_on_the_work_directory_is_refused() -> TestResult {
+    let t = Setup::new("busy").await?;
+    let first = t.bridge().await?;
+    let backend: Arc<dyn RepoBackend> = t.backend.clone();
+    let second = Bridge::open(backend, None, t.options()).await;
+    assert!(
+        matches!(second, Err(SyncError::Busy(_))),
+        "{:?}",
+        second.map(drop)
+    );
+    let mut options = t.options();
+    options.shared = true;
+    let backend: Arc<dyn RepoBackend> = t.backend.clone();
+    let checker = Bridge::open(backend, None, options).await?;
+    assert!(!checker.check(BridgeCheckTrigger::Check).await?.diverged);
+    drop(first);
+    t.bridge().await?;
+    Ok(())
+}

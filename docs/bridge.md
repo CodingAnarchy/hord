@@ -31,6 +31,8 @@ hord git sync --check    # compare main with the export; exit 1 if it has diverg
 hord git sync --repair   # FORCE-PUSH the export of the log to main
 ```
 
+One bridge at a time uses a work directory: a second `hord git sync` there refuses to start, except `--check`, which saves no state and may run beside the daemon.
+
 `--repair` discards every commit on `main` that the export does not contain. Run `--check` first, and save anything worth keeping from the diverged commits as a pull request.
 
 The daemon follows the repository's event stream and exports each landing when it happens. It saves its position in `<work_dir>/state.json`, along with the last change it pushed and each pull request's proposal. After a restart it resumes from there, so it neither skips nor repeats a change, a comment, or a status.
