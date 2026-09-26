@@ -686,3 +686,106 @@ async fn landings_are_signed_by_a_listed_lander_key() -> TestResult {
     assert_eq!(lander(&report).len(), 1, "{:#?}", report.violations);
     Ok(())
 }
+
+/// A check on `record`'s result, passing or failing, unsigned.
+fn check_on(record: &ChangeRecord, result: EvidenceResult) -> TestResult<Evidence> {
+    Ok(Evidence {
+        kind: EvidenceKind::Check,
+        qualifier: None,
+        snapshot: record.result,
+        toolchain: record.provenance.toolchain,
+        command: "cargo check".into(),
+        scope: None,
+        result,
+        log: None,
+        cost_ms: 1,
+        produced_by: Actor::Agent {
+            id: "ci".into(),
+            model: "m1".into(),
+            model_hash: Bytes::default(),
+            harness: "h1".into(),
+        },
+        produced_at: Timestamp::from_millis(now_ms()?),
+        signature: None,
+    })
+}
+
+/// The audit judges a landing on the evidence the lander counted, as its
+/// `Landed` event lists it (ADR 0038): evidence attached afterwards can
+/// neither clear a landing that had none nor fail one that passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evidence_attached_after_landing_changes_nothing() -> TestResult {
+    let dir = temp("counted")?;
+    let repo = Repo::create(dir.0.join("repo")).await?;
+    repo.bootstrap(
+        vec![(
+            "src/lib.rs".parse::<RepoPath>()?,
+            b"pub fn a() -> u32 {\n    1\n}\n".to_vec(),
+        )],
+        Intent::from_summary("seed"),
+        Actor::Human { id: "seed".into() },
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let since = now_ms()?;
+    let local = LocalRepo::without_lander(repo.clone());
+    let attach = |record: &ChangeRecord, change: &str, result: EvidenceResult| {
+        let evidence = check_on(record, result);
+        let change = change.to_owned();
+        let local = &local;
+        async move {
+            local
+                .attach_evidence(proto::AttachEvidenceRequest {
+                    change,
+                    evidence: hord_encoding::encode(&evidence?)?,
+                })
+                .await?;
+            TestResult::Ok(())
+        }
+    };
+    let propose = |body: &'static str| {
+        let repo = repo.clone();
+        async move {
+            let mut ws = repo
+                .begin(BeginOptions::at_head(Actor::Human { id: "ada".into() }))
+                .await?;
+            ws.write_file(&"src/lib.rs".parse()?, body).await?;
+            TestResult::Ok(ws.propose(Intent::from_summary(body)).await?)
+        }
+    };
+
+    // A lands with no evidence; B with a passing check.
+    let a = propose("pub fn a() -> u32 {\n    2\n}\n").await?;
+    repo.submit(a.change).await?;
+    repo.land_local().await?;
+    let b = propose("pub fn a() -> u32 {\n    3\n}\n").await?;
+    attach(&b.record, &wire::id(b.change), EvidenceResult::Pass).await?;
+    repo.submit(b.change).await?;
+    repo.land_local().await?;
+    let evidence_findings = |report: &proto::AuditReport| -> Vec<String> {
+        report
+            .violations
+            .iter()
+            .filter(|v| v.criterion() == AuditCriterion::Evidence)
+            .filter_map(|v| v.change.clone())
+            .collect()
+    };
+    let audit = || LocalAudit::new(Arc::new(LocalRepo::without_lander(repo.clone())), None);
+    let before = audit().audit_log(window(since)?).await?;
+    assert_eq!(evidence_findings(&before), [wire::id(a.change)]);
+    assert!(before.fallbacks.is_empty(), "{:?}", before.fallbacks);
+
+    // Afterwards: a pass for A, a failure for B.
+    attach(&a.record, &wire::id(a.change), EvidenceResult::Pass).await?;
+    attach(
+        &b.record,
+        &wire::id(b.change),
+        EvidenceResult::Fail {
+            summary: "flaky".into(),
+        },
+    )
+    .await?;
+    let after = audit().audit_log(window(since)?).await?;
+    assert_eq!(evidence_findings(&after), [wire::id(a.change)]);
+    Ok(())
+}

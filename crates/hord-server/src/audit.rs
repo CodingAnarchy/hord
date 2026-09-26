@@ -120,7 +120,10 @@ pub struct LandedFacts {
     /// The lander's signature on its `Landed` event (ADR 0038), checked
     /// against the auth file's `[[lander]]` keys.
     pub lander: KeyCheck,
-    /// Its evidence.
+    /// Whether its `Landed` event predates ADR 0038's list of the evidence
+    /// counted, so [`Self::evidence`] is what was attached before it landed.
+    pub evidence_fallback: bool,
+    /// Its evidence: what the lander counted.
     pub evidence: Vec<EvidenceFacts>,
     /// Head's policy, judged again.
     pub policy: PolicyJudgement,
@@ -255,7 +258,23 @@ pub fn judge(facts: &AuditFacts) -> proto::AuditReport {
         ok: violations.is_empty(),
         violations,
         notes,
+        fallbacks: fallbacks(facts),
     }
+}
+
+/// The fallbacks the audit used for events recorded before ADR 0038, in
+/// words.
+fn fallbacks(facts: &AuditFacts) -> Vec<String> {
+    let mut out = Vec::new();
+    let evidence = facts.changes.iter().filter(|c| c.evidence_fallback).count();
+    if evidence > 0 {
+        out.push(format!(
+            "{evidence} landing{} recorded before Landed listed the evidence counted: judged on \
+             the evidence attached before it landed, plus what its Landed event listed",
+            if evidence == 1 { "" } else { "s" }
+        ));
+    }
+    out
 }
 
 /// What is wrong with a signature, for `what`; `None` when nothing is.
@@ -621,6 +640,8 @@ pub async fn gather(
     let events = all_events(repo).await?;
     let mut landed_ever = BTreeSet::new();
     let mut landed = Vec::new();
+    // Each evidence id's first `EvidenceAttached` cursor.
+    let mut attached: BTreeMap<String, u64> = BTreeMap::new();
     let mut submitted = BTreeMap::new();
     let mut arbitrations = Vec::new();
     let mut bridge_checks = Vec::new();
@@ -637,8 +658,13 @@ pub async fn gather(
             proto::event::Kind::Landed(event) => {
                 landed_ever.insert(event.change.clone());
                 if within(envelope.at_ms) {
-                    landed.push((envelope.at_ms, event.clone()));
+                    landed.push((envelope.at_ms, envelope.cursor, event.clone()));
                 }
+            }
+            proto::event::Kind::EvidenceAttached(event) => {
+                attached
+                    .entry(event.evidence.clone())
+                    .or_insert(envelope.cursor);
             }
             proto::event::Kind::Submitted(event) => {
                 submitted.insert(event.change.clone(), event.clone());
@@ -664,7 +690,7 @@ pub async fn gather(
         }
     }
     bridge_checks.sort_by_key(|c| c.at_ms);
-    landed.sort_by_key(|(_, event)| event.position);
+    landed.sort_by_key(|(_, _, event)| event.position);
 
     let queue: BTreeMap<ChangeId, QueueEntry> = repo
         .queue()
@@ -678,7 +704,7 @@ pub async fn gather(
         .collect();
 
     let mut changes = Vec::new();
-    for (at_ms, event) in landed {
+    for (at_ms, cursor, event) in landed {
         let id = change_id(&event.change)?;
         let entry = queue.get(&id);
         let record = repo.change(id).await.map_err(internal)?;
@@ -710,12 +736,32 @@ pub async fn gather(
             (None, key @ KeyCheck::Bad(_), _) => (AuditOrigin::Signed, key),
             (None, key @ KeyCheck::Unsigned, None) => (AuditOrigin::Unsigned, key),
         };
-        let evidence = landed_evidence(repo, auth, &record, &submitted_record).await?;
-        let policy = match repo
-            .judge_landed(id, entry.and_then(|e| e.report.clone()))
-            .await
-            .map_err(internal)?
-        {
+        // What the lander counted (ADR 0038); for a landing recorded before
+        // `Landed` listed it, what was attached before it landed.
+        let (counted, evidence_fallback) = match &event.counted {
+            Some(counted) => (
+                counted
+                    .evidence
+                    .iter()
+                    .map(|e| wire::object_id("evidence", e))
+                    .collect::<ApiResult<Vec<ObjectId>>>()?,
+                false,
+            ),
+            None => {
+                let candidates = candidate_evidence(repo, &record, &submitted_record).await?;
+                let listed = event
+                    .evidence
+                    .iter()
+                    .map(|e| wire::object_id("evidence", e))
+                    .collect::<ApiResult<Vec<ObjectId>>>()?;
+                (
+                    attached_before(&candidates, &listed, &attached, cursor),
+                    true,
+                )
+            }
+        };
+        let evidence = landed_evidence(repo, auth, record.result, counted.clone()).await?;
+        let policy = match repo.judge_landed(id, counted).await.map_err(internal)? {
             Ok((Decision::Allow, source)) => PolicyJudgement::Allow(source.as_str().into()),
             Ok((Decision::Deny { reasons }, source)) => PolicyJudgement::Deny(
                 source.as_str().into(),
@@ -738,6 +784,7 @@ pub async fn gather(
             origin,
             key,
             lander: check_lander(auth, &event),
+            evidence_fallback,
             evidence,
             policy,
         });
@@ -757,53 +804,85 @@ pub async fn gather(
     })
 }
 
-/// The evidence the lander could count for `record` (landed as rebased
-/// from `submitted`, or submitted as is): the author's, what is indexed for
-/// its result, and the reviews indexed for the submitted result
-/// (ADR 0031).
+/// The evidence the lander could have counted for `record` (landed as
+/// rebased from `submitted`, or submitted as is), as the store holds it
+/// now: the author's, what is indexed for its result, and the reviews
+/// indexed for the submitted result (ADR 0031). Only for landings whose
+/// `Landed` event predates ADR 0038's list of what was counted.
+async fn candidate_evidence(
+    repo: &Repo,
+    record: &ChangeRecord,
+    submitted: &ChangeRecord,
+) -> ApiResult<Vec<ObjectId>> {
+    let store_repo = repo.clone();
+    let (landed_result, submitted_result) = (record.result, submitted.result);
+    let mut ids: Vec<ObjectId> = record
+        .evidence
+        .iter()
+        .chain(&submitted.evidence)
+        .copied()
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let store = store_repo.store();
+        ids.extend(store.evidence_at(landed_result).map_err(internal)?);
+        if submitted_result != landed_result {
+            // Only reviews carry across a rebase.
+            for id in store.evidence_at(submitted_result).map_err(internal)? {
+                let evidence: Evidence = store.get_object(id).map_err(internal)?;
+                if evidence.kind == EvidenceKind::Review {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok::<_, ApiError>(ids)
+    })
+    .await
+    .map_err(internal)?
+}
+
+/// ADR 0038's fallback for a landing recorded before `Landed` listed what
+/// was counted: of `candidates`, the evidence whose first `EvidenceAttached`
+/// event (`attached`, by cursor) came before the landing's (`landed_at`),
+/// plus what the `Landed` event `listed`. Evidence attached later cannot
+/// clear the landing, or fail it.
+fn attached_before(
+    candidates: &[ObjectId],
+    listed: &[ObjectId],
+    attached: &BTreeMap<String, u64>,
+    landed_at: u64,
+) -> Vec<ObjectId> {
+    let mut seen = BTreeSet::new();
+    candidates
+        .iter()
+        .filter(|id| {
+            attached
+                .get(&wire::id(**id))
+                .is_some_and(|cursor| *cursor < landed_at)
+        })
+        .chain(listed)
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+/// Facts about the evidence `ids`, for a change whose result is
+/// `landed_result`.
 async fn landed_evidence(
     repo: &Repo,
     auth: Option<&AuthStore>,
-    record: &ChangeRecord,
-    submitted: &ChangeRecord,
+    landed_result: ObjectId,
+    ids: Vec<ObjectId>,
 ) -> ApiResult<Vec<EvidenceFacts>> {
     let store_repo = repo.clone();
-    let (landed_result, submitted_result) = (record.result, submitted.result);
-    let mut ids: Vec<(ObjectId, bool)> = Vec::new();
-    for id in record.evidence.iter().chain(&submitted.evidence) {
-        ids.push((*id, false));
-    }
     let loaded = tokio::task::spawn_blocking(move || {
         let store = store_repo.store();
-        let mut all = ids;
-        all.extend(
-            store
-                .evidence_at(landed_result)
-                .map_err(internal)?
-                .into_iter()
-                .map(|id| (id, false)),
-        );
-        if submitted_result != landed_result {
-            // Only reviews carry across a rebase.
-            all.extend(
-                store
-                    .evidence_at(submitted_result)
-                    .map_err(internal)?
-                    .into_iter()
-                    .map(|id| (id, true)),
-            );
-        }
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        for (id, reviews_only) in all {
-            if !seen.insert(id) {
-                continue;
+        for id in ids {
+            if seen.insert(id) {
+                let evidence: Evidence = store.get_object(id).map_err(internal)?;
+                out.push((id, evidence));
             }
-            let evidence: Evidence = store.get_object(id).map_err(internal)?;
-            if reviews_only && evidence.kind != EvidenceKind::Review {
-                continue;
-            }
-            out.push((id, evidence));
         }
         Ok::<_, ApiError>(out)
     })
@@ -966,6 +1045,7 @@ mod tests {
             origin: AuditOrigin::Signed,
             key: KeyCheck::Bound,
             lander: KeyCheck::Bound,
+            evidence_fallback: false,
             evidence: vec![passing("test"), passing("review:human")],
             policy: PolicyJudgement::Allow("head".into()),
         }
@@ -1161,6 +1241,29 @@ mod tests {
                 (AuditCriterion::UnrecordedLanding, Some("edited".into())),
             ]
         );
+    }
+
+    #[test]
+    fn the_fallback_counts_only_evidence_attached_before_the_landing() {
+        let [early, late, never, listed] =
+            [b"early", b"late!", b"never", b"liste"].map(|b| ObjectId::from_canonical(b));
+        let attached = BTreeMap::from([(wire::id(early), 3), (wire::id(late), 9)]);
+        assert_eq!(
+            attached_before(&[early, late, never, listed], &[listed], &attached, 5),
+            [early, listed]
+        );
+    }
+
+    #[test]
+    fn the_report_names_the_evidence_fallback() {
+        let mut facts = clean();
+        assert!(judge(&facts).fallbacks.is_empty());
+        facts.changes[0].evidence_fallback = true;
+        facts.changes[2].evidence_fallback = true;
+        let report = judge(&facts);
+        assert!(report.ok);
+        assert_eq!(report.fallbacks.len(), 1, "{:?}", report.fallbacks);
+        assert!(report.fallbacks[0].starts_with("2 landings"));
     }
 
     #[test]

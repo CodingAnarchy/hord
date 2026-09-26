@@ -1015,6 +1015,15 @@ message Landed {
   // The lander's Ed25519 signature over the landed id and `position`
   // (domain `hord.landed`). Unset on events recorded before ADR 0038.
   optional bytes lander_signature = 6;
+  // Exactly the evidence the lander counted when it judged the change
+  // against head's policy (ADR 0038). Unset on events recorded before it.
+  CountedEvidence counted = 7;
+}
+
+// Evidence a landing was judged on (ADR 0038).
+message CountedEvidence {
+  // ObjectIds of the Evidence objects.
+  repeated string evidence = 1;
 }
 
 // A change was rejected.
@@ -2133,6 +2142,9 @@ message AuditReport {
   repeated AuditFinding notes = 9;
   // No violations.
   bool ok = 10;
+  // Fallbacks used for events recorded before ADR 0038, in words: what
+  // the audit could not check as ADR 0038 says, and what it did instead.
+  repeated string fallbacks = 11;
 }
 
 // ---------------------------------------------------------------- git bridge

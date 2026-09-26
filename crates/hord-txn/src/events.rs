@@ -456,6 +456,7 @@ pub(crate) fn landed(
     position: u64,
     submitted: Option<ChangeId>,
     evidence: &[ObjectId],
+    counted: &[ObjectId],
     lander: &Signature,
     previous: Option<ChangeId>,
 ) -> Vec<Kind> {
@@ -467,6 +468,9 @@ pub(crate) fn landed(
             evidence: evidence.iter().copied().map(wire::id).collect(),
             lander_key_id: Some(lander.key_id.clone()),
             lander_signature: Some(lander.bytes.to_vec()),
+            counted: Some(proto::CountedEvidence {
+                evidence: counted.iter().copied().map(wire::id).collect(),
+            }),
         }),
         Kind::HeadMoved(proto::HeadMoved {
             from: previous.map(wire::id),

@@ -658,6 +658,7 @@ impl Inner {
             0,
             None,
             &[],
+            &[],
             &signature,
             None,
         ))?;

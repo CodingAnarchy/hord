@@ -1170,8 +1170,10 @@ impl Inner {
             }
             Verdict::Pass { evidence } => evidence,
         };
+        // What the policy is judged over, and `Landed` lists (ADR 0038).
+        let counted = self.candidate_evidence_ids(&landed, &report)?;
         if let (Ok((policy, _)), Some(mut facts)) = (&policy, facts) {
-            facts.evidence = self.candidate_evidence_facts(&landed, &report)?;
+            facts.evidence = self.evidence_facts_of(&counted)?;
             if let hord_policy::Decision::Deny { reasons } = policy.evaluate(&facts) {
                 let summary = reasons
                     .iter()
@@ -1232,7 +1234,7 @@ impl Inner {
         let submitted = (landed_id != entry.change).then_some(entry.change);
         let signature = sign::sign_landing(landed_id, position, &lander_key);
         self.emit(events::landed(
-            landed_id, position, submitted, &evidence, &signature, previous,
+            landed_id, position, submitted, &evidence, &counted, &signature, previous,
         ))?;
         // The footprint is a cache (`footprint` recomputes it on a miss).
         if let Ok(footprint) = self.footprint_of(landed_id, &landed) {
