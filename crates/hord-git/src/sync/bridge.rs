@@ -20,7 +20,7 @@ use tokio_stream::StreamExt;
 
 use super::SyncError;
 use super::cache::{CacheStore, ObjectCache};
-use super::mirror::{Mirror, Pushed, redact};
+use super::mirror::{Mirror, Pushed, check_transport, redact};
 use super::pulls::{PullRequest, PullRequests, StatusState};
 use super::state::{PullState, State};
 use crate::export::{export_changes, lookup_exported, open_or_init};
@@ -56,6 +56,10 @@ pub struct BridgeOptions {
     /// Open the work directory without its lock, beside a bridge that
     /// holds it: only for [`Bridge::check`], which saves no state.
     pub shared: bool,
+    /// Allow sending [`Self::token`] to an `http://` remote on a loopback
+    /// host (`hord git sync --insecure`). Otherwise a token goes over
+    /// `https://` (or to a local path) only.
+    pub insecure: bool,
 }
 
 impl fmt::Debug for BridgeOptions {
@@ -68,6 +72,7 @@ impl fmt::Debug for BridgeOptions {
             .field("poll", &self.poll)
             .field("check_every", &self.check_every)
             .field("shared", &self.shared)
+            .field("insecure", &self.insecure)
             .finish()
     }
 }
@@ -85,6 +90,7 @@ impl BridgeOptions {
             poll: Duration::from_secs(60),
             check_every: Duration::from_secs(60 * 60),
             shared: false,
+            insecure: false,
         }
     }
 }
@@ -158,6 +164,9 @@ impl Bridge {
         pulls: Option<Arc<dyn PullRequests>>,
         options: BridgeOptions,
     ) -> Result<Self, SyncError> {
+        if options.token.is_some() {
+            check_transport(&options.remote, options.insecure)?;
+        }
         let work = options.work_dir.clone();
         fs::create_dir_all(&work)
             .await

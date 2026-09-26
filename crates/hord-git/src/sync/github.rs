@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 
 use super::SyncError;
+use super::mirror::check_transport;
 use super::pulls::{PullRequest, PullRequests, StatusState};
 
 /// How long one API call may take.
@@ -42,6 +43,9 @@ pub struct GitHubOptions {
     pub token: String,
     /// The branch pull requests target: `main`.
     pub base: String,
+    /// Allow an `http://` API root, on a loopback host only (a test
+    /// server): `hord git sync --insecure`.
+    pub insecure: bool,
 }
 
 impl fmt::Debug for GitHubOptions {
@@ -51,6 +55,7 @@ impl fmt::Debug for GitHubOptions {
             .field("repository", &self.repository)
             .field("token", &"…")
             .field("base", &self.base)
+            .field("insecure", &self.insecure)
             .finish()
     }
 }
@@ -87,8 +92,10 @@ struct ApiHead {
 
 impl GitHub {
     /// A client for `options`. Fails when the system's root certificates
-    /// cannot be loaded.
+    /// cannot be loaded, or the API root is plain `http://` (the token would
+    /// travel in the clear) without `insecure` and a loopback host.
     pub fn new(options: GitHubOptions) -> Result<Self, SyncError> {
+        check_transport(&options.api, options.insecure)?;
         let https = HttpsConnectorBuilder::new()
             .with_provider_and_native_roots(ring::default_provider())
             .map_err(|err| SyncError::Pulls(format!("load root certificates: {err}")))?

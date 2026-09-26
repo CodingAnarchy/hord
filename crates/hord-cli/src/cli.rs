@@ -556,5 +556,10 @@ pub enum GitCommand {
         /// The bridge's config file [default: .hord/bridge.toml].
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
+        /// Allow sending the token over plain http:// to a loopback host
+        /// (a local test server or proxy). Without it the token goes over
+        /// https:// only.
+        #[arg(long)]
+        insecure: bool,
     },
 }

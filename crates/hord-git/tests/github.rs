@@ -83,7 +83,17 @@ async fn the_github_client_speaks_the_rest_api() -> TestResult {
         repository: "o/r".into(),
         token: "secret".into(),
         base: "main".into(),
+        insecure: true,
     })?;
+    // Without --insecure, the token never goes over plain http://.
+    let refused = GitHub::new(GitHubOptions {
+        api: format!("http://{addr}/"),
+        repository: "o/r".into(),
+        token: "secret".into(),
+        base: "main".into(),
+        insecure: false,
+    });
+    assert!(refused.is_err(), "{refused:?}");
     let pulls = github.open_pulls().await?;
     assert_eq!(pulls.len(), 1);
     let pull = &pulls[0];
@@ -149,6 +159,7 @@ async fn a_long_comment_is_cut_to_fit() -> TestResult {
         repository: "o/r".into(),
         token: "secret".into(),
         base: "main".into(),
+        insecure: true,
     })?;
 
     let report = "- `src/lib.rs`: both changed `parse`\n".repeat(3_000);

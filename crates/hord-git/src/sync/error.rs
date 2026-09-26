@@ -32,6 +32,13 @@ pub enum SyncError {
         #[source]
         source: std::io::Error,
     },
+    /// The bridge's token would travel over plain `http://`: refused
+    /// unless `--insecure` and the host is a loopback address.
+    #[error(
+        "refusing to send the bridge's token over plain http:// to {0}: use https://, or \
+         --insecure for a loopback address"
+    )]
+    PlainHttp(String),
     /// Another bridge holds the work directory's lock.
     #[error(
         "another hord git sync is using this work directory (it holds {0}); stop it first, \

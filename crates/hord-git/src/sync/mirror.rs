@@ -6,11 +6,13 @@
 //! never on the command line or in the URL.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use http::Uri;
 use tokio::process::Command;
 
 use super::SyncError;
@@ -177,6 +179,30 @@ fn checked(what: &str, out: Output) -> Result<String, SyncError> {
     })
 }
 
+/// Whether a token may be sent to `url`: always over anything but plain
+/// `http://`; over `http://` only with `insecure`, and only to a loopback
+/// host (a test server, a local proxy).
+pub(crate) fn check_transport(url: &str, insecure: bool) -> Result<(), SyncError> {
+    if !url.starts_with("http://") {
+        return Ok(());
+    }
+    let loopback = url.parse::<Uri>().ok().is_some_and(|uri| {
+        uri.host().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    });
+    if insecure && loopback {
+        Ok(())
+    } else {
+        Err(SyncError::PlainHttp(redact(url)))
+    }
+}
+
 /// `url` without a `user:password@` part.
 pub(crate) fn redact(url: &str) -> String {
     match url.split_once("://") {
@@ -193,7 +219,33 @@ pub(crate) fn redact(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{check_transport, redact};
+
+    #[test]
+    fn a_token_goes_over_plain_http_only_to_loopback_when_insecure() {
+        for url in [
+            "https://github.com/o/r.git",
+            "/srv/mirror.git",
+            "file:///m.git",
+        ] {
+            assert!(check_transport(url, false).is_ok(), "{url}");
+        }
+        for url in [
+            "http://127.0.0.1:9000/o/r.git",
+            "http://localhost/api",
+            "http://[::1]:80/",
+        ] {
+            assert!(check_transport(url, false).is_err(), "{url}");
+            assert!(check_transport(url, true).is_ok(), "{url}");
+        }
+        for url in [
+            "http://github.com/o/r.git",
+            "http://10.0.0.1/",
+            "http://u:p@evil/",
+        ] {
+            assert!(check_transport(url, true).is_err(), "{url}");
+        }
+    }
 
     #[test]
     fn credentials_are_redacted() {

@@ -144,6 +144,7 @@ fn run_blocking(cli: Cli) -> Result<()> {
                 check,
                 repair,
                 config,
+                insecure,
             } => {
                 let mode = match (once, check, repair) {
                     (true, _, _) => cmd::git_sync::Mode::Once,
@@ -151,7 +152,7 @@ fn run_blocking(cli: Cli) -> Result<()> {
                     (_, _, true) => cmd::git_sync::Mode::Repair,
                     _ => cmd::git_sync::Mode::Daemon,
                 };
-                cmd::git_sync::run(json, &target, mode, config)
+                cmd::git_sync::run(json, &target, mode, config, insecure)
             }
         },
         Command::Review {

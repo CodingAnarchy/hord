@@ -44,7 +44,7 @@ The daemon follows the repository's event stream and exports each landing when i
    - Pull requests: read and write (to list, comment on, and close pull requests);
    - Commit statuses: read and write.
 
-   Store the token in a file on the host, outside the repository, readable only by the bridge's user. The bridge refuses a token file inside the repository's working tree, except under `.hord/`.
+   Store the token in a file on the host, outside the repository, readable only by the bridge's user. The bridge sends it only over `https://` (to the mirror and the API); a plain `http://` address is refused, except on a loopback host with `--insecure` (a local test server or proxy). The bridge refuses a token file inside the repository's working tree, except under `.hord/`.
 
 2. **Protect `main`.** In the GitHub repository's settings, add a branch protection rule (or a ruleset) for `main`:
    - restrict who can push to `main` to the bridge's account or app only;

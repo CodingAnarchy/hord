@@ -77,7 +77,13 @@ struct GitHubConfig {
     api: Option<String>,
 }
 
-pub fn run(json: bool, target: &Target, mode: Mode, config: Option<PathBuf>) -> Result<()> {
+pub fn run(
+    json: bool,
+    target: &Target,
+    mode: Mode,
+    config: Option<PathBuf>,
+    insecure: bool,
+) -> Result<()> {
     let root = repo::discover_root().ok();
     let config_path = match (config, &root) {
         (Some(path), _) => path,
@@ -112,6 +118,7 @@ pub fn run(json: bool, target: &Target, mode: Mode, config: Option<PathBuf>) -> 
                 repository: github.repository.clone(),
                 token,
                 base: "main".into(),
+                insecure,
             };
             Some(Arc::new(GitHub::new(options)?))
         }
@@ -119,6 +126,7 @@ pub fn run(json: bool, target: &Target, mode: Mode, config: Option<PathBuf>) -> 
     };
     let mut options = BridgeOptions::new(config.remote.clone(), work_dir);
     options.token = token;
+    options.insecure = insecure;
     options.voucher = voucher;
     if let Some(secs) = config.poll_secs {
         options.poll = Duration::from_secs(secs.max(1));
