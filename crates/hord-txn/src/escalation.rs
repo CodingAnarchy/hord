@@ -201,7 +201,6 @@ struct Expected {
 
 /// A protected test a replay changed (ADR 0034).
 #[derive(Debug)]
-#[allow(dead_code)] // `before` and `after` feed the attempt's detail.
 pub(crate) struct Tampered {
     /// Its id where it is protected.
     pub node: NodeId,
@@ -212,6 +211,36 @@ pub(crate) struct Tampered {
     /// The replay's same-named definition, whitespace collapsed; `None`
     /// when the replay has none.
     pub after: Option<String>,
+}
+
+/// Longest excerpt of a test's text in a tamper report.
+const EXCERPT: usize = 400;
+
+/// A tampered attempt's detail (ADR 0034): the tests it changed, then each
+/// one's text as protected and as the replay has it (whitespace collapsed),
+/// so a reader sees exactly what changed.
+pub(crate) fn tamper_report(touched: &[Tampered]) -> String {
+    let excerpt = |text: &str| {
+        let mut out: String = text.chars().take(EXCERPT).collect();
+        if text.chars().count() > EXCERPT {
+            out.push('…');
+        }
+        format!("`{out}`")
+    };
+    let names: Vec<&str> = touched.iter().map(|t| t.name.as_str()).collect();
+    let mut out = format!("{TAMPERED}: {}", names.join(", "));
+    for t in touched {
+        out.push_str(&format!(
+            "\n{} before: {}\n{} after: {}",
+            t.name,
+            excerpt(&t.before),
+            t.name,
+            t.after
+                .as_deref()
+                .map_or_else(|| "(missing)".to_owned(), excerpt)
+        ));
+    }
+    out
 }
 
 /// How the lander words a replay rejected for changing a protected test
@@ -802,8 +831,7 @@ impl Inner {
         // satisfy. Rejected before verification, like an over-budget result.
         let touched = self.tampered_tests(of, &record)?;
         if !touched.is_empty() {
-            let names: Vec<&str> = touched.iter().map(|t| t.name.as_str()).collect();
-            let why = format!("{TAMPERED}: {} (proposed change {id})", names.join(", "));
+            let why = format!("{} (proposed change {id})", tamper_report(&touched));
             self.emit(vec![events::rejected(id, &why)])?;
             *tampered = touched.into_iter().map(|t| t.node).collect();
             return Ok(Err((ReplayOutcome::Tampered, why)));

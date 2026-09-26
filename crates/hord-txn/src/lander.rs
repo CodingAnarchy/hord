@@ -59,7 +59,7 @@ use hord_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::conflict::{ConflictReport, Footprint, check};
-use crate::escalation::{Escalation, Origin, TAMPERED};
+use crate::escalation::{Escalation, Origin, tamper_report};
 use crate::events;
 use crate::files::{validate, validate_except};
 use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRequest};
@@ -911,9 +911,8 @@ impl Inner {
         if let Some(Origin::Replay { of }) = entry.origin {
             let touched = self.tampered_tests(of, &record)?;
             if !touched.is_empty() {
-                let names: Vec<&str> = touched.iter().map(|t| t.name.as_str()).collect();
                 return Ok(Prepared::Park(QueueStatus::Rejected {
-                    reason: format!("{TAMPERED}: {}", names.join(", ")),
+                    reason: tamper_report(&touched),
                 }));
             }
         }

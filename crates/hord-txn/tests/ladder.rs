@@ -1201,6 +1201,8 @@ async fn a_replay_must_keep_its_own_changes_tests_as_written() -> TestResult {
         ],
         "{attempts:#?}"
     );
+    let dropped = attempts[1].detail.as_deref().unwrap_or_default();
+    assert!(dropped.contains("beta_is_21 after: (missing)"), "{dropped}");
     for attempt in &attempts[..2] {
         assert!(
             attempt
@@ -1262,6 +1264,20 @@ async fn reformatting_or_adding_beside_a_protected_test_is_not_tampering() -> Te
     assert!(
         matches!(entry.status, QueueStatus::Replayed { .. }),
         "{entry:#?}"
+    );
+    // The detail shows the test before and after, whitespace collapsed.
+    let detail = attempts[0].detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains(
+            "beta_is_20 before: `#[test] fn beta_is_20() { assert_eq!(fixture::beta(), 20); }`"
+        ),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(
+            "beta_is_20 after: `#[test] fn beta_is_20() { assert_eq!(fixture::beta(), 21); }`"
+        ),
+        "{detail}"
     );
     Ok(())
 }
