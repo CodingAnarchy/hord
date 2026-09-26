@@ -570,11 +570,9 @@ fn hord_arbitrate_resolves_a_parked_change_with_a_signed_decision() -> TestResul
                 },
             )
             .await?;
-            let found = view.history.iter().find_map(|e| {
-                match e.event.as_ref().and_then(|e| e.kind.as_ref()) {
-                    Some(Kind::Arbitrated(a)) => Some(a.clone()),
-                    _ => None,
-                }
+            let found = view.history.iter().find_map(|e| match e.kind() {
+                Some(Kind::Arbitrated(a)) => Some(a.clone()),
+                _ => None,
             });
             if let Some(found) = found {
                 return Ok::<_, Box<dyn std::error::Error>>(found);

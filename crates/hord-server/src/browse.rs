@@ -397,10 +397,6 @@ fn identity_view(delta: &IdentityDelta, names: &Names) -> proto::IdentityDeltaVi
     }
 }
 
-fn kind_of(envelope: &proto::EventEnvelope) -> Option<&Kind> {
-    envelope.event.as_ref()?.kind.as_ref()
-}
-
 /// The timeline of a change: its intent and proposal, the events that name
 /// it (with each replay attempt's outcome and spend from the escalation),
 /// and the evidence on its snapshots, oldest first.
@@ -446,7 +442,7 @@ fn trace_steps(
             cursor: Some(envelope.cursor),
             ..Default::default()
         };
-        match kind_of(envelope) {
+        match envelope.kind() {
             Some(Kind::Submitted(s)) => {
                 step.stage = proto::TraceStage::Submitted.into();
                 step.text = format!(
@@ -621,13 +617,13 @@ fn trace_steps(
 fn decisions_first(steps: &mut Vec<(proto::TraceStep, bool)>, history: &[proto::EventEnvelope]) {
     let event = |cursor: Option<u64>| cursor.and_then(|c| history.iter().find(|e| e.cursor == c));
     for decision in history {
-        let Some(Kind::Arbitrated(a)) = kind_of(decision) else {
+        let Some(Kind::Arbitrated(a)) = decision.kind() else {
             continue;
         };
         // The resolution's ids: as the arbiter gave it, and as it landed.
         let mut ids = BTreeSet::from([a.result.clone()]);
         for e in history {
-            if let Some(Kind::Landed(l)) = kind_of(e)
+            if let Some(Kind::Landed(l)) = e.kind()
                 && (ids.contains(&l.change)
                     || l.submitted.as_ref().is_some_and(|s| ids.contains(s)))
             {
@@ -644,7 +640,7 @@ fn decisions_first(steps: &mut Vec<(proto::TraceStep, bool)>, history: &[proto::
         let first = steps[..at].iter().position(|(s, of_landed)| {
             *of_landed
                 || event(s.cursor).is_some_and(|e| {
-                    !matches!(kind_of(e), Some(Kind::Arbitrated(_))) && names_any(e, &ids)
+                    !matches!(e.kind(), Some(Kind::Arbitrated(_))) && names_any(e, &ids)
                 })
         });
         if let Some(first) = first {

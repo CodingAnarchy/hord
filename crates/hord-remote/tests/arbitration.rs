@@ -154,11 +154,9 @@ async fn arbitrated_event(remote: &RemoteRepo, parked: &str) -> TestResult<proto
                 change: parked.to_owned(),
             })
             .await?;
-        let found = view.history.iter().find_map(|e| {
-            match e.event.as_ref().and_then(|e| e.kind.as_ref()) {
-                Some(Kind::Arbitrated(a)) => Some(a.clone()),
-                _ => None,
-            }
+        let found = view.history.iter().find_map(|e| match e.kind() {
+            Some(Kind::Arbitrated(a)) => Some(a.clone()),
+            _ => None,
         });
         if let Some(found) = found {
             return Ok(found);

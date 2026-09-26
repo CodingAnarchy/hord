@@ -416,9 +416,7 @@ fn span(ms: u64) -> String {
 /// event (ADR 0036). With none in the window the report says "no bridge
 /// checks recorded".
 fn bridge_check(envelope: &proto::EventEnvelope) -> Option<BridgeCheck> {
-    let Some(proto::event::Kind::BridgeChecked(c)) =
-        envelope.event.as_ref().and_then(|e| e.kind.as_ref())
-    else {
+    let Some(proto::event::Kind::BridgeChecked(c)) = envelope.kind() else {
         return None;
     };
     let commit = |c: &Option<String>| c.as_deref().unwrap_or("none").to_owned();
@@ -531,7 +529,7 @@ pub async fn gather(
         {
             bridge_checks.push(check);
         }
-        let Some(kind) = envelope.event.as_ref().and_then(|e| e.kind.as_ref()) else {
+        let Some(kind) = envelope.kind() else {
             continue;
         };
         match kind {

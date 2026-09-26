@@ -318,7 +318,7 @@ async fn strip_events(Ctx(repo): Ctx, headers: HeaderMap) -> PageResult {
             let Some(i) = strip.apply(&envelope) else {
                 continue;
             };
-            if let Some(Kind::Submitted(s)) = envelope.event.as_ref().and_then(|e| e.kind.as_ref())
+            if let Some(Kind::Submitted(s)) = envelope.kind()
                 && strip.rows()[i].summary.is_none()
             {
                 label(&repo, &mut strip, &s.change).await;

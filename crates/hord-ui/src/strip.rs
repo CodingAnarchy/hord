@@ -314,7 +314,7 @@ impl Strip {
         }
         self.cursor = envelope.cursor;
         self.at_ms = envelope.at_ms;
-        let kind = envelope.event.as_ref()?.kind.as_ref()?;
+        let kind = envelope.kind()?;
         let touched = match kind {
             Kind::Submitted(s) => {
                 let i = self.row_for(&s.change);

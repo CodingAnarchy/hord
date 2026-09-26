@@ -103,7 +103,7 @@ async fn propose(repo: &Repo, who: &str, body: &str, summary: &str) -> TestResul
 }
 
 fn names(envelope: &proto::EventEnvelope, change: &str) -> Option<&'static str> {
-    match envelope.event.as_ref()?.kind.as_ref()? {
+    match envelope.kind()? {
         Kind::Landed(l) if l.change == change || l.submitted.as_deref() == Some(change) => {
             Some("landed")
         }
@@ -441,10 +441,11 @@ async fn hord_serve_mounts_the_ui_beside_the_grpc_services() -> TestResult {
         view.queue.as_ref().map(proto::QueueEntry::status),
         Some(proto::QueueStatus::Conflicted)
     );
-    assert!(view.history.iter().any(|e| matches!(
-        e.event.as_ref().and_then(|e| e.kind.as_ref()),
-        Some(Kind::Parked(_))
-    )));
+    assert!(
+        view.history
+            .iter()
+            .any(|e| matches!(e.kind(), Some(Kind::Parked(_))))
+    );
     sc.running.stop().await;
     Ok(())
 }
@@ -650,11 +651,9 @@ async fn a_parked_change_resolved_from_the_workbench_lands_with_both_parents() -
                 change: sc.parked.clone(),
             })
             .await?;
-        arbitrated = view.history.iter().find_map(|e| {
-            match e.event.as_ref().and_then(|e| e.kind.as_ref()) {
-                Some(Kind::Arbitrated(a)) => Some(a.clone()),
-                _ => None,
-            }
+        arbitrated = view.history.iter().find_map(|e| match e.kind() {
+            Some(Kind::Arbitrated(a)) => Some(a.clone()),
+            _ => None,
         });
         if arbitrated.is_some() {
             break;
