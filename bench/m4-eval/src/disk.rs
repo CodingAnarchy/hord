@@ -54,7 +54,53 @@ pub(crate) fn prune_target(target: &Path, since: SystemTime, keep: usize) -> u64
             freed += prune_units(&profile.join(unit_dir), since, keep);
         }
     }
-    freed + remove(&target.join("tmp").join("cit"))
+    let cit = scratch_dir(target);
+    restore_permissions(&cit);
+    freed + remove(&cit)
+}
+
+/// Cargo's per-test scratch trees in `target` (`CARGO_TARGET_TMPDIR/cit`).
+pub(crate) fn scratch_dir(target: &Path) -> PathBuf {
+    target.join("tmp").join("cit")
+}
+
+/// `chmod -R u+rwx` (best effort): cargo's read-only tests
+/// (`registry::readonly_registry_still_works*`,
+/// `registry::inaccessible_registry_cache_still_works`, ...) make parts of
+/// their scratch tree read-only or `000` and restore them only if they
+/// reach the end. A failed run leaves a tree that neither the next run's
+/// setup nor [`remove`] can clear, so every later run of those tests in the
+/// same target fails (gate run 36189604585). A directory is opened up before
+/// it is read, so `000` directories are handled.
+pub(crate) fn restore_permissions(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let _ = fs::set_permissions(path, owner_rwx(meta.permissions()));
+    if meta.is_dir() {
+        for child in read_dir(path) {
+            restore_permissions(&child);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn owner_rwx(perms: fs::Permissions) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    fs::Permissions::from_mode(perms.mode() | 0o700)
+}
+
+#[cfg(not(unix))]
+#[allow(
+    clippy::permissions_set_readonly_false,
+    reason = "not Unix: clearing the read-only attribute is the whole point, and there is no world-writable mode bit here"
+)]
+fn owner_rwx(mut perms: fs::Permissions) -> fs::Permissions {
+    perms.set_readonly(false);
+    perms
 }
 
 /// The profile directories of a target directory (`debug`, `release`, and
@@ -462,6 +508,42 @@ mod tests {
         assert!(freed >= 3000, "freed {freed}");
         // Nothing new was built: a second prune removes nothing.
         assert_eq!(prune_target(&root, since, 2), 0);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restores_permissions_a_failed_read_only_test_left() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("hord-m4-perms-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cit = scratch_dir(&root);
+        let home = cit.join("testsuite/registry/readonly/home/.cargo");
+        let locked = home.join("registry/index/x/.cache/3/f");
+        fs::create_dir_all(&locked)?;
+        fs::write(locked.join("foo"), "cache")?;
+        fs::write(home.join("config.toml"), "")?;
+        // What the tests leave behind when they fail before restoring:
+        // read-only files and directories, and a `000` directory.
+        fs::set_permissions(home.join("config.toml"), fs::Permissions::from_mode(0o444))?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o555))?;
+        restore_permissions(&cit);
+        let mode = |p: &Path| fs::metadata(p).map(|m| m.permissions().mode() & 0o700);
+        assert_eq!(mode(&locked)?, 0o700);
+        assert_eq!(mode(&home.join("config.toml"))?, 0o700);
+        fs::remove_dir_all(&cit)?;
+        assert!(!cit.exists());
+
+        // Pruning restores permissions itself before removing the tree.
+        fs::create_dir_all(&locked)?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+        prune_target(&root, SystemTime::now(), KEEP_GENERATIONS);
+        assert!(
+            !cit.exists(),
+            "prune removes a scratch tree with a 000 directory"
+        );
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }

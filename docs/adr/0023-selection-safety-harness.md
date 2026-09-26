@@ -46,3 +46,4 @@ Option 2. Selection safety is graded on 500 real cargo commits with one seeded f
 ## Amendments (2026-09-25, after the first CI gate run)
 
 - **Chain windows start after cargo `89e13501a` (2026-01-03).** Before it, cargo's test support names every test's scratch directory `cit/t0` in a fresh process, so the per-test processes of instrumented runs collide; 15 chains 35 first-parent commits apart (525 commits) fit between it and the pinned corpus head.
+- **A miss is a confirmed miss (2026-09-25, after gate run 36189604585).** A test failure in (a) counts as detecting the fault only if the test passes when re-run without the fault. The safety gate counts confirmed misses; unconfirmed ones, and the tests that fail either way, are listed for review. The harness already documented this definition.

@@ -17,8 +17,11 @@
 //! that type-checks, run the chain's selection (b), and (a) every test of
 //! the affected packages when (b) did not detect it. A miss is a fault (a)
 //! detects and (b) does not, confirmed by re-running the missed failures
-//! without the fault. The fault never reaches the records: the chain ran
-//! the commit unmutated.
+//! without the fault. A failure that also happens without the fault
+//! detects nothing (by (a), or by (b) when no failing test executed the
+//! faulted function). Only confirmed misses fail the safety gate;
+//! unconfirmed ones are listed for review. The fault never reaches the
+//! records: the chain ran the commit unmutated.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -115,11 +118,50 @@ pub(crate) struct FaultGrade {
     pub miss: bool,
     /// The missed failures pass without the fault.
     pub confirmed_miss: bool,
+    /// The confirmed missed tests: (a) failures (b) did not contain that
+    /// pass without the fault.
+    #[serde(default)]
+    pub missed: Vec<String>,
+    /// Failures that also happen without the fault: not detections, by (b)
+    /// or (a).
+    #[serde(default)]
+    pub unrelated: Vec<String>,
+    /// Output of each unrelated failure, with and without the fault, to
+    /// diagnose why it fails either way.
+    #[serde(default)]
+    pub unrelated_output: Vec<UnrelatedOutput>,
     pub failed: Vec<String>,
     /// A command hung or crashed; its units were counted as failing.
     pub unattributed: bool,
     pub build_ms: u64,
     pub grade_ms: u64,
+}
+
+/// A test that failed with and without the fault, and its output in each.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UnrelatedOutput {
+    pub test: String,
+    pub with_fault: String,
+    pub without_fault: String,
+}
+
+/// The output of each unrelated test, from the faulted and the clean runs.
+fn unrelated_output(
+    unrelated: &BTreeSet<Unit>,
+    with_fault: &BTreeMap<String, String>,
+    without_fault: &BTreeMap<String, String>,
+) -> Vec<UnrelatedOutput> {
+    unrelated
+        .iter()
+        .filter_map(|u| match u {
+            Unit::Test(t) => Some(UnrelatedOutput {
+                test: u.label(),
+                with_fault: with_fault.get(&t.name).cloned().unwrap_or_default(),
+                without_fault: without_fault.get(&t.name).cloned().unwrap_or_default(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One graded commit: up to `--faults-per-commit` faults where (b) does not
@@ -687,14 +729,7 @@ fn grade_fault(
         .find(|(n, _)| *n == fault_node)
         .map(|(_, u)| u.iter().cloned().collect())
         .unwrap_or_default();
-    let mut grader = Grader {
-        runner,
-        root,
-        ran: BTreeSet::new(),
-        failed: BTreeSet::new(),
-        unattributed: false,
-        timed_out: false,
-    };
+    let mut grader = Grader::new(runner, root);
     let mut out = FaultGrade {
         fault,
         probe_only: false,
@@ -702,6 +737,9 @@ fn grade_fault(
         detected_a: None,
         miss: false,
         confirmed_miss: false,
+        missed: Vec::new(),
+        unrelated: Vec::new(),
+        unrelated_output: Vec::new(),
         failed: Vec::new(),
         unattributed: false,
         build_ms: 0,
@@ -720,48 +758,119 @@ fn grade_fault(
         out.unattributed = grader.unattributed;
         return Ok(out);
     }
+    // The faulty file, to put back after a clean re-run.
+    let file = root.join(fault_path);
+    let faulty = fs::read_to_string(&file)?;
     // (b): the selection, the tests that ran the faulted function first.
     let mut batch: Vec<Unit> = set.iter().cloned().collect();
     batch.sort_by_key(|u| !probe.contains(u));
     grader.run(batch, &|failed| !set.is_disjoint(failed))?;
-    let detected = !set.is_disjoint(&grader.failed);
+    // Failures that also happen without the fault are not detections
+    // (ADR 0023: a miss is a confirmed miss). A (b) failure by a test that
+    // never executed the faulted function is checked without the fault
+    // before it counts, so a test failing for other reasons cannot stand in
+    // for a detection and skip (a).
+    let mut unrelated: BTreeSet<Unit> = BTreeSet::new();
+    let mut clean_output: BTreeMap<String, String> = BTreeMap::new();
+    let b_failed: BTreeSet<Unit> = grader.failed.intersection(set).cloned().collect();
+    if !b_failed.is_empty() && b_failed.is_disjoint(&probe) {
+        let clean = clean_run(runner, worker, fault_path, &b_failed)?;
+        out.unattributed |= clean.unattributed;
+        unrelated.extend(clean.failed);
+        clean_output.extend(clean.excerpts);
+        fs::write(&file, &faulty)?;
+    }
+    let detected = grader
+        .failed
+        .iter()
+        .any(|u| set.contains(u) && !unrelated.contains(u));
     if !detected {
         let mut batch: Vec<Unit> = a_set.difference(&grader.ran).cloned().collect();
         batch.sort_by_key(|u| !probe.contains(u));
-        grader.run(batch, &|failed| !a_set.is_disjoint(failed))?;
+        grader.run(batch, &|failed| {
+            failed
+                .iter()
+                .any(|u| a_set.contains(u) && !set.contains(u) && !unrelated.contains(u))
+        })?;
     }
+    // (a) failures (b) did not contain: a miss, confirmed when they pass
+    // without the fault.
+    let missed: BTreeSet<Unit> = grader
+        .failed
+        .iter()
+        .filter(|u| a_set.contains(u) && !set.contains(u) && !unrelated.contains(u))
+        .cloned()
+        .collect();
+    let mut confirmed: BTreeSet<Unit> = BTreeSet::new();
+    if !detected && !missed.is_empty() {
+        let clean = clean_run(runner, worker, fault_path, &missed)?;
+        out.unattributed |= clean.unattributed;
+        confirmed = missed.difference(&clean.failed).cloned().collect();
+        unrelated.extend(clean.failed);
+        clean_output.extend(clean.excerpts);
+    }
+    let classified = classify(a_set, &grader, &unrelated, detected, &missed, &confirmed);
     out.detected = Some(detected);
-    out.detected_a = if !a_set.is_disjoint(&grader.failed) {
-        Some(true)
-    } else if a_set.is_subset(&grader.ran) {
-        Some(false)
-    } else {
-        None
-    };
-    out.miss = out.detected_a == Some(true) && !detected;
+    out.detected_a = classified.detected_a;
+    out.miss = classified.miss;
+    out.unattributed |= grader.unattributed;
+    out.confirmed_miss = classified.confirmed_miss && !out.unattributed;
     out.failed = grader.failed.iter().map(Unit::label).collect();
-    out.unattributed = grader.unattributed;
-    if out.miss {
-        // The missed failures must pass without the fault.
-        worker.checkout.restore(fault_path)?;
-        let missed: Vec<Unit> = grader
-            .failed
-            .iter()
-            .filter(|u| a_set.contains(u) && !set.contains(u))
-            .cloned()
-            .collect();
-        let mut clean = Grader {
-            runner,
-            root,
-            ran: BTreeSet::new(),
-            failed: BTreeSet::new(),
-            unattributed: false,
-            timed_out: false,
-        };
-        clean.run(missed.clone(), &|_| false)?;
-        out.confirmed_miss = !missed.is_empty() && clean.failed.is_empty() && !grader.unattributed;
-    }
+    out.missed = confirmed.iter().map(Unit::label).collect();
+    out.unrelated = unrelated.iter().map(Unit::label).collect();
+    out.unrelated_output = unrelated_output(&unrelated, &grader.excerpts, &clean_output);
     Ok(out)
+}
+
+/// How one fault's runs grade, once failures without the fault are known.
+#[derive(Debug, PartialEq, Eq)]
+struct Classified {
+    detected_a: Option<bool>,
+    /// (a) failed on tests (b) did not contain, before confirmation.
+    miss: bool,
+    /// Some of those tests pass without the fault.
+    confirmed_miss: bool,
+}
+
+/// Grade from the runs: a failure in `unrelated` (it also fails without
+/// the fault) detects nothing.
+fn classify(
+    a_set: &BTreeSet<Unit>,
+    grader: &Grader<'_>,
+    unrelated: &BTreeSet<Unit>,
+    detected: bool,
+    missed: &BTreeSet<Unit>,
+    confirmed: &BTreeSet<Unit>,
+) -> Classified {
+    let a_detected = grader
+        .failed
+        .iter()
+        .any(|u| a_set.contains(u) && !unrelated.contains(u));
+    Classified {
+        detected_a: if a_detected {
+            Some(true)
+        } else if a_set.is_subset(&grader.ran) {
+            Some(false)
+        } else {
+            None
+        },
+        miss: !detected && !missed.is_empty(),
+        confirmed_miss: !detected && !confirmed.is_empty(),
+    }
+}
+
+/// Re-run `units` with the fault removed (the caller puts it back if it
+/// grades on).
+fn clean_run<'a>(
+    runner: &'a CargoRunner,
+    worker: &'a Worker,
+    fault_path: &str,
+    units: &BTreeSet<Unit>,
+) -> Result<Grader<'a>> {
+    worker.checkout.restore(fault_path)?;
+    let mut clean = Grader::new(runner, &worker.checkout.root);
+    clean.run(units.iter().cloned().collect(), &|_| false)?;
+    Ok(clean)
 }
 
 /// What a chain was: written to `chain/meta.json` when it starts, so a
@@ -808,7 +917,12 @@ pub(crate) struct ChainReport {
     /// Grading (faults, (b), (a)) per commit, in seconds: the harness's cost,
     /// not the lander's.
     pub grade_secs_mean: f64,
+    /// Confirmed misses (ADR 0023): chain, commit, fault, missed tests.
     pub misses: Vec<String>,
+    /// (a) failed where (b) did not, but only on tests that also fail
+    /// without the fault: listed for review, not gated.
+    #[serde(default)]
+    pub unconfirmed_misses: Vec<String>,
     /// Peak disk use per filesystem (`chain/disk.json`), if sampled.
     pub disk: Option<disk::DiskLog>,
 }
@@ -841,7 +955,7 @@ impl Counts {
         if !r.covers_a {
             self.informative_commits += 1;
         }
-        if r.faults.iter().any(|f| f.miss) {
+        if r.faults.iter().any(|f| f.confirmed_miss) {
             self.commits_with_miss += 1;
         }
         for f in &r.faults {
@@ -878,7 +992,13 @@ pub(crate) struct FreshReport {
     pub counts: Counts,
     pub fallbacks: BTreeMap<String, usize>,
     pub lander_secs_mean: f64,
+    /// Confirmed misses: what the safety gate counts.
     pub misses: Vec<String>,
+    /// Unconfirmed misses, listed for review.
+    pub unconfirmed_misses: Vec<String>,
+    /// "(a) failures unrelated to the fault": tests that failed with and
+    /// without a fault, with how many faults they did so for.
+    pub unrelated_failures: BTreeMap<String, usize>,
     pub quarantine: Vec<String>,
     pub sample: Vec<crate::SampleResult>,
     pub profraw_in_cwd: Vec<String>,
@@ -1015,18 +1135,28 @@ fn chain_report(work: &Path) -> (ChainReport, Vec<ChainStep>, Vec<FreshResult>) 
     } else {
         meta.commits.len()
     };
-    let misses = results
-        .iter()
-        .filter(|r| r.faults.iter().any(|f| f.miss))
-        .map(|r| {
-            format!(
-                "{} {} {}",
-                meta.chain,
-                r.step.index,
-                &r.step.commit[..10.min(r.step.commit.len())]
-            )
-        })
-        .collect();
+    let describe = |r: &FreshResult, f: &FaultGrade, tests: &[String]| {
+        format!(
+            "{} #{} {} {:?} in {}: {}",
+            meta.chain,
+            r.step.index,
+            &r.step.commit[..10.min(r.step.commit.len())],
+            f.fault.kind,
+            f.fault.name,
+            tests.join(", ")
+        )
+    };
+    let mut misses = Vec::new();
+    let mut unconfirmed_misses = Vec::new();
+    for r in &results {
+        for f in &r.faults {
+            if f.confirmed_miss {
+                misses.push(describe(r, f, &f.missed));
+            } else if f.miss {
+                unconfirmed_misses.push(describe(r, f, &f.unrelated));
+            }
+        }
+    }
     let graded_secs: Vec<f64> = results.iter().map(|r| r.grade_ms as f64 / 1000.0).collect();
     let report = ChainReport {
         chain: meta.chain.clone(),
@@ -1050,6 +1180,7 @@ fn chain_report(work: &Path) -> (ChainReport, Vec<ChainStep>, Vec<FreshResult>) 
         initial_secs,
         grade_secs_mean: mean(&graded_secs),
         misses,
+        unconfirmed_misses,
         disk: read_json(&work.join("chain/disk.json")),
     };
     (report, steps, results)
@@ -1108,6 +1239,16 @@ pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshRe
         .iter()
         .flat_map(|c| c.misses.iter().cloned())
         .collect();
+    let unconfirmed_misses: Vec<String> = chains
+        .iter()
+        .flat_map(|c| c.unconfirmed_misses.iter().cloned())
+        .collect();
+    let mut unrelated_failures: BTreeMap<String, usize> = BTreeMap::new();
+    for f in results.iter().flat_map(|(_, r)| &r.faults) {
+        for t in &f.unrelated {
+            *unrelated_failures.entry(t.clone()).or_default() += 1;
+        }
+    }
     let efficiency_median_small = median(small.iter().map(|s| share(s)).collect());
     let lander: Vec<f64> = steps.iter().map(|s| s.chain_ms as f64 / 1000.0).collect();
     FreshReport {
@@ -1122,10 +1263,12 @@ pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshRe
         efficiency_median_all: median(ok.iter().map(|s| share(s)).collect()),
         fallbacks: fallback_counts(ok.iter().copied()),
         lander_secs_mean: mean(&lander),
-        safety_gate: counts.fault_misses == 0,
+        safety_gate: counts.fault_confirmed_misses == 0,
         efficiency_gate: efficiency_median_small_quarantined.is_some_and(|m| m <= 0.20),
         counts,
         misses,
+        unconfirmed_misses,
+        unrelated_failures,
         quarantine: quarantine.into_iter().collect(),
         sample,
         profraw_in_cwd: Vec::new(),
@@ -1153,7 +1296,7 @@ pub(crate) fn print(r: &FreshReport) -> String {
         (
             "Verdict",
             format!(
-                "safety {} (zero misses), efficiency {} (median <= 20% for write sets <= 5){}",
+                "safety {} (zero confirmed misses), efficiency {} (median <= 20% for write sets <= 5){}",
                 if r.safety_gate { "PASS" } else { "FAIL" },
                 if r.efficiency_gate { "PASS" } else { "FAIL" },
                 if r.complete {
@@ -1188,8 +1331,12 @@ pub(crate) fn print(r: &FreshReport) -> String {
             ),
         ),
         (
-            "Misses per fault (confirmed)",
-            format!("{} ({})", c.fault_misses, c.fault_confirmed_misses),
+            "Misses per fault: confirmed (gated) / unconfirmed (review)",
+            format!(
+                "{} / {}",
+                c.fault_confirmed_misses,
+                c.fault_misses - c.fault_confirmed_misses
+            ),
         ),
         (
             "Commits: with faults / informative / with a miss",
@@ -1198,7 +1345,7 @@ pub(crate) fn print(r: &FreshReport) -> String {
                 c.commits_with_faults, c.informative_commits, c.commits_with_miss
             ),
         ),
-        ("Misses", format!("{:?}", r.misses)),
+        ("Confirmed misses", format!("{:?}", r.misses)),
         (
             "Lander wall time per commit (mean)",
             format!("{:.0} s", r.lander_secs_mean),
@@ -1227,7 +1374,7 @@ pub(crate) fn print(r: &FreshReport) -> String {
             pct(ch.efficiency_median_small),
             ch.counts.faults,
             ch.counts.informative_faults,
-            ch.counts.fault_misses,
+            ch.counts.fault_confirmed_misses,
             ch.lander_secs_mean,
             ch.lander_secs_p90
                 .map_or("n/a".into(), |v| format!("{v:.0}")),
@@ -1238,6 +1385,35 @@ pub(crate) fn print(r: &FreshReport) -> String {
         println!("  chain {line}");
         md.push_str(&line);
         md.push('\n');
+    }
+    if !r.unconfirmed_misses.is_empty() {
+        md.push_str(
+            "\n## Unconfirmed misses (review; the listed tests also fail without the fault)\n\n",
+        );
+        for m in &r.unconfirmed_misses {
+            md.push_str(&format!("- {m}\n"));
+        }
+    }
+    if !r.unrelated_failures.is_empty() {
+        md.push_str("\n## (a) failures unrelated to the fault\n\n| Test | Faults |\n|---|---|\n");
+        for (t, n) in &r.unrelated_failures {
+            md.push_str(&format!("| `{t}` | {n} |\n"));
+        }
+        // One pair of outputs per test: why it fails either way.
+        let mut shown = BTreeSet::new();
+        for o in r
+            .results
+            .iter()
+            .flat_map(|(_, res)| &res.faults)
+            .flat_map(|f| &f.unrelated_output)
+        {
+            if shown.insert(o.test.clone()) {
+                md.push_str(&format!(
+                    "\n<details><summary>`{}`</summary>\n\nWith the fault:\n\n```text\n{}\n```\n\nWithout the fault:\n\n```text\n{}\n```\n\n</details>\n",
+                    o.test, o.with_fault, o.without_fault
+                ));
+            }
+        }
     }
     if !r.sample.is_empty() {
         md.push_str("\n## Full-suite sample (literal `cargo test`, not gated)\n\n| Commit | Failed | Minutes |\n|---|---|---|\n");
@@ -1381,6 +1557,198 @@ mod tests {
         assert_eq!(names.len(), 4);
     }
 
+    fn unit(name: &str) -> Unit {
+        Unit::Test(hord_verify::TestRef {
+            package: "cargo".into(),
+            target: hord_verify::TestTarget {
+                kind: "test".into(),
+                name: "testsuite".into(),
+            },
+            name: name.into(),
+        })
+    }
+
+    fn units_of(names: &[&str]) -> BTreeSet<Unit> {
+        names.iter().map(|n| unit(n)).collect()
+    }
+
+    #[test]
+    fn failures_without_the_fault_detect_nothing() {
+        let runner = CargoRunner::default();
+        let root = Path::new("/w");
+        // (b) = {x}; (a) = {x, env, y}. Everything in (a) ran.
+        let a_set = units_of(&["x", "env", "y"]);
+        let mut grader = Grader::new(&runner, root);
+        grader.ran = a_set.clone();
+
+        // Gate run 36189604585: (a) failed only on a test that also fails
+        // without the fault. Not a detection, and not a confirmed miss.
+        grader.failed = units_of(&["env"]);
+        let env = units_of(&["env"]);
+        let c = classify(&a_set, &grader, &env, false, &env, &BTreeSet::new());
+        assert_eq!(
+            c,
+            Classified {
+                detected_a: Some(false),
+                miss: true,
+                confirmed_miss: false,
+            }
+        );
+
+        // A real miss: y fails with the fault and passes without it.
+        grader.failed = units_of(&["env", "y"]);
+        let missed = units_of(&["env", "y"]);
+        let c = classify(&a_set, &grader, &env, false, &missed, &units_of(&["y"]));
+        assert_eq!(
+            (c.detected_a, c.miss, c.confirmed_miss),
+            (Some(true), true, true)
+        );
+
+        // (b) detected it: no miss, whatever (a) did.
+        grader.failed = units_of(&["x"]);
+        let c = classify(
+            &a_set,
+            &grader,
+            &BTreeSet::new(),
+            true,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            (c.detected_a, c.miss, c.confirmed_miss),
+            (Some(true), false, false)
+        );
+
+        // (a) did not finish and nothing related failed: undetermined.
+        grader.ran = units_of(&["x"]);
+        grader.failed = BTreeSet::new();
+        let c = classify(
+            &a_set,
+            &grader,
+            &BTreeSet::new(),
+            false,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(c.detected_a, None);
+    }
+
+    #[test]
+    fn unrelated_failures_keep_their_output_with_and_without_the_fault() {
+        let with: BTreeMap<String, String> = [
+            (
+                "registry::readonly".to_owned(),
+                "denied (faulted)".to_owned(),
+            ),
+            ("x".to_owned(), "the fault".to_owned()),
+        ]
+        .into();
+        let without: BTreeMap<String, String> =
+            [("registry::readonly".to_owned(), "denied (clean)".to_owned())].into();
+        let mut unrelated = units_of(&["registry::readonly"]);
+        unrelated.insert(Unit::Doc("cargo".into()));
+        let out = unrelated_output(&unrelated, &with, &without);
+        assert_eq!(
+            out,
+            vec![UnrelatedOutput {
+                test: "cargo/testsuite:registry::readonly".into(),
+                with_fault: "denied (faulted)".into(),
+                without_fault: "denied (clean)".into(),
+            }],
+            "doctest sets have no per-test output"
+        );
+    }
+
+    #[test]
+    fn the_safety_gate_counts_confirmed_misses_and_lists_the_rest() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("hord-m4-confirmed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let step = ChainStep {
+            index: 0,
+            commit: "a07c49a989d565727725e5bb5a8038ff402006a8".into(),
+            write_set: 1,
+            selected: 1,
+            suite: 100,
+            ..ChainStep::default()
+        };
+        write_json(
+            &dir.join("chain/meta.json"),
+            &ChainMeta {
+                chain: "2/15".into(),
+                commits: vec![step.commit.clone()],
+                ..ChainMeta::default()
+            },
+        )?;
+        write_json(&dir.join("chain/0.json"), &step)?;
+        let fault = |name: &str, confirmed: bool| FaultGrade {
+            fault: Fault {
+                path: "src/lib.rs".into(),
+                name: name.into(),
+                kind: FaultKind::Panic,
+                rejected: 0,
+                edited_lines: 0,
+            },
+            probe_only: false,
+            detected: Some(false),
+            detected_a: Some(confirmed),
+            miss: true,
+            confirmed_miss: confirmed,
+            missed: if confirmed {
+                vec!["cargo/testsuite:y".into()]
+            } else {
+                Vec::new()
+            },
+            unrelated: vec!["cargo/testsuite:registry::readonly".into()],
+            unrelated_output: vec![UnrelatedOutput {
+                test: "cargo/testsuite:registry::readonly".into(),
+                with_fault: "Permission denied".into(),
+                without_fault: "Permission denied (clean)".into(),
+            }],
+            failed: Vec::new(),
+            unattributed: false,
+            build_ms: 0,
+            grade_ms: 0,
+        };
+        let result = |faults| FreshResult {
+            step: step.clone(),
+            faults,
+            ..FreshResult::default()
+        };
+        write_json(
+            &dir.join("fresh-results/0.json"),
+            &result(vec![fault("f", false)]),
+        )?;
+        let r = report(std::slice::from_ref(&dir), &BTreeSet::new());
+        assert!(r.safety_gate, "an unconfirmed miss is not gated");
+        assert_eq!(r.misses.len(), 0);
+        assert_eq!(r.unconfirmed_misses.len(), 1);
+        assert!(
+            r.unconfirmed_misses[0].contains("registry::readonly"),
+            "{:?}",
+            r.unconfirmed_misses
+        );
+        assert_eq!(
+            r.unrelated_failures
+                .get("cargo/testsuite:registry::readonly"),
+            Some(&1)
+        );
+        let md = print(&r);
+        assert!(md.contains("(a) failures unrelated to the fault"));
+        assert!(md.contains("Permission denied (clean)"), "{md}");
+
+        write_json(
+            &dir.join("fresh-results/0.json"),
+            &result(vec![fault("f", false), fault("g", true)]),
+        )?;
+        let r = report(std::slice::from_ref(&dir), &BTreeSet::new());
+        assert!(!r.safety_gate, "a confirmed miss fails the gate");
+        assert_eq!(r.misses.len(), 1);
+        assert!(r.misses[0].contains("cargo/testsuite:y"), "{:?}", r.misses);
+        assert_eq!(r.counts.commits_with_miss, 1);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[test]
     fn counts_are_per_fault_and_per_commit() {
         let grade = |probe_only: bool, detected: Option<bool>, miss: bool| FaultGrade {
@@ -1396,6 +1764,9 @@ mod tests {
             detected_a: detected.or(Some(miss)),
             miss,
             confirmed_miss: miss,
+            missed: Vec::new(),
+            unrelated: Vec::new(),
+            unrelated_output: Vec::new(),
             failed: Vec::new(),
             unattributed: false,
             build_ms: 0,
