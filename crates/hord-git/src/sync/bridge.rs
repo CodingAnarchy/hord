@@ -22,7 +22,7 @@ use super::cache::{CacheStore, ObjectCache};
 use super::mirror::{Mirror, Pushed};
 use super::pulls::{PullRequest, PullRequests, StatusState};
 use super::state::{PullState, State};
-use crate::export::{export_change, lookup_exported, open_or_init};
+use crate::export::{export_changes, lookup_exported, open_or_init};
 use crate::import::{open_repo, propose_git_commit};
 use crate::{Error, GitOid};
 
@@ -317,10 +317,10 @@ impl Bridge {
         let git_dir = self.export_dir().to_owned();
         let changes = changes.to_vec();
         blocking(move || {
-            changes
-                .iter()
-                .map(|id| Ok(export_change(&store, *id, &git_dir)?.as_gix()))
-                .collect()
+            Ok(export_changes(&store, &changes, &git_dir)?
+                .into_iter()
+                .map(|oid| oid.as_gix())
+                .collect())
         })
         .await
     }

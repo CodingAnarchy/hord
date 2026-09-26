@@ -15,11 +15,11 @@
 //! target, a build failure) makes the attempt `TAMPERED`. The lander's
 //! usual verification still runs on the replay's result as proposed.
 
-use std::collections::BTreeMap;
-use std::fs::File;
+use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use hord_core::{ChangeId, ChangeRecord, NodeId, RepoPath, Timestamp};
 use hord_verify_rust::libtest::strip_ansi;
@@ -29,6 +29,11 @@ use crate::{Error, Result};
 
 /// How long the pinned run may take before it counts as failed.
 const LIMIT: Duration = Duration::from_secs(600);
+
+/// How far past now a restored file is dated: more than a coarse file
+/// system's one-second resolution, so cargo never takes it for the file
+/// it built from.
+const MTIME_MARGIN: Duration = Duration::from_secs(2);
 
 /// How a protected test fared in the pinned run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,7 +88,31 @@ impl Inner {
         if self.blob_id(record.result, &manifest)?.is_none() {
             return Ok(Pinned::Passed);
         }
-        let pinned = self.run_tests(record, &expected, true)?;
+        let scratch = self.store.hord_dir().join("pinned").join(format!(
+            "{}-{}",
+            record.result.to_hex(),
+            Timestamp::now().as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch)?;
+        let verdict = self.pinned_in(record, &expected, &scratch);
+        let _ = std::fs::remove_dir_all(&scratch);
+        verdict
+    }
+
+    /// [`Self::pinned_check`] in the scratch directory `scratch`. Both runs
+    /// share one checkout, so the second rebuilds only the targets whose
+    /// files the overlay changed.
+    fn pinned_in(
+        &self,
+        record: &ChangeRecord,
+        expected: &[crate::escalation::Expected],
+        scratch: &Path,
+    ) -> Result<Pinned> {
+        let tree = scratch.join("tree");
+        self.checkout(record.result, &tree)?;
+        let overlaid = self.overlay(expected, &tree)?;
+        let pinned = self.run_tests(expected, &tree, scratch, true)?;
         let mut tampered = Vec::new();
         let mut suspects = Vec::new();
         for (test, (fared, why)) in expected.iter().zip(&pinned) {
@@ -96,7 +125,8 @@ impl Inner {
             }
         }
         if !suspects.is_empty() {
-            let as_left = self.run_tests(record, &expected, false)?;
+            self.restore(record, &overlaid, &tree)?;
+            let as_left = self.run_tests(expected, &tree, scratch, false)?;
             let mut fails = Vec::new();
             for (test, why) in suspects {
                 let passes_as_left = expected
@@ -127,53 +157,67 @@ impl Inner {
         }
     }
 
-    /// Run the tests of `record`'s result, with each protected test's file
-    /// as protected when `overlay`, else as the replay left it. How each of
+    /// Write each protected test's file into `tree` as it is protected;
+    /// the paths written.
+    fn overlay<'a>(
+        &self,
+        expected: &'a [crate::escalation::Expected],
+        tree: &Path,
+    ) -> Result<BTreeSet<&'a RepoPath>> {
+        let mut overlaid = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for test in expected {
+            if !seen.insert(&test.path) {
+                continue;
+            }
+            if let Some(bytes) = self.file_bytes(test.source, &test.path)? {
+                let target = fs_path(tree, &test.path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&target, bytes.as_slice())?;
+                overlaid.insert(&test.path);
+            }
+        }
+        Ok(overlaid)
+    }
+
+    /// Put the `overlaid` files of `tree` back as `record`'s result has
+    /// them (removed where it has none), each dated after the run that
+    /// just built them so cargo rebuilds what reads them, even on a file
+    /// system that keeps whole seconds.
+    fn restore(
+        &self,
+        record: &ChangeRecord,
+        overlaid: &BTreeSet<&RepoPath>,
+        tree: &Path,
+    ) -> Result<()> {
+        for path in overlaid {
+            let target = fs_path(tree, path);
+            match self.file_bytes(record.result, path)? {
+                Some(bytes) => {
+                    std::fs::write(&target, bytes.as_slice())?;
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&target)?
+                        .set_modified(SystemTime::now() + MTIME_MARGIN)?;
+                }
+                None => std::fs::remove_file(&target)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Run `cargo test` in `tree`, the files overlaid when `overlay` (for
+    /// the report's wording), logging under `scratch`. How each of
     /// `expected` fared, with why, in order.
     fn run_tests(
         &self,
-        record: &ChangeRecord,
         expected: &[crate::escalation::Expected],
-        overlay: bool,
-    ) -> Result<Vec<(Fared, String)>> {
-        let scratch = self.store.hord_dir().join("pinned").join(format!(
-            "{}-{}-{}",
-            record.result.to_hex(),
-            if overlay { "pinned" } else { "as-left" },
-            Timestamp::now().as_millis()
-        ));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch)?;
-        let outcome = self.run_tests_in(record, expected, overlay, &scratch);
-        let _ = std::fs::remove_dir_all(&scratch);
-        outcome
-    }
-
-    fn run_tests_in(
-        &self,
-        record: &ChangeRecord,
-        expected: &[crate::escalation::Expected],
-        overlay: bool,
+        tree: &Path,
         scratch: &Path,
+        overlay: bool,
     ) -> Result<Vec<(Fared, String)>> {
-        let tree = scratch.join("tree");
-        self.checkout(record.result, &tree)?;
-        if overlay {
-            // Each protected test's file, as it is protected.
-            let mut overlaid: BTreeMap<&RepoPath, ()> = BTreeMap::new();
-            for test in expected {
-                if overlaid.insert(&test.path, ()).is_some() {
-                    continue;
-                }
-                if let Some(bytes) = self.file_bytes(test.source, &test.path)? {
-                    let target = fs_path(&tree, &test.path);
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&target, bytes.as_slice())?;
-                }
-            }
-        }
         let log_path = scratch.join("cargo-test.log");
         let log = File::create(&log_path)?;
         let mut child = Command::new("cargo")
@@ -183,7 +227,7 @@ impl Inner {
             .args(["test", "--tests", "--no-fail-fast", "--color", "never"])
             .args(["--", "--color", "never"])
             .env("CARGO_TERM_COLOR", "never")
-            .current_dir(&tree)
+            .current_dir(tree)
             .env(
                 "CARGO_TARGET_DIR",
                 self.store.hord_dir().join("pinned-target"),
