@@ -174,6 +174,26 @@ impl Server {
         Ok(TcpListener::bind(addr).await?)
     }
 
+    /// The key bindings `hord audit` checks signatures against: the auth
+    /// file tokens are checked against, else `server.toml`'s `[auth] file`
+    /// (a daemon or local endpoint, which takes no tokens, still reads the
+    /// bindings), else none.
+    fn audit_keys(&self) -> Option<Arc<AuthStore>> {
+        self.auth.clone().or_else(|| {
+            let file = &self.config.auth.as_ref()?.file;
+            match AuthStore::open(file) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(err) => {
+                    eprintln!(
+                        "hord serve: audit without key bindings: {}: {err}",
+                        file.display()
+                    );
+                    None
+                }
+            }
+        })
+    }
+
     /// Every route: the gRPC services, `GET /schema.json`, and the web UI
     /// (ADR 0030).
     #[must_use]
@@ -194,7 +214,7 @@ impl Server {
             ))))
             .add_service(AuditServer::new(GrpcAudit::new(
                 Arc::clone(&self.hosts),
-                self.auth.clone(),
+                self.audit_keys(),
             )));
         if let Some(workspaces) = &self.workspaces {
             routes = routes.add_service(

@@ -4,7 +4,7 @@
 //! `queue`, `land --local`, `conflicts`, `log`, `blame`, `query`, `watch`,
 //! `remote add|rm|list|set-default`, `serve`, `git import`, `git export`,
 //! `policy check`, `replay`, `arbitrate`, `review`, `login`, `token mint`,
-//! `user add`, `key show|verify`.
+//! `user add`, `key show|verify`, `audit`.
 //!
 //! `--json` is the canonical agent output: the protobuf JSON mapping of the
 //! command's `hord.proto` message (ADR 0024). Human-oriented text is
@@ -234,5 +234,18 @@ fn run_blocking(cli: Cli) -> Result<()> {
             replay,
             note,
         } => cmd::arbitrate::run(json, &target, change, pick, edit, replay, note),
+        Command::Audit {
+            since,
+            until,
+            max_bridge_gap,
+            require_bridge,
+        } => cmd::audit::run(
+            json,
+            &target,
+            &since,
+            until.as_deref(),
+            max_bridge_gap,
+            require_bridge,
+        ),
     }
 }

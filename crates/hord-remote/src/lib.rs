@@ -36,6 +36,7 @@ macro_rules! call {
     };
 }
 
+mod audit;
 mod auth;
 mod changes;
 mod client;
@@ -43,6 +44,7 @@ mod push;
 mod transport;
 mod workspaces;
 
+pub use audit::RemoteAudit;
 pub use auth::RemoteAuth;
 pub use changes::RemoteChanges;
 pub use client::{ConnectOptions, RemoteRepo, open_cache};

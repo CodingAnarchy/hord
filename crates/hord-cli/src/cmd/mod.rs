@@ -1,6 +1,7 @@
 //! Command implementations.
 
 pub mod arbitrate;
+pub mod audit;
 pub mod blame;
 pub mod git;
 pub mod init;

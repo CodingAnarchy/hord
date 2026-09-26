@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use hord_api::WorkspacesBackend;
-use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig, TlsConfig, UiSigner};
+use hord_server::{
+    AuthConfig, AuthStore, Hosts, ServeOptions, Server, ServerConfig, TlsConfig, UiSigner,
+};
 
 use crate::workspaces::LocalWorkspaces;
 use crate::{identity, repo, txn};
@@ -77,7 +79,7 @@ pub async fn run(
     let listener = Server::bind(addr, &options).await?;
     let local = listener.local_addr()?;
     let auth = auth.or_else(|| config.auth.as_ref().map(|a| a.file.clone()));
-    let (stop_local, local_endpoints) = serve_local_endpoints(&hosts);
+    let (stop_local, local_endpoints) = serve_local_endpoints(&hosts, auth.as_deref());
     let mut server = Server::new(hosts, config);
     let mut note = String::new();
     if let Some(tls) = &tls {
@@ -121,8 +123,11 @@ pub async fn run(
 /// the store, so `hord` commands in the repository, including a replay
 /// harness's `hord propose`, reach it there. They share the lander. The
 /// endpoint takes no tokens, like the daemon's; it is the local user's.
+///
+/// `auth` is not enforced there; `hord audit` reads its key bindings.
 fn serve_local_endpoints(
     hosts: &Hosts,
+    auth: Option<&std::path::Path>,
 ) -> (
     tokio::sync::watch::Sender<bool>,
     Vec<tokio::task::JoinHandle<()>>,
@@ -140,9 +145,15 @@ fn serve_local_endpoints(
         };
         let workspaces: Arc<dyn WorkspacesBackend> =
             Arc::new(LocalWorkspaces::local(local.repo().clone(), None));
+        let config = ServerConfig {
+            auth: auth.map(|file| AuthConfig {
+                file: file.to_path_buf(),
+            }),
+            ..ServerConfig::default()
+        };
         let server = Server::new(
             Hosts::from_local(name.to_owned(), Arc::clone(local)),
-            ServerConfig::default(),
+            config,
         )
         .with_workspaces(workspaces);
         let mut stopped = stopped.clone();

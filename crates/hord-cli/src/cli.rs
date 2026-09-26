@@ -304,6 +304,28 @@ pub enum Command {
         #[arg(long, value_name = "TEXT", requires = "replay")]
         note: Option<String>,
     },
+    /// Check M6's acceptance criteria over a window of the log (spec §12
+    /// M6): every landed change has an intent, provenance and passing
+    /// evidence that satisfies head's policy; reviews and arbitrations are
+    /// signed by bound keys; nothing landed outside the lander; and the git
+    /// bridge's checks ran hourly and passed. Exits non-zero on a
+    /// violation. Works locally or against `--remote`.
+    Audit {
+        /// Start of the window: a date (`2026-09-01`, midnight UTC) or an
+        /// RFC 3339 time (`2026-09-01T12:00:00Z`).
+        #[arg(long, value_name = "DATE")]
+        since: String,
+        /// End of the window (exclusive), in the same forms (default: now).
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// The longest allowed time between bridge checks, in minutes
+        /// (default: 65, hourly with slack).
+        #[arg(long, value_name = "MINUTES")]
+        max_bridge_gap: Option<u64>,
+        /// Fail when no bridge check was recorded in the window.
+        #[arg(long)]
+        require_bridge: bool,
+    },
 }
 
 /// `hord token` subcommands.
