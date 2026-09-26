@@ -2,8 +2,9 @@
 //! (spec §10.5.4): scopes per RPC, provenance from the token, and
 //! signatures by keys bound to the token's actor.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+
+use std::path::Path;
 
 use hord_api::auth::Scope;
 use hord_api::{ApiError, RepoBackend, proto, wire};
@@ -15,33 +16,7 @@ use hord_remote::RemoteRepo;
 use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig};
 use hord_txn::{Repo, RepoOptions};
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_dir_all(&self.0)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("remove temp dir {}: {err}", self.0.display());
-        }
-    }
-}
-
-fn temp(tag: &str) -> std::io::Result<Dir> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-remote-auth-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    if path.exists() {
-        std::fs::remove_dir_all(&path)?;
-    }
-    std::fs::create_dir_all(&path)?;
-    Ok(Dir(path))
-}
+use common::{TestResult, temp};
 
 /// A server requiring tokens from `auth`; stopped when the sender drops.
 async fn serve(repo: &Path, auth: &Path) -> TestResult<(String, tokio::sync::oneshot::Sender<()>)> {

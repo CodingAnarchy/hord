@@ -5,9 +5,9 @@
 //! unevidenced seed before it does not. The git bridge's recorded checks
 //! and a pull request it vouched for are audited too.
 
-use std::path::PathBuf;
+mod common;
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hord_api::auth::Scope;
@@ -23,33 +23,7 @@ use hord_server::{AuthStore, Hosts, LocalAudit, ServeOptions, Server, ServerConf
 use hord_txn::{Base, BeginOptions, LocalRepo, Repo, RepoOptions, StubVerifier};
 use tokio_stream::StreamExt;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_dir_all(&self.0)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("remove temp dir {}: {err}", self.0.display());
-        }
-    }
-}
-
-fn temp(tag: &str) -> std::io::Result<Dir> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-remote-audit-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    if path.exists() {
-        std::fs::remove_dir_all(&path)?;
-    }
-    std::fs::create_dir_all(&path)?;
-    Ok(Dir(path))
-}
+use common::{TestResult, temp};
 
 fn now_ms() -> TestResult<u64> {
     Ok(u64::try_from(

@@ -8,16 +8,13 @@
 //! - `hord serve` mounts the same router at `/` and `/r/<name>/`.
 //! - The recording plays back to the end on the landing strip.
 
+mod common;
+
 use std::collections::VecDeque;
-use std::env;
-use std::fs;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::{self, Body};
@@ -30,7 +27,7 @@ use hord_core::sign::{self, SigningKey};
 use hord_core::{Actor, Bytes, ChangeId, Intent, RepoPath};
 use hord_remote::RemoteRepo;
 use hord_server::{
-    AuthStore, Hosts, ServeOptions, Server, ServerConfig, UI_REVIEW_KIND, UiSigner, save_recording,
+    AuthStore, Hosts, Server, ServerConfig, UI_REVIEW_KIND, UiSigner, save_recording,
 };
 use hord_txn::{BeginOptions, ReplayFuture, ReplayHarness, Repo, RepoOptions};
 use hord_ui::UI_TOKEN_COOKIE;
@@ -40,41 +37,13 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::handshake;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tower::ServiceExt;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+use common::{Dir, Running, TestResult, temp};
 
 const LIB: &str = "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    2\n}\n";
-
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    /// A failed removal is reported, not raised: a drop cannot return it.
-    fn drop(&mut self) {
-        if let Err(err) = fs::remove_dir_all(&self.0)
-            && err.kind() != ErrorKind::NotFound
-        {
-            eprintln!("remove temp dir {}: {err}", self.0.display());
-        }
-    }
-}
-
-fn temp(tag: &str) -> std::io::Result<Dir> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = env::temp_dir().join(format!(
-        "hord-ui-{tag}-{}-{}",
-        process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    if path.exists() {
-        fs::remove_dir_all(&path)?;
-    }
-    fs::create_dir_all(&path)?;
-    Ok(Dir(path))
-}
 
 fn agent(id: &str) -> Actor {
     Actor::Agent {
@@ -87,28 +56,6 @@ fn agent(id: &str) -> Actor {
 
 fn path(p: &str) -> TestResult<RepoPath> {
     Ok(p.parse()?)
-}
-
-/// A running server: its address and the handle that stops it.
-struct Running {
-    addr: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Running {
-    fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    async fn stop(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
 }
 
 async fn serve(root: &Path) -> TestResult<Running> {
@@ -133,23 +80,7 @@ async fn serve_harness(
         },
     )
     .await?;
-    let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
-    let addr = listener.local_addr()?;
-    let (stop, stopped) = oneshot::channel::<()>();
-    let server = setup(Server::new(hosts, ServerConfig::default()));
-    let task = tokio::spawn(async move {
-        server
-            .serve(listener, async {
-                let _ = stopped.await;
-            })
-            .await
-            .expect("serve the test server");
-    });
-    Ok(Running {
-        addr,
-        stop: Some(stop),
-        task: Some(task),
-    })
+    Running::start(setup(Server::new(hosts, ServerConfig::default()))).await
 }
 
 /// The scenario: two agents change `two` from the same base; the first
