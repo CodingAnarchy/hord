@@ -597,7 +597,19 @@ pub(crate) struct Grader<'a> {
     pub timed_out: bool,
 }
 
-impl Grader<'_> {
+impl<'a> Grader<'a> {
+    /// A grader that has run nothing yet.
+    pub(crate) fn new(runner: &'a CargoRunner, root: &'a Path) -> Self {
+        Self {
+            runner,
+            root,
+            ran: BTreeSet::new(),
+            failed: BTreeSet::new(),
+            unattributed: false,
+            timed_out: false,
+        }
+    }
+
     /// Run `batch` (in order, one command per test binary, doctest set, or
     /// package filter) until `stop` holds after a command.
     pub(crate) fn run(
@@ -931,14 +943,7 @@ pub(crate) fn evaluate(
         .collect();
     let mut order: Vec<&str> = VARIANTS.to_vec();
     order.sort_by_key(|v| (sets[v].len(), *v));
-    let mut grader = Grader {
-        runner: &runner,
-        root,
-        ran: BTreeSet::new(),
-        failed: BTreeSet::new(),
-        unattributed: false,
-        timed_out: false,
-    };
+    let mut grader = Grader::new(&runner, root);
     // The probe runs first for everyone. A variant whose selection holds
     // all of (a) cannot miss, so it is not graded further.
     let probe_batch: Vec<Unit> = probe.intersection(&a_set).cloned().collect();
@@ -1001,14 +1006,7 @@ pub(crate) fn evaluate(
             .filter(|u| a_set.contains(u) && !sets[v].contains(u))
             .cloned()
             .collect();
-        let mut clean = Grader {
-            runner: &runner,
-            root,
-            ran: BTreeSet::new(),
-            failed: BTreeSet::new(),
-            unattributed: false,
-            timed_out: false,
-        };
+        let mut clean = Grader::new(&runner, root);
         clean.run(missed.clone(), &|_| false)?;
         let confirmed = !missed.is_empty() && clean.failed.is_empty() && !grader.unattributed;
         if let Some(r) = result.variants.get_mut(v) {
