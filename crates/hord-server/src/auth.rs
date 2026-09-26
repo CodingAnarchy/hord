@@ -32,6 +32,8 @@
 //! (a running server checks every second) or [`AuthStore::reload`] (`hord
 //! serve` on SIGHUP), without a restart.
 
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
@@ -685,12 +687,21 @@ fn write(path: &Path, state: &AuthFile) -> Result<(), AuthError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".tmp{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, text).map_err(io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+    // A new file, owner-only from the start: never readable by others, and
+    // never a leftover (or a symlink planted in its place) written through.
+    match std::fs::remove_file(&tmp) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(io(err)),
+        _ => {}
     }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp).map_err(io)?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(io)?;
+    drop(file);
     std::fs::rename(&tmp, path).map_err(io)
 }
 
@@ -780,6 +791,35 @@ mod tests {
             Err(AuthError::Invalid { .. })
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_written_owner_only_never_through_a_planted_link()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let path = temp_file("planted");
+        let _ = std::fs::remove_file(&path);
+        let elsewhere = temp_file("elsewhere");
+        std::fs::write(&elsewhere, "")?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".tmp{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        let _ = std::fs::remove_file(&tmp);
+        symlink(&elsewhere, &tmp)?;
+
+        AuthStore::add_user(&path, "ada", "pw", &[Scope::Read])?;
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere)?,
+            "",
+            "not written through"
+        );
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        for file in [&path, &elsewhere, &tmp] {
+            let _ = std::fs::remove_file(file);
+        }
         Ok(())
     }
 
