@@ -1,6 +1,7 @@
 //! The UI's routes (ADR 0030): server-rendered pages over [`UiRepo`]'s
 //! backends, an SSE relay of the event stream for the landing strip, and
-//! form POSTs that each become one RPC.
+//! form POSTs that each become one RPC. A `{snapshot}` of `head` means
+//! head's result.
 //!
 //! | Route | Reads | Acts |
 //! |---|---|---|
@@ -10,6 +11,11 @@
 //! | `POST /changes/{id}/review` | | the review seam ([`ReviewBackend`]) |
 //! | `GET /arbitrate/{id}` | `GetChange`, `Head` | |
 //! | `POST /arbitrate/{id}` | | `Arbitrate` |
+//! | `GET /nodes/{id}` | `NodeLineage` | |
+//! | `GET /trace/{id}` and `…/json` | `ChangeTrace` | |
+//! | `GET /tree` and `/tree/{snapshot}?path=` | `ListTree` | |
+//! | `GET /file/{snapshot}?path=` | `GetFile` | |
+//! | `GET /graph/{snapshot}/{node}` | `NodeEdges` | |
 //! | `GET /recordings` | `ListRecordings` | |
 //! | `GET /recordings/{id}` and `…/frames` | `GetRecording`, `Queue` | |
 //! | `GET /static/{name}` | embedded assets | |
@@ -36,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::browse;
 use crate::playback::Playback;
 use crate::present;
 use crate::strip::Strip;
@@ -152,6 +159,13 @@ pub fn router(hosts: Arc<dyn UiHosts>) -> Router {
         .route("/changes/{id}", get(change_page))
         .route("/changes/{id}/review", post(review))
         .route("/arbitrate/{id}", get(workbench).post(arbitrate))
+        .route("/nodes/{id}", get(lineage))
+        .route("/trace/{id}", get(trace))
+        .route("/trace/{id}/json", get(trace_json))
+        .route("/tree", get(tree_head))
+        .route("/tree/{snapshot}", get(tree))
+        .route("/file/{snapshot}", get(file))
+        .route("/graph/{snapshot}/{node}", get(graph))
         .route("/recordings", get(recordings))
         .route("/recordings/{id}", get(playback_page))
         .route("/recordings/{id}/frames", get(frames))
@@ -377,6 +391,7 @@ async fn change_page_with(repo: &UiRepo, id: String, flash: Option<String>) -> P
         title: side.summary.clone(),
         base: repo.base.clone(),
         status: view.queue.as_ref().map(present::status),
+        result: (!view.result.is_empty()).then(|| view.result.clone()),
         evidence: present::evidence(&view),
         provenance: present::provenance(&view),
         reads: view.read_set.iter().map(view::NodeView::from).collect(),
@@ -564,6 +579,125 @@ async fn arbitrate(
         },
     };
     workbench_with(&repo, id, Some(flash), false).await
+}
+
+// ------------------------------------------------------------ views 4–6
+
+async fn lineage(Ctx(repo): Ctx, Path(id): Path<String>) -> PageResult {
+    let reply = repo
+        .changes
+        .node_lineage(proto::NodeLineageRequest { node: id })
+        .await
+        .or_page(&repo.base)?;
+    Ok(html(&browse::lineage_page(&repo.base, &reply)))
+}
+
+async fn change_trace(repo: &UiRepo, id: String) -> ApiResult<proto::ChangeTraceResponse> {
+    repo.changes
+        .change_trace(proto::ChangeTraceRequest { change: id })
+        .await
+}
+
+async fn trace(Ctx(repo): Ctx, Path(id): Path<String>) -> PageResult {
+    let reply = change_trace(&repo, id).await.or_page(&repo.base)?;
+    Ok(html(&browse::trace_page(&repo.base, &reply)))
+}
+
+/// The trace as a download: `ChangeTraceResponse` in the canonical JSON
+/// mapping, the messages the page is built from.
+async fn trace_json(Ctx(repo): Ctx, Path(id): Path<String>) -> PageResult {
+    let reply = change_trace(&repo, id.clone()).await.or_page(&repo.base)?;
+    let body = serde_json::to_string_pretty(&reply)
+        .map_err(|e| PageError::new(&repo.base, ApiError::Internal(e.to_string())))?;
+    let disposition = format!(
+        "attachment; filename=\"trace-{}.json\"",
+        view::short_id(&id)
+    );
+    let mut response = ([(header::CONTENT_TYPE, "application/json")], body).into_response();
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
+}
+
+/// A snapshot in a URL: `head` is head's result, which the RPCs spell as
+/// the empty string.
+fn snapshot_arg(snapshot: String) -> String {
+    if snapshot == "head" {
+        String::new()
+    } else {
+        snapshot
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PathQuery {
+    #[serde(default)]
+    path: String,
+}
+
+async fn tree_page(repo: &UiRepo, snapshot: String, path: String) -> PageResult {
+    let reply = repo
+        .changes
+        .list_tree(proto::ListTreeRequest {
+            snapshot: snapshot_arg(snapshot),
+            path,
+        })
+        .await
+        .or_page(&repo.base)?;
+    Ok(html(&browse::TreePage {
+        title: if reply.path.is_empty() {
+            "Repository".into()
+        } else {
+            reply.path.clone()
+        },
+        base: repo.base.clone(),
+        crumbs: browse::crumbs(&reply.path),
+        snapshot: reply.snapshot,
+        entries: reply.entries,
+    }))
+}
+
+async fn tree_head(Ctx(repo): Ctx, Query(query): Query<PathQuery>) -> PageResult {
+    tree_page(&repo, String::new(), query.path).await
+}
+
+async fn tree(
+    Ctx(repo): Ctx,
+    Path(snapshot): Path<String>,
+    Query(query): Query<PathQuery>,
+) -> PageResult {
+    tree_page(&repo, snapshot, query.path).await
+}
+
+async fn file(
+    Ctx(repo): Ctx,
+    Path(snapshot): Path<String>,
+    Query(query): Query<PathQuery>,
+) -> PageResult {
+    let reply = repo
+        .changes
+        .get_file(proto::GetFileRequest {
+            snapshot: snapshot_arg(snapshot),
+            path: query.path,
+        })
+        .await
+        .or_page(&repo.base)?;
+    Ok(html(&browse::file_page(&repo.base, &reply)))
+}
+
+async fn graph(Ctx(repo): Ctx, Path((snapshot, node)): Path<(String, String)>) -> PageResult {
+    let reply = repo
+        .changes
+        .node_edges(proto::NodeEdgesRequest {
+            snapshot: snapshot_arg(snapshot),
+            node,
+        })
+        .await
+        .or_page(&repo.base)?;
+    Ok(html(&browse::graph_page(&repo.base, &reply)))
 }
 
 // ------------------------------------------------------------ playback

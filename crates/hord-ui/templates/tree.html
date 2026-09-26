@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h1><a href="{{ base }}/tree/{{ snapshot }}">/</a>{% for c in crumbs %}<a href="{{ base }}/tree/{{ snapshot }}?path={{ c.path }}">{{ c.name }}</a>/{% endfor %}</h1>
+<p class="legend">snapshot <code>{{ snapshot }}</code></p>
+<ul class="tree">
+{% for e in entries %}{% if e.dir %}<li class="dir"><a href="{{ base }}/tree/{{ snapshot }}?path={{ e.path }}">{{ e.name }}/</a></li>
+{% else %}<li class="file"><a href="{{ base }}/file/{{ snapshot }}?path={{ e.path }}">{{ e.name }}</a></li>
+{% endif %}{% else %}<li>Empty.</li>
+{% endfor %}
+</ul>
+{% endblock %}

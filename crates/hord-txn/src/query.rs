@@ -5,15 +5,37 @@
 //! from `land`, `bootstrap`, or a git import. `hord blame`, `hord log
 //! --node`/`--path`, and `hord query` are thin wrappers over this type.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, RepoPath, SnapshotId};
 use hord_lang::Anchor;
 use hord_store::EdgeKind;
+use hord_verify::{Definition, ReferenceGraph, newest_coverage};
+use hord_verify_rust::rust_traits;
 
+use crate::graph::SnapshotGraph;
 use crate::repo::{Inner, Repo, blocking};
-use crate::semantic::enclosing;
+use crate::semantic::{DefinitionInfo, enclosing};
 use crate::{Error, Result};
+
+/// Landed snapshots searched for a coverage record, newest first.
+const COVERAGE_HISTORY: usize = 64;
+
+/// A definition's `Tests` edges in a snapshot (spec §3.8), for the
+/// repository browser.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TestEdges {
+    /// `Tests(t, node)`: test definitions that name it (the adapter
+    /// heuristic), that recorded coverage says ran it, or recorded in the
+    /// edge index.
+    pub tested_by: BTreeSet<NodeId>,
+    /// `Tests(node, x)`, when `node` is a test: what it names, what
+    /// coverage says it ran, and what the edge index records.
+    pub tests: BTreeSet<NodeId>,
+    /// Tests coverage says ran it that map to no definition, by the
+    /// runner's name (`package::name`).
+    pub unmapped: BTreeSet<String>,
+}
 
 /// Read-only queries over a [`Repo`]'s landed history. Cheap to clone.
 #[derive(Clone, Debug)]
@@ -65,6 +87,49 @@ impl Query {
     pub async fn touches_path(&self, change: ChangeRecord, filter: RepoPath) -> Result<bool> {
         blocking(&self.repo.inner, move |inner| {
             inner.touches_path(&change, &filter)
+        })
+        .await
+    }
+
+    /// Files at or below `prefix` in `snapshot` (every file for the empty
+    /// path), in path order, with their Blob ids.
+    pub async fn files_under(
+        &self,
+        snapshot: SnapshotId,
+        prefix: RepoPath,
+    ) -> Result<Vec<(RepoPath, ObjectId)>> {
+        blocking(&self.repo.inner, move |inner| {
+            inner.files_under(snapshot, &prefix)
+        })
+        .await
+    }
+
+    /// Where each of `nodes` is defined in `snapshot`: those it has, by id.
+    pub async fn locate(
+        &self,
+        snapshot: SnapshotId,
+        nodes: BTreeSet<NodeId>,
+    ) -> Result<BTreeMap<NodeId, DefinitionInfo>> {
+        blocking(&self.repo.inner, move |inner| {
+            inner.locate(snapshot, &nodes)
+        })
+        .await
+    }
+
+    /// `References(x, node)` in `snapshot`: the definitions that name
+    /// `node`, by the resolver over the snapshot's reference index (the
+    /// dependents the impact set uses, spec §6.5), in id order.
+    pub async fn referenced_by(&self, snapshot: SnapshotId, node: NodeId) -> Result<Vec<NodeId>> {
+        blocking(&self.repo.inner, move |inner| {
+            inner.referenced_by(snapshot, node)
+        })
+        .await
+    }
+
+    /// `node`'s `Tests` edges in `snapshot`, both ways.
+    pub async fn test_edges(&self, snapshot: SnapshotId, node: NodeId) -> Result<TestEdges> {
+        blocking(&self.repo.inner, move |inner| {
+            inner.test_edges(snapshot, node)
         })
         .await
     }
@@ -263,6 +328,113 @@ impl Inner {
                 out.extend(parsed.tree.ids.values().copied());
             }
         }
+        Ok(out)
+    }
+
+    fn locate(
+        &self,
+        snapshot: SnapshotId,
+        nodes: &BTreeSet<NodeId>,
+    ) -> Result<BTreeMap<NodeId, DefinitionInfo>> {
+        let index = self.ref_index(snapshot)?;
+        let paths: BTreeSet<RepoPath> = nodes.iter().filter_map(|n| index.path_of(*n)).collect();
+        let mut out = BTreeMap::new();
+        for path in paths {
+            for def in self.definitions_at(snapshot, &path)? {
+                if nodes.contains(&def.node) {
+                    out.insert(def.node, def);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn referenced_by(&self, snapshot: SnapshotId, node: NodeId) -> Result<Vec<NodeId>> {
+        let graph = SnapshotGraph::new(self, snapshot)?;
+        let mut out = graph
+            .dependents(node)
+            .map_err(|e| Error::Verify(e.to_string()))?;
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Whether `def` is a test: a Rust function with a test attribute
+    /// (the heuristic test selection uses).
+    fn is_test(&self, snapshot: SnapshotId, def: &DefinitionInfo) -> Result<bool> {
+        let Some(view) = self.file_view(snapshot, &def.path)? else {
+            return Ok(false);
+        };
+        if view
+            .parsed
+            .as_ref()
+            .is_none_or(|p| p.lang.as_str() != hord_lang_rust::LANG)
+        {
+            return Ok(false);
+        }
+        let Some(text) = view.bytes.as_slice().get(def.span.clone()) else {
+            return Ok(false);
+        };
+        let def = Definition {
+            node: def.node,
+            path: def.path.clone(),
+            kind: def.kind,
+            name: def.name.clone(),
+            span: def.span.clone(),
+            parent: def.parent,
+        };
+        Ok(rust_traits(&def, text).test)
+    }
+
+    fn test_edges(&self, snapshot: SnapshotId, node: NodeId) -> Result<TestEdges> {
+        let mut out = TestEdges::default();
+        let this = self.locate(snapshot, &BTreeSet::from([node]))?;
+        let is_test = match this.get(&node) {
+            Some(def) => self.is_test(snapshot, def)?,
+            None => false,
+        };
+        // The adapter heuristic: a test names what it tests.
+        let dependents: BTreeSet<NodeId> =
+            self.referenced_by(snapshot, node)?.into_iter().collect();
+        for (id, def) in self.locate(snapshot, &dependents)? {
+            if self.is_test(snapshot, &def)? {
+                out.tested_by.insert(id);
+            }
+        }
+        if is_test {
+            out.tests
+                .extend(self.edges(snapshot, node, EdgeKind::References)?);
+        }
+        // Recorded edges, both ways only as far as the index goes: it is
+        // keyed by source.
+        out.tests
+            .extend(self.store.edges(snapshot, node, EdgeKind::Tests)?);
+        // Observed edges: the newest coverage record on this snapshot or an
+        // older landed one (ADR 0022).
+        let history = self.snapshot_history(snapshot, COVERAGE_HISTORY)?;
+        if let Some((_, record)) =
+            newest_coverage(&self.store, history, None).map_err(|e| Error::Verify(e.to_string()))?
+        {
+            for t in &record.tests {
+                if t.node == Some(node) {
+                    out.tests.extend(record.covered_by(t));
+                }
+            }
+            let covering = record.tests_covering(&BTreeSet::from([node]));
+            for t in record.tests.iter().filter(|t| covering.contains(&t.test)) {
+                match t.node {
+                    Some(test) => {
+                        out.tested_by.insert(test);
+                    }
+                    None => {
+                        out.unmapped
+                            .insert(format!("{}::{}", t.test.package, t.test.name));
+                    }
+                }
+            }
+        }
+        out.tested_by.remove(&node);
+        out.tests.remove(&node);
         Ok(out)
     }
 
