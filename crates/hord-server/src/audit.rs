@@ -32,7 +32,8 @@ use hord_api::proto::{AuditCriterion, AuditOrigin};
 use hord_api::{ApiError, ApiResult, AuditBackend, proto, wire};
 use hord_core::sign::{self, SignError};
 use hord_core::{
-    Actor, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, ObjectId, Signature,
+    Actor, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IntentRef, ObjectId,
+    Signature,
 };
 use hord_policy::{Decision, EvidenceTag};
 use hord_txn::{LocalRepo, Origin, QueueEntry, QueueStatus, Repo};
@@ -113,7 +114,8 @@ pub struct LandedFacts {
     /// How it reached the lander.
     pub origin: AuditOrigin,
     /// For [`AuditOrigin::Signed`] or an unsigned record: the submitted
-    /// record's signature, checked against its author.
+    /// record's signature, checked against its author. For
+    /// [`AuditOrigin::BridgeVouched`]: the voucher ([`check_voucher`]).
     pub key: KeyCheck,
     /// Its evidence.
     pub evidence: Vec<EvidenceFacts>,
@@ -297,7 +299,12 @@ fn judge_change(landed: &LandedFacts, violations: &mut Vec<proto::AuditFinding>)
                 "the submitted record is unsigned and no bridge vouched for it".into()
             }),
         )),
-        AuditOrigin::BridgeVouched | AuditOrigin::Replay | AuditOrigin::Arbitration => {}
+        AuditOrigin::BridgeVouched => {
+            if let Some(problem) = key_problem(&landed.key, "bridge voucher") {
+                violations.push(finding(AuditCriterion::Provenance, change, problem));
+            }
+        }
+        AuditOrigin::Replay | AuditOrigin::Arbitration => {}
     }
     let checks: Vec<&EvidenceFacts> = landed.evidence.iter().filter(|e| !e.attestation).collect();
     if !checks.iter().any(|e| e.failure.is_none()) {
@@ -437,6 +444,41 @@ fn bridge_check(envelope: &proto::EventEnvelope) -> Option<BridgeCheck> {
 /// (ADR 0037): the key id on its `Submitted` event.
 fn bridge_voucher(submitted: &proto::Submitted) -> Option<String> {
     submitted.voucher.clone()
+}
+
+/// Check the voucher of an unsigned submitted `record` as the server's
+/// ingest checks a `bridge` token's submission (ADR 0037): a git author's
+/// change naming its pull request's head, vouched for by a bound key. A
+/// change submitted where no token is involved (a daemon, a local
+/// endpoint) was not checked at ingest, so a voucher string alone proves
+/// nothing.
+fn check_voucher(auth: Option<&AuthStore>, record: &ChangeRecord, voucher: &str) -> KeyCheck {
+    if !matches!(record.provenance.actor, Actor::Human { .. }) {
+        return KeyCheck::Bad(format!(
+            "a bridge vouches only for a git author's change, not agent {}",
+            record.provenance.actor.id()
+        ));
+    }
+    if !record
+        .intent
+        .refs
+        .iter()
+        .any(|r| matches!(r, IntentRef::GitCommit { .. }))
+    {
+        return KeyCheck::Bad(
+            "a vouched change names its pull request's head (a git commit ref)".into(),
+        );
+    }
+    let Some(auth) = auth else {
+        return KeyCheck::Unchecked;
+    };
+    match auth.key_actor(voucher) {
+        Ok(Some(_)) => KeyCheck::Bound,
+        Ok(None) => KeyCheck::Bad(format!(
+            "vouched for by key {voucher}, which is not bound to any actor"
+        )),
+        Err(err) => KeyCheck::Bad(format!("look up key {voucher}: {err}")),
+    }
 }
 
 /// Check `signature` over an object claimed by `actor`: `verify` checks it
@@ -598,14 +640,17 @@ pub async fn gather(
         let voucher = submitted
             .get(&wire::id(submitted_id))
             .and_then(bridge_voucher);
-        let origin = match (entry.and_then(|e| e.origin.as_ref()), &key, voucher) {
-            (Some(Origin::Replay { .. }), _, _) => AuditOrigin::Replay,
-            (Some(Origin::Arbitration { .. }), _, _) => AuditOrigin::Arbitration,
-            (None, KeyCheck::Bound, _) => AuditOrigin::Signed,
-            (None, KeyCheck::Unchecked, _) => AuditOrigin::SignedUnbound,
-            (None, KeyCheck::Unsigned, Some(_)) => AuditOrigin::BridgeVouched,
-            (None, KeyCheck::Bad(_), _) => AuditOrigin::Signed,
-            (None, KeyCheck::Unsigned, None) => AuditOrigin::Unsigned,
+        let (origin, key) = match (entry.and_then(|e| e.origin.as_ref()), key, voucher) {
+            (Some(Origin::Replay { .. }), key, _) => (AuditOrigin::Replay, key),
+            (Some(Origin::Arbitration { .. }), key, _) => (AuditOrigin::Arbitration, key),
+            (None, key @ KeyCheck::Bound, _) => (AuditOrigin::Signed, key),
+            (None, key @ KeyCheck::Unchecked, _) => (AuditOrigin::SignedUnbound, key),
+            (None, KeyCheck::Unsigned, Some(voucher)) => (
+                AuditOrigin::BridgeVouched,
+                check_voucher(auth, &submitted_record, &voucher),
+            ),
+            (None, key @ KeyCheck::Bad(_), _) => (AuditOrigin::Signed, key),
+            (None, key @ KeyCheck::Unsigned, None) => (AuditOrigin::Unsigned, key),
         };
         let evidence = landed_evidence(repo, auth, &record, &submitted_record).await?;
         let policy = match repo
@@ -1070,12 +1115,20 @@ mod tests {
             facts.changes[n].origin = origin;
             facts.changes[n].key = KeyCheck::Unsigned;
         }
+        // A vouched change's key is its voucher's, bound to the bridge.
+        facts.changes[0].key = KeyCheck::Bound;
         let report = judge(&facts);
         assert!(report.ok, "{:#?}", report.violations);
         assert_eq!(
             report.changes[0].origin(),
             AuditOrigin::BridgeVouched,
             "reported apart from signed changes"
+        );
+        // A voucher bound to no one vouches for nothing.
+        facts.changes[0].key = KeyCheck::Bad("not bound".into());
+        assert_eq!(
+            criteria(&judge(&facts)),
+            [(AuditCriterion::Provenance, Some("change-0".into()))]
         );
     }
 

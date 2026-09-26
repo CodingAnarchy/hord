@@ -544,3 +544,75 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     assert_eq!(report.bridge.unwrap_or_default().diverged, 1);
     Ok(())
 }
+
+/// An unsigned change that names a voucher reaches the log without the
+/// server's bridge check when it is submitted where no token is involved
+/// (the daemon, `hord serve`'s local endpoint). The audit checks the
+/// voucher itself: a key bound to no one vouches for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voucher_bound_to_no_one_fails_provenance() -> TestResult {
+    let dir = temp("voucher")?;
+    let repo_dir = dir.0.join("repo");
+    let repo = Repo::create(&repo_dir).await?;
+    repo.bootstrap(
+        vec![(
+            "src/lib.rs".parse::<RepoPath>()?,
+            b"pub fn a() -> u32 {\n    1\n}\n".to_vec(),
+        )],
+        Intent::from_summary("seed"),
+        Actor::Human { id: "seed".into() },
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let since = now_ms()?;
+
+    let mut ws = repo
+        .begin(BeginOptions::at_head(Actor::Human {
+            id: "Mallory <m@example.com>".into(),
+        }))
+        .await?;
+    ws.write_file(&"src/lib.rs".parse()?, "pub fn a() -> u32 {\n    2\n}\n")
+        .await?;
+    let mut record = ws.propose(Intent::from_summary("Rewrite a")).await?.record;
+    record.intent.refs = vec![IntentRef::GitCommit {
+        sha: "a".repeat(40),
+    }];
+    let forged = SigningKey::generate()?.public().key_id();
+    record.provenance.voucher = Some(forged.clone());
+    let bytes = hord_encoding::encode(&record)?;
+    let change = wire::id(wire::verified_object(&wire::object(bytes.clone()))?);
+    let local = LocalRepo::without_lander(repo.clone());
+    local
+        .put_objects(proto::PutObjectsRequest {
+            objects: vec![wire::object(bytes)],
+        })
+        .await?;
+    local
+        .submit(proto::SubmitRequest {
+            change: change.clone(),
+        })
+        .await?;
+    repo.land_local().await?;
+    drop((ws, local));
+
+    let auth = dir.0.join("auth.toml");
+    AuthStore::add_user(&auth, "root", "pw", &[Scope::Admin])?;
+    let audit = LocalAudit::new(
+        Arc::new(LocalRepo::without_lander(repo)),
+        Some(Arc::new(AuthStore::open(&auth)?)),
+    );
+    let report = audit.audit_log(window(since)?).await?;
+    assert_eq!(report.changes.len(), 1, "{:#?}", report.changes);
+    let provenance: Vec<&str> = report
+        .violations
+        .iter()
+        .filter(|v| v.criterion() == AuditCriterion::Provenance)
+        .map(|v| v.detail.as_str())
+        .collect();
+    assert!(
+        provenance.len() == 1 && provenance[0].contains(&forged),
+        "{:#?}",
+        report.violations
+    );
+    Ok(())
+}
