@@ -1945,6 +1945,9 @@ message GetKeyResponse {
   string key_id = 1;
   // The actor it is bound to.
   Actor actor = 2;
+  // When it was revoked (ms since the Unix epoch), if it was (ADR 0038):
+  // a signature it made before then still counts.
+  optional uint64 revoked_at_ms = 3;
 }
 
 // `hord login`.
@@ -2021,6 +2024,9 @@ message KeyVerifyResult {
   optional string reason = 5;
   // The key's actor, when the server knows it.
   Actor actor = 6;
+  // When the server revoked the key, if it did (ADR 0038): the signature
+  // still verifies, and counts if it was made before then.
+  optional uint64 revoked_at_ms = 7;
 }
 
 // ---------------------------------------------------------------- audit

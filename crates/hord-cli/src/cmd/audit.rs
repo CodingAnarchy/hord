@@ -36,8 +36,8 @@ fn parse_time(date: &str) -> Result<u64> {
         .with_context(|| format!("{date:?} is before 1970"))
 }
 
-/// `ms` as an RFC 3339 time, for the text report.
-fn show_time(ms: u64) -> String {
+/// `ms` as an RFC 3339 time, for text output.
+pub(crate) fn show_time(ms: u64) -> String {
     i128::from(ms)
         .checked_mul(1_000_000)
         .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())

@@ -378,6 +378,16 @@ impl AuthStore {
         })
     }
 
+    /// `key_id`'s binding, revoked or not ([`Self::key_binding`]),
+    /// re-reading the file (blocking) for a key not seen yet.
+    pub fn key_binding_fresh(&self, key_id: &str) -> Result<Option<KeyBinding>, AuthError> {
+        if let Some(binding) = self.key_binding(key_id) {
+            return Ok(Some(binding));
+        }
+        *self.lock() = load(&self.path)?;
+        Ok(self.key_binding(key_id))
+    }
+
     /// The actor `key_id` is bound to, if any.
     pub fn key_actor(&self, key_id: &str) -> Result<Option<Actor>, AuthError> {
         let mut state = self.lock();

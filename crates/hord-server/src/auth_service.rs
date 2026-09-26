@@ -131,12 +131,14 @@ impl AuthTrait for GrpcAuth {
         let store = self.store()?;
         let key_id = request.into_inner().key_id;
         let lookup = key_id.clone();
-        let actor = blocking(move || store.key_actor(&lookup))
+        // Revoked keys too: what they signed before still verifies.
+        let binding = blocking(move || store.key_binding_fresh(&lookup))
             .await?
             .ok_or_else(|| Status::not_found(format!("no key {key_id} on this server")))?;
         Ok(Response::new(proto::GetKeyResponse {
             key_id,
-            actor: Some(wire::actor(&actor)),
+            actor: Some(wire::actor(&binding.actor)),
+            revoked_at_ms: binding.revoked_at_ms,
         }))
     }
 }

@@ -731,6 +731,14 @@ fn revoked_tokens_and_keys_are_refused_and_kept() -> TestResult {
     let auth_arg = auth.to_str().ok_or("auth path is UTF-8")?;
     w.login(&w.eve, "eve")?;
     json(dir, &w.eve, &["queue"])?;
+    // The bot signs a change before its key is revoked.
+    let before = w.submit(
+        &w.bot,
+        "docs/notes.txt",
+        "notes\n",
+        "bot notes\n",
+        "bot notes",
+    )?;
 
     let revoked = json(
         dir,
@@ -764,5 +772,10 @@ fn revoked_tokens_and_keys_are_refused_and_kept() -> TestResult {
     let change = w.propose(&w.bot, "src/lib.rs", "    1\n", "    10\n", "alpha ten")?;
     let err = fails(dir, &w.bot, &["submit", &change])?;
     assert!(err.contains("was revoked"), "{err}");
+    // What it signed before still verifies, and says the key is revoked.
+    let verified = json(dir, &w.bot, &["key", "verify", &before])?;
+    assert_eq!(verified["verified"], true, "{verified:#}");
+    assert!(verified["revokedAtMs"].is_string(), "{verified:#}");
+    assert!(verified["actor"].is_object(), "{verified:#}");
     Ok(())
 }
