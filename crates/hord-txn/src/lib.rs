@@ -49,6 +49,7 @@ mod graph;
 mod lander;
 mod local;
 mod materialize;
+mod pinned;
 mod propose;
 mod query;
 mod rebase;

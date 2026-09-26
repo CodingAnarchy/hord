@@ -1039,13 +1039,13 @@ async fn collide_with_tests(repo: &Repo) -> TestResult<(ChangeId, ChangeId)> {
     edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
     a.write_file(
         &path("tests/a.rs"),
-        test_file("beta_is_20", "assert_eq!(fixture::beta(), 20);"),
+        test_file("beta_at_least_20", "assert!(fixture::beta() >= 20);"),
     )
     .await?;
     edit(&mut b, "src/lib.rs", LIB, "    2\n", "    21\n").await?;
     b.write_file(&path("tests/b.rs"), own_test()).await?;
     let ca = a
-        .propose(accepts("beta returns 20", "beta_is_20"))
+        .propose(accepts("beta returns 20", "beta_at_least_20"))
         .await?
         .change;
     repo.submit(ca).await?;
@@ -1070,7 +1070,7 @@ async fn a_replay_that_changes_a_protected_test_is_tampered() -> TestResult {
             ("tests/b.rs", own_test()),
             (
                 "tests/a.rs",
-                test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
+                test_file("beta_at_least_20", "assert!(fixture::beta() >= 0);"),
             ),
         ]),
         // Makes beta 21, keeps its own change's test as written, and adds
@@ -1096,7 +1096,7 @@ async fn a_replay_that_changes_a_protected_test_is_tampered() -> TestResult {
     let requests = harness.requests();
     let protected = &requests.first().ok_or("a replay request")?.protected_tests;
     assert!(
-        protected.contains(&"beta_is_20".to_owned())
+        protected.contains(&"beta_at_least_20".to_owned())
             && protected.contains(&"beta_is_21".to_owned()),
         "{protected:?}"
     );
@@ -1109,13 +1109,18 @@ async fn a_replay_that_changes_a_protected_test_is_tampered() -> TestResult {
     assert_eq!(attempts.len(), 2, "{attempts:#?}");
     assert_eq!(attempts[0].outcome, ReplayOutcome::Tampered);
     assert!(attempts[0].change.is_none(), "not submitted");
-    let a_test = def(&mut begin(&t.repo, "r").await?, "tests/a.rs", "beta_is_20").await?;
+    let a_test = def(
+        &mut begin(&t.repo, "r").await?,
+        "tests/a.rs",
+        "beta_at_least_20",
+    )
+    .await?;
     assert_eq!(attempts[0].tampered, vec![a_test]);
     assert!(
         attempts[0]
             .detail
             .as_deref()
-            .is_some_and(|d| d.contains("beta_is_20")),
+            .is_some_and(|d| d.contains("beta_at_least_20")),
         "{:#?}",
         attempts[0]
     );
@@ -1124,15 +1129,12 @@ async fn a_replay_that_changes_a_protected_test_is_tampered() -> TestResult {
     let a_now = file_at_head(&t.repo, "tests/a.rs")
         .await?
         .ok_or("tests/a.rs")?;
-    assert!(
-        a_now.contains("assert_eq!(fixture::beta(), 20);"),
-        "{a_now}"
-    );
+    assert!(a_now.contains("assert!(fixture::beta() >= 20);"), "{a_now}");
     let events = events(&t.repo).await?;
     assert!(
         events
             .iter()
-            .any(|k| matches!(k, Kind::Rejected(r) if r.reason.contains("beta_is_20"))),
+            .any(|k| matches!(k, Kind::Rejected(r) if r.reason.contains("beta_at_least_20"))),
         "{events:#?}"
     );
     Ok(())
@@ -1153,7 +1155,7 @@ async fn a_manual_replay_that_changes_a_protected_test_is_rejected() -> TestResu
     ws.write_file(&path("tests/b.rs"), own_test()).await?;
     ws.write_file(
         &path("tests/a.rs"),
-        test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
+        test_file("beta_at_least_20", "assert!(fixture::beta() >= 0);"),
     )
     .await?;
     let proposal = ws.propose(intent("replay: beta returns 21")).await?;
@@ -1164,7 +1166,7 @@ async fn a_manual_replay_that_changes_a_protected_test_is_rejected() -> TestResu
     let QueueStatus::Rejected { reason } = t.repo.status(replay_id).await?.status else {
         return Err("the tampering replay is rejected".into());
     };
-    assert!(reason.contains("beta_is_20"), "{reason}");
+    assert!(reason.contains("beta_at_least_20"), "{reason}");
     let entry = t.repo.status(cb).await?;
     let attempt = escalation(&entry)?
         .attempts
@@ -1245,7 +1247,7 @@ async fn a_replay_must_keep_its_own_changes_tests_as_written() -> TestResult {
 #[tokio::test]
 async fn reformatting_or_adding_beside_a_protected_test_is_not_tampering() -> TestResult {
     let lib_21 = LIB.replace("    2\n", "    21\n");
-    let reformatted = "#[test]\nfn beta_is_20()\n{\n        assert_eq!( fixture::beta(),  20 );\n}\n\n#[test]\nfn beta_is_not_zero() {\n    assert_ne!(fixture::beta(), 0);\n}\n";
+    let reformatted = "#[test]\nfn beta_at_least_20()\n{\n        assert!( fixture::beta()  >= 20 );\n}\n\n#[test]\nfn beta_is_not_zero() {\n    assert_ne!(fixture::beta(), 0);\n}\n";
     let harness = Scripted::new([
         // Changes the protected test's tokens: tampering.
         Step::Write(vec![
@@ -1253,7 +1255,7 @@ async fn reformatting_or_adding_beside_a_protected_test_is_not_tampering() -> Te
             ("tests/b.rs", own_test()),
             (
                 "tests/a.rs",
-                test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
+                test_file("beta_at_least_20", "assert!(fixture::beta() >= 0);"),
             ),
         ]),
         // Reformats it and adds a sibling: allowed.
@@ -1287,13 +1289,13 @@ async fn reformatting_or_adding_beside_a_protected_test_is_not_tampering() -> Te
     let detail = attempts[0].detail.as_deref().unwrap_or_default();
     assert!(
         detail.contains(
-            "beta_is_20 before: `#[test] fn beta_is_20() { assert_eq!(fixture::beta(), 20); }`"
+            "beta_at_least_20 before: `#[test] fn beta_at_least_20() { assert!(fixture::beta() >= 20); }`"
         ),
         "{detail}"
     );
     assert!(
         detail.contains(
-            "beta_is_20 after: `#[test] fn beta_is_20() { assert_eq!(fixture::beta(), 21); }`"
+            "beta_at_least_20 after: `#[test] fn beta_at_least_20() { assert!(fixture::beta() >= 0); }`"
         ),
         "{detail}"
     );
@@ -1331,6 +1333,77 @@ async fn the_replay_workspace_is_seeded_with_the_changes_own_tests() -> TestResu
         file_at_head(&t.repo, "tests/b.rs").await?,
         Some(own_test()),
         "b's test as b wrote it"
+    );
+    Ok(())
+}
+
+/// ADR 0034 amendment: the protected tests run from their protected files
+/// before a replay lands, and must run and pass. Shadowing the crate in the
+/// test's file (m5-090's trick), ignoring the test, and disabling its
+/// target in Cargo.toml are each TAMPERED; an honest fix lands.
+#[tokio::test]
+async fn protected_tests_must_run_and_pass_from_their_protected_files() -> TestResult {
+    let lib_21 = LIB.replace("    2\n", "    21\n");
+    let shadowed = format!(
+        "{}\nmod fixture {{\n    pub fn beta() -> u32 {{\n        21\n    }}\n}}\n",
+        own_test()
+    );
+    let ignored = format!("#[ignore]\n{}", own_test());
+    let manifest = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\ntest = false\n";
+    let harness = Scripted::new([
+        // beta stays 20; the test file shadows the crate so the test passes.
+        Step::Write(vec![("tests/b.rs", shadowed)]),
+        // beta stays 20; the test is ignored.
+        Step::Write(vec![("tests/b.rs", ignored)]),
+        // Right code, but the test's target is disabled.
+        Step::Write(vec![
+            ("src/lib.rs", lib_21.clone()),
+            ("tests/b.rs", own_test()),
+            ("Cargo.toml", manifest.into()),
+        ]),
+        // Honest.
+        Step::Write(vec![("src/lib.rs", lib_21), ("tests/b.rs", own_test())]),
+    ]);
+    let t = ladder_repo(
+        "[land]\nmax_replay_attempts = 4\n",
+        Some(Arc::new(harness.clone())),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (_, cb) = collide_with_tests(&t.repo).await?;
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    let attempts = &escalation(&entry)?.attempts;
+    let outcomes: Vec<ReplayOutcome> = attempts.iter().map(|a| a.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            ReplayOutcome::Tampered,
+            ReplayOutcome::Tampered,
+            ReplayOutcome::Tampered,
+            ReplayOutcome::Proposed
+        ],
+        "{attempts:#?}"
+    );
+    let detail = |i: usize| attempts[i].detail.clone().unwrap_or_default();
+    assert!(
+        detail(0).contains("pinned acceptance run") && detail(0).contains("beta_is_21 failed"),
+        "{}",
+        detail(0)
+    );
+    assert!(detail(1).contains("beta_is_21"), "{}", detail(1));
+    assert!(
+        detail(2).contains("pinned acceptance run") && detail(2).contains("did not run"),
+        "{}",
+        detail(2)
+    );
+    assert!(
+        matches!(entry.status, QueueStatus::Replayed { .. }),
+        "{entry:#?}"
+    );
+    assert!(
+        head_lib(&t.repo).await?.contains("    21\n"),
+        "the honest fix landed"
     );
     Ok(())
 }

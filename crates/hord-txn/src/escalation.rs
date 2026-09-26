@@ -192,15 +192,20 @@ pub struct Arbiter {
 pub(crate) type Seeds = (Vec<(RepoPath, Vec<u8>)>, Vec<String>);
 
 /// A protected test as a replay must keep it (ADR 0034).
-struct Expected {
+pub(crate) struct Expected {
     /// The acceptance name.
-    name: String,
+    pub name: String,
     qualified: String,
-    path: RepoPath,
-    node: NodeId,
+    /// Its file.
+    pub path: RepoPath,
+    /// Its id where it is protected.
+    pub node: NodeId,
     normalized: ObjectId,
     /// Its text, whitespace collapsed.
     text: String,
+    /// The snapshot it is protected as: head for the landed side's tests,
+    /// the original change's result for its own.
+    pub source: SnapshotId,
 }
 
 /// A protected test a replay changed (ADR 0034).
@@ -245,6 +250,15 @@ pub(crate) fn tamper_report(touched: &[Tampered]) -> String {
         ));
     }
     out
+}
+
+/// A replay's pinned acceptance run failures, as a rejection reason.
+pub(crate) fn pinned_report(failed: &[(NodeId, String)]) -> String {
+    let reasons: Vec<&str> = failed.iter().map(|(_, why)| why.as_str()).collect();
+    format!(
+        "{TAMPERED}: the pinned acceptance run (ADR 0034) failed: {}",
+        reasons.join("; ")
+    )
 }
 
 /// How the lander words a replay rejected for changing a protected test
@@ -840,6 +854,15 @@ impl Inner {
             *tampered = touched.into_iter().map(|t| t.node).collect();
             return Ok(Err((ReplayOutcome::Tampered, why)));
         }
+        // ADR 0034 amendment: the protected tests must also run and pass
+        // from their protected files.
+        let failed = self.pinned_run(of, &record)?;
+        if !failed.is_empty() {
+            let why = format!("{} (proposed change {id})", pinned_report(&failed));
+            self.emit(vec![events::rejected(id, &why)])?;
+            *tampered = failed.into_iter().map(|(node, _)| node).collect();
+            return Ok(Err((ReplayOutcome::Tampered, why)));
+        }
         match record.provenance.parent_intent {
             Some(parent) if parent == of => return Ok(Ok(id)),
             Some(other) => {
@@ -921,6 +944,17 @@ impl Inner {
         Ok(out)
     }
 
+    /// Whether `replay` was proposed by an attempt the ladder ran for `of`
+    /// (its checks ran in the attempt).
+    pub(crate) fn ran_in_ladder(&self, of: ChangeId, replay: ChangeId) -> Result<bool> {
+        let Ok(entry) = self.submitted_entry(of) else {
+            return Ok(false);
+        };
+        Ok(entry
+            .escalation
+            .is_some_and(|e| e.attempts.iter().any(|a| a.change == Some(replay))))
+    }
+
     /// The files that put `of`'s own acceptance tests into a workspace on
     /// `base` as `of` wrote them (ADR 0034), and those tests' names. A file
     /// `base` lacks is `of`'s whole file; a test missing from a file `base`
@@ -979,7 +1013,7 @@ impl Inner {
 
     /// The protected tests of a replay of `of` onto `base`, as a replay
     /// must keep them.
-    fn expected_tests(&self, of: ChangeId, base: SnapshotId) -> Result<Vec<Expected>> {
+    pub(crate) fn expected_tests(&self, of: ChangeId, base: SnapshotId) -> Result<Vec<Expected>> {
         let names = self.protected_test_names(of)?;
         let mut out = self.named_tests(base, &names)?;
         let original = self.change_record(of)?;
@@ -1024,6 +1058,7 @@ impl Inner {
                     path: path.clone(),
                     node: def.node,
                     normalized,
+                    source: snapshot,
                 });
             }
         }

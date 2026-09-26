@@ -59,7 +59,7 @@ use hord_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::conflict::{ConflictReport, Footprint, check};
-use crate::escalation::{Escalation, Origin, tamper_report};
+use crate::escalation::{Escalation, Origin, pinned_report, tamper_report};
 use crate::events;
 use crate::files::{validate, validate_except};
 use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRequest};
@@ -914,6 +914,16 @@ impl Inner {
                 return Ok(Prepared::Park(QueueStatus::Rejected {
                     reason: tamper_report(&touched),
                 }));
+            }
+            // A replay the ladder ran had its pinned acceptance run in its
+            // attempt; one submitted by hand has it here.
+            if !self.ran_in_ladder(of, entry.change)? {
+                let failed = self.pinned_run(of, &record)?;
+                if !failed.is_empty() {
+                    return Ok(Prepared::Park(QueueStatus::Rejected {
+                        reason: pinned_report(&failed),
+                    }));
+                }
             }
         }
         // ADR 0026: the landing base's policy judges the change.
