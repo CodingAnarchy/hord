@@ -94,6 +94,10 @@ fn owner_rwx(perms: fs::Permissions) -> fs::Permissions {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::permissions_set_readonly_false,
+    reason = "not Unix: clearing the read-only attribute is the whole point, and there is no world-writable mode bit here"
+)]
 fn owner_rwx(mut perms: fs::Permissions) -> fs::Permissions {
     perms.set_readonly(false);
     perms
