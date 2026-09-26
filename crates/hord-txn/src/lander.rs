@@ -1038,7 +1038,7 @@ impl Inner {
     /// The lander's `Rebase` attestation for `submitted` landing as
     /// `result` (ADR 0018 amendment). A pure function of the two records,
     /// so the same landing gives the same landed id anywhere: its time is
-    /// the submitted record's `created_at`. Unsigned until M5.
+    /// the submitted record's `created_at`. Unsigned: the lander has no key.
     fn rebase_attestation(
         &self,
         submitted: ChangeId,

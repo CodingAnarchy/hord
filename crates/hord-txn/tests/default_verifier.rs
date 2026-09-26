@@ -1,6 +1,7 @@
 //! The default verifier fails closed (spec §15: never land an unverified
-//! merge). Until M4's verifier, a change lands only when its conflict report
-//! is clean; an overlap that rebases cleanly parks with the reason.
+//! merge). With no verification requirements, a change lands only when its
+//! conflict report is clean; an overlap that rebases cleanly parks with the
+//! reason.
 
 mod common;
 

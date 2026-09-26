@@ -381,8 +381,8 @@ fn read_write_through_references_is_explained() -> TestResult {
     json(dir, &["submit", &first])?;
     json(dir, &["submit", &second])?;
     let landed = json(dir, &["land", "--local"])?;
-    // No verifier until M4, so the default fails closed (spec §15): the
-    // overlap parks instead of landing flagged.
+    // Nothing verifies this repository, so the default fails closed (spec
+    // §15): the overlap parks instead of landing flagged.
     assert_eq!(landed["head"], first.as_str());
     let result = json(dir, &["conflicts", &second])?;
     assert_eq!(result["entry"]["status"], CONFLICTED);
