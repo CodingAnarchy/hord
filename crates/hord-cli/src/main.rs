@@ -45,6 +45,9 @@ async fn main() {
     let cli = Cli::parse();
     let json = cli.json;
     if let Err(err) = run(cli).await {
+        if let Some(output::Exit(code)) = err.downcast_ref() {
+            std::process::exit(*code);
+        }
         output::fail(json, &err);
         std::process::exit(1);
     }

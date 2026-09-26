@@ -5,7 +5,6 @@
 //! the server's auth file (ADR 0038).
 
 use std::path::Path;
-use std::process;
 
 use anyhow::{Context, Result, anyhow, bail};
 use hord_api::{RepoBackend, proto, wire};
@@ -13,6 +12,7 @@ use hord_core::sign::{self, PublicKey};
 use hord_core::{ChangeRecord, Evidence, ObjectId, Signature};
 use hord_server::AuthStore;
 
+use crate::output::Exit;
 use crate::session::{Session, Target};
 use crate::txn::{self, block_on};
 use crate::{identity, output};
@@ -136,7 +136,7 @@ pub fn run_verify(json: bool, target: &Target, object: String, key: Option<Strin
         );
     }
     if !result.verified {
-        process::exit(1);
+        return Err(Exit(1).into());
     }
     Ok(())
 }

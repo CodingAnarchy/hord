@@ -18,7 +18,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +31,7 @@ use hord_git::sync::{
 use hord_txn::LocalRepo;
 use serde::Deserialize;
 
+use crate::output::Exit;
 use crate::session::{self, Session, Target};
 use crate::txn::block_on;
 use crate::{output, repo};
@@ -105,7 +105,28 @@ pub fn run(
         (None, None) => bail!("set work_dir in {}", config_path.display()),
     };
 
-    let (backend, key) = backend(target, config.follow.as_deref())?;
+    let (backend, key, local) = backend(target, config.follow.as_deref())?;
+    let result = sync(json, mode, &config, backend, key, token, work_dir, insecure);
+    // A lander this process ran for the bridge stops, and the store closes,
+    // before the process exits (an unclosed store needs repair next time).
+    if let Some(local) = local {
+        block_on(local.shutdown());
+    }
+    result
+}
+
+/// [`run`] once the backend is open.
+#[allow(clippy::too_many_arguments)]
+fn sync(
+    json: bool,
+    mode: Mode,
+    config: &Config,
+    backend: Arc<dyn RepoBackend>,
+    key: Option<SigningKey>,
+    token: Option<String>,
+    work_dir: PathBuf,
+    insecure: bool,
+) -> Result<()> {
     let pulls: Option<Arc<dyn PullRequests>> = match &config.github {
         Some(github) => {
             let token = token
@@ -151,7 +172,7 @@ pub fn run(
             if check.diverged {
                 // Divergence is the answer, not a failure to run: exit 1
                 // after the report, like `hord policy check` on deny.
-                process::exit(1);
+                return Err(Exit(1).into());
             }
             Ok(())
         }
@@ -173,29 +194,41 @@ pub fn run(
 
 /// The repository to follow, and the key that vouches for pull requests
 /// (ADR 0037) and signs bridge checks (ADR 0038): the logged-in
-/// credential's, against a remote.
+/// credential's, against a remote. With neither a remote nor a daemon, the
+/// repository is served in this process, returned to be shut down.
+#[allow(clippy::type_complexity)]
 fn backend(
     target: &Target,
     follow: Option<&str>,
-) -> Result<(Arc<dyn RepoBackend>, Option<SigningKey>)> {
+) -> Result<(
+    Arc<dyn RepoBackend>,
+    Option<SigningKey>,
+    Option<Arc<LocalRepo>>,
+)> {
     if follow.is_some() || target.remote.is_some() {
         let (name, url) = session::remote_url(target, follow)?;
         let (remote, credential) = session::connect(&name, &url)?;
         let key = credential.map(|c| c.key()).transpose()?;
-        return Ok((Arc::new(remote), key));
+        return Ok((Arc::new(remote), key, None));
     }
-    let backend: Arc<dyn RepoBackend> = match Session::open(target)? {
-        Session::Daemon { remote } => Arc::new(remote),
+    match Session::open(target)? {
+        Session::Daemon { remote } => Ok((Arc::new(remote), None, None)),
         Session::Remote {
             remote, credential, ..
         } => {
             let key = credential.map(|c| c.key()).transpose()?;
-            return Ok((Arc::new(remote), key));
+            Ok((Arc::new(remote), key, None))
         }
         // No daemon: land here, so pull requests do not wait for one.
-        Session::Direct { repo } => Arc::new(LocalRepo::new(repo)?),
-    };
-    Ok((backend, None))
+        Session::Direct { repo } => {
+            let local = Arc::new(LocalRepo::new(repo)?);
+            Ok((
+                Arc::clone(&local) as Arc<dyn RepoBackend>,
+                None,
+                Some(local),
+            ))
+        }
+    }
 }
 
 /// The token in `file`, which must not be in the repository's tracked

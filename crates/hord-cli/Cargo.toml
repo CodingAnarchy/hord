@@ -42,3 +42,4 @@ hord-identity.workspace = true
 hord-lang.workspace = true
 hord-lang-rust.workspace = true
 rcgen.workspace = true
+redb.workspace = true

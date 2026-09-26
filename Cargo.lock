@@ -2146,6 +2146,7 @@ dependencies = [
  "hord-store",
  "hord-txn",
  "rcgen",
+ "redb",
  "rpassword",
  "serde",
  "serde_json",

@@ -7,8 +7,10 @@ mod common;
 use common::TempDir;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -42,6 +44,27 @@ fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
         .output()?;
     assert!(out.status.success(), "git {args:?}: {}", describe(&out));
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+
+/// The redb databases under `dir` that were not closed cleanly: opening
+/// them runs a repair.
+fn needing_repair(dir: &Path) -> TestResult<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|e| e != "redb") {
+            continue;
+        }
+        let repaired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&repaired);
+        redb::Builder::new()
+            .set_repair_callback(move |_| flag.store(true, Ordering::Relaxed))
+            .open(&path)?;
+        if repaired.load(Ordering::Relaxed) {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 #[test]
@@ -94,6 +117,8 @@ fn once_check_and_repair() -> TestResult {
     assert_eq!(check["diverged"], true, "{check}");
     assert_eq!(check["actual"].as_str(), Some(manual.as_str()));
     assert_eq!(check["trigger"], "BRIDGE_CHECK_TRIGGER_CHECK");
+    // Exiting non-zero still closed the store: nothing needs repair.
+    assert_eq!(needing_repair(&repo.join(".hord"))?, Vec::<PathBuf>::new());
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/heads/main"])?,
         manual,

@@ -18,7 +18,7 @@ use hord_policy::{ActorClass, CompiledPolicy, Decision, EvidenceFact, POLICY_PAT
 use hord_txn::Repo;
 use serde::{Deserialize, Serialize};
 
-use crate::output;
+use crate::output::{self, Exit};
 use crate::session::{Session, Target};
 use crate::txn::{self, block_on};
 use crate::workspaces::this_caller;
@@ -125,7 +125,7 @@ pub fn run_check(
         print_text(&result);
     }
     if reply.deny {
-        std::process::exit(1);
+        return Err(Exit(1).into());
     }
     Ok(())
 }
