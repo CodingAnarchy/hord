@@ -15,6 +15,8 @@ Dependency additions (one line each):
 
 `time` 0.3 (hord-server, features `parsing` and `formatting`; already hord-cli's): reads and writes the auth file's RFC 3339 `revoked_at` times (ADR 0038).
 
+`rustls` 0.23 (hord-remote; already hord-git's, and tonic's TLS): its re-exported PEM reader checks that a `--ca-file` holds a certificate before trusting it (ADR 0032).
+
 `reflink-copy` 0.1 (hord-txn only, ADR 0016): safe wrapper over `clonefile(2)` / `FICLONE` for copy-on-write workspace checkouts, so no hord crate needs `unsafe` outside `hord-vfs`.
 
 `windows-sys` 0.61 (hord-cli, Windows only, feature `Win32_Foundation`, ADR 0027): `SetHandleInformation`, so the daemon does not inherit the CLI's stdio.

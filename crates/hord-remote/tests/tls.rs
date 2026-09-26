@@ -248,3 +248,22 @@ async fn plaintext_needs_insecure_bind_off_loopback_but_tls_does_not() -> TestRe
     drop(Server::bind(any, &tls).await?);
     Ok(())
 }
+
+/// A CA file with no certificate in it is an error that says so, before
+/// any connection, not a later "unknown issuer".
+#[tokio::test]
+async fn a_ca_file_without_certificates_is_refused() -> TestResult {
+    for pem in [&b"not a certificate\n"[..], b""] {
+        let options = ConnectOptions {
+            token: None,
+            ca_pem: Some(pem.to_vec()),
+        };
+        match RemoteRepo::connect_with("https://127.0.0.1:9", &options).await {
+            Err(hord_remote::Error::Tls { reason, .. }) => {
+                assert!(reason.contains("no PEM certificate"), "{reason}");
+            }
+            other => return Err(format!("expected a TLS error, got {other:?}").into()),
+        }
+    }
+    Ok(())
+}

@@ -11,6 +11,8 @@ use hord_api::{
 };
 use hord_core::ObjectId;
 use hord_txn::{ObjectSource, Repo, RepoOptions};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
@@ -41,16 +43,32 @@ impl std::fmt::Debug for ConnectOptions {
 /// `ca_pem`. A host with no system roots (a bare container) still trusts
 /// `ca_pem` alone.
 fn with_tls(endpoint: Endpoint, url: &str, ca_pem: Option<&[u8]>) -> Result<Endpoint, Error> {
-    let tls_error = |err: tonic::transport::Error| Error::Tls {
+    let reason = |err: tonic::transport::Error| {
+        std::error::Error::source(&err).map_or_else(|| err.to_string(), ToString::to_string)
+    };
+    let tls_error = |err| Error::Tls {
         url: url.to_owned(),
-        reason: std::error::Error::source(&err)
-            .map_or_else(|| err.to_string(), ToString::to_string),
+        reason: reason(err),
     };
     let Some(ca) = ca_pem else {
         return endpoint
             .tls_config(ClientTlsConfig::new().with_native_roots())
             .map_err(tls_error);
     };
+    // A CA file that holds no certificate would be trusted as nothing, and
+    // the server then fail as "unknown issuer": say what is wrong instead.
+    let certificates = CertificateDer::pem_slice_iter(ca)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| Error::Tls {
+            url: url.to_owned(),
+            reason: format!("the CA file is not PEM certificates: {err}"),
+        })?;
+    if certificates.is_empty() {
+        return Err(Error::Tls {
+            url: url.to_owned(),
+            reason: "the CA file holds no PEM certificate".into(),
+        });
+    }
     let ca = Certificate::from_pem(ca);
     match endpoint.clone().tls_config(
         ClientTlsConfig::new()
@@ -58,9 +76,18 @@ fn with_tls(endpoint: Endpoint, url: &str, ca_pem: Option<&[u8]>) -> Result<Endp
             .ca_certificate(ca.clone()),
     ) {
         Ok(endpoint) => Ok(endpoint),
-        Err(_) => endpoint
+        // No system roots (a bare container): the CA alone. If that fails
+        // too, both reasons.
+        Err(with_roots) => endpoint
             .tls_config(ClientTlsConfig::new().ca_certificate(ca))
-            .map_err(tls_error),
+            .map_err(|alone| Error::Tls {
+                url: url.to_owned(),
+                reason: format!(
+                    "{}; with the CA file alone: {}",
+                    reason(with_roots),
+                    reason(alone)
+                ),
+            }),
     }
 }
 

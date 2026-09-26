@@ -2412,6 +2412,7 @@ dependencies = [
  "hyper-util",
  "prost",
  "rcgen",
+ "rustls",
  "serde_json",
  "thiserror",
  "tokio",

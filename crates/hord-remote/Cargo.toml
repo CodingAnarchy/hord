@@ -17,6 +17,7 @@ hord-store.workspace = true
 hord-txn.workspace = true
 http.workspace = true
 hyper-util.workspace = true
+rustls.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }
 tokio-stream.workspace = true
