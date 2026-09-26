@@ -1,0 +1,31 @@
+[package]
+name = "hord-eval-m5"
+description = "M5 conflict corpus: replay, budget enforcement, and arbitration round-trip harness (spec §12 M5, ADR 0029)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hord-eval-m5"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+hord-api.workspace = true
+hord-core.workspace = true
+hord-encoding.workspace = true
+hord-remote.workspace = true
+hord-txn.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process", "signal", "time"] }
+tokio-stream.workspace = true
+toml.workspace = true

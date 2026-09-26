@@ -1,0 +1,77 @@
+id = "m5-008"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: same-tokens #8 (raise x9)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn raise(x: u32) -> u32 {
+    x * 9
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "raise adds one after scaling"
+body = "Callers need raise(x) to be x times 9 plus one, so that zero never maps to zero."
+test = "raise_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn raise_adds_one() {
+    assert_eq!(fixture::raise(3), 28);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn raise(x: u32) -> u32 {
+    x * 9 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "raise saturates instead of overflowing"
+body = "raise panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "raise_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn raise_saturates() {
+    assert_eq!(fixture::raise(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn raise(x: u32) -> u32 {
+    x.saturating_mul(9)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn raise(x: u32) -> u32 {
+    x.saturating_mul(9).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn raise_saturates() {
+    assert_eq!(fixture::raise(u32::MAX), u32::MAX);
+}
+"""

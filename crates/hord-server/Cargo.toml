@@ -9,12 +9,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+argon2.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+blake3.workspace = true
 bytes.workspace = true
+cookie.workspace = true
+diffy.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 hord-api.workspace = true
+hord-core.workspace = true
+hord-encoding.workspace = true
 hord-store.workspace = true
 hord-txn.workspace = true
+hord-ui.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper-util.workspace = true
@@ -30,3 +39,5 @@ tower.workspace = true
 
 [dev-dependencies]
 hord-api = { workspace = true, features = ["conformance"] }
+hord-verify.workspace = true
+hord-verify-rust.workspace = true

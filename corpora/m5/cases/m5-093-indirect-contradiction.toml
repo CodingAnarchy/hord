@@ -1,0 +1,181 @@
+id = "m5-093"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #5 (error policy: parse_duration of a bare number)"
+script = [
+    "workaround",
+    "workaround",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+/// Seconds in a duration such as `90s` or `2m`. A bare number is seconds.
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, unit) = match text.strip_suffix('m') {
+        Some(number) => (number, 60),
+        None => (text.strip_suffix('s').unwrap_or(text), 1),
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n * unit)
+        .map_err(|e| format!("{text:?}: {e}"))
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "durations need a unit"
+body = "`timeout = 5` in a config file meant five minutes to the person who wrote it and five seconds to us, and the outage lasted an afternoon. parse_duration should reject a number without a unit (s or m)."
+test = "unitless_durations_are_rejected"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn unitless_durations_are_rejected() {
+    assert!(fixture::parse_duration("90").is_err());
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// Seconds in a duration such as `90s` or `2m`. The unit is required.
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, unit) = if let Some(number) = text.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = text.strip_suffix('s') {
+        (number, 1)
+    } else {
+        return Err(format!("{text:?} has no unit (s or m)"));
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n * unit)
+        .map_err(|e| format!("{text:?}: {e}"))
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "honor Retry-After headers"
+body = "Upstream APIs tell us when to retry with a Retry-After header, which carries bare seconds (`Retry-After: 90`). Add retry_after(header). Every duration we act on goes through parse_duration so limits and logs treat them alike, and the retry scheduler logs parse_duration of the header next to the wait, so `90` has to read as 90 seconds both ways."
+test = "retry_after_reads_bare_seconds"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn retry_after_reads_bare_seconds() {
+    assert_eq!(fixture::parse_duration("90"), Ok(90));
+    assert_eq!(fixture::retry_after("90"), Ok(90));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// Seconds in a duration such as `90s` or `2m`. A bare number is seconds.
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, unit) = match text.strip_suffix('m') {
+        Some(number) => (number, 60),
+        None => (text.strip_suffix('s').unwrap_or(text), 1),
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n * unit)
+        .map_err(|e| format!("{text:?}: {e}"))
+}
+
+/// Seconds to wait before retrying, from an HTTP Retry-After header.
+pub fn retry_after(header: &str) -> Result<u64, String> {
+    parse_duration(header)
+}
+"""
+
+[[workarounds]]
+summary = "parse_duration keeps accepting a bare number"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Seconds in a duration such as `90s` or `2m`. A bare number is seconds.
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, unit) = match text.strip_suffix('m') {
+        Some(number) => (number, 60),
+        None => (text.strip_suffix('s').unwrap_or(text), 1),
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n * unit)
+        .map_err(|e| format!("{text:?}: {e}"))
+}
+
+/// Seconds to wait before retrying, from an HTTP Retry-After header.
+pub fn retry_after(header: &str) -> Result<u64, String> {
+    parse_duration(header)
+}
+"""
+
+[[workarounds]]
+summary = "retry_after parses on its own, leniently"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Seconds in a duration such as `90s` or `2m`. The unit is required.
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, unit) = if let Some(number) = text.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = text.strip_suffix('s') {
+        (number, 1)
+    } else {
+        return Err(format!("{text:?} has no unit (s or m)"));
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n * unit)
+        .map_err(|e| format!("{text:?}: {e}"))
+}
+
+/// Seconds to wait before retrying, from an HTTP Retry-After header.
+pub fn retry_after(header: &str) -> Result<u64, String> {
+    header.trim().parse::<u64>().map_err(|e| format!("{header:?}: {e}"))
+}
+"""
+
+[[workarounds]]
+summary = "retry_after rewrites the input into a form parse_duration takes"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Seconds in a duration such as `90s` or `2m`. The unit is required.
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, unit) = if let Some(number) = text.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = text.strip_suffix('s') {
+        (number, 1)
+    } else {
+        return Err(format!("{text:?} has no unit (s or m)"));
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n * unit)
+        .map_err(|e| format!("{text:?}: {e}"))
+}
+
+/// Seconds to wait before retrying, from an HTTP Retry-After header.
+pub fn retry_after(header: &str) -> Result<u64, String> {
+    parse_duration(&format!("{}s", header.trim()))
+}
+"""

@@ -196,7 +196,7 @@ impl VerifyPlan {
 mod tests {
     use std::str::FromStr;
 
-    use hord_core::{Actor, LandPolicy, Timestamp};
+    use hord_core::{Actor, LandPolicy, ReplayPolicy, Timestamp};
 
     use super::*;
     use crate::MemoryIndex;
@@ -288,6 +288,7 @@ mod tests {
                 max_impact: Some(40),
             },
             rules: Vec::new(),
+            replay: ReplayPolicy::default(),
         };
         let p = VerifyPolicy::from_policy(&policy).requiring(["lint"]);
         assert!(p.requires("check") && p.requires("test:selected") && p.requires("lint"));

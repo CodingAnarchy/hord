@@ -152,6 +152,7 @@ fn coverage_follows_subprocesses_and_drives_selection() -> Result<(), String> {
             )]
             .into_iter()
             .collect(),
+            cancel: Default::default(),
         },
     )
     .expect("collect coverage on the fixture");
@@ -211,6 +212,7 @@ fn coverage_follows_subprocesses_and_drives_selection() -> Result<(), String> {
                 ..Default::default()
             }),
             lines_of_interest: Default::default(),
+            cancel: Default::default(),
         },
     )
     .expect("collect coverage on the fixture");
@@ -258,6 +260,7 @@ fn coverage_follows_subprocesses_and_drives_selection() -> Result<(), String> {
             skip: BTreeSet::new(),
             only: Some(hord_verify_rust::TestFilter::default()),
             lines_of_interest: Default::default(),
+            cancel: Default::default(),
         },
     )
     .expect("collect coverage on the fixture");
@@ -355,6 +358,7 @@ fn coverage_follows_subprocesses_and_drives_selection() -> Result<(), String> {
                 skip: BTreeSet::new(),
                 only: None,
                 lines_of_interest: Default::default(),
+                cancel: Default::default(),
             },
             &index,
         )

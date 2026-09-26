@@ -6,11 +6,14 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_core::{
-    Actor, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
+    Actor, Bytes, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
     RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
 };
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
+use hord_verify_rust::Cancel;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::gate::Verifier;
 use crate::lander::QueueEntry;
@@ -72,6 +75,13 @@ pub struct RepoOptions {
     /// a source that fetches on demand (spec §8.3); what it fetches is kept
     /// in the store, and writes go to the store.
     pub objects: Option<Arc<dyn ObjectSource>>,
+    /// The replay harness the lander runs on a conflicted change (spec
+    /// §6.4 rung 2, §6.6). `None`: conflicted changes wait as
+    /// [`crate::QueueStatus::Conflicted`] for an arbiter. A
+    /// [`crate::CommandHarness`] that proposes through `hord` needs the
+    /// lander to run in the process that serves the repository (its daemon
+    /// or `hord serve`).
+    pub harness: Option<Arc<dyn crate::ReplayHarness>>,
 }
 
 impl std::fmt::Debug for RepoOptions {
@@ -84,6 +94,7 @@ impl std::fmt::Debug for RepoOptions {
             )
             .field("verifier", &self.verifier.is_some())
             .field("objects", &self.objects.is_some())
+            .field("harness", &self.harness.as_ref().map(|h| h.name()))
             .finish()
     }
 }
@@ -196,6 +207,14 @@ pub(crate) struct Inner {
     pub wake: tokio::sync::Notify,
     /// The persisted event log (spec §10.5.3), opened on first use.
     pub events: Mutex<Option<Arc<crate::events::EventLog>>>,
+    /// Every task this repository spawns that holds it: blocking store
+    /// work, verification, and replays. [`Repo::close`] waits for them.
+    pub tasks: TaskTracker,
+    /// Cancelled by [`Repo::close`]: replays and the lander stop at once.
+    pub closing: CancellationToken,
+    /// Set with [`Self::closing`]: running verification commands are
+    /// killed (their process groups) and record nothing.
+    pub verify_cancel: Cancel,
     /// Reference indexes for impact sets ([`crate::graph`]).
     pub refs: Mutex<crate::graph::RefCache>,
     /// Checkout slots for verification ([`crate::gate`]).
@@ -209,6 +228,19 @@ pub(crate) struct Inner {
     /// Definitions of the last snapshot verified under coverage, updated by
     /// difference to the next ([`crate::gate`]).
     pub definition_index: Mutex<Option<(SnapshotId, Arc<hord_verify_rust::DefinitionIndex>)>>,
+    /// The replay harness ([`RepoOptions::harness`]).
+    pub harness: Option<Arc<dyn crate::ReplayHarness>>,
+    /// Serializes updates to escalation state on queue entries.
+    pub ladder: Mutex<()>,
+    /// Replays running in this process.
+    pub replays: crate::escalation::Replays,
+    /// Replays of changes that entered the ladder as they settled, for the
+    /// lander to start ([`crate::lander`]).
+    pub pending_replays: Mutex<Vec<crate::escalation::ReplayJob>>,
+    /// The pinned acceptance run's verdict on replays the ladder submitted
+    /// (ADR 0034): `None` passed, `Some` the tests that fail either way.
+    /// Read, and dropped, when the lander prepares the replay.
+    pub pinned: Mutex<HashMap<ChangeId, Option<String>>>,
 }
 
 impl Drop for Inner {
@@ -397,12 +429,20 @@ impl Inner {
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
             wake: tokio::sync::Notify::new(),
             events: Mutex::new(None),
+            tasks: TaskTracker::new(),
+            closing: CancellationToken::new(),
+            verify_cancel: Cancel::new(),
             refs: Mutex::new(crate::graph::RefCache::default()),
             slots: crate::gate::Slots::default(),
             fetching: std::array::from_fn(|_| Mutex::new(())),
             policies: Mutex::new(HashMap::new()),
             landed_chain: Mutex::new(crate::gate::LandedChain::default()),
             definition_index: Mutex::new(None),
+            harness: options.harness,
+            ladder: Mutex::new(()),
+            replays: crate::escalation::Replays::default(),
+            pending_replays: Mutex::new(Vec::new()),
+            pinned: Mutex::new(HashMap::new()),
         })
     }
 
@@ -635,14 +675,27 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// Stop replays, the lander's waits, and running verification (see
+    /// [`Repo::close`]); does not wait.
+    pub(crate) fn stop_background(&self) {
+        self.closing.cancel();
+        self.verify_cancel.cancel();
+    }
+}
+
 /// Run `f` against the shared state on tokio's blocking pool.
 pub(crate) async fn blocking<T, F>(inner: &Arc<Inner>, f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&Inner) -> Result<T> + Send + 'static,
 {
+    let tasks = inner.tasks.clone();
     let inner = Arc::clone(inner);
-    spawn_blocking(move || f(&inner)).await
+    tasks
+        .spawn_blocking(move || f(&inner))
+        .await
+        .map_err(|err| Error::Task(err.to_string()))?
 }
 
 /// Run `f` on tokio's blocking pool.
@@ -908,6 +961,46 @@ impl Repo {
     ) -> Result<hord_api::EventStream> {
         let log = blocking(&self.inner, Inner::event_log).await?;
         Ok(log.subscribe(from))
+    }
+
+    /// End every event stream and wait for the tasks behind them (see
+    /// [`Self::events`]); later streams end at once. Lets a server's live
+    /// streams, and so its connections, finish before it stops.
+    pub async fn close_events(&self) {
+        self.inner.close_events().await;
+    }
+
+    /// Stop what this repository runs in the background and wait until none
+    /// of it holds the repository: replays are stopped (a dropped attempt
+    /// kills its harness, and the next start resumes it), verification is
+    /// cancelled (its commands are killed and it records nothing; the next
+    /// start verifies again), event streams end, and every blocking,
+    /// verification, and replay task it spawned is awaited. The handle stays usable for reads and writes; it runs no
+    /// more replays or event streams.
+    pub async fn close(&self) {
+        self.inner.stop_background();
+        self.inner.close_events().await;
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
+    }
+
+    /// Up to `limit` recorded events with a cursor greater than `after`, in
+    /// cursor order: the persisted event log read back, without following
+    /// live events (the web UI's per-change history, ADR 0030).
+    pub async fn recorded_events(
+        &self,
+        after: hord_api::EventCursor,
+        limit: usize,
+    ) -> Result<Vec<hord_api::proto::EventEnvelope>> {
+        blocking(&self.inner, move |inner| {
+            inner.event_log()?.read_after(after, limit)
+        })
+        .await
+    }
+
+    /// Bytes of the file at `path` in `snapshot`; `None` when absent.
+    pub async fn file_bytes(&self, snapshot: SnapshotId, path: RepoPath) -> Result<Option<Bytes>> {
+        blocking(&self.inner, move |inner| inner.file_bytes(snapshot, &path)).await
     }
 
     /// Explain a change's conflicts (`hord conflicts`).

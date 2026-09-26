@@ -14,11 +14,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use hord_api::{ApiError, ApiResult, WorkspacesBackend, proto, wire};
+use hord_core::sign;
 use hord_core::{Actor, ObjectId, Op};
 use hord_remote::RemoteRepo;
 use hord_store::WorkspaceId;
 use hord_txn::{Base, BeginOptions, Materialization, MaterializeMode, Repo};
 
+use crate::session::{self, Signer};
 use crate::txn::{self, Names, block_on, hex};
 use crate::{intent, repo};
 
@@ -27,6 +29,7 @@ use crate::{intent, repo};
 pub struct LocalWorkspaces {
     repo: Repo,
     remote: Option<RemoteRepo>,
+    signer: Option<Signer>,
     shutdown: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -37,16 +40,20 @@ impl LocalWorkspaces {
         Self {
             repo,
             remote: None,
+            signer: None,
             shutdown,
         }
     }
 
     /// Over a clone's cache store for `remote` (its objects are read from
-    /// `remote` and proposals pushed to it).
-    pub fn remote(cache: Repo, remote: RemoteRepo) -> Self {
+    /// `remote` and proposals pushed to it). With a `signer` (`hord
+    /// login`), proposals are authored by its actor and signed with its key
+    /// (spec §10.5.4).
+    pub fn remote(cache: Repo, remote: RemoteRepo, signer: Option<Signer>) -> Self {
         Self {
             repo: cache,
             remote: Some(remote),
+            signer,
             shutdown: None,
         }
     }
@@ -59,6 +66,20 @@ impl LocalWorkspaces {
         let repo = self.repo.clone();
         let remote = self.remote.clone();
         tokio::task::spawn_blocking(move || f(&repo, remote.as_ref()))
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))?
+            .map_err(api_error)
+    }
+
+    async fn run_signed<T, F>(&self, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Repo, Option<&RemoteRepo>, Option<&Signer>) -> Result<T> + Send + 'static,
+    {
+        let repo = self.repo.clone();
+        let remote = self.remote.clone();
+        let signer = self.signer.clone();
+        tokio::task::spawn_blocking(move || f(&repo, remote.as_ref(), signer.as_ref()))
             .await
             .map_err(|err| ApiError::Internal(err.to_string()))?
             .map_err(api_error)
@@ -326,9 +347,27 @@ fn status(repo: &Repo, request: &proto::StatusRequest) -> Result<proto::StatusRe
 fn propose(
     repo: &Repo,
     remote: Option<&RemoteRepo>,
+    signer: Option<&Signer>,
     request: &proto::ProposeRequest,
 ) -> Result<proto::ProposeResponse> {
-    let (actor, session) = caller(request.caller.as_ref())?;
+    let (mut actor, session) = caller(request.caller.as_ref())?;
+    // Against a true remote the record is signed here, before it is pushed
+    // (spec §10.5.4): with the logged-in actor's key, else this user's own.
+    // Served by a daemon, the CLI signs the record it gets back
+    // (`cmd::propose`), so the daemon never holds a private key.
+    let local;
+    let signer = match (signer, remote) {
+        (Some(signer), _) => Some(signer),
+        (None, Some(_)) => {
+            local = session::local_signer()?;
+            Some(&local)
+        }
+        (None, None) => None,
+    };
+    // The server sets provenance from the token: author as the signer.
+    if let Some(signer) = signer {
+        actor = signer.actor.clone();
+    }
     let file = intent::parse(&request.intent)
         .with_context(|| format!("parse intent file {}", request.intent_path))?;
     let meta = repo::resolve_workspace(repo.store(), request.workspace.as_deref())?;
@@ -337,16 +376,24 @@ fn propose(
         ws.declare_read(read);
     }
     let proposal = block_on(ws.propose(file.intent))?;
+    let (change, record) = match signer {
+        Some(signer) => {
+            let mut record = proposal.record;
+            sign::sign_change(&mut record, &signer.key)?;
+            (repo.store().put_object(&record)?, record)
+        }
+        None => (proposal.change, proposal.record),
+    };
     let pushed = match remote {
         Some(remote) => Some(
-            block_on(hord_remote::push_change(remote, repo, proposal.change))
+            block_on(hord_remote::push_change(remote, repo, change))
                 .context("push the proposal's objects to the remote")?,
         ),
         None => None,
     };
-    let record = &proposal.record;
+    let record = &record;
     Ok(proto::ProposeResponse {
-        change: hex(proposal.change),
+        change: hex(change),
         workspace: meta.id.to_string(),
         base: hex(record.base),
         result: hex(record.result),
@@ -427,7 +474,7 @@ impl WorkspacesBackend for LocalWorkspaces {
     }
 
     async fn propose(&self, request: proto::ProposeRequest) -> ApiResult<proto::ProposeResponse> {
-        self.run(move |repo, remote| propose(repo, remote, &request))
+        self.run_signed(move |repo, remote, signer| propose(repo, remote, signer, &request))
             .await
     }
 

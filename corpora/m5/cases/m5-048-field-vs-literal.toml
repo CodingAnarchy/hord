@@ -1,0 +1,111 @@
+id = "m5-048"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: field-vs-literal #4 (Item.weight/sample_item)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Item {
+    pub name: String,
+}
+
+impl Item {
+    pub fn new(name: &str) -> Self {
+        Item { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Item gets a weight field, 20 by default"
+body = "Add `weight: u32` to Item. Item::new sets it to 20."
+test = "item_weight_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn item_weight_defaults() {
+    assert_eq!(fixture::Item::new("x").weight, 20);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Item {
+    pub name: String,
+    pub weight: u32,
+}
+
+impl Item {
+    pub fn new(name: &str) -> Self {
+        Item { name: name.into(), weight: 20 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add sample_item, a Item named sample_item"
+body = 'Add sample_item(), which builds a Item named "sample_item".'
+test = "sample_item_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn sample_item_is_named() {
+    assert_eq!(fixture::sample_item().name, "sample_item");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Item {
+    pub name: String,
+}
+
+impl Item {
+    pub fn new(name: &str) -> Self {
+        Item { name: name.into() }
+    }
+}
+
+pub fn sample_item() -> Item {
+    Item { name: "sample_item".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Item {
+    pub name: String,
+    pub weight: u32,
+}
+
+impl Item {
+    pub fn new(name: &str) -> Self {
+        Item { name: name.into(), weight: 20 }
+    }
+}
+
+pub fn sample_item() -> Item {
+    Item { name: "sample_item".into(), weight: 20 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn sample_item_is_named() {
+    assert_eq!(fixture::sample_item().name, "sample_item");
+}
+"""

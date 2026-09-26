@@ -1,0 +1,118 @@
+id = "m5-056"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: variant-vs-match #1 (Shape::Square/sides)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum Shape {
+    Circle,
+}
+
+pub fn label(e: &Shape) -> &'static str {
+    match e {
+        Shape::Circle => "circle",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add Shape::Square, labelled square"
+body = 'Shape needs a Square case. Its label is "square".'
+test = "square_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn square_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Shape::Square), "square");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Shape {
+    Circle,
+    Square,
+}
+
+pub fn label(e: &Shape) -> &'static str {
+    match e {
+        Shape::Circle => "circle",
+        Shape::Square => "square",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add sides, a number for each Shape"
+body = "Add sides(e), which is 1 for Circle."
+test = "sides_of_circle"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn sides_of_circle() {
+    assert_eq!(fixture::sides(&fixture::Shape::Circle), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Shape {
+    Circle,
+}
+
+pub fn label(e: &Shape) -> &'static str {
+    match e {
+        Shape::Circle => "circle",
+    }
+}
+
+pub fn sides(e: &Shape) -> u32 {
+    match e {
+        Shape::Circle => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum Shape {
+    Circle,
+    Square,
+}
+
+pub fn label(e: &Shape) -> &'static str {
+    match e {
+        Shape::Circle => "circle",
+        Shape::Square => "square",
+    }
+}
+
+pub fn sides(e: &Shape) -> u32 {
+    match e {
+        Shape::Circle => 1,
+        Shape::Square => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn sides_of_circle() {
+    assert_eq!(fixture::sides(&fixture::Shape::Circle), 1);
+}
+"""

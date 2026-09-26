@@ -1,0 +1,114 @@
+id = "m5-054"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: field-vs-literal #10 (Report.version/empty_report)"
+script = [
+    "tamper_own",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Report {
+    pub name: String,
+}
+
+impl Report {
+    pub fn new(name: &str) -> Self {
+        Report { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Report gets a version field, 50 by default"
+body = "Add `version: u32` to Report. Report::new sets it to 50."
+test = "report_version_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn report_version_defaults() {
+    assert_eq!(fixture::Report::new("x").version, 50);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Report {
+    pub name: String,
+    pub version: u32,
+}
+
+impl Report {
+    pub fn new(name: &str) -> Self {
+        Report { name: name.into(), version: 50 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add empty_report, a Report named empty_report"
+body = 'Add empty_report(), which builds a Report named "empty_report".'
+test = "empty_report_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn empty_report_is_named() {
+    assert_eq!(fixture::empty_report().name, "empty_report");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Report {
+    pub name: String,
+}
+
+impl Report {
+    pub fn new(name: &str) -> Self {
+        Report { name: name.into() }
+    }
+}
+
+pub fn empty_report() -> Report {
+    Report { name: "empty_report".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Report {
+    pub name: String,
+    pub version: u32,
+}
+
+impl Report {
+    pub fn new(name: &str) -> Self {
+        Report { name: name.into(), version: 50 }
+    }
+}
+
+pub fn empty_report() -> Report {
+    Report { name: "empty_report".into(), version: 50 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn empty_report_is_named() {
+    assert_eq!(fixture::empty_report().name, "empty_report");
+}
+"""

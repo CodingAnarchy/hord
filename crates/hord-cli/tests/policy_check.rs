@@ -398,6 +398,7 @@ fn evidence_indexed_for_the_result_snapshot_counts() -> TestResult {
         cost_ms: 1,
         produced_by: hord_core::Actor::Human { id: "ada".into() },
         produced_at: hord_core::Timestamp::from_millis(1),
+        signature: None,
     };
     store.put_evidence(&evidence(hord_core::EvidenceKind::Check, None, snapshot))?;
     // A full run meets `test:selected` (ADR 0026).

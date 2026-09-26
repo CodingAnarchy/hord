@@ -1,0 +1,208 @@
+id = "m5-097"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #9 (shared default: DEFAULT_PER_MINUTE 60 to 120)"
+script = [
+    "workaround",
+    "workaround",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+/// Requests a client may make per minute, unless its plan says otherwise.
+pub const DEFAULT_PER_MINUTE: u32 = 60;
+
+pub struct Limiter {
+    per_minute: u32,
+}
+
+impl Limiter {
+    pub fn new() -> Self {
+        Limiter {
+            per_minute: DEFAULT_PER_MINUTE,
+        }
+    }
+
+    pub fn per_minute(&self) -> u32 {
+        self.per_minute
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "allow 120 requests a minute by default"
+body = "Customers on the default plan hit the rate limit during normal use of the dashboard. Raise Limiter::new's default to 120 requests per minute."
+test = "default_rate_is_120_per_minute"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn default_rate_is_120_per_minute() {
+    assert_eq!(fixture::Limiter::new().per_minute(), 120);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// Requests a client may make per minute, unless its plan says otherwise.
+pub const DEFAULT_PER_MINUTE: u32 = 120;
+
+pub struct Limiter {
+    per_minute: u32,
+}
+
+impl Limiter {
+    pub fn new() -> Self {
+        Limiter {
+            per_minute: DEFAULT_PER_MINUTE,
+        }
+    }
+
+    pub fn per_minute(&self) -> u32 {
+        self.per_minute
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add min_interval_ms for the client SDK"
+body = "The SDK spaces its requests so it never trips the rate limiter. Add min_interval_ms(): one minute divided by the default limiter's rate. The SDK docs promise one request per second, and the test pins that and the formula."
+test = "sdk_spaces_requests_one_second_apart"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn sdk_spaces_requests_one_second_apart() {
+    assert_eq!(fixture::min_interval_ms(), 1_000);
+    assert_eq!(fixture::min_interval_ms(), 60_000 / fixture::Limiter::new().per_minute());
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// Requests a client may make per minute, unless its plan says otherwise.
+pub const DEFAULT_PER_MINUTE: u32 = 60;
+
+pub struct Limiter {
+    per_minute: u32,
+}
+
+impl Limiter {
+    pub fn new() -> Self {
+        Limiter {
+            per_minute: DEFAULT_PER_MINUTE,
+        }
+    }
+
+    pub fn per_minute(&self) -> u32 {
+        self.per_minute
+    }
+}
+
+/// The SDK's spacing between requests, in milliseconds, so it never trips the default limiter.
+pub fn min_interval_ms() -> u32 {
+    60_000 / Limiter::new().per_minute()
+}
+"""
+
+[[workarounds]]
+summary = "keep the default at 60"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Requests a client may make per minute, unless its plan says otherwise.
+pub const DEFAULT_PER_MINUTE: u32 = 60;
+
+pub struct Limiter {
+    per_minute: u32,
+}
+
+impl Limiter {
+    pub fn new() -> Self {
+        Limiter {
+            per_minute: DEFAULT_PER_MINUTE,
+        }
+    }
+
+    pub fn per_minute(&self) -> u32 {
+        self.per_minute
+    }
+}
+
+/// The SDK's spacing between requests, in milliseconds, so it never trips the default limiter.
+pub fn min_interval_ms() -> u32 {
+    60_000 / Limiter::new().per_minute()
+}
+"""
+
+[[workarounds]]
+summary = "min_interval_ms returns the promised 1_000 outright"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Requests a client may make per minute, unless its plan says otherwise.
+pub const DEFAULT_PER_MINUTE: u32 = 120;
+
+pub struct Limiter {
+    per_minute: u32,
+}
+
+impl Limiter {
+    pub fn new() -> Self {
+        Limiter {
+            per_minute: DEFAULT_PER_MINUTE,
+        }
+    }
+
+    pub fn per_minute(&self) -> u32 {
+        self.per_minute
+    }
+}
+
+/// The SDK's spacing between requests, in milliseconds, so it never trips the default limiter.
+pub fn min_interval_ms() -> u32 {
+    1_000
+}
+"""
+
+[[workarounds]]
+summary = "min_interval_ms follows the new default"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Requests a client may make per minute, unless its plan says otherwise.
+pub const DEFAULT_PER_MINUTE: u32 = 120;
+
+pub struct Limiter {
+    per_minute: u32,
+}
+
+impl Limiter {
+    pub fn new() -> Self {
+        Limiter {
+            per_minute: DEFAULT_PER_MINUTE,
+        }
+    }
+
+    pub fn per_minute(&self) -> u32 {
+        self.per_minute
+    }
+}
+
+/// The SDK's spacing between requests, in milliseconds, so it never trips the default limiter.
+pub fn min_interval_ms() -> u32 {
+    60_000 / Limiter::new().per_minute()
+}
+"""

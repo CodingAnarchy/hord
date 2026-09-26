@@ -781,22 +781,23 @@ Accept:
 - Replay budget enforcement: no replay exceeds its cost budget.
 - **Arbitration round-trip:** every parked case in the conflict corpus can be resolved from the workbench, and the resolution lands as a change with both parents and a signed `Arbitrated` event.
 - **Review round-trip:** a policy rule requiring `review:human` blocks landing until a human signs from the UI or `hord review`; the resulting `Evidence` is verifiable with the signer's public key.
-- **Demo:** the M4 flight-recorder log plays back on the landing strip end-to-end, and a person unfamiliar with hord can explain from the UI alone why a given change was parked (usability check, 5 participants).
+- **Demo:** the M4 flight-recorder log plays back on the landing strip end-to-end. (The usability check moved to M6, ADR 0035.)
 - The UI issues no request that is not in `/api/v1/schema.json` (enforced by a proxy in the UI test suite).
 
 ### M6 — Self-hosting
 
-Deliver: hord's own repository is a hord repository, served by `hord serve` on a team host. The git mirror (`hord git sync`) is what GitHub sees. All contributions — human and agent — go through the lander. Web UI views 4–6 (lineage, provenance trace, repository browser).
+Deliver: hord's own repository is a hord repository, served by `hord serve` on a team host. The git mirror (`hord git sync`) is what GitHub sees. All contributions — human and agent — go through the lander. Web UI views 4–6 (lineage, provenance trace, repository browser). TLS for `hord serve` (in-process `rustls` or a documented terminating proxy; ADR 0032).
 
 Accept:
 - Thirty consecutive days of development with zero manual git operations by the core team.
 - Every change in that window has an intent, provenance, and passing evidence.
 - Every human review and arbitration in that window was performed through the UI or CLI against the server, not by editing the store.
 - Bridge sync never diverges (checked hourly).
+- **Usability (from M5, ADR 0035):** a person unfamiliar with hord can explain from the UI alone why a given change was parked, on the self-hosted server (5 participants).
 
 ### M7 — Scale and breadth (OPEN, sequenced by need)
 
-Candidates: FUSE VFS; partitioned landers; second Tier 2 adapter (TypeScript or Python) to validate the adapter abstraction; WASM adapters; rust-analyzer-precision references; coverage-refined test edges; mirrored landers.
+Candidates: FUSE VFS; partitioned landers; second Tier 2 adapter (TypeScript or Python) to validate the adapter abstraction; WASM adapters; rust-analyzer-precision references; coverage-refined test edges; mirrored landers; OIDC login (§10.5.4, ADR 0032).
 
 ---
 
@@ -824,9 +825,9 @@ Each should become an ADR. Listed roughly in the order they will block progress.
 3. rust-analyzer as Tier 2 backend: decided by ADR 0009 (do not embed the crates).
 4. Read-set collection fidelity: how much to trust access logs vs. adapter references vs. declarations; whether to require declarations from agents. Blocks M3.
 5. Test selection for Rust below crate granularity (§4.2). Blocks M4 efficiency target.
-6. Policy language beyond TOML (§7.2). Decide by M5.
+6. Policy language beyond TOML (§7.2): decided by ADR 0028 (declarative TOML through M5).
 7. Remote protocol (§8.2). Decide by M4.
-8. Replay nondeterminism: how to compare two replays of the same intent; whether to run N replays and vote. Blocks M5.
+8. Replay nondeterminism: decided by ADR 0029 (one replay per attempt, judged by evidence; attempts go to arbitration as candidates).
 9. Macro handling beyond opacity: whether stored expansions ever pay for themselves. M7.
 10. Large generated files (bindings, protobuf output): store as blobs, or parse and pay the cost? Decide at M1 with a size cutoff.
 11. Comments as first-class nodes with their own identity (for doc-blame)? M7.

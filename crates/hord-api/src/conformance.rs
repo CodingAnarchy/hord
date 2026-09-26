@@ -102,7 +102,7 @@ pub async fn run(backend: &dyn RepoBackend) -> Outcome {
     queries(backend, &fx, a, b).await?;
     evidence(backend, &fx, b).await?;
     rejection(backend, &fx).await?;
-    unimplemented_until_m5(backend).await?;
+    arbitrate_unknown(backend).await?;
     events_resume(backend).await
 }
 
@@ -677,6 +677,7 @@ async fn evidence(backend: &dyn RepoBackend, fx: &Fixture, b: ObjectId) -> Outco
         cost_ms: 0,
         produced_by: actor(),
         produced_at: Timestamp::from_millis(2),
+        signature: None,
     };
     let good = hord_encoding::encode(&make(*fx.snapshots.get(&b).check("b's snapshot")?))
         .check("encode")?;
@@ -791,19 +792,20 @@ async fn rejection(backend: &dyn RepoBackend, fx: &Fixture) -> Outcome {
     Ok(())
 }
 
-/// Arbitration is M5; refs list.
-async fn unimplemented_until_m5(backend: &dyn RepoBackend) -> Outcome {
+/// Arbitrating a change that is not in the queue is NOT_FOUND; refs list.
+async fn arbitrate_unknown(backend: &dyn RepoBackend) -> Outcome {
     expect_err(
-        "arbitrate before M5",
+        "arbitrate an unknown change",
         backend
             .arbitrate(proto::ArbitrateRequest {
                 change: wire::id(ObjectId::from_canonical(b"x")),
                 action: Some(proto::Arbitration {
-                    action: Some(proto::arbitration::Action::Replay(true)),
+                    action: Some(proto::arbitration::Action::PickOurs(true)),
                 }),
+                ..Default::default()
             })
             .await,
-        |e| matches!(e, ApiError::Unimplemented(_)),
+        |e| matches!(e, ApiError::NotFound(_)),
     )?;
     let refs = backend
         .refs(proto::RefsRequest::default())

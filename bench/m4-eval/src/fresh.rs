@@ -335,6 +335,7 @@ fn chain(
         skip: BTreeSet::new(),
         only: None,
         lines_of_interest: BTreeMap::new(),
+        cancel: Default::default(),
     };
     std::thread::scope(|scope| -> Result<()> {
         let spawn_build = |i: usize| {
@@ -553,6 +554,7 @@ fn chain_step(
         skip: ctx.quarantine.clone(),
         only: Some(filter.clone()),
         lines_of_interest: BTreeMap::new(),
+        cancel: Default::default(),
     };
     let empty = || {
         CoverageRecord::new(

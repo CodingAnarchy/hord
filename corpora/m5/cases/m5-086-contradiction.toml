@@ -1,0 +1,62 @@
+id = "m5-086"
+kind = "contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: contradiction #10 (multiplier x6 or x14)"
+script = [
+    "wrong",
+    "wrong",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn multiplier(x: u32) -> u32 {
+    x * 6
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "multiplier multiplies by 14"
+body = "The new pricing model needs multiplier to multiply by 14."
+test = "multiplier_is_14x"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn multiplier_is_14x() {
+    assert_eq!(fixture::multiplier(2), 28);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn multiplier(x: u32) -> u32 {
+    x * 14
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "pin multiplier at 6x with a test"
+body = "Billing relies on multiplier multiplying by 6; add a test so it cannot change."
+test = "multiplier_stays_6x"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn multiplier_stays_6x() {
+    assert_eq!(fixture::multiplier(2), 12);
+}
+"""
+
+[tasks.files]

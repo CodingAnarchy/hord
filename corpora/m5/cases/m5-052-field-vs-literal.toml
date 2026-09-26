@@ -1,0 +1,111 @@
+id = "m5-052"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: field-vs-literal #8 (Device.port/loopback_device)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Device {
+    pub name: String,
+}
+
+impl Device {
+    pub fn new(name: &str) -> Self {
+        Device { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Device gets a port field, 40 by default"
+body = "Add `port: u32` to Device. Device::new sets it to 40."
+test = "device_port_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn device_port_defaults() {
+    assert_eq!(fixture::Device::new("x").port, 40);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Device {
+    pub name: String,
+    pub port: u32,
+}
+
+impl Device {
+    pub fn new(name: &str) -> Self {
+        Device { name: name.into(), port: 40 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add loopback_device, a Device named loopback_device"
+body = 'Add loopback_device(), which builds a Device named "loopback_device".'
+test = "loopback_device_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn loopback_device_is_named() {
+    assert_eq!(fixture::loopback_device().name, "loopback_device");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Device {
+    pub name: String,
+}
+
+impl Device {
+    pub fn new(name: &str) -> Self {
+        Device { name: name.into() }
+    }
+}
+
+pub fn loopback_device() -> Device {
+    Device { name: "loopback_device".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Device {
+    pub name: String,
+    pub port: u32,
+}
+
+impl Device {
+    pub fn new(name: &str) -> Self {
+        Device { name: name.into(), port: 40 }
+    }
+}
+
+pub fn loopback_device() -> Device {
+    Device { name: "loopback_device".into(), port: 40 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn loopback_device_is_named() {
+    assert_eq!(fixture::loopback_device().name, "loopback_device");
+}
+"""

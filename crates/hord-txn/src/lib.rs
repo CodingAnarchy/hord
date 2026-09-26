@@ -10,6 +10,8 @@
 //! Lander::spawn(repo, cancel)  the same lander as a long-running task
 //! Repo::events(from)           the event stream (spec §10.5.3), resumable
 //! Repo::conflicts(change)      machine-readable ConflictReport
+//! ReplayHarness                spec §6.6 replay (rung 2), CommandHarness
+//! Repo::arbitrate(change, ..)  spec §6.4 rung 3
 //! Repo::query()                blame, log filters, and edges (Query)
 //! LocalRepo                    hord_api::RepoBackend over all of the above
 //! ```
@@ -39,6 +41,7 @@
 
 mod conflict;
 mod error;
+mod escalation;
 mod events;
 mod files;
 mod gate;
@@ -46,20 +49,29 @@ mod graph;
 mod lander;
 mod local;
 mod materialize;
+mod pinned;
 mod propose;
 mod query;
 mod rebase;
+mod replay;
 mod repo;
 mod semantic;
 mod sets;
 mod snapshot;
 mod source;
+mod summary;
+mod theirs;
 mod workspace;
 
 pub use conflict::{
     AdapterMerge, ConflictKind, ConflictReport, MergeConflict, MergeSeverity, SetConflict,
 };
 pub use error::{Error, Result};
+pub use escalation::{
+    ARBITRATION_DOMAIN, Arbiter, Arbitration, ArbitrationCandidate, Escalation, Origin,
+    PendingResolution, ReplayAttempt, ReplayOutcome, arbitration_message, as_replay,
+    sign_arbitration, verify_arbitration,
+};
 pub use gate::{
     Built, EngineVerifier, FailClosedVerifier, InstrumentedTests, PolicySource, RustFactory,
     StubVerifier, Verdict, Verifier, VerifierFactory, VerifyContext, VerifyFuture, VerifyRequest,
@@ -67,11 +79,18 @@ pub use gate::{
 };
 pub use hord_store::{EdgeKind, WorkspaceId};
 pub use lander::{Lander, QueueEntry, QueueStatus, SPECULATIVE_WINDOW};
-pub use local::{LocalRepo, conflict_report_message, queue_entry_message};
+pub use local::{
+    LocalRepo, arbitrate_request, conflict_report_message, escalation_message, queue_entry_message,
+};
 pub use materialize::MaterializeMode;
 pub use propose::ReadDeclaration;
 pub use query::{Query, line_start};
+pub use replay::{
+    CommandHarness, ReplayFuture, ReplayHarness, budget_message, intent_message, over_budget,
+    provenance_message, summary_message,
+};
 pub use repo::{Base, BeginOptions, Head, Repo, RepoConfig, RepoOptions, default_adapters};
 pub use semantic::DefinitionInfo;
 pub use source::ObjectSource;
+pub use summary::{ConflictSide, ConflictSummary, SummaryNode};
 pub use workspace::{AccessLog, Materialization, Proposal, Workspace};

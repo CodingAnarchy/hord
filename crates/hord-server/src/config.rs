@@ -3,13 +3,16 @@
 //! ```toml
 //! bind = "127.0.0.1:7878"
 //!
+//! [auth]
+//! file = "auth.toml"             # relative to this file; see `AuthStore`
+//!
 //! [[webhook]]
 //! url = "http://127.0.0.1:9000/hord"
 //! kinds = ["landed", "parked"]   # empty or absent: every kind
 //! repos = ["app"]                # empty or absent: every hosted repo
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -26,6 +29,18 @@ pub struct ServerConfig {
     /// Webhooks.
     #[serde(default, rename = "webhook")]
     pub webhooks: Vec<WebhookConfig>,
+    /// Require bearer tokens (spec §10.5.4).
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+}
+
+/// `[auth]`: where the auth file is ([`crate::AuthStore`]).
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// The auth file. A relative path is relative to `server.toml`'s
+    /// directory once [`ServerConfig::load`] has read it.
+    pub file: PathBuf,
 }
 
 /// One webhook: POST every matching event, JSON-mapped (spec §10.5.3).
@@ -52,7 +67,11 @@ impl ServerConfig {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(err.into()),
         };
-        Self::parse(path, &text)
+        let mut config = Self::parse(path, &text)?;
+        if let (Some(auth), Some(dir)) = (&mut config.auth, path.parent()) {
+            auth.file = dir.join(&auth.file);
+        }
+        Ok(config)
     }
 
     /// Parse `text` (read from `path`, which errors name).
@@ -96,8 +115,12 @@ mod tests {
         let path = Path::new("server.toml");
         let config = ServerConfig::parse(
             path,
-            "bind = \"127.0.0.1:1\"\n[[webhook]]\nurl = \"http://h/x\"\nkinds = [\"landed\"]\n",
+            "bind = \"127.0.0.1:1\"\n[auth]\nfile = \"auth.toml\"\n[[webhook]]\nurl = \"http://h/x\"\nkinds = [\"landed\"]\n",
         )?;
+        assert_eq!(
+            config.auth.as_ref().map(|a| a.file.as_path()),
+            Some(Path::new("auth.toml"))
+        );
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:1"));
         assert_eq!(config.webhooks[0].kinds, ["landed"]);
         for bad in [

@@ -6,20 +6,34 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use hord_api::MAX_MESSAGE_BYTES;
+use hord_api::proto::auth_server::AuthServer;
+use hord_api::proto::changes_server::ChangesServer;
 use hord_api::proto::repo_backend_server::RepoBackendServer;
 use hord_api::proto::schema_server::SchemaServer;
 use hord_api::proto::workspaces_server::WorkspacesServer;
 use tokio::net::TcpListener;
 use tonic::service::Routes;
 
+use crate::auth::AuthStore;
+use crate::auth_service::GrpcAuth;
+use crate::authz::AuthLayer;
+use crate::changes::GrpcChanges;
 use crate::config::ServerConfig;
 use crate::hosts::Hosts;
 use crate::route::RepoPrefixLayer;
 use crate::service::{GrpcRepoBackend, GrpcSchema};
+use crate::ui::{HostedUi, UiSigner};
 use crate::{Error, Result};
 
 /// How long shutdown waits for open calls (such as event streams) to end.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often shutdown checks that the served routes released the hosts.
+const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How long shutdown waits for request tasks to release the repositories
+/// before it returns anyway (the store's lock timeout keeps a reopen safe).
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Options for [`Server::bind`].
 #[derive(Clone, Debug, Default)]
@@ -44,6 +58,8 @@ pub struct Server {
     config: ServerConfig,
     workspaces: Option<Arc<dyn hord_api::WorkspacesBackend>>,
     activity: Arc<crate::activity::Activity>,
+    auth: Option<Arc<AuthStore>>,
+    ui_signer: Option<UiSigner>,
 }
 
 impl std::fmt::Debug for Server {
@@ -52,6 +68,8 @@ impl std::fmt::Debug for Server {
             .field("hosts", &self.hosts)
             .field("config", &self.config)
             .field("workspaces", &self.workspaces.is_some())
+            .field("auth", &self.auth.as_ref().map(|a| a.path()))
+            .field("ui_signer", &self.ui_signer)
             .finish()
     }
 }
@@ -65,7 +83,26 @@ impl Server {
             config,
             workspaces: None,
             activity: Arc::default(),
+            auth: None,
+            ui_signer: None,
         }
+    }
+
+    /// Sign reviews made in the web UI with `signer` (ADR 0030): the key of
+    /// whoever runs the server. With auth, ingest accepts such a review
+    /// only from a signed-in actor who is `signer`'s actor.
+    #[must_use]
+    pub fn with_ui_signer(mut self, signer: UiSigner) -> Self {
+        self.ui_signer = Some(signer);
+        self
+    }
+
+    /// Require a bearer token on every call but the public ones, checked
+    /// against `auth`, and enforce each RPC's scope (spec §10.5.4).
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthStore) -> Self {
+        self.auth = Some(Arc::new(auth));
+        self
     }
 
     /// Also serve `hord.v1.Workspaces` over `workspaces`: a repository's
@@ -89,15 +126,24 @@ impl Server {
         Ok(TcpListener::bind(addr).await?)
     }
 
-    /// Every route: the two gRPC services and `GET /schema.json`.
+    /// Every route: the gRPC services, `GET /schema.json`, and the web UI
+    /// (ADR 0030).
     #[must_use]
     pub fn routes(&self) -> Routes {
-        let backend = RepoBackendServer::new(GrpcRepoBackend::new(Arc::clone(&self.hosts)))
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        let backend = RepoBackendServer::new(GrpcRepoBackend::new(
+            Arc::clone(&self.hosts),
+            self.auth.clone(),
+        ))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
         // gRPC-Web wraps only the gRPC services: tonic-web answers any
         // other HTTP/1 request with 400, which would hide `/schema.json`.
-        let mut routes = Routes::new(backend).add_service(SchemaServer::new(GrpcSchema));
+        let mut routes = Routes::new(backend)
+            .add_service(SchemaServer::new(GrpcSchema))
+            .add_service(AuthServer::new(GrpcAuth::new(self.auth.clone())))
+            .add_service(ChangesServer::new(GrpcChanges::new(Arc::clone(
+                &self.hosts,
+            ))));
         if let Some(workspaces) = &self.workspaces {
             routes = routes.add_service(
                 WorkspacesServer::new(crate::service::GrpcWorkspaces::new(Arc::clone(workspaces)))
@@ -108,12 +154,25 @@ impl Server {
         let router = routes
             .into_axum_router()
             .layer(tonic_web::GrpcWebLayer::new())
-            .route("/schema.json", get(schema_json));
+            .route("/schema.json", get(schema_json))
+            .merge(hord_ui::router(Arc::new(HostedUi::new(
+                Arc::clone(&self.hosts),
+                self.auth.clone(),
+                self.ui_signer.clone(),
+            ))));
         Routes::from(router)
     }
 
     /// Serve on `listener` until `shutdown` resolves, then stop the
     /// landers. Webhooks run meanwhile.
+    ///
+    /// Returns once nothing the server started holds a repository: event
+    /// streams, webhooks, and landers have ended, replays and verification
+    /// in progress are cancelled (nothing is recorded for them; the next
+    /// start resumes), and the tasks the repositories spawned are done.
+    /// Requests still open are waited for up to 10 s, then named on stderr.
+    /// Dropping the [`Server`] then closes every repository, which may be
+    /// reopened at once.
     pub async fn serve(
         &self,
         listener: TcpListener,
@@ -173,31 +232,63 @@ impl Server {
             })
             .collect();
         let (stop, mut stopped) = tokio::sync::watch::channel(());
-        let serving = tonic::transport::Server::builder()
-            .accept_http1(true)
-            .layer(crate::activity::ActivityLayer(Arc::clone(&self.activity)))
-            .layer(RepoPrefixLayer)
-            .add_routes(self.routes())
-            .serve_with_incoming_shutdown(incoming, async move {
-                let _ = stopped.changed().await;
-            });
-        tokio::pin!(serving);
-        // Graceful shutdown waits for every connection to close, and a live
-        // event stream never does: after the grace period, stop anyway.
-        let served = tokio::select! {
-            served = &mut serving => served,
-            () = shutdown => {
-                let _ = stop.send(());
-                tokio::time::timeout(SHUTDOWN_GRACE, &mut serving)
-                    .await
-                    .unwrap_or(Ok(()))
+        let served = {
+            let serving = tonic::transport::Server::builder()
+                .accept_http1(true)
+                .layer(crate::activity::ActivityLayer(Arc::clone(&self.activity)))
+                .layer(RepoPrefixLayer::new(self.hosts.names().map(str::to_owned)))
+                .layer(AuthLayer(self.auth.clone()))
+                .add_routes(self.routes())
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = stopped.changed().await;
+                });
+            tokio::pin!(serving);
+            tokio::select! {
+                served = &mut serving => served,
+                () = shutdown => {
+                    let _ = stop.send(());
+                    // Graceful shutdown waits for every connection to close. A
+                    // live event stream (gRPC `Events`, the UI's SSE relay)
+                    // never ends by itself: end them all first, so the drain
+                    // finishes. The grace period only bounds a client that keeps
+                    // a request open.
+                    self.hosts.close_events().await;
+                    tokio::time::timeout(SHUTDOWN_GRACE, &mut serving)
+                        .await
+                        .unwrap_or(Ok(()))
+                }
             }
         };
+        // Nothing may hold a repository once this returns, so a caller can
+        // reopen it at once: the webhook tasks, the landers and every task
+        // the repositories spawned, and then the services' own handles.
         for hook in hooks {
             hook.abort();
+            let _ = hook.await;
         }
         self.hosts.shutdown().await;
+        self.released().await;
         Ok(served?)
+    }
+
+    /// Wait until the served routes (each service holds the hosts) are
+    /// gone, which happens once every connection task has ended. After
+    /// [`RELEASE_WAIT`], say which repositories requests still hold, and
+    /// return.
+    async fn released(&self) {
+        let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+        while Arc::strong_count(&self.hosts) > 1 {
+            if tokio::time::Instant::now() >= deadline {
+                let held: Vec<&str> = self.hosts.names().collect();
+                eprintln!(
+                    "hord serve: stopped with requests still holding {} after {}s",
+                    held.join(", "),
+                    RELEASE_WAIT.as_secs()
+                );
+                return;
+            }
+            tokio::time::sleep(RELEASE_POLL).await;
+        }
     }
 }
 

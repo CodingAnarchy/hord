@@ -35,6 +35,7 @@ use hord_verify::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::Cancel;
 use crate::cargo::CargoWorkspace;
 use crate::libtest::parse_list;
 use crate::runner::{now, run_captured};
@@ -126,6 +127,8 @@ pub struct CoverageOptions {
     /// in [`CoverageRun::lines`]: region-level data for chosen lines, such
     /// as the lines a change edits. Empty: none (the default; cheaper).
     pub lines_of_interest: BTreeMap<RepoPath, BTreeSet<u32>>,
+    /// Kills the running build or test when set.
+    pub cancel: Cancel,
 }
 
 impl Default for CoverageOptions {
@@ -140,6 +143,7 @@ impl Default for CoverageOptions {
             skip: BTreeSet::new(),
             only: None,
             lines_of_interest: BTreeMap::new(),
+            cancel: Cancel::default(),
         }
     }
 }
@@ -497,12 +501,16 @@ pub fn build_suite_with_env(
             "--message-format=json-render-diagnostics",
         ])
         .current_dir(&root)
+        .env("CARGO_TERM_COLOR", "never")
         .envs(&env)
         .envs(extra_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let built = run_captured(build, None, None)?;
+    let built = run_captured(build, None, None, &options.cancel)?;
+    if built.cancelled {
+        return Err(Error::Cancelled);
+    }
     if !built.success() {
         return Err(Error::tool("cargo test --no-run", built.stderr));
     }
@@ -572,13 +580,17 @@ pub fn build_suite_with_env(
             script.display()
         ))
         .current_dir(&root)
+        .env("CARGO_TERM_COLOR", "never")
         .envs(&env)
         .envs(extra_env)
         .env("HORD_CAPTURE_DIR", work.join("capture"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let listed = run_captured(list, None, None)?;
+    let listed = run_captured(list, None, None, &options.cancel)?;
+    if listed.cancelled {
+        return Err(Error::Cancelled);
+    }
     if !listed.success() {
         return Err(Error::tool("cargo test --list", listed.stderr));
     }
@@ -742,13 +754,19 @@ pub fn run_suite(
         let export_profile = Arc::clone(&export_profile);
         let (query, lines) = (Arc::clone(&query), Arc::clone(&lines));
         let (work, bin, timeout) = (work.clone(), bin.clone(), options.test_timeout);
+        let cancel = options.cancel.clone();
         handles.push(thread::spawn(move || {
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some((id, test, env, exe)) = jobs.get(i) else {
                     break;
                 };
-                let outcome = run_one(&work, &bin, *id, test, env, exe, timeout, &names, &query);
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let outcome = run_one(
+                    &work, &bin, *id, test, env, exe, timeout, &cancel, &names, &query,
+                );
                 match outcome {
                     Ok((covered, passed, profile, hit)) => {
                         if !hit.is_empty() {
@@ -841,6 +859,10 @@ pub fn run_suite(
     }
     let _ = fs::remove_dir_all(work);
     let record = CoverageRecord::new(suite.snapshot, toolchain.id()?, instrumented, tests);
+    // Tests a cancel killed (or never started) say nothing: no run.
+    if options.cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     Ok(CoverageRun {
         command: format!(
             "cargo llvm-cov (per test) cargo test {} --tests -- --exact",
@@ -915,6 +937,7 @@ fn run_one(
     env: &BTreeMap<String, String>,
     exe: &Path,
     timeout: Duration,
+    cancel: &Cancel,
     names: &Mutex<Interner>,
     query: &LineQuery,
 ) -> Result<(BTreeSet<u32>, bool, Option<PathBuf>, TestLines)> {
@@ -934,7 +957,7 @@ fn run_one(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let out = run_captured(cmd, Some(timeout), None)?;
+    let out = run_captured(cmd, Some(timeout), None, cancel)?;
     let raws: Vec<PathBuf> = fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "profraw"))

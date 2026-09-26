@@ -1,0 +1,62 @@
+id = "m5-078"
+kind = "contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: contradiction #2 (scale x2 or x6)"
+script = [
+    "wrong",
+    "wrong",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn scale(x: u32) -> u32 {
+    x * 2
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "scale multiplies by 6"
+body = "The new pricing model needs scale to multiply by 6."
+test = "scale_is_6x"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn scale_is_6x() {
+    assert_eq!(fixture::scale(2), 12);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn scale(x: u32) -> u32 {
+    x * 6
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "pin scale at 2x with a test"
+body = "Billing relies on scale multiplying by 2; add a test so it cannot change."
+test = "scale_stays_2x"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn scale_stays_2x() {
+    assert_eq!(fixture::scale(2), 4);
+}
+"""
+
+[tasks.files]

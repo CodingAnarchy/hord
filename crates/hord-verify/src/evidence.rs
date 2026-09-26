@@ -51,6 +51,7 @@ impl EvidenceFields {
             cost_ms: self.cost_ms,
             produced_by: self.produced_by,
             produced_at: self.produced_at,
+            signature: None,
         }
     }
 }

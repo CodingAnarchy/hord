@@ -1,0 +1,77 @@
+id = "m5-002"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: same-tokens #2 (boost x3)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn boost(x: u32) -> u32 {
+    x * 3
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "boost adds one after scaling"
+body = "Callers need boost(x) to be x times 3 plus one, so that zero never maps to zero."
+test = "boost_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn boost_adds_one() {
+    assert_eq!(fixture::boost(3), 10);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn boost(x: u32) -> u32 {
+    x * 3 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "boost saturates instead of overflowing"
+body = "boost panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "boost_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn boost_saturates() {
+    assert_eq!(fixture::boost(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn boost(x: u32) -> u32 {
+    x.saturating_mul(3)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn boost(x: u32) -> u32 {
+    x.saturating_mul(3).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn boost_saturates() {
+    assert_eq!(fixture::boost(u32::MAX), u32::MAX);
+}
+"""

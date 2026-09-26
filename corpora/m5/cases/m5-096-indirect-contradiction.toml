@@ -1,0 +1,208 @@
+id = "m5-096"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #8 (shared default: DEFAULT_PAGE_SIZE 20 to 50)"
+script = [
+    "workaround",
+    "give_up",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+/// Results per page, unless the user picks another size.
+pub const DEFAULT_PAGE_SIZE: usize = 20;
+
+pub struct Pager {
+    page_size: usize,
+}
+
+impl Pager {
+    pub fn new() -> Self {
+        Pager {
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "show 50 results per page by default"
+body = "Users page through search results 20 at a time and give up before they find anything. Show 50 per page by default: change the default page size of Pager::new."
+test = "default_page_size_is_50"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn default_page_size_is_50() {
+    assert_eq!(fixture::Pager::new().page_size(), 50);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// Results per page, unless the user picks another size.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+pub struct Pager {
+    page_size: usize,
+}
+
+impl Pager {
+    pub fn new() -> Self {
+        Pager {
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add pages_needed for the pagination bar"
+body = "The pagination bar needs to know how many pages a result set spans. Add pages_needed(items): the item count divided by the default pager's page size, rounded up. Our 100-item fixture listing has to show 5 pages, as in the design mock, and the test pins that and the formula."
+test = "a_hundred_items_span_five_pages"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn a_hundred_items_span_five_pages() {
+    assert_eq!(fixture::pages_needed(100), 5);
+    assert_eq!(fixture::pages_needed(100), 100usize.div_ceil(fixture::Pager::new().page_size()));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// Results per page, unless the user picks another size.
+pub const DEFAULT_PAGE_SIZE: usize = 20;
+
+pub struct Pager {
+    page_size: usize,
+}
+
+impl Pager {
+    pub fn new() -> Self {
+        Pager {
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+
+/// How many pages `items` results span at the default page size.
+pub fn pages_needed(items: usize) -> usize {
+    items.div_ceil(Pager::new().page_size())
+}
+"""
+
+[[workarounds]]
+summary = "keep the default at 20"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Results per page, unless the user picks another size.
+pub const DEFAULT_PAGE_SIZE: usize = 20;
+
+pub struct Pager {
+    page_size: usize,
+}
+
+impl Pager {
+    pub fn new() -> Self {
+        Pager {
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+
+/// How many pages `items` results span at the default page size.
+pub fn pages_needed(items: usize) -> usize {
+    items.div_ceil(Pager::new().page_size())
+}
+"""
+
+[[workarounds]]
+summary = "pages_needed returns the promised 5 outright"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Results per page, unless the user picks another size.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+pub struct Pager {
+    page_size: usize,
+}
+
+impl Pager {
+    pub fn new() -> Self {
+        Pager {
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+
+/// How many pages `items` results span at the default page size.
+pub fn pages_needed(items: usize) -> usize {
+    5
+}
+"""
+
+[[workarounds]]
+summary = "pages_needed follows the new default"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// Results per page, unless the user picks another size.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+pub struct Pager {
+    page_size: usize,
+}
+
+impl Pager {
+    pub fn new() -> Self {
+        Pager {
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+
+/// How many pages `items` results span at the default page size.
+pub fn pages_needed(items: usize) -> usize {
+    items.div_ceil(Pager::new().page_size())
+}
+"""

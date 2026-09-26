@@ -120,6 +120,16 @@ pub fn merge<A: LangAdapter + ?Sized>(
     mode: MergeMode,
 ) -> Result<MergeResult, Conflict> {
     let root = NodeId::file_root(path);
+    if mode == MergeMode::Lander {
+        let moved = moved_vs_edited(base, ours, theirs);
+        if !moved.is_empty() {
+            return Err(Conflict::hard(
+                moved,
+                "one side moved this definition and the other edited it; the merge \
+                 cannot place the edit (spec §5.2)",
+            ));
+        }
+    }
     let ours_map = crate::defs::mapping_between(base, ours, root);
     let theirs_map = crate::defs::mapping_between(base, theirs, root);
     let ours_ops = crate::diff::diff_structural(base, &ours.tree, &ours_map, root);
@@ -144,6 +154,53 @@ pub fn merge<A: LangAdapter + ?Sized>(
         }
         conflict
     })
+}
+
+/// Where each definition is: its enclosing definition (`None` at file
+/// level) and its `normalized` hash.
+fn placement(tree: &IdentifiedTree) -> BTreeMap<NodeId, (Option<NodeId>, Option<ObjectId>)> {
+    tree.ids
+        .iter()
+        .map(|(site, id)| {
+            let parent =
+                hord_lang::enclosing_site(&tree.ids, site).and_then(|s| tree.ids.get(s).copied());
+            let normalized = hord_lang::oid_at(&tree.tree, site)
+                .and_then(|oid| tree.tree.get(oid))
+                .map(|node| node.normalized);
+            (*id, (parent, normalized))
+        })
+        .collect()
+}
+
+/// Definitions one side moved (a new enclosing definition, same id) while
+/// the other side edited them (a new `normalized` hash). The structural
+/// compose cannot put the edit at the moved place: it would land the edit
+/// at the old place beside the moved definition. The lander reports these
+/// as hard conflicts instead (in both directions).
+fn moved_vs_edited(
+    base: &IdentifiedTree,
+    ours: &IdentifiedTree,
+    theirs: &IdentifiedTree,
+) -> Vec<NodeId> {
+    let (b, o, t) = (placement(base), placement(ours), placement(theirs));
+    let mut out = Vec::new();
+    for (id, (base_parent, base_hash)) in &b {
+        let (Some((ours_parent, ours_hash)), Some((theirs_parent, theirs_hash))) =
+            (o.get(id), t.get(id))
+        else {
+            continue;
+        };
+        let ours_moved = ours_parent != base_parent;
+        let theirs_moved = theirs_parent != base_parent;
+        let ours_edited = ours_hash != base_hash;
+        let theirs_edited = theirs_hash != base_hash;
+        if (ours_moved && !theirs_moved && theirs_edited)
+            || (theirs_moved && !ours_moved && ours_edited)
+        {
+            out.push(*id);
+        }
+    }
+    out
 }
 
 /// Keep a structural compose unless it invented a line. In

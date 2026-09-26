@@ -510,3 +510,36 @@ fn file_level_conflicts_name_the_file_root() -> Result<(), Box<dyn std::error::E
     assert_eq!(err.nodes, vec![root], "{err}");
     Ok(())
 }
+
+/// The rung-1 regression (agent `ladder`'s probe): ours moved `delta` into
+/// `mod math` (same NodeId), theirs edited `delta` in place. The lander's
+/// merge used to land the edit as a second top-level `delta` beside the
+/// moved, unedited one. It is a hard conflict naming `delta`; the corpus
+/// mode is unchanged.
+#[test]
+fn a_move_against_an_edit_is_a_hard_conflict_not_a_duplicate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = rust();
+    let base_src = b"pub fn a() -> u32 {\n    1\n}\n\npub fn delta() -> u32 {\n    4\n}\n";
+    let ours_src = b"pub fn a() -> u32 {\n    1\n}\n\npub mod math {\n    pub fn delta() -> u32 {\n        4\n    }\n}\n";
+    let theirs_src = b"pub fn a() -> u32 {\n    1\n}\n\npub fn delta() -> u32 {\n    44\n}\n";
+    let base = parse_identified(&adapter, base_src);
+    let side = |src: &[u8]| {
+        let (tree, mapping) = identify_result(&adapter, &base, src);
+        hord_lang::IdentifiedTree::new(tree, mapping.nodes)
+    };
+    let (ours, theirs) = (side(ours_src), side(theirs_src));
+    let (_, delta) = common::def_named(&base, "fn delta").ok_or("delta in base")?;
+    assert!(
+        ours.ids.values().any(|id| *id == delta),
+        "the move keeps delta's id"
+    );
+    for (a, b) in [(&ours, &theirs), (&theirs, &ours)] {
+        let conflict = merge(&adapter, &common::file(), &base, a, b, MergeMode::Lander)
+            .err()
+            .ok_or("a hard conflict, not a merge")?;
+        assert_eq!(conflict.kind, ConflictKind::Hard);
+        assert!(conflict.nodes.contains(&delta), "{conflict}");
+    }
+    Ok(())
+}

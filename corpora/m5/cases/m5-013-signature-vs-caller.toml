@@ -1,0 +1,104 @@
+id = "m5-013"
+kind = "signature-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: signature-vs-caller #2 (weigh/weigh_padded)"
+script = [
+    "tamper",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn weigh(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn weigh_twice(x: u32) -> u32 {
+    weigh(weigh(x))
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "weigh takes its factor as a parameter"
+body = "weigh always doubles. Callers need other factors: add a `factor` parameter and keep weigh_twice doubling twice."
+test = "weigh_takes_a_factor"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn weigh_takes_a_factor() {
+    assert_eq!(fixture::weigh(3, 4), 12);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn weigh(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn weigh_twice(x: u32) -> u32 {
+    weigh(weigh(x, 2), 2)
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add weigh_padded: weigh plus one"
+body = "Add weigh_padded(x), which is weigh(x) plus one."
+test = "weigh_padded_is_one_more"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn weigh_padded_is_one_more() {
+    assert_eq!(fixture::weigh_padded(4), 9);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn weigh(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn weigh_twice(x: u32) -> u32 {
+    weigh(weigh(x))
+}
+
+pub fn weigh_padded(x: u32) -> u32 {
+    weigh(x) + 1
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn weigh(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn weigh_twice(x: u32) -> u32 {
+    weigh(weigh(x, 2), 2)
+}
+
+pub fn weigh_padded(x: u32) -> u32 {
+    weigh(x, 2) + 1
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn weigh_padded_is_one_more() {
+    assert_eq!(fixture::weigh_padded(4), 9);
+}
+"""

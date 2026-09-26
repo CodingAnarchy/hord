@@ -167,7 +167,9 @@ pub async fn serve(root: &Path) -> Result<()> {
         move || hord_store::Store::open_with_lock_timeout(&root, Duration::from_secs(2))
     })
     .await??;
-    let repo = hord_txn::Repo::from_store(store, hord_txn::RepoOptions::default()).await?;
+    // The daemon runs the lander, so it runs the replay harness too.
+    let options = crate::cmd::replay::lander_options(root)?;
+    let repo = hord_txn::Repo::from_store(store, options).await?;
     let stop = Arc::new(tokio::sync::Notify::new());
     let workspaces: Arc<dyn WorkspacesBackend> = Arc::new(LocalWorkspaces::local(
         repo.clone(),

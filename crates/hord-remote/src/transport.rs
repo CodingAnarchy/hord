@@ -5,15 +5,29 @@
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use hord_api::auth::AUTHORIZATION;
+use http::HeaderValue;
 use tonic::body::Body;
 use tonic::transport::Channel;
 use tower::Service;
 
-/// A [`Channel`] that prefixes request paths with `/r/<name>`, if any.
-#[derive(Clone, Debug)]
+/// A [`Channel`] that prefixes request paths with `/r/<name>`, if any, and
+/// sends a bearer token, if any (spec §10.5.4).
+#[derive(Clone)]
 pub(crate) struct Transport {
     channel: Channel,
     prefix: Option<Arc<str>>,
+    authorization: Option<HeaderValue>,
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the token.
+        f.debug_struct("Transport")
+            .field("prefix", &self.prefix)
+            .field("token", &self.authorization.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Transport {
@@ -21,7 +35,17 @@ impl Transport {
         Self {
             channel,
             prefix: prefix.map(Arc::from),
+            authorization: None,
         }
+    }
+
+    /// Send `token` as `authorization: Bearer <token>` on every call. A
+    /// token that is not a valid header value is refused.
+    pub(crate) fn with_token(mut self, token: &str) -> Option<Self> {
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+        value.set_sensitive(true);
+        self.authorization = Some(value);
+        Some(self)
     }
 }
 
@@ -35,6 +59,9 @@ impl Service<http::Request<Body>> for Transport {
     }
 
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        if let Some(value) = &self.authorization {
+            request.headers_mut().insert(AUTHORIZATION, value.clone());
+        }
         if let Some(prefix) = &self.prefix {
             let mut parts = request.uri().clone().into_parts();
             let path = parts

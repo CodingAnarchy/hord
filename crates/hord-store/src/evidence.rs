@@ -181,6 +181,7 @@ mod tests {
             cost_ms: 5,
             produced_by: Actor::Human { id: "t".into() },
             produced_at: Timestamp::from_millis(1),
+            signature: None,
         }
     }
 

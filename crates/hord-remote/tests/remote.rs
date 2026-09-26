@@ -171,7 +171,7 @@ async fn a_root_server_routes_by_repo_prefix() -> TestResult {
     let root = temp("conf-root")?;
     empty_repo(&root.0.join("team/app")).await?;
     empty_repo(&root.0.join("other")).await?;
-    let hosts = Hosts::open_root(&root.0, RepoOptions::default).await?;
+    let hosts = Hosts::open_root(&root.0, |_| Ok(RepoOptions::default())).await?;
     assert_eq!(hosts.names().collect::<Vec<_>>(), ["other", "team/app"]);
     let running = serve(hosts, ServerConfig::default()).await?;
     let app = RemoteRepo::connect(&format!("{}/r/team/app", running.url())).await?;
@@ -459,6 +459,7 @@ async fn webhooks_receive_the_events_they_ask_for() -> TestResult {
             kinds: vec!["landed".into()],
             repos: vec![],
         }],
+        auth: None,
     };
     let running = serve(hosts, config).await?;
     let remote = RemoteRepo::connect(&running.url()).await?;

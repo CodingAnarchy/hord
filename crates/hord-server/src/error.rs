@@ -17,14 +17,23 @@ pub enum Error {
         /// to trip `clippy::result_large_err` on every function returning this type.
         source: Box<hord_txn::Error>,
     },
+    /// A hosted repository's options could not be built (for example its
+    /// `.hord/replay.toml` is invalid).
+    #[error("repository {path}: {reason}")]
+    Options {
+        /// Its root.
+        path: PathBuf,
+        /// Why.
+        reason: String,
+    },
     /// `--root` found no repository.
     #[error("no repository (.hord/) under {0}")]
     NoRepos(PathBuf),
-    /// A non-loopback bind address without `--insecure-bind` (ADR 0024:
-    /// there is no authentication until M5).
+    /// A non-loopback bind address without `--insecure-bind` (ADR 0024;
+    /// there is no TLS, so tokens would travel in the clear).
     #[error(
-        "refusing to bind {0}: not a loopback address, and there is no authentication \
-         until M5; pass --insecure-bind to bind it anyway"
+        "refusing to bind {0}: not a loopback address, and there is no TLS (bearer \
+         tokens would travel in the clear); pass --insecure-bind to bind it anyway"
     )]
     InsecureBind(std::net::SocketAddr),
     /// `server.toml` is invalid.

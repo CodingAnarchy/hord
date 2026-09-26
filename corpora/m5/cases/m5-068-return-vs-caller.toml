@@ -1,0 +1,88 @@
+id = "m5-068"
+kind = "return-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: return-vs-caller #2 (parse_port/is_port)"
+script = [
+    "wrong",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_port(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "parse_port says why parsing failed"
+body = "Return a Result from parse_port whose error is the parse error's message."
+test = "parse_port_reports_errors"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_port_reports_errors() {
+    assert!(fixture::parse_port("x").is_err());
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_port(s: &str) -> Result<u32, String> {
+    s.parse().map_err(|e: std::num::ParseIntError| e.to_string())
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add is_port, whether parse_port accepts the input"
+body = "Add is_port(s): true when parse_port accepts s."
+test = "is_port_accepts_digits"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn is_port_accepts_digits() {
+    assert!(fixture::is_port("5") && !fixture::is_port("x"));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_port(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+
+pub fn is_port(s: &str) -> bool {
+    parse_port(s).is_some()
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn parse_port(s: &str) -> Result<u32, String> {
+    s.parse().map_err(|e: std::num::ParseIntError| e.to_string())
+}
+
+pub fn is_port(s: &str) -> bool {
+    parse_port(s).is_ok()
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn is_port_accepts_digits() {
+    assert!(fixture::is_port("5") && !fixture::is_port("x"));
+}
+"""

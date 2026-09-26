@@ -59,9 +59,11 @@ use hord_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::conflict::{ConflictReport, Footprint, check};
+use crate::escalation::{Escalation, Origin, pinned_report, tamper_report};
 use crate::events;
 use crate::files::{validate, validate_except};
 use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRequest};
+use crate::pinned::Pinned;
 use crate::propose::declared;
 use crate::rebase::rebase;
 use crate::repo::{Head, Inner, Repo, blocking, lock, now};
@@ -98,6 +100,37 @@ pub enum QueueStatus {
         /// Why, in words.
         reason: String,
     },
+    /// Conflicted, and on rung 2 of the escalation ladder (spec §6.4): the
+    /// replay harness is running this attempt, or the replay it proposed is
+    /// in the queue. See the entry's [`Escalation`].
+    Replaying {
+        /// Attempt number, from 1.
+        attempt: u32,
+    },
+    /// Replays ran out: parked in the arbitration queue (spec §6.4 rung 3)
+    /// with a conflict summary and the replay candidates.
+    NeedsArbitration,
+    /// Resolved by a replay: a change with `parent_intent` naming this one
+    /// landed.
+    Replayed {
+        /// The id the replay landed under.
+        landed: ChangeId,
+    },
+    /// Resolved by an arbiter: a change whose parents include this one
+    /// landed.
+    Arbitrated {
+        /// The id the resolution landed under.
+        landed: ChangeId,
+    },
+}
+
+impl QueueStatus {
+    /// Whether an arbiter may resolve an entry in this status: a conflict
+    /// with no harness to replay it, or one whose replays ran out.
+    #[must_use]
+    pub fn is_arbitrable(&self) -> bool {
+        matches!(self, Self::Conflicted | Self::NeedsArbitration)
+    }
 }
 
 /// One submission in the lander queue (`hord queue`).
@@ -115,6 +148,11 @@ pub struct QueueEntry {
     pub updated_at: Timestamp,
     /// The lander's findings once processed; `None` while queued.
     pub report: Option<ConflictReport>,
+    /// Why this change was submitted, when it is part of another change's
+    /// escalation: a replay or an arbiter's resolution.
+    pub origin: Option<Origin>,
+    /// Its way up the escalation ladder (spec §6.4), once it entered it.
+    pub escalation: Option<Escalation>,
 }
 
 /// Stored form of a [`QueueEntry`]; the sequence number is the table key.
@@ -125,6 +163,10 @@ struct StoredEntry {
     submitted_at: Timestamp,
     updated_at: Timestamp,
     report: Option<ConflictReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<Origin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    escalation: Option<Escalation>,
 }
 
 /// Ids that name `entry` ([`QueueEntry::names`]), for the store's index.
@@ -152,6 +194,8 @@ impl QueueEntry {
             submitted_at: stored.submitted_at,
             updated_at: stored.updated_at,
             report: stored.report,
+            origin: stored.origin,
+            escalation: stored.escalation,
         }
     }
 
@@ -162,6 +206,8 @@ impl QueueEntry {
             submitted_at: self.submitted_at,
             updated_at: self.updated_at,
             report: self.report.clone(),
+            origin: self.origin,
+            escalation: self.escalation.clone(),
         }
     }
 
@@ -345,10 +391,21 @@ pub(crate) fn is_transient(err: &Error) -> bool {
 /// when they reach the front, for the same reason.
 pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
     let mut state = repo.inner.lander.lock().await;
+    if state.cursor.is_none() {
+        // First run in this process: replays a stopped lander left behind.
+        for job in blocking(&repo.inner, Inner::resume_ladders).await? {
+            crate::replay::spawn_replay(repo, job);
+        }
+    }
     let mut processed = Vec::new();
     let ahead = check_ahead();
     let mut window: VecDeque<Slot> = VecDeque::new();
     loop {
+        // Closing the repository: stop here, recording nothing more.
+        if repo.inner.closing.is_cancelled() {
+            abandon(&mut window, &mut state);
+            break;
+        }
         // Fill the window.
         while window.len() < SPECULATIVE_WINDOW {
             let from = match window.back() {
@@ -373,7 +430,7 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                     state.checking.entry(change)
                 {
                     let inner = Arc::clone(&repo.inner);
-                    slot.insert(tokio::task::spawn_blocking(move || {
+                    slot.insert(repo.inner.tasks.spawn_blocking(move || {
                         // A failure is found again, and classified, in `prepare`.
                         let _ = inner.check_ops(change);
                     }));
@@ -412,7 +469,16 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
             });
         }
         let Some(front) = window.pop_front() else {
-            break;
+            if !repo.inner.replays.any() {
+                break;
+            }
+            // Replays are running (spec §6.4 rung 2): what they propose is
+            // submitted, which wakes this loop, as does a replay finishing.
+            tokio::select! {
+                () = repo.inner.wake.notified() => {}
+                () = repo.inner.closing.cancelled() => {}
+            }
+            continue;
         };
         state.cursor = Some(front.seq());
         let (done, mispredicted) = match front {
@@ -420,9 +486,25 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                 let entry = blocking(&repo.inner, move |inner| inner.settle(*entry)).await?;
                 (entry, false)
             }
-            Slot::Verifying { candidate, verdict } => {
+            Slot::Verifying {
+                candidate,
+                mut verdict,
+            } => {
                 let predicted = candidate.predicted;
-                let verdict = verdict.await.unwrap_or_else(|err| Verdict::Fail {
+                // Shutdown must not wait out a verification run: cancel it
+                // (its commands are killed) and record nothing. The change
+                // stays queued, and the next start verifies it again.
+                let verdict = tokio::select! {
+                    verdict = &mut verdict => verdict,
+                    () = repo.inner.closing.cancelled() => {
+                        verdict.abort();
+                        let seq = candidate.entry.seq;
+                        abandon(&mut window, &mut state);
+                        state.cursor = Some(seq);
+                        break;
+                    }
+                };
+                let verdict = verdict.unwrap_or_else(|err| Verdict::Fail {
                     evidence: Vec::new(),
                     reason: format!("verification task failed: {err}"),
                 });
@@ -442,6 +524,16 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
                 }
             }
         }
+        // Rung 2 and 3 (spec §6.4): start the replays of a change that
+        // entered the ladder when it settled, and move the escalation of
+        // the change this one replays or resolves.
+        let (done, mut jobs) = blocking(&repo.inner, move |inner| inner.escalate(done)).await?;
+        jobs.extend(std::mem::take(&mut *crate::repo::lock(
+            &repo.inner.pending_replays,
+        )));
+        for job in jobs {
+            crate::replay::spawn_replay(repo, job);
+        }
         processed.push(done);
     }
     // Idle: make the events of this run durable.
@@ -449,6 +541,19 @@ pub(crate) async fn run(repo: &Repo) -> Result<Vec<QueueEntry>> {
         blocking(&repo.inner, |inner| inner.sync_events()).await?;
     }
     Ok(processed)
+}
+
+/// Drop the window without recording anything: abort its verification
+/// and point the cursor at its first entry, which is still queued.
+fn abandon(window: &mut VecDeque<Slot>, state: &mut LanderState) {
+    if let Some(front) = window.front() {
+        state.cursor = Some(front.seq());
+    }
+    for slot in window.drain(..) {
+        if let Slot::Verifying { verdict, .. } = slot {
+            verdict.abort();
+        }
+    }
 }
 
 /// Start verifying `candidate` on the runtime.
@@ -475,12 +580,27 @@ fn spawn_verify(
         plan_only: false,
     };
     let verifier = Arc::clone(&repo.inner.verifier);
-    tokio::spawn(async move { verifier.verify(request).await })
+    repo.inner
+        .tasks
+        .spawn(async move { verifier.verify(request).await })
 }
 
 impl Inner {
     pub(crate) fn submit(&self, change: ChangeId) -> Result<QueueEntry> {
+        self.submit_as(change, None)
+    }
+
+    /// [`Self::submit`], naming why: an arbiter's resolution passes its
+    /// [`Origin`]. A record whose `provenance.parent_intent` is set is a
+    /// replay of that change ([`Origin::Replay`]) however it was submitted.
+    pub(crate) fn submit_as(&self, change: ChangeId, origin: Option<Origin>) -> Result<QueueEntry> {
         let record = self.change_record(change)?;
+        let origin = origin.or_else(|| {
+            record
+                .provenance
+                .parent_intent
+                .map(|of| Origin::Replay { of })
+        });
         // Queued already, or landed already: submitting again is a no-op.
         if let Some(entry) = self
             .named_entries(change)?
@@ -497,6 +617,8 @@ impl Inner {
             submitted_at: at,
             updated_at: at,
             report: None,
+            origin,
+            escalation: None,
         };
         // `propose` checked the ops; record that for a lander in any process.
         let checked: &[ChangeId] = if self.was_proposed(change) {
@@ -593,7 +715,7 @@ impl Inner {
         Ok(out)
     }
 
-    fn put_entry(&self, entry: &QueueEntry) -> Result<()> {
+    pub(crate) fn put_entry(&self, entry: &QueueEntry) -> Result<()> {
         self.store
             .queue_set(entry.seq, &hord_encoding::encode(&entry.to_stored())?)?;
         Ok(())
@@ -685,7 +807,7 @@ impl Inner {
                 let footprint = Arc::new(self.footprint_of(landed_id, &landed)?);
                 let predicted = match (&policy, &facts) {
                     (Ok((policy, _)), Some(facts)) => {
-                        self.predict(policy, facts, &require, &landed)?
+                        self.predict(policy, facts, &require, &landed, &report)?
                     }
                     (Ok(_), None) => true,
                     (Err(_), _) => false,
@@ -728,8 +850,9 @@ impl Inner {
         facts: &hord_policy::Facts,
         require: &BTreeSet<String>,
         landed: &ChangeRecord,
+        report: &ConflictReport,
     ) -> Result<bool> {
-        let mut evidence = self.evidence_facts(landed.result)?;
+        let mut evidence = self.candidate_evidence_facts(landed, report)?;
         for requirement in require {
             let Ok(tag) = requirement.parse::<hord_policy::EvidenceTag>() else {
                 continue;
@@ -748,9 +871,16 @@ impl Inner {
         Ok(policy.evaluate(&assumed).is_allow())
     }
 
-    /// Write an entry settled at prepare, and announce it.
+    /// Write a settled entry, and announce it. A conflicted change that
+    /// goes on to rung 2 is written once, already replaying (or parked for
+    /// arbitration when no replay is allowed): it is never visible, or
+    /// announced, as conflicted in between ([`Inner::enter_ladder`]).
     fn settle(&self, mut entry: QueueEntry) -> Result<QueueEntry> {
         entry.updated_at = now();
+        if let Some(jobs) = self.enter_ladder(&mut entry)? {
+            crate::repo::lock(&self.pending_replays).extend(jobs);
+            return Ok(entry);
+        }
         self.put_entry(&entry)?;
         self.emit(events::settled(&entry))?;
         Ok(entry)
@@ -777,11 +907,45 @@ impl Inner {
             validate(self, entry.change, &record)?;
             self.store.mark_checked(entry.change)?;
         }
+        // ADR 0034: a replay, however it was submitted, may not change the
+        // acceptance tests it must satisfy.
+        let mut pinned_fails = None;
+        if let Some(Origin::Replay { of }) = entry.origin {
+            let touched = self.tampered_tests(of, &record)?;
+            if !touched.is_empty() {
+                return Ok(Prepared::Park(QueueStatus::Rejected {
+                    reason: tamper_report(&touched),
+                }));
+            }
+            // The pinned acceptance run: the ladder's attempt ran it and
+            // left its verdict; otherwise (by hand, or after a restart) it
+            // runs here.
+            let cached = lock(&self.pinned).remove(&entry.change);
+            pinned_fails = match cached {
+                Some(verdict) => verdict,
+                None => match self.pinned_check(of, &record)? {
+                    Pinned::Tampered(failed) => {
+                        return Ok(Prepared::Park(QueueStatus::Rejected {
+                            reason: pinned_report(&failed),
+                        }));
+                    }
+                    Pinned::Fails(fails) => Some(fails.join("; ")),
+                    Pinned::Passed => None,
+                },
+            };
+        }
         // ADR 0026: the landing base's policy judges the change.
         let policy = self.policy_at(head.snapshot)?;
         let (set_report, landed_writes) =
             self.set_check(entry.change, &record, head, staged, &policy)?;
         let report = report.insert(set_report);
+        if let Some(fails) = pinned_fails {
+            // A wrong replay (ADR 0034): its protected tests fail either way.
+            report.verification = Some(format!(
+                "protected acceptance tests fail (ADR 0034): {fails}"
+            ));
+            return Ok(Prepared::Park(QueueStatus::Conflicted));
+        }
         if let Err(reason) = &policy {
             // Nothing weaker than a readable policy judges a change.
             return Ok(Prepared::Park(QueueStatus::Parked {
@@ -797,7 +961,10 @@ impl Inner {
         };
         report.merge = rebased.soft;
         report.adapter_merged = rebased.adapter_merged;
-        if rebased.result == head.snapshot {
+        // An arbiter's resolution may change nothing ("keep ours"): it
+        // lands to record the decision and its parents (spec §6.4 rung 3).
+        let resolution = matches!(entry.origin, Some(Origin::Arbitration { .. }));
+        if rebased.result == head.snapshot && !resolution {
             // Head already has everything this change does: nothing to append.
             let reason = match self.landed_as(entry.change)? {
                 Some(landed) => return Ok(Prepared::Park(QueueStatus::Landed { landed })),
@@ -829,10 +996,18 @@ impl Inner {
                 let attestation = self.rebase_attestation(entry.change, &record, rebased.result);
                 let mut evidence = record.evidence.clone();
                 evidence.push(ObjectId::of(&attestation)?);
+                // The first parent is the head it lands on; further parents
+                // (an arbiter's resolution names the colliding changes) stay.
+                let mut parents: Vec<ChangeId> = head.change.into_iter().collect();
+                for parent in record.parents.iter().skip(1) {
+                    if !parents.contains(parent) {
+                        parents.push(*parent);
+                    }
+                }
                 let landed = ChangeRecord {
                     base: head.snapshot,
                     result: rebased.result,
-                    parents: head.change.into_iter().collect(),
+                    parents,
                     ops: rebased.ops,
                     write_set,
                     identity_deltas,
@@ -891,6 +1066,7 @@ impl Inner {
                 harness: "hord-txn".into(),
             },
             produced_at: record.provenance.created_at,
+            signature: None,
         }
     }
 
@@ -948,7 +1124,7 @@ impl Inner {
             Verdict::Pass { evidence } => evidence,
         };
         if let (Ok((policy, _)), Some(mut facts)) = (&policy, facts) {
-            facts.evidence = self.evidence_facts(landed.result)?;
+            facts.evidence = self.candidate_evidence_facts(&landed, &report)?;
             if let hord_policy::Decision::Deny { reasons } = policy.evaluate(&facts) {
                 let summary = reasons
                     .iter()

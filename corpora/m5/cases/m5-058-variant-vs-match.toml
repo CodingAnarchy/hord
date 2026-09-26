@@ -1,0 +1,118 @@
+id = "m5-058"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: variant-vs-match #3 (Status::Closed/weight)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum Status {
+    Open,
+}
+
+pub fn label(e: &Status) -> &'static str {
+    match e {
+        Status::Open => "open",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add Status::Closed, labelled closed"
+body = 'Status needs a Closed case. Its label is "closed".'
+test = "closed_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn closed_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Status::Closed), "closed");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Status {
+    Open,
+    Closed,
+}
+
+pub fn label(e: &Status) -> &'static str {
+    match e {
+        Status::Open => "open",
+        Status::Closed => "closed",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add weight, a number for each Status"
+body = "Add weight(e), which is 1 for Open."
+test = "weight_of_open"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn weight_of_open() {
+    assert_eq!(fixture::weight(&fixture::Status::Open), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Status {
+    Open,
+}
+
+pub fn label(e: &Status) -> &'static str {
+    match e {
+        Status::Open => "open",
+    }
+}
+
+pub fn weight(e: &Status) -> u32 {
+    match e {
+        Status::Open => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum Status {
+    Open,
+    Closed,
+}
+
+pub fn label(e: &Status) -> &'static str {
+    match e {
+        Status::Open => "open",
+        Status::Closed => "closed",
+    }
+}
+
+pub fn weight(e: &Status) -> u32 {
+    match e {
+        Status::Open => 1,
+        Status::Closed => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn weight_of_open() {
+    assert_eq!(fixture::weight(&fixture::Status::Open), 1);
+}
+"""

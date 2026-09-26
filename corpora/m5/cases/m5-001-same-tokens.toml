@@ -1,0 +1,77 @@
+id = "m5-001"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: same-tokens #1 (widen x2)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn widen(x: u32) -> u32 {
+    x * 2
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "widen adds one after scaling"
+body = "Callers need widen(x) to be x times 2 plus one, so that zero never maps to zero."
+test = "widen_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn widen_adds_one() {
+    assert_eq!(fixture::widen(3), 7);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn widen(x: u32) -> u32 {
+    x * 2 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "widen saturates instead of overflowing"
+body = "widen panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "widen_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn widen_saturates() {
+    assert_eq!(fixture::widen(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn widen(x: u32) -> u32 {
+    x.saturating_mul(2)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn widen(x: u32) -> u32 {
+    x.saturating_mul(2).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn widen_saturates() {
+    assert_eq!(fixture::widen(u32::MAX), u32::MAX);
+}
+"""

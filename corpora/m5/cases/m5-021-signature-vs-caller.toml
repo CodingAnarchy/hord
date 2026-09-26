@@ -1,0 +1,101 @@
+id = "m5-021"
+kind = "signature-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: signature-vs-caller #10 (speed/speed_boosted)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn speed(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x))
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "speed takes its factor as a parameter"
+body = "speed always doubles. Callers need other factors: add a `factor` parameter and keep speed_twice doubling twice."
+test = "speed_takes_a_factor"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn speed_takes_a_factor() {
+    assert_eq!(fixture::speed(3, 12), 36);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn speed(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x, 2), 2)
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add speed_boosted: speed plus one"
+body = "Add speed_boosted(x), which is speed(x) plus one."
+test = "speed_boosted_is_one_more"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn speed_boosted_is_one_more() {
+    assert_eq!(fixture::speed_boosted(4), 9);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn speed(x: u32) -> u32 {
+    x * 2
+}
+
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x))
+}
+
+pub fn speed_boosted(x: u32) -> u32 {
+    speed(x) + 1
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn speed(x: u32, factor: u32) -> u32 {
+    x * factor
+}
+
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x, 2), 2)
+}
+
+pub fn speed_boosted(x: u32) -> u32 {
+    speed(x, 2) + 1
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn speed_boosted_is_one_more() {
+    assert_eq!(fixture::speed_boosted(4), 9);
+}
+"""

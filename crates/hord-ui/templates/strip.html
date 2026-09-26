@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Landing strip</h1>
+<p class="legend">proposed → verifying → landed · replaying · arbitration{% if let Some(head) = head %} · head <code>{{ head }}</code>{% endif %}</p>
+<ol id="strip" class="strip"{% if let Some(live) = live %} data-live="{{ live }}"{% endif %}>
+{% for row in rows %}{% include "strip_row.html" %}
+{% endfor %}
+</ol>
+{% endblock %}
+{% block scripts %}<script src="{{ base }}/static/strip.js" defer></script>{% endblock %}

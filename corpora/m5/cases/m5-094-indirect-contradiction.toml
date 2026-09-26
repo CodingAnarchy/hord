@@ -1,0 +1,220 @@
+id = "m5-094"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #6 (error policy: parse_version of a two-part version)"
+script = [
+    "workaround",
+    "give_up",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+/// A `major.minor.patch` version. Missing parts are 0.
+pub fn parse_version(text: &str) -> Result<(u32, u32, u32), String> {
+    let mut parts = text
+        .trim()
+        .split('.')
+        .map(|p| p.parse::<u32>().map_err(|e| format!("{text:?}: {e}")));
+    let major = parts.next().unwrap_or(Ok(0))?;
+    let minor = parts.next().unwrap_or(Ok(0))?;
+    let patch = parts.next().unwrap_or(Ok(0))?;
+    if parts.next().is_some() {
+        return Err(format!("{text:?} has more than three parts"));
+    }
+    Ok((major, minor, patch))
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "versions must have three parts"
+body = "Lockfiles compare versions exactly, and `1.2` next to `1.2.0` gave us two entries for one package. parse_version should reject anything but major.minor.patch."
+test = "two_part_versions_are_rejected"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn two_part_versions_are_rejected() {
+    assert!(fixture::parse_version("1.2").is_err());
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// A `major.minor.patch` version. All three parts are required.
+pub fn parse_version(text: &str) -> Result<(u32, u32, u32), String> {
+    let mut parts = text
+        .trim()
+        .split('.')
+        .map(|p| p.parse::<u32>().map_err(|e| format!("{text:?}: {e}")));
+    let mut next = || {
+        parts
+            .next()
+            .unwrap_or_else(|| Err(format!("{text:?} is not major.minor.patch")))
+    };
+    let version = (next()?, next()?, next()?);
+    if next().is_ok() {
+        return Err(format!("{text:?} has more than three parts"));
+    }
+    Ok(version)
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add satisfies for hand-written requirements"
+body = "People write requirements by hand as `1.2`, meaning 1.2.0 or later within 1.x. Add satisfies(required, found). The dependency report prints parse_version of each requirement next to the verdict, so `1.2` has to parse as 1.2.0 there too."
+test = "short_requirements_are_satisfied"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn short_requirements_are_satisfied() {
+    assert_eq!(fixture::parse_version("1.2"), Ok((1, 2, 0)));
+    assert_eq!(fixture::satisfies("1.2", "1.2.5"), Ok(true));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// A `major.minor.patch` version. Missing parts are 0.
+pub fn parse_version(text: &str) -> Result<(u32, u32, u32), String> {
+    let mut parts = text
+        .trim()
+        .split('.')
+        .map(|p| p.parse::<u32>().map_err(|e| format!("{text:?}: {e}")));
+    let major = parts.next().unwrap_or(Ok(0))?;
+    let minor = parts.next().unwrap_or(Ok(0))?;
+    let patch = parts.next().unwrap_or(Ok(0))?;
+    if parts.next().is_some() {
+        return Err(format!("{text:?} has more than three parts"));
+    }
+    Ok((major, minor, patch))
+}
+
+/// Whether `found` meets the requirement `required`: the same major
+/// version, and no older.
+pub fn satisfies(required: &str, found: &str) -> Result<bool, String> {
+    let (required, found) = (parse_version(required)?, parse_version(found)?);
+    Ok(required.0 == found.0 && found >= required)
+}
+"""
+
+[[workarounds]]
+summary = "parse_version keeps accepting a two-part version"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// A `major.minor.patch` version. Missing parts are 0.
+pub fn parse_version(text: &str) -> Result<(u32, u32, u32), String> {
+    let mut parts = text
+        .trim()
+        .split('.')
+        .map(|p| p.parse::<u32>().map_err(|e| format!("{text:?}: {e}")));
+    let major = parts.next().unwrap_or(Ok(0))?;
+    let minor = parts.next().unwrap_or(Ok(0))?;
+    let patch = parts.next().unwrap_or(Ok(0))?;
+    if parts.next().is_some() {
+        return Err(format!("{text:?} has more than three parts"));
+    }
+    Ok((major, minor, patch))
+}
+
+/// Whether `found` meets the requirement `required`: the same major
+/// version, and no older.
+pub fn satisfies(required: &str, found: &str) -> Result<bool, String> {
+    let (required, found) = (parse_version(required)?, parse_version(found)?);
+    Ok(required.0 == found.0 && found >= required)
+}
+"""
+
+[[workarounds]]
+summary = "satisfies parses on its own, leniently"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// A `major.minor.patch` version. All three parts are required.
+pub fn parse_version(text: &str) -> Result<(u32, u32, u32), String> {
+    let mut parts = text
+        .trim()
+        .split('.')
+        .map(|p| p.parse::<u32>().map_err(|e| format!("{text:?}: {e}")));
+    let mut next = || {
+        parts
+            .next()
+            .unwrap_or_else(|| Err(format!("{text:?} is not major.minor.patch")))
+    };
+    let version = (next()?, next()?, next()?);
+    if next().is_ok() {
+        return Err(format!("{text:?} has more than three parts"));
+    }
+    Ok(version)
+}
+
+/// Whether `found` meets the requirement `required`: the same major
+/// version, and no older.
+pub fn satisfies(required: &str, found: &str) -> Result<bool, String> {
+    let lenient = |text: &str| -> Result<(u32, u32, u32), String> {
+        let mut parts = text.trim().split('.').map(|p| p.parse::<u32>().map_err(|e| e.to_string()));
+        Ok((
+            parts.next().unwrap_or(Ok(0))?,
+            parts.next().unwrap_or(Ok(0))?,
+            parts.next().unwrap_or(Ok(0))?,
+        ))
+    };
+    let (required, found) = (lenient(required)?, lenient(found)?);
+    Ok(required.0 == found.0 && found >= required)
+}
+"""
+
+[[workarounds]]
+summary = "satisfies rewrites the input into a form parse_version takes"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// A `major.minor.patch` version. All three parts are required.
+pub fn parse_version(text: &str) -> Result<(u32, u32, u32), String> {
+    let mut parts = text
+        .trim()
+        .split('.')
+        .map(|p| p.parse::<u32>().map_err(|e| format!("{text:?}: {e}")));
+    let mut next = || {
+        parts
+            .next()
+            .unwrap_or_else(|| Err(format!("{text:?} is not major.minor.patch")))
+    };
+    let version = (next()?, next()?, next()?);
+    if next().is_ok() {
+        return Err(format!("{text:?} has more than three parts"));
+    }
+    Ok(version)
+}
+
+/// Whether `found` meets the requirement `required`: the same major
+/// version, and no older.
+pub fn satisfies(required: &str, found: &str) -> Result<bool, String> {
+    let padded = |text: &str| {
+        let text = text.trim();
+        match text.matches('.').count() {
+            0 => format!("{text}.0.0"),
+            1 => format!("{text}.0"),
+            _ => text.to_owned(),
+        }
+    };
+    let (required, found) = (
+        parse_version(&padded(required))?,
+        parse_version(&padded(found))?,
+    );
+    Ok(required.0 == found.0 && found >= required)
+}
+"""

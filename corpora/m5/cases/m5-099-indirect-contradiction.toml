@@ -1,0 +1,309 @@
+id = "m5-099"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #11 (capacity vs feature: Inbox of 50 or 80)"
+script = [
+    "workaround",
+    "workaround",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Inbox {
+    items: Vec<u32>,
+}
+
+impl Inbox {
+    pub fn new() -> Self {
+        Inbox { items: Vec::new() }
+    }
+
+    /// Adds one message.
+    pub fn deliver(&mut self, message: u32) -> Result<(), String> {
+        self.items.push(message);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest message out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "cap inboxes at 50 messages"
+body = "A misbehaving integration filled one inbox with two million messages. Cap Inbox at 50 messages: deliver returns an error when the inbox is full, so the sender backs off."
+test = "inbox_rejects_the_51st_message"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn inbox_rejects_the_51st_message() {
+    let mut all = fixture::Inbox::new();
+    for i in 0..50 {
+        all.deliver(i).expect("room for 50");
+    }
+    assert!(all.deliver(50).is_err(), "the 51st message is rejected");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// The most messages one Inbox holds.
+pub const MAX_MESSAGES: usize = 50;
+
+pub struct Inbox {
+    items: Vec<u32>,
+}
+
+impl Inbox {
+    pub fn new() -> Self {
+        Inbox { items: Vec::new() }
+    }
+
+    /// Adds one message.
+    pub fn deliver(&mut self, message: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_MESSAGES {
+            return Err(format!("full: {} messages", MAX_MESSAGES));
+        }
+        self.items.push(message);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest message out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add archive_all for the weekly digest"
+body = "The weekly digest archives everything a user received that week. Add archive_all(inbox), which archives every delivered message and returns the count. A busy week is 80 messages, and each of them has to be delivered and make it into the digest."
+test = "archive_all_takes_a_busy_week"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn archive_all_takes_a_busy_week() {
+    let mut all = fixture::Inbox::new();
+    for i in 0..80 {
+        all.deliver(i).expect("a busy week delivers every message");
+    }
+    assert_eq!(fixture::archive_all(&mut all), 80);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Inbox {
+    items: Vec<u32>,
+}
+
+impl Inbox {
+    pub fn new() -> Self {
+        Inbox { items: Vec::new() }
+    }
+
+    /// Adds one message.
+    pub fn deliver(&mut self, message: u32) -> Result<(), String> {
+        self.items.push(message);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest message out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Archives every delivered message and returns how many it archived.
+pub fn archive_all(all: &mut Inbox) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "raise the cap to 80"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The most messages one Inbox holds.
+pub const MAX_MESSAGES: usize = 80;
+
+pub struct Inbox {
+    items: Vec<u32>,
+}
+
+impl Inbox {
+    pub fn new() -> Self {
+        Inbox { items: Vec::new() }
+    }
+
+    /// Adds one message.
+    pub fn deliver(&mut self, message: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_MESSAGES {
+            return Err(format!("full: {} messages", MAX_MESSAGES));
+        }
+        self.items.push(message);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest message out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Archives every delivered message and returns how many it archived.
+pub fn archive_all(all: &mut Inbox) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "a full Inbox drops its oldest message instead of refusing"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The most messages one Inbox holds.
+pub const MAX_MESSAGES: usize = 50;
+
+pub struct Inbox {
+    items: Vec<u32>,
+}
+
+impl Inbox {
+    pub fn new() -> Self {
+        Inbox { items: Vec::new() }
+    }
+
+    /// Adds one message.
+    pub fn deliver(&mut self, message: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_MESSAGES {
+            self.items.remove(0);
+        }
+        self.items.push(message);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest message out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Archives every delivered message and returns how many it archived.
+pub fn archive_all(all: &mut Inbox) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "keep the container unbounded"
+
+[workarounds.files]
+"src/lib.rs" = """
+pub struct Inbox {
+    items: Vec<u32>,
+}
+
+impl Inbox {
+    pub fn new() -> Self {
+        Inbox { items: Vec::new() }
+    }
+
+    /// Adds one message.
+    pub fn deliver(&mut self, message: u32) -> Result<(), String> {
+        self.items.push(message);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest message out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Archives every delivered message and returns how many it archived.
+pub fn archive_all(all: &mut Inbox) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""

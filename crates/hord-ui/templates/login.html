@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Sign in</h1>
+<p>This server requires a bearer token (spec §10.5.4). Run <code>hord login &lt;remote&gt;</code>; the token it stores is in <code>~/.hord/credentials.toml</code>. Paste it here. It is kept in a cookie that only this site's pages send.</p>
+<form class="login" method="post" action="{{ base }}/login">
+  <label>token <input name="token" type="password" size="60" autocomplete="off"></label>
+  <button>sign in</button>
+</form>
+<form class="login" method="post" action="{{ base }}/logout"><button>sign out</button></form>
+{% endblock %}

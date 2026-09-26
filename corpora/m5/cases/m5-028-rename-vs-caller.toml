@@ -1,0 +1,85 @@
+id = "m5-028"
+kind = "rename-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: rename-vs-caller #6 (combine->sum_parts/combine_twice)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn combine(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rename combine to sum_parts"
+body = "combine is a vague name. Rename it to sum_parts; its behavior stays the same."
+test = "sum_parts_sums"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn sum_parts_sums() {
+    assert_eq!(fixture::sum_parts(&[1, 2, 3]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn sum_parts(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add combine_twice: twice the combine"
+body = "Add combine_twice(xs), twice the sum that combine computes."
+test = "combine_twice_doubles"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn combine_twice_doubles() {
+    assert_eq!(fixture::combine_twice(&[1, 2]), 6);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn combine(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn combine_twice(xs: &[i32]) -> i32 {
+    combine(xs) * 2
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn sum_parts(xs: &[i32]) -> i32 {
+    xs.iter().sum()
+}
+
+pub fn combine_twice(xs: &[i32]) -> i32 {
+    sum_parts(xs) * 2
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn combine_twice_doubles() {
+    assert_eq!(fixture::combine_twice(&[1, 2]), 6);
+}
+"""

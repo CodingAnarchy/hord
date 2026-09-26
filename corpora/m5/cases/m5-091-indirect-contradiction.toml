@@ -1,0 +1,251 @@
+id = "m5-091"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #3 (invariant vs caller: validate_port of 0)"
+script = [
+    "workaround",
+    "workaround",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+/// The largest port accepted.
+pub const MAX_PORT: u32 = 65_535;
+
+/// Checks a listener's port. The supervisor runs this again on every listener at startup.
+pub fn validate_port(port: u32) -> Result<u32, String> {
+    if port > MAX_PORT {
+        return Err(format!("port {port} is over {MAX_PORT}"));
+    }
+    Ok(port)
+}
+
+pub struct Listener {
+    pub name: String,
+    pub port: u32,
+}
+
+pub fn listen(name: &str, port: u32) -> Result<Listener, String> {
+    let port = validate_port(port)?;
+    Ok(Listener {
+        name: name.to_owned(),
+        port,
+    })
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "reject port 0 in configuration"
+body = "Port 0 in our config files has only ever been a typo, and it silently binds a random port that nothing can reach. Make validate_port reject port 0."
+test = "port_zero_is_rejected"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn port_zero_is_rejected() {
+    assert!(fixture::validate_port(0).is_err());
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// The largest port accepted.
+pub const MAX_PORT: u32 = 65_535;
+
+/// Checks a listener's port. The supervisor runs this again on every listener at startup.
+pub fn validate_port(port: u32) -> Result<u32, String> {
+    if port == 0 {
+        return Err("port 0 is not a port".to_owned());
+    }
+    if port > MAX_PORT {
+        return Err(format!("port {port} is over {MAX_PORT}"));
+    }
+    Ok(port)
+}
+
+pub struct Listener {
+    pub name: String,
+    pub port: u32,
+}
+
+pub fn listen(name: &str, port: u32) -> Result<Listener, String> {
+    let port = validate_port(port)?;
+    Ok(Listener {
+        name: name.to_owned(),
+        port,
+    })
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add listen_ephemeral: let the OS pick the port"
+body = "Integration tests start many services at once and collide on fixed ports. Add listen_ephemeral(name), which makes a listener on port 0 so the operating system assigns a free one. The supervisor validates each listener's port with validate_port at startup, so an ephemeral listener has to pass it."
+test = "an_ephemeral_listener_is_valid"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn an_ephemeral_listener_is_valid() {
+    let made = fixture::listen_ephemeral("metrics").expect("an ephemeral listener asks for port 0");
+    assert_eq!(made.port, 0);
+    assert!(fixture::validate_port(made.port).is_ok(), "the supervisor re-validates every listener");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// The largest port accepted.
+pub const MAX_PORT: u32 = 65_535;
+
+/// Checks a listener's port. The supervisor runs this again on every listener at startup.
+pub fn validate_port(port: u32) -> Result<u32, String> {
+    if port > MAX_PORT {
+        return Err(format!("port {port} is over {MAX_PORT}"));
+    }
+    Ok(port)
+}
+
+pub struct Listener {
+    pub name: String,
+    pub port: u32,
+}
+
+pub fn listen(name: &str, port: u32) -> Result<Listener, String> {
+    let port = validate_port(port)?;
+    Ok(Listener {
+        name: name.to_owned(),
+        port,
+    })
+}
+
+/// A listener on port 0, so the operating system assigns a free port.
+pub fn listen_ephemeral(name: &str) -> Result<Listener, String> {
+    listen(name, 0)
+}
+"""
+
+[[workarounds]]
+summary = "keep accepting 0: drop the new rule"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The largest port accepted.
+pub const MAX_PORT: u32 = 65_535;
+
+/// Checks a listener's port. The supervisor runs this again on every listener at startup.
+pub fn validate_port(port: u32) -> Result<u32, String> {
+    if port > MAX_PORT {
+        return Err(format!("port {port} is over {MAX_PORT}"));
+    }
+    Ok(port)
+}
+
+pub struct Listener {
+    pub name: String,
+    pub port: u32,
+}
+
+pub fn listen(name: &str, port: u32) -> Result<Listener, String> {
+    let port = validate_port(port)?;
+    Ok(Listener {
+        name: name.to_owned(),
+        port,
+    })
+}
+
+/// A listener on port 0, so the operating system assigns a free port.
+pub fn listen_ephemeral(name: &str) -> Result<Listener, String> {
+    listen(name, 0)
+}
+"""
+
+[[workarounds]]
+summary = "listen_ephemeral builds the Listener without validate_port"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The largest port accepted.
+pub const MAX_PORT: u32 = 65_535;
+
+/// Checks a listener's port. The supervisor runs this again on every listener at startup.
+pub fn validate_port(port: u32) -> Result<u32, String> {
+    if port == 0 {
+        return Err("port 0 is not a port".to_owned());
+    }
+    if port > MAX_PORT {
+        return Err(format!("port {port} is over {MAX_PORT}"));
+    }
+    Ok(port)
+}
+
+pub struct Listener {
+    pub name: String,
+    pub port: u32,
+}
+
+pub fn listen(name: &str, port: u32) -> Result<Listener, String> {
+    let port = validate_port(port)?;
+    Ok(Listener {
+        name: name.to_owned(),
+        port,
+    })
+}
+
+/// A listener on port 0, so the operating system assigns a free port.
+pub fn listen_ephemeral(name: &str) -> Result<Listener, String> {
+    Ok(Listener {
+        name: name.to_owned(),
+        port: 0,
+    })
+}
+"""
+
+[[workarounds]]
+summary = "listen_ephemeral asks for 1 instead, the nearest accepted value"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The largest port accepted.
+pub const MAX_PORT: u32 = 65_535;
+
+/// Checks a listener's port. The supervisor runs this again on every listener at startup.
+pub fn validate_port(port: u32) -> Result<u32, String> {
+    if port == 0 {
+        return Err("port 0 is not a port".to_owned());
+    }
+    if port > MAX_PORT {
+        return Err(format!("port {port} is over {MAX_PORT}"));
+    }
+    Ok(port)
+}
+
+pub struct Listener {
+    pub name: String,
+    pub port: u32,
+}
+
+pub fn listen(name: &str, port: u32) -> Result<Listener, String> {
+    let port = validate_port(port)?;
+    Ok(Listener {
+        name: name.to_owned(),
+        port,
+    })
+}
+
+/// A listener on port 0, so the operating system assigns a free port.
+pub fn listen_ephemeral(name: &str) -> Result<Listener, String> {
+    listen(name, 1)
+}
+"""

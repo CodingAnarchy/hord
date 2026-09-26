@@ -1,0 +1,59 @@
+:root {
+  --bg: #fbfbfa; --fg: #1d1d1b; --muted: #6b6b66; --line: #e2e2dd; --card: #ffffff;
+  --pass: #1f7a3a; --fail: #b3261e; --skip: #8a6d00; --accent: #2a5bd7;
+  --proposed: #6b6b66; --verifying: #2a5bd7; --replaying: #8a4fd0; --arbitration: #b3261e;
+  --review: #8a6d00; --landed: #1f7a3a; --rejected: #555; --arbitrated: #2c7a7b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --fg: #e8e8e3; --muted: #a0a09a; --line: #33332f; --card: #1f1f1d;
+    --pass: #5cc27a; --fail: #f07a70; --skip: #d9b84a; --accent: #7fa2ff;
+    --proposed: #a0a09a; --verifying: #7fa2ff; --replaying: #c39bf5; --arbitration: #f07a70;
+    --review: #d9b84a; --landed: #5cc27a; --rejected: #999; --arbitrated: #6fc9c9;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+a { color: var(--accent); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+pre { white-space: pre-wrap; background: var(--card); border: 1px solid var(--line); padding: 8px 12px; border-radius: 6px; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+.top { display: flex; gap: 16px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.top nav a { margin-right: 12px; }
+.brand { font-weight: 700; text-decoration: none; color: var(--fg); }
+.legend { color: var(--muted); overflow-wrap: anywhere; }
+.flash { border-left: 3px solid var(--accent); padding: 4px 10px; }
+.strip { list-style: none; padding: 0; margin: 0; }
+.row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1.4fr) minmax(0, 2fr); gap: 4px 12px;
+  padding: 8px 12px; margin-bottom: 6px; background: var(--card); border: 1px solid var(--line);
+  border-left: 4px solid var(--stage, var(--line)); border-radius: 6px; }
+.row .label { font-weight: 600; overflow-wrap: anywhere; }
+.row .actor, .row .conflict { color: var(--muted); font-size: 13px; }
+.row .stage { color: var(--stage); font-size: 13px; }
+.row .evidence, .row .workbench { grid-column: 1 / -1; }
+.stage-proposed { --stage: var(--proposed); } .stage-verifying { --stage: var(--verifying); }
+.stage-replaying { --stage: var(--replaying); } .stage-arbitration { --stage: var(--arbitration); }
+.stage-review { --stage: var(--review); } .stage-landed { --stage: var(--landed); }
+.stage-rejected { --stage: var(--rejected); } .stage-arbitrated { --stage: var(--arbitrated); }
+.evidence { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 4px; }
+.ev { font-size: 12px; padding: 1px 6px; border-radius: 10px; border: 1px solid currentColor; }
+.ev-pass { color: var(--pass); } .ev-fail { color: var(--fail); } .ev-skip { color: var(--skip); } .ev-unknown { color: var(--muted); }
+.transport { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+.transport input[type=range] { flex: 1 1 240px; }
+.tabs > input { position: absolute; opacity: 0; }
+.tabs > label { display: inline-block; padding: 6px 12px; border-bottom: 2px solid transparent; cursor: pointer; }
+.tabs > input:checked + label { border-color: var(--accent); }
+.tabs .tab { display: none; }
+#tab-semantic:checked ~ .semantic, #tab-text:checked ~ .text { display: block; }
+.ops { padding-left: 18px; } .op-delete { color: var(--fail); } .op-insert { color: var(--pass); }
+.sets, .sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.provenance { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
+.provenance dt { color: var(--muted); } .provenance dd { margin: 0; overflow-wrap: anywhere; }
+.contested { width: 100%; border-collapse: collapse; display: block; overflow-x: auto; }
+.contested th, .contested td { text-align: left; vertical-align: top; padding: 6px; border-bottom: 1px solid var(--line); }
+.reason { font-size: 17px; }
+.ladder .at { color: var(--muted); font-size: 12px; }
+form.review, form.arbitrate { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+form textarea { flex: 1 1 100%; font: inherit; }
+button { font: inherit; padding: 4px 12px; }
+@media (max-width: 640px) { .row { grid-template-columns: 1fr; } }

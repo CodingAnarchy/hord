@@ -32,7 +32,8 @@ use hord_verify::{
     Checkout, CoverageRecord, Drift, EvidenceIndex, ImpactBound, ImpactSet, Toolchain, VerifyPlan,
     VerifyPolicy,
 };
-use hord_verify_rust::{DefinitionIndex, InstrumentedRun};
+use hord_verify_rust::{Cancel, DefinitionIndex, InstrumentedRun};
+use tokio_util::task::TaskTracker;
 
 use crate::conflict::ConflictReport;
 use crate::repo::{Inner, fs_path, lock};
@@ -74,6 +75,19 @@ pub trait VerifyContext: Send + Sync {
     /// The verifier planned `plan` (the `Verifying` event; `hord verify
     /// --plan-only`).
     fn planned(&self, plan: &VerifyPlan);
+
+    /// Set when verification must stop (the repository is shutting down):
+    /// running commands are killed and nothing is recorded. Never set by
+    /// default.
+    fn cancel(&self) -> Cancel {
+        Cancel::default()
+    }
+
+    /// Where to run blocking verification work so that closing the
+    /// repository waits for it; `None` runs it untracked.
+    fn tasks(&self) -> Option<TaskTracker> {
+        None
+    }
 }
 
 /// What the lander asks a [`Verifier`] to check.
@@ -191,6 +205,7 @@ pub trait VerifierFactory: Send + Sync {
         checkout: &Checkout,
         coverage: Option<Arc<CoverageRecord>>,
         drift: Option<Arc<Drift>>,
+        cancel: &Cancel,
     ) -> hord_verify::Result<Built>;
 }
 
@@ -280,16 +295,26 @@ impl VerifierFactory for RustFactory {
         checkout: &Checkout,
         coverage: Option<Arc<CoverageRecord>>,
         drift: Option<Arc<Drift>>,
+        cancel: &Cancel,
     ) -> hord_verify::Result<Built> {
         let toolchain = self.toolchain().ok_or_else(|| hord_verify::Error::Tool {
             tool: "rustc".into(),
             message: "no toolchain".into(),
         })?;
+        // Per-test coverage needs cargo-llvm-cov (which the toolchain
+        // records only when it is installed) and a POSIX shell. Without
+        // them the tests run as planned, whole packages or the workspace
+        // (ADR 0022): a missing optional tool must not fail every change.
+        let coverage_tool = cfg!(unix)
+            && toolchain
+                .components
+                .contains_key(hord_verify_rust::coverage::LLVM_COV);
         let workspace = hord_verify_rust::CargoWorkspace::load(&checkout.root)?;
         let mut verifier = hord_verify_rust::RustVerifier::new(toolchain, workspace)?
             .with_coverage(coverage)
             .with_drift(drift);
         verifier.runner = self.runner.clone();
+        verifier.runner.cancel = cancel.clone();
         verifier.quarantine = self.quarantine.clone();
         // Instrumented builds use other flags: their own target directory,
         // kept in the slot (`target/` survives a slot reset) or beside the
@@ -298,7 +323,7 @@ impl VerifierFactory for RustFactory {
             Some(dir) => dir.join("hord-coverage"),
             None => checkout.root.join("target").join("hord-coverage"),
         };
-        let instrumented = RustInstrumented {
+        let instrumented = coverage_tool.then(|| RustInstrumented {
             verifier: verifier.clone(),
             options: hord_verify_rust::CoverageOptions {
                 packages: None,
@@ -308,11 +333,12 @@ impl VerifierFactory for RustFactory {
                 skip: BTreeSet::new(),
                 only: None,
                 lines_of_interest: BTreeMap::new(),
+                cancel: cancel.clone(),
             },
-        };
+        });
         Ok(Built {
             verifier: Box::new(verifier),
-            instrumented: Some(Box::new(instrumented)),
+            instrumented: instrumented.map(|i| Box::new(i) as Box<dyn InstrumentedTests>),
         })
     }
 }
@@ -401,12 +427,18 @@ impl Verifier for EngineVerifier {
     fn verify(&self, request: VerifyRequest) -> VerifyFuture<'_> {
         let factory = Arc::clone(&self.factory);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || engine_verify(factory.as_ref(), &request))
-                .await
-                .unwrap_or_else(|err| Verdict::Fail {
-                    evidence: Vec::new(),
-                    reason: format!("verification task failed: {err}"),
-                })
+            // Tracked, so closing the repository waits for it: a cancel
+            // kills its commands, and it returns at once.
+            let tasks = request.context.tasks();
+            let run = move || engine_verify(factory.as_ref(), &request);
+            let task = match tasks {
+                Some(tasks) => tasks.spawn_blocking(run),
+                None => tokio::task::spawn_blocking(run),
+            };
+            task.await.unwrap_or_else(|err| Verdict::Fail {
+                evidence: Vec::new(),
+                reason: format!("verification task failed: {err}"),
+            })
         })
     }
 }
@@ -455,6 +487,7 @@ fn engine_run(
         &checkout,
         coverage.map(|(_, record)| Arc::new(record)),
         drift,
+        &context.cancel(),
     )?;
     let verifier = built.verifier.as_ref();
     let tests_required = TEST_REQUIREMENTS.iter().any(|r| request.policy.requires(r));
@@ -727,6 +760,33 @@ impl Inner {
         for id in self.store.evidence_at(snapshot)? {
             let evidence: Evidence = self.get_object(id)?;
             out.extend(EvidenceFact::of(&evidence));
+        }
+        Ok(out)
+    }
+
+    /// Evidence facts for judging the candidate `landed` with its rebase
+    /// `report`: everything indexed for its result, plus, for a rebased
+    /// record whose rebase merged nothing (no `merge`, no `adapter_merged`),
+    /// the `review:*` evidence indexed for the submitted record's result
+    /// (ADR 0031). Machine evidence counts only for the exact snapshot.
+    pub(crate) fn candidate_evidence_facts(
+        &self,
+        landed: &ChangeRecord,
+        report: &ConflictReport,
+    ) -> Result<Vec<EvidenceFact>> {
+        let mut out = self.evidence_facts(landed.result)?;
+        if let Some(submitted) = landed.rebased_from
+            && report.merge.is_empty()
+            && report.adapter_merged.is_empty()
+        {
+            let submitted = self.change_record(submitted)?;
+            if submitted.result != landed.result {
+                out.extend(
+                    self.evidence_facts(submitted.result)?
+                        .into_iter()
+                        .filter(|fact| fact.tag.kind() == "review"),
+                );
+            }
         }
         Ok(out)
     }
@@ -1183,6 +1243,14 @@ fn verify_err(err: Error) -> hord_verify::Error {
 }
 
 impl VerifyContext for CandidateContext {
+    fn cancel(&self) -> Cancel {
+        self.inner.verify_cancel.clone()
+    }
+
+    fn tasks(&self) -> Option<TaskTracker> {
+        Some(self.inner.tasks.clone())
+    }
+
     fn impact(&self, bound: ImpactBound) -> hord_verify::Result<ImpactSet> {
         self.inner
             .impact_set(&self.record, bound, true)
@@ -1407,5 +1475,44 @@ impl crate::Repo {
             plan,
             verdict,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A toolchain without cargo-llvm-cov verifies tests as planned
+    /// (whole packages or the workspace) instead of failing every change
+    /// on `cargo llvm-cov show-env` (the CI test jobs, which do not
+    /// install it, parked every M5 case).
+    #[test]
+    fn without_cargo_llvm_cov_tests_run_uninstrumented() -> hord_verify::Result<()> {
+        let root = std::env::temp_dir().join(format!("hord-gate-nocov-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )?;
+        std::fs::write(root.join("src/lib.rs"), "")?;
+        let checkout = Checkout {
+            root: root.clone(),
+            snapshot: hord_core::ObjectId::from_bytes([1; 32]),
+        };
+        let built = |components: &[&str]| {
+            let factory = RustFactory::new(root.clone());
+            let mut toolchain = Toolchain::new("rust").with("rustc", "rustc 1.0.0");
+            for c in components {
+                toolchain = toolchain.with(*c, format!("{c} 1.0.0"));
+            }
+            let _ = factory.toolchain.set(Some(toolchain));
+            factory.build(&checkout, None, None, &Cancel::default())
+        };
+        let without = built(&[]);
+        let with = built(&[hord_verify_rust::coverage::LLVM_COV]);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(without?.instrumented.is_none());
+        assert_eq!(with?.instrumented.is_some(), cfg!(unix));
+        Ok(())
     }
 }

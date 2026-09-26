@@ -1,0 +1,88 @@
+id = "m5-072"
+kind = "return-vs-caller"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: return-vs-caller #6 (parse_score/is_score)"
+script = [
+    "sleep",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "parse_score says why parsing failed"
+body = "Return a Result from parse_score whose error is the parse error's message."
+test = "parse_score_reports_errors"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_score_reports_errors() {
+    assert!(fixture::parse_score("x").is_err());
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_score(s: &str) -> Result<u32, String> {
+    s.parse().map_err(|e: std::num::ParseIntError| e.to_string())
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add is_score, whether parse_score accepts the input"
+body = "Add is_score(s): true when parse_score accepts s."
+test = "is_score_accepts_digits"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn is_score_accepts_digits() {
+    assert!(fixture::is_score("5") && !fixture::is_score("x"));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+
+pub fn is_score(s: &str) -> bool {
+    parse_score(s).is_some()
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn parse_score(s: &str) -> Result<u32, String> {
+    s.parse().map_err(|e: std::num::ParseIntError| e.to_string())
+}
+
+pub fn is_score(s: &str) -> bool {
+    parse_score(s).is_ok()
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn is_score_accepts_digits() {
+    assert!(fixture::is_score("5") && !fixture::is_score("x"));
+}
+"""

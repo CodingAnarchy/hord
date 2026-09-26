@@ -1,0 +1,111 @@
+id = "m5-049"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: field-vs-literal #5 (Ticket.severity/blank_ticket)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Ticket {
+    pub name: String,
+}
+
+impl Ticket {
+    pub fn new(name: &str) -> Self {
+        Ticket { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Ticket gets a severity field, 25 by default"
+body = "Add `severity: u32` to Ticket. Ticket::new sets it to 25."
+test = "ticket_severity_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn ticket_severity_defaults() {
+    assert_eq!(fixture::Ticket::new("x").severity, 25);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Ticket {
+    pub name: String,
+    pub severity: u32,
+}
+
+impl Ticket {
+    pub fn new(name: &str) -> Self {
+        Ticket { name: name.into(), severity: 25 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add blank_ticket, a Ticket named blank_ticket"
+body = 'Add blank_ticket(), which builds a Ticket named "blank_ticket".'
+test = "blank_ticket_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn blank_ticket_is_named() {
+    assert_eq!(fixture::blank_ticket().name, "blank_ticket");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Ticket {
+    pub name: String,
+}
+
+impl Ticket {
+    pub fn new(name: &str) -> Self {
+        Ticket { name: name.into() }
+    }
+}
+
+pub fn blank_ticket() -> Ticket {
+    Ticket { name: "blank_ticket".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Ticket {
+    pub name: String,
+    pub severity: u32,
+}
+
+impl Ticket {
+    pub fn new(name: &str) -> Self {
+        Ticket { name: name.into(), severity: 25 }
+    }
+}
+
+pub fn blank_ticket() -> Ticket {
+    Ticket { name: "blank_ticket".into(), severity: 25 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn blank_ticket_is_named() {
+    assert_eq!(fixture::blank_ticket().name, "blank_ticket");
+}
+"""

@@ -1,0 +1,10 @@
+<li class="row stage-{{ row.stage_class }}" id="{{ row.dom_id }}">
+  <a class="label" href="{{ base }}/changes/{{ row.change }}">{{ row.label }}</a>
+  <span class="actor">{{ row.actor }}</span>
+  <span class="stage">{{ row.stage }}</span>
+  {% if let Some(conflict) = row.conflict %}<span class="conflict">{{ conflict }}</span>{% endif %}
+  {% if row.parked %}<a class="workbench" href="{{ base }}/arbitrate/{{ row.change }}">open workbench</a>{% endif %}
+  <ul class="evidence">
+    {% for ev in row.evidence %}<li class="ev ev-{{ ev.class }}" title="{{ ev.id }}">{{ ev.kind }}: {{ ev.result }}</li>{% endfor %}
+  </ul>
+</li>

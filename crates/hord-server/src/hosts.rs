@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hord_api::{ApiError, RepoBackend};
+use hord_api::{ApiError, ChangesBackend, RepoBackend};
 use hord_txn::{LocalRepo, Repo, RepoOptions};
 
+use crate::changes::LocalChanges;
 use crate::route::RepoName;
 use crate::{Error, Result};
 
@@ -17,8 +18,9 @@ const ROOT_DEPTH: usize = 4;
 /// `/r/<name>/` prefix, or many (`--root`), each reached only by its name.
 pub struct Hosts {
     repos: BTreeMap<String, Arc<dyn RepoBackend>>,
+    changes: BTreeMap<String, Arc<dyn ChangesBackend>>,
     single: Option<String>,
-    locals: Vec<Arc<LocalRepo>>,
+    locals: Vec<(String, Arc<LocalRepo>)>,
 }
 
 impl std::fmt::Debug for Hosts {
@@ -58,8 +60,13 @@ impl Hosts {
     }
 
     /// Host every repository (a directory holding `.hord/`) under `dir`,
-    /// named by its path relative to `dir` (`--root`).
-    pub async fn open_root(dir: &Path, options: impl Fn() -> RepoOptions) -> Result<Self> {
+    /// named by its path relative to `dir` (`--root`). `options` gives each
+    /// repository's options from its root, so each lander gets its own
+    /// configuration (such as its replay harness).
+    pub async fn open_root(
+        dir: &Path,
+        options: impl Fn(&Path) -> std::result::Result<RepoOptions, String>,
+    ) -> Result<Self> {
         let mut found = Vec::new();
         find_repos(dir, dir, 0, &mut found)?;
         if found.is_empty() {
@@ -67,10 +74,31 @@ impl Hosts {
         }
         let mut hosts = Self::empty();
         for (name, path) in found {
-            let local = open_local(&path, options()).await?;
+            let options = options(&path).map_err(|reason| Error::Options {
+                path: path.clone(),
+                reason,
+            })?;
+            let local = open_local(&path, options).await?;
             hosts.insert_local(name, local);
         }
         Ok(hosts)
+    }
+
+    /// Host one repository that another [`Hosts`] already serves, sharing
+    /// its lander (for its local endpoint, beside a `--root` server).
+    #[must_use]
+    pub fn from_local(name: String, local: Arc<LocalRepo>) -> Self {
+        let mut hosts = Self::empty();
+        hosts.insert_local(name.clone(), local);
+        hosts.single = Some(name);
+        hosts
+    }
+
+    /// The repositories this server opened, by name, with their landers.
+    pub fn locals(&self) -> impl Iterator<Item = (&str, &Arc<LocalRepo>)> {
+        self.locals
+            .iter()
+            .map(|(name, local)| (name.as_str(), local))
     }
 
     /// Host already-open backends by name. With one entry, it is also
@@ -82,14 +110,24 @@ impl Hosts {
             .flatten();
         Self {
             repos,
+            changes: BTreeMap::new(),
             single,
             locals: Vec::new(),
         }
     }
 
+    /// Also serve the `Changes` service (ADR 0030) for the repository
+    /// `name`, over `changes`.
+    #[must_use]
+    pub fn with_changes(mut self, name: &str, changes: Arc<dyn ChangesBackend>) -> Self {
+        self.changes.insert(name.to_owned(), changes);
+        self
+    }
+
     fn empty() -> Self {
         Self {
             repos: BTreeMap::new(),
+            changes: BTreeMap::new(),
             single: None,
             locals: Vec::new(),
         }
@@ -97,8 +135,12 @@ impl Hosts {
 
     fn insert_local(&mut self, name: String, local: Arc<LocalRepo>) {
         self.repos
-            .insert(name, Arc::clone(&local) as Arc<dyn RepoBackend>);
-        self.locals.push(local);
+            .insert(name.clone(), Arc::clone(&local) as Arc<dyn RepoBackend>);
+        self.changes.insert(
+            name.clone(),
+            Arc::new(LocalChanges::new(Arc::clone(&local))),
+        );
+        self.locals.push((name, local));
     }
 
     /// Names of the hosted repositories.
@@ -117,24 +159,53 @@ impl Hosts {
         &self,
         name: Option<&RepoName>,
     ) -> Result<Arc<dyn RepoBackend>, ApiError> {
-        let name = match (name, &self.single) {
-            (Some(RepoName(name)), _) => name,
-            (None, Some(single)) => single,
-            (None, None) => {
-                return Err(ApiError::InvalidArgument(
-                    "this server hosts several repositories; address one as /r/<name>/".into(),
-                ));
-            }
-        };
+        let name = self.addressed(name)?;
         self.repos
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("no repository {name:?} on this server")))
     }
 
-    /// Stop every lander this server started.
+    /// The `Changes` backend a request names, or the only one.
+    pub(crate) fn resolve_changes(
+        &self,
+        name: Option<&RepoName>,
+    ) -> Result<Arc<dyn ChangesBackend>, ApiError> {
+        let name = self.addressed(name)?;
+        if !self.repos.contains_key(name) {
+            return Err(ApiError::NotFound(format!(
+                "no repository {name:?} on this server"
+            )));
+        }
+        self.changes.get(name).cloned().ok_or_else(|| {
+            ApiError::Unimplemented(format!("repository {name:?} serves no Changes service"))
+        })
+    }
+
+    /// The repository name a request addresses: its `/r/<name>/` prefix,
+    /// else the only one.
+    pub(crate) fn addressed<'a>(&'a self, name: Option<&'a RepoName>) -> Result<&'a str, ApiError> {
+        match (name, &self.single) {
+            (Some(RepoName(name)), _) => Ok(name),
+            (None, Some(single)) => Ok(single),
+            (None, None) => Err(ApiError::InvalidArgument(
+                "this server hosts several repositories; address one as /r/<name>/".into(),
+            )),
+        }
+    }
+
+    /// End the event streams of every repository this server opened, so
+    /// its connections can drain.
+    pub async fn close_events(&self) {
+        for (_, local) in &self.locals {
+            local.close_events().await;
+        }
+    }
+
+    /// Stop every lander this server started and close its repository:
+    /// afterwards no task they spawned holds it.
     pub async fn shutdown(&self) {
-        for local in &self.locals {
+        for (_, local) in &self.locals {
             local.shutdown().await;
         }
     }

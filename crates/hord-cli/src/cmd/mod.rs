@@ -1,16 +1,23 @@
 //! Command implementations.
 
+pub mod arbitrate;
 pub mod blame;
 pub mod git;
 pub mod init;
+pub mod key;
 pub mod lander;
 pub mod log;
+pub mod login;
 pub mod policy;
 pub mod propose;
 pub mod query;
 pub mod remote;
+pub mod replay;
+pub mod review;
 pub mod serve;
 pub mod status;
+pub mod token;
+pub mod user;
 pub mod verify;
 pub mod watch;
 pub mod ws;

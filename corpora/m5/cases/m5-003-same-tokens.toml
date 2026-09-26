@@ -1,0 +1,77 @@
+id = "m5-003"
+kind = "same-tokens"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: same-tokens #3 (stretch x4)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn stretch(x: u32) -> u32 {
+    x * 4
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "stretch adds one after scaling"
+body = "Callers need stretch(x) to be x times 4 plus one, so that zero never maps to zero."
+test = "stretch_adds_one"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn stretch_adds_one() {
+    assert_eq!(fixture::stretch(3), 13);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn stretch(x: u32) -> u32 {
+    x * 4 + 1
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "stretch saturates instead of overflowing"
+body = "stretch panics in debug builds on large inputs. Make it saturate at u32::MAX."
+test = "stretch_saturates"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn stretch_saturates() {
+    assert_eq!(fixture::stretch(u32::MAX), u32::MAX);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn stretch(x: u32) -> u32 {
+    x.saturating_mul(4)
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub fn stretch(x: u32) -> u32 {
+    x.saturating_mul(4).saturating_add(1)
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn stretch_saturates() {
+    assert_eq!(fixture::stretch(u32::MAX), u32::MAX);
+}
+"""

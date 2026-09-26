@@ -18,8 +18,11 @@ use hord_core::{Actor, ChangeId, Evidence, ObjectId};
 use prost::Message;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::conflict::{ConflictReport, MergeSeverity};
+use crate::escalation::Arbiter;
 use crate::lander::{QueueEntry, QueueStatus};
 use crate::repo::{Inner, lock, now};
 use crate::{Error, Result};
@@ -45,6 +48,11 @@ pub(crate) struct EventLog {
     /// and broadcasting, so live order is cursor order.
     last: Mutex<EventCursor>,
     live: broadcast::Sender<proto::EventEnvelope>,
+    /// Cancelled when the repository is shut down: every subscription ends,
+    /// so a server's live streams let its connections close.
+    closed: CancellationToken,
+    /// The tasks following subscriptions, awaited by [`Self::close`].
+    followers: TaskTracker,
 }
 
 impl std::fmt::Debug for EventLog {
@@ -72,7 +80,18 @@ impl EventLog {
             db,
             last: Mutex::new(last),
             live,
+            closed: CancellationToken::new(),
+            followers: TaskTracker::new(),
         })
+    }
+
+    /// End every subscription, now and later (a shut-down repository), and
+    /// wait until no task following one is left: none of them can then
+    /// hold the log, even for a read in progress.
+    pub(crate) async fn close(&self) {
+        self.closed.cancel();
+        self.followers.close();
+        self.followers.wait().await;
     }
 
     /// Record `events` in one commit, in order, and broadcast them.
@@ -149,13 +168,19 @@ impl EventLog {
 
     /// A stream of the events after `from` (every recorded one first), or
     /// only live events when `from` is `None`. The stream holds the log
-    /// weakly: it ends when the log is dropped, and it stops following
-    /// when the stream is dropped.
+    /// weakly: it ends when the log is dropped or closed, and it stops
+    /// following when the stream is dropped.
     pub(crate) fn subscribe(self: &Arc<Self>, from: Option<EventCursor>) -> EventStream {
         let live = self.live.subscribe();
         let start = from.unwrap_or_else(|| self.last());
         let (tx, rx) = mpsc::channel(LIVE_BUFFER);
-        tokio::spawn(follow(Arc::downgrade(self), live, start, tx));
+        self.followers.spawn(follow(
+            Arc::downgrade(self),
+            self.closed.clone(),
+            live,
+            start,
+            tx,
+        ));
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 }
@@ -171,18 +196,20 @@ type Sink = mpsc::Sender<std::result::Result<proto::EventEnvelope, ApiError>>;
 /// Send recorded events after `seen`, then live ones, to `tx`.
 async fn follow(
     log: Weak<EventLog>,
+    closed: CancellationToken,
     mut live: broadcast::Receiver<proto::EventEnvelope>,
     mut seen: EventCursor,
     tx: Sink,
 ) {
     // Replay the backlog. Live events that arrive meanwhile wait in the
     // broadcast buffer and are skipped below if already replayed.
-    if !replay(&log, &mut seen, &tx).await {
+    if !replay(&log, &closed, &mut seen, &tx).await {
         return;
     }
     loop {
         tokio::select! {
             () = tx.closed() => return,
+            () = closed.cancelled() => return,
             received = live.recv() => match received {
                 Ok(envelope) => {
                     if envelope.cursor <= seen {
@@ -190,7 +217,7 @@ async fn follow(
                     }
                     if envelope.cursor > seen + 1 {
                         // A gap: something was missed; fill it from the log.
-                        if !replay(&log, &mut seen, &tx).await {
+                        if !replay(&log, &closed, &mut seen, &tx).await {
                             return;
                         }
                         if envelope.cursor <= seen {
@@ -203,7 +230,7 @@ async fn follow(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if !replay(&log, &mut seen, &tx).await {
+                    if !replay(&log, &closed, &mut seen, &tx).await {
                         return;
                     }
                 }
@@ -214,9 +241,17 @@ async fn follow(
 }
 
 /// Send every recorded event after `seen`. False when the subscriber or the
-/// log is gone, or reading failed (the error is sent first).
-async fn replay(log: &Weak<EventLog>, seen: &mut EventCursor, tx: &Sink) -> bool {
+/// log is gone or closed, or reading failed (the error is sent first).
+async fn replay(
+    log: &Weak<EventLog>,
+    closed: &CancellationToken,
+    seen: &mut EventCursor,
+    tx: &Sink,
+) -> bool {
     loop {
+        if closed.is_cancelled() {
+            return false;
+        }
         let Some(strong) = log.upgrade() else {
             return false;
         };
@@ -255,6 +290,15 @@ impl Inner {
         let log = Arc::new(EventLog::open(self.store.hord_dir())?);
         *slot = Some(Arc::clone(&log));
         Ok(log)
+    }
+
+    /// End every event subscription and wait for their tasks, if the log
+    /// was opened. Later subscriptions end at once.
+    pub(crate) async fn close_events(&self) {
+        let open = lock(&self.events).clone();
+        if let Some(log) = open {
+            log.close().await;
+        }
     }
 
     /// Record and broadcast `events`.
@@ -356,8 +400,53 @@ pub(crate) fn settled(entry: &QueueEntry) -> Vec<Kind> {
                 detail: reason.clone(),
             })]
         }
-        QueueStatus::Queued | QueueStatus::Landed { .. } => Vec::new(),
+        QueueStatus::Queued
+        | QueueStatus::Landed { .. }
+        | QueueStatus::Replaying { .. }
+        | QueueStatus::NeedsArbitration
+        | QueueStatus::Replayed { .. }
+        | QueueStatus::Arbitrated { .. } => Vec::new(),
     }
+}
+
+/// `Rejected` for `change` (a replay the lander would not submit).
+pub(crate) fn rejected(change: ChangeId, reason: &str) -> Kind {
+    Kind::Rejected(proto::Rejected {
+        change: wire::id(change),
+        reason: reason.into(),
+    })
+}
+
+/// `Replaying` for attempt `attempt` on `change`.
+pub(crate) fn replaying(change: ChangeId, attempt: u32, harness: &str) -> Kind {
+    Kind::Replaying(proto::Replaying {
+        change: wire::id(change),
+        attempt,
+        harness: harness.into(),
+    })
+}
+
+/// `Parked` for a change that entered the arbitration queue.
+pub(crate) fn needs_arbitration(change: ChangeId, detail: String) -> Kind {
+    Kind::Parked(proto::Parked {
+        change: wire::id(change),
+        reason: proto::ParkReason::NeedsArbitration.into(),
+        detail,
+    })
+}
+
+/// `Arbitrated`: `change` was resolved by `arbiter`, landing as `result`.
+pub(crate) fn arbitrated(change: ChangeId, arbiter: &Arbiter, result: ChangeId) -> Kind {
+    Kind::Arbitrated(proto::Arbitrated {
+        change: wire::id(change),
+        by: Some(wire::actor(&arbiter.actor)),
+        result: wire::id(result),
+        key_id: arbiter.signature.as_ref().map(|s| s.key_id.clone()),
+        signature: arbiter
+            .signature
+            .as_ref()
+            .map(|s| s.bytes.as_slice().to_vec()),
+    })
 }
 
 /// `Landed` then `HeadMoved` for a landing at `position`.

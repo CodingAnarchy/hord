@@ -1,0 +1,87 @@
+id = "m5-042"
+kind = "move-vs-edit"
+conflict = "hard"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: move-vs-edit #9 (parse_year into dates)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn parse_year(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "move parse_year into module dates"
+body = "Move parse_year into a new public module `dates`, re-exported at the crate root."
+test = "parse_year_lives_in_dates"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn parse_year_lives_in_dates() {
+    assert_eq!(fixture::dates::parse_year("7"), Some(7));
+}
+"""
+
+[tasks.files]
+"src/dates.rs" = """
+pub fn parse_year(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+"""
+"src/lib.rs" = """
+pub mod dates;
+
+pub use dates::parse_year;
+"""
+
+[[tasks]]
+name = "b"
+summary = "parse_year ignores surrounding whitespace"
+body = "parse_year rejects input with spaces around the number. Trim it first."
+test = "parse_year_trims"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn parse_year_trims() {
+    assert_eq!(fixture::parse_year(" 7 "), Some(7));
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn parse_year(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+
+[resolution]
+"src/dates.rs" = """
+pub fn parse_year(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+"""
+"src/lib.rs" = """
+pub mod dates;
+
+pub use dates::parse_year;
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn parse_year_trims() {
+    assert_eq!(fixture::parse_year(" 7 "), Some(7));
+}
+"""
