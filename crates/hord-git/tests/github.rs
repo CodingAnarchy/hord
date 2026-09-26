@@ -33,7 +33,7 @@ async fn api(State(seen): State<Seen>, request: Request<Body>) -> Response<Body>
         method.clone(),
         uri.clone(),
         auth,
-        body,
+        body.clone(),
     ));
     let (status, reply) = if method == "GET" && uri.starts_with("/repos/o/r/pulls?") {
         let pulls = json!([{
@@ -49,6 +49,16 @@ async fn api(State(seen): State<Seen>, request: Request<Body>) -> Response<Body>
         (
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"message": "closed"}),
+        )
+    } else if uri.ends_with("/comments")
+        && body["body"]
+            .as_str()
+            .is_some_and(|b| b.chars().count() > 65_536)
+    {
+        // GitHub's limit on a comment body.
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"message": "body is too long (maximum is 65536 characters)"}),
         )
     } else if uri.contains("/statuses/bad") {
         (StatusCode::NOT_FOUND, json!({"message": "Not Found"}))
@@ -121,5 +131,36 @@ async fn the_github_client_speaks_the_rest_api() -> TestResult {
     );
     assert_eq!(seen[2].3, json!({"body": "**Parked.**"}));
     assert_eq!(seen[3].3, json!({"state": "closed"}));
+    Ok(())
+}
+
+/// A comment longer than GitHub accepts (a parked pull request's conflict
+/// report, one line per finding) is cut to fit, rather than failing every
+/// time the bridge tries to post it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_comment_is_cut_to_fit() -> TestResult {
+    let seen: Seen = Arc::default();
+    let app = Router::new().fallback(api).with_state(Arc::clone(&seen));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let github = GitHub::new(GitHubOptions {
+        api: format!("http://{addr}"),
+        repository: "o/r".into(),
+        token: "secret".into(),
+        base: "main".into(),
+    })?;
+
+    let report = "- `src/lib.rs`: both changed `parse`\n".repeat(3_000);
+    github.comment(5, &report).await?;
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let body = seen[0].3["body"].as_str().ok_or("a comment body")?;
+    assert!(body.chars().count() <= 65_536);
+    assert!(report.starts_with(&body[..1_000]));
+    assert!(
+        body.ends_with("`hord queue`)"),
+        "{}",
+        &body[body.len() - 40..]
+    );
     Ok(())
 }

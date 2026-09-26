@@ -27,6 +27,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const PER_PAGE: usize = 100;
 /// The commit status context the bridge sets.
 const CONTEXT: &str = "hord/lander";
+/// GitHub refuses a comment body longer than this, in characters (422).
+const MAX_COMMENT_CHARS: usize = 65_536;
 
 /// Where the GitHub side is, from the bridge's config file.
 #[derive(Clone)]
@@ -213,7 +215,7 @@ impl PullRequests for GitHub {
     }
 
     async fn comment(&self, pull: u64, body: &str) -> Result<(), SyncError> {
-        let body = json!({ "body": body });
+        let body = json!({ "body": comment_body(body) });
         let url = self.url(&format!("issues/{pull}/comments"));
         self.call(Method::POST, &url, Some(body)).await.map(drop)
     }
@@ -228,6 +230,19 @@ impl PullRequests for GitHub {
         }
         Err(failed(&Method::PATCH, &url, status, &bytes))
     }
+}
+
+/// `body` cut to what GitHub accepts: a long conflict report would
+/// otherwise make every attempt to comment fail.
+fn comment_body(body: &str) -> String {
+    const CUT: &str = "\n\n… (cut: the full report is in `hord queue`)";
+    if body.chars().count() <= MAX_COMMENT_CHARS {
+        return body.to_owned();
+    }
+    let keep = MAX_COMMENT_CHARS - CUT.chars().count();
+    let mut out: String = body.chars().take(keep).collect();
+    out.push_str(CUT);
+    out
 }
 
 fn failed(method: &Method, url: &str, status: StatusCode, body: &[u8]) -> SyncError {
