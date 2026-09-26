@@ -421,7 +421,14 @@ async fn a_pull_request_lands_reports_and_closes() -> TestResult {
             _ => None,
         })
         .collect();
-    assert_eq!(states, vec![StatusState::Pending, StatusState::Success]);
+    // Pending only if the bridge reported before the lander landed it.
+    assert!(
+        matches!(
+            states[..],
+            [StatusState::Success] | [StatusState::Pending, StatusState::Success]
+        ),
+        "{states:?}"
+    );
     assert!(
         reported
             .iter()
