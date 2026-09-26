@@ -8,14 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hord_core::{ChangeId, ChangeRecord, NodeId, ObjectId, RepoPath, SnapshotId};
-use hord_lang::Anchor;
+use hord_lang::{Anchor, Site};
 use hord_store::EdgeKind;
 use hord_verify::{Definition, ReferenceGraph, newest_coverage};
 use hord_verify_rust::rust_traits;
 
 use crate::graph::SnapshotGraph;
 use crate::repo::{Inner, Repo, blocking};
-use crate::semantic::{DefinitionInfo, enclosing};
+use crate::semantic::{DefinitionInfo, Parsed, enclosing};
 use crate::{Error, Result};
 
 /// Landed snapshots searched for a coverage record, newest first.
@@ -449,42 +449,65 @@ impl Inner {
             .edges(snapshot, source, kind)?
             .into_iter()
             .collect();
-        if matches!(kind, EdgeKind::References | EdgeKind::Contains) {
-            for (path, _) in self.list_files(snapshot)? {
-                let Some(parsed) = self.parsed_at(snapshot, &path)? else {
-                    continue;
-                };
-                let Some((site, _)) = parsed.tree.ids.iter().find(|(_, id)| **id == source) else {
-                    continue;
-                };
-                let site = site.clone();
-                match kind {
-                    EdgeKind::References => {
-                        if parsed.lang.as_str() == hord_lang_rust::LANG
-                            && let Some(node) = parsed.tree.node_at(&site)
-                        {
-                            let ctx = self.rust_ctx(snapshot)?;
-                            let anchor = Anchor::Definition(source);
-                            self.rust_references(&ctx, snapshot, source, &anchor, node, &mut out)?;
-                        }
-                    }
-                    _ => {
-                        let parents = enclosing(&parsed.tree);
-                        out.extend(
-                            parsed
-                                .tree
-                                .ids
-                                .iter()
-                                .filter(|(child, _)| parents.get(*child) == Some(&site))
-                                .map(|(_, id)| *id),
-                        );
+        if matches!(kind, EdgeKind::References | EdgeKind::Contains)
+            && let Some((parsed, site)) = self.defining(snapshot, source)?
+        {
+            match kind {
+                EdgeKind::References => {
+                    if parsed.lang.as_str() == hord_lang_rust::LANG
+                        && let Some(node) = parsed.tree.node_at(&site)
+                    {
+                        let ctx = self.rust_ctx(snapshot)?;
+                        let anchor = Anchor::Definition(source);
+                        self.rust_references(&ctx, snapshot, source, &anchor, node, &mut out)?;
                     }
                 }
-                break;
+                _ => {
+                    let parents = enclosing(&parsed.tree);
+                    out.extend(
+                        parsed
+                            .tree
+                            .ids
+                            .iter()
+                            .filter(|(child, _)| parents.get(*child) == Some(&site))
+                            .map(|(_, id)| *id),
+                    );
+                }
             }
         }
         out.remove(&source);
         Ok(out.into_iter().collect())
+    }
+
+    /// The parsed file of `snapshot` that defines `source`, and its site
+    /// there: the file the reference index places it in, when that file
+    /// holds it, else the first file in path order that does (the index
+    /// leaves out manifests). The index spares reading every file before
+    /// it.
+    fn defining(&self, snapshot: SnapshotId, source: NodeId) -> Result<Option<(Parsed, Site)>> {
+        let site_in = |path: &RepoPath| -> Result<Option<(Parsed, Site)>> {
+            let Some(parsed) = self.parsed_at(snapshot, path)? else {
+                return Ok(None);
+            };
+            let site = parsed
+                .tree
+                .ids
+                .iter()
+                .find(|(_, id)| **id == source)
+                .map(|(site, _)| site.clone());
+            Ok(site.map(|site| (parsed, site)))
+        };
+        if let Some(path) = self.ref_index(snapshot)?.path_of(source)
+            && let Some(found) = site_in(&path)?
+        {
+            return Ok(Some(found));
+        }
+        for (path, _) in self.list_files(snapshot)? {
+            if let Some(found) = site_in(&path)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 }
 
