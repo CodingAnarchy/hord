@@ -352,13 +352,16 @@ async fn propose(
 
 /// The git bridge's real `BridgeChecked` events (ADR 0036), recorded with
 /// its `bridge` token, and a pull request it submitted on its author's
-/// behalf (ADR 0037). Time is scaled down: the allowed gap is 1.5 s, not an
-/// hour. Checks at a steady pace audit clean; a pause longer than the gap
-/// and a diverged check fail. The vouched change is counted apart from the
-/// signed one.
+/// behalf (ADR 0037), through the real RPCs and scopes. The vouched change
+/// is counted apart from the signed one. Timing is not under test here
+/// (the unit tests judge gaps over explicit timestamps; the server stamps
+/// events itself): the allowed gap is ten minutes, far longer than the
+/// test takes, so checks audit clean; a diverged check fails; and a window
+/// ending twice the gap after the last check has a gap, whatever the
+/// runner's speed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
-    const GAP_MS: u64 = 1_500;
+    const GAP_MS: u64 = 10 * 60 * 1000;
     let dir = temp("bridge")?;
     let repo_dir = dir.0.join("repo");
     let stub = || RepoOptions {
@@ -489,9 +492,8 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
     vouched.provenance.voucher = Some(bridge.key_id.clone());
     let vouched = land(&bridge_remote, &ci, &vouched).await?;
 
-    // Checks at a steady pace, well inside the gap.
+    // More checks, all passing, well inside the gap.
     for _ in 0..3 {
-        tokio::time::sleep(Duration::from_millis(GAP_MS / 5)).await;
         bridge_remote.record_bridge_check(check(false)).await?;
     }
     let steady_until = now_ms()? + 1;
@@ -518,10 +520,19 @@ async fn bridge_checks_and_a_vouched_pull_request_are_audited() -> TestResult {
         ]
     );
 
-    // A pause longer than the gap, then a diverged check.
-    tokio::time::sleep(Duration::from_millis(GAP_MS * 2)).await;
+    // A diverged check fails, on its own.
     bridge_remote.record_bridge_check(check(true)).await?;
-    let report = root.audit().audit_log(audit(now_ms()? + 1)).await?;
+    let now = now_ms()? + 1;
+    let report = root.audit().audit_log(audit(now)).await?;
+    let criteria: Vec<AuditCriterion> = report.violations.iter().map(|v| v.criterion()).collect();
+    assert_eq!(
+        criteria,
+        [AuditCriterion::BridgeDiverged],
+        "{:#?}",
+        report.violations
+    );
+    // A window that ends twice the gap after the last check has a gap.
+    let report = root.audit().audit_log(audit(now + 2 * GAP_MS)).await?;
     let criteria: Vec<AuditCriterion> = report.violations.iter().map(|v| v.criterion()).collect();
     assert_eq!(
         criteria,

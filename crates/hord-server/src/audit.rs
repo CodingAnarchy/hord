@@ -391,14 +391,24 @@ fn judge_bridge(
                 AuditCriterion::BridgeGap,
                 None,
                 format!(
-                    "no bridge check from {from} ms to {to} ms ({} min, more than {} min)",
-                    gap / 60_000,
-                    max / 60_000
+                    "no bridge check from {from} ms to {to} ms ({}, more than {})",
+                    span(gap),
+                    span(max)
                 ),
             ));
         }
     }
     bridge
+}
+
+/// `ms` in words: seconds under a minute, else whole minutes.
+fn span(ms: u64) -> String {
+    if ms < 60_000 {
+        // Tenths of a second, in integers: no float formatting to round.
+        format!("{}.{} s", ms / 1_000, ms % 1_000 / 100)
+    } else {
+        format!("{} min", ms / 60_000)
+    }
 }
 
 /// The divergence check an event records, if it is one: a `BridgeChecked`
@@ -980,6 +990,25 @@ mod tests {
         let mut late = clean();
         late.bridge_checks.retain(|c| c.at_ms >= 2 * HOUR);
         assert_eq!(criteria(&judge(&late)), [(AuditCriterion::BridgeGap, None)]);
+    }
+
+    #[test]
+    fn gaps_read_in_seconds_under_a_minute() {
+        assert_eq!(span(1_500), "1.5 s");
+        assert_eq!(span(59_999), "59.9 s");
+        assert_eq!(span(65 * 60 * 1000), "65 min");
+        let facts = AuditFacts {
+            max_bridge_gap_ms: 1_500,
+            ..clean()
+        };
+        let report = judge(&facts);
+        assert!(
+            report.violations[0]
+                .detail
+                .ends_with("(60 min, more than 1.5 s)"),
+            "{:?}",
+            report.violations
+        );
     }
 
     #[test]
