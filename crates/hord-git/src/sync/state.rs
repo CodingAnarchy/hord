@@ -35,6 +35,9 @@ pub(crate) struct PullState {
     /// The last outcome reported on the pull request.
     #[serde(default)]
     pub(crate) reported: Option<String>,
+    /// Whether the bridge closed it (its change landed).
+    #[serde(default)]
+    pub(crate) closed: bool,
 }
 
 impl State {

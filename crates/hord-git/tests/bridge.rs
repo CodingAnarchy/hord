@@ -18,6 +18,7 @@ use hord_api::{ApiError, ApiResult, EventStream, RepoBackend, wire};
 use hord_core::{Actor, ChangeId, ChangeRecord, Intent, IntentRef, RepoPath, Snapshot};
 use hord_git::sync::{
     Bridge, BridgeOptions, Check, PullRequest, PullRequests, Reported, ScriptedPulls, StatusState,
+    SyncError,
 };
 use hord_git::{ExportCache, MemoryStore, Store, git_tree_sha, import_git, import_git_window};
 use hord_txn::{BeginOptions, LocalRepo, Repo, RepoOptions, StubVerifier};
@@ -848,5 +849,85 @@ async fn the_daemon_stops_while_waiting_for_the_event_stream() -> TestResult {
     )
     .await??;
     stopper.await?;
+    Ok(())
+}
+
+/// A pull request host whose first `close` fails, as a GitHub 502 would.
+struct CloseFailsOnce {
+    inner: Arc<ScriptedPulls>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl PullRequests for CloseFailsOnce {
+    async fn open_pulls(&self) -> Result<Vec<PullRequest>, SyncError> {
+        self.inner.open_pulls().await
+    }
+    async fn set_status(
+        &self,
+        pull: u64,
+        sha: &str,
+        state: StatusState,
+        description: &str,
+    ) -> Result<(), SyncError> {
+        self.inner.set_status(pull, sha, state, description).await
+    }
+    async fn comment(&self, pull: u64, body: &str) -> Result<(), SyncError> {
+        self.inner.comment(pull, body).await
+    }
+    async fn close(&self, pull: u64) -> Result<(), SyncError> {
+        if !self.failed.swap(true, Ordering::Relaxed) {
+            return Err(SyncError::Pulls("PATCH …/pulls: 502 Bad Gateway".into()));
+        }
+        self.inner.close(pull).await
+    }
+}
+
+/// A failed close is retried without posting the outcome again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_close_is_retried_without_repeating_the_comment() -> TestResult {
+    let t = Setup::new("close").await?;
+    let backend: Arc<dyn RepoBackend> = t.backend.clone();
+    let pulls: Arc<dyn PullRequests> = Arc::new(CloseFailsOnce {
+        inner: t.pulls.clone(),
+        failed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut bridge = Bridge::open(backend, Some(pulls), t.options()).await?;
+    bridge.sync_once().await?;
+    let main = t.main()?.ok_or("main after the first sync")?;
+    let head = t.push_commit(
+        main,
+        "notes.txt",
+        "alpha\nbeta (fixed)\ngamma\n",
+        "fix beta\n",
+        "refs/pull/7/head",
+    )?;
+    t.pulls.open(t.pull(7, head, "Fix the notes"));
+    let report = bridge.sync_once().await?;
+    let (_, change) = *report.proposed.first().ok_or("the pull was proposed")?;
+    t.settle(&wire::id(change)).await?;
+
+    assert!(bridge.sync_once().await.is_err(), "the close failed");
+    assert!(t.pulls.is_open(7));
+    bridge.sync_once().await?;
+    assert!(!t.pulls.is_open(7), "closed on the retry");
+    let reported = t.pulls.reported_on(7);
+    let landed_comments = reported
+        .iter()
+        .filter(|r| matches!(r, Reported::Comment { body, .. } if body.contains("Landed")))
+        .count();
+    let successes = reported
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Reported::Status {
+                    state: StatusState::Success,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!((landed_comments, successes), (1, 1), "{reported:?}");
     Ok(())
 }

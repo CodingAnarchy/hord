@@ -527,6 +527,7 @@ impl Bridge {
                             head,
                             change: Some(wire::id(change)),
                             reported: None,
+                            closed: false,
                         },
                     );
                 }
@@ -548,6 +549,7 @@ impl Bridge {
                             head: pull.head_sha.clone(),
                             change: None,
                             reported: Some("error".into()),
+                            closed: false,
                         },
                     );
                 }
@@ -658,6 +660,11 @@ impl Bridge {
             let Some(mut outcome) = self.outcome(change, &entry).await? else {
                 continue;
             };
+            let fresh = pull.reported.as_deref() != Some(outcome.key);
+            // Reported, but the close failed: only the close is left.
+            if !fresh && !(outcome.close && !pull.closed) {
+                continue;
+            }
             if outcome.close {
                 let heads = match &mut heads {
                     Some(heads) => heads,
@@ -679,23 +686,28 @@ impl Bridge {
                     ));
                 }
             }
-            if pull.reported.as_deref() == Some(outcome.key) {
-                continue;
-            }
-            pulls
-                .set_status(number, &pull.head, outcome.state, &clip(&outcome.status))
-                .await?;
-            if let Some(text) = &outcome.comment {
-                pulls.comment(number, text).await?;
+            // Each step is saved once done, so a failed later step is
+            // retried without repeating the earlier ones.
+            if fresh {
+                pulls
+                    .set_status(number, &pull.head, outcome.state, &clip(&outcome.status))
+                    .await?;
+                if let Some(text) = &outcome.comment {
+                    pulls.comment(number, text).await?;
+                }
+                report.reported.push((number, outcome.key.to_owned()));
+                if let Some(state) = self.state.pulls.get_mut(&number) {
+                    state.reported = Some(outcome.key.to_owned());
+                }
+                self.save().await?;
             }
             if outcome.close {
                 pulls.close(number).await?;
+                if let Some(state) = self.state.pulls.get_mut(&number) {
+                    state.closed = true;
+                }
+                self.save().await?;
             }
-            report.reported.push((number, outcome.key.to_owned()));
-            if let Some(state) = self.state.pulls.get_mut(&number) {
-                state.reported = Some(outcome.key.to_owned());
-            }
-            self.save().await?;
         }
         Ok(())
     }
