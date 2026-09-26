@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hord_core::{Actor, EvidenceKind, EvidenceResult, NodeId, ObjectId, RepoPath};
+use hord_core::{Actor, EvidenceKind, EvidenceResult, NodeId, ObjectId, RepoPath, Timestamp};
 use hord_verify::{
     COVERAGE_KIND, Checkout, CoverageRecord, Definition, Error, EvidenceFields, EvidenceIndex,
     Result, TestRef, TestTarget, Toolchain, line_range,
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::cancel::Cancel;
 use crate::cargo::CargoWorkspace;
 use crate::libtest::parse_list;
-use crate::runner::{now, run_captured};
+use crate::runner::run_captured;
 
 /// [`Toolchain`] component name of `cargo-llvm-cov`.
 pub const LLVM_COV: &str = "cargo-llvm-cov";
@@ -894,7 +894,7 @@ pub fn record_evidence(
         log: Some(log),
         cost_ms: run.elapsed_ms,
         produced_by: actor,
-        produced_at: now(),
+        produced_at: Timestamp::now(),
     }
     .build();
     index.put_evidence(&evidence)

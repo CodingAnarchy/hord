@@ -2324,7 +2324,6 @@ dependencies = [
  "hord-txn",
  "http",
  "http-body-util",
- "hyper",
  "hyper-rustls",
  "hyper-util",
  "rustls",
@@ -2521,13 +2520,11 @@ dependencies = [
  "axum",
  "cookie",
  "hord-api",
- "http-body-util",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",
- "tower",
 ]
 
 [[package]]
@@ -2547,15 +2544,12 @@ name = "hord-verify-rust"
 version = "0.0.0"
 dependencies = [
  "hord-core",
- "hord-encoding",
  "hord-lang",
  "hord-lang-rust",
- "hord-store",
  "hord-verify",
  "rustc-demangle",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]

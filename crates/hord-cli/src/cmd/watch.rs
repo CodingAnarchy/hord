@@ -104,7 +104,7 @@ pub fn run(
                 Ok(Some(Ok(envelope))) => envelope,
             };
             cursor = Some(envelope.cursor);
-            let Some(kind) = envelope.event.as_ref().and_then(|e| e.kind.as_ref()) else {
+            let Some(kind) = envelope.kind() else {
                 continue;
             };
             if queue && !queue_kind(kind) {

@@ -3,8 +3,9 @@
 //! share the port, a client that does not trust the CA is refused, and a
 //! plaintext non-loopback bind still needs `--insecure-bind`.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+
+use std::path::Path;
 use std::time::Duration;
 
 use hord_api::auth::Scope;
@@ -19,33 +20,7 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tower::ServiceExt;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_dir_all(&self.0)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("remove temp dir {}: {err}", self.0.display());
-        }
-    }
-}
-
-fn temp(tag: &str) -> std::io::Result<Dir> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-remote-tls-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    if path.exists() {
-        std::fs::remove_dir_all(&path)?;
-    }
-    std::fs::create_dir_all(&path)?;
-    Ok(Dir(path))
-}
+use common::{TestResult, temp};
 
 /// A CA and a server certificate it signed for `localhost` and
 /// `127.0.0.1`, written as PEM files under `dir`. Returns the server's

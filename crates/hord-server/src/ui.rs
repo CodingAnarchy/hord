@@ -15,7 +15,6 @@
 //! someone else.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::http::Extensions;
@@ -474,7 +473,7 @@ impl ReviewBackend for SigningReviewer {
             log: None,
             cost_ms: 0,
             produced_by: self.signer.actor.clone(),
-            produced_at: now(),
+            produced_at: Timestamp::now(),
             signature: None,
         };
         sign::sign_evidence(&mut evidence, &self.signer.key)
@@ -509,11 +508,4 @@ impl ArbitrationSigner for SigningArbiter {
         request.signature = Some(signature.bytes.as_slice().to_vec());
         Ok(())
     }
-}
-
-fn now() -> Timestamp {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    Timestamp::from_millis(ms)
 }

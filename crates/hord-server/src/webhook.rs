@@ -86,7 +86,7 @@ pub(crate) async fn deliver(
         Client::builder(TokioExecutor::new()).build_http();
     while let Some(item) = events.next().await {
         let Ok(envelope) = item else { continue };
-        let Some(kind) = envelope.event.as_ref().and_then(|e| e.kind.as_ref()) else {
+        let Some(kind) = envelope.kind() else {
             continue;
         };
         let kind = event_kind_name(kind);

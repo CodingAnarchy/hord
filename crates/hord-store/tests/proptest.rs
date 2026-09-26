@@ -1,23 +1,14 @@
 //! Property tests: `get(put(bytes)) == bytes` and ids are BLAKE3 of the bytes.
 
+mod common;
+
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hord_core::ObjectId;
 use hord_store::Store;
 use proptest::prelude::*;
 
-fn temp_repo() -> std::io::Result<PathBuf> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-store-prop-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
+use common::temp_repo;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]

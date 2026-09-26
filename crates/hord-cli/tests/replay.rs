@@ -5,40 +5,18 @@
 
 mod common;
 
+use common::TempDir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const LIB: &str = "pub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n";
 /// One second and ten tokens per attempt.
 const POLICY: &str = "[replay]\nbudget = { wall_time_secs = 1, tokens = 10 }\n";
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // The daemon exits once `.hord/` is gone.
-        common::drop_tree(&self.0);
-    }
-}
 
 fn hord(dir: &Path, args: &[&str]) -> TestResult<String> {
     let out = Command::new(env!("CARGO_BIN_EXE_hord"))

@@ -116,14 +116,6 @@ impl Hosts {
         }
     }
 
-    /// Also serve the `Changes` service (ADR 0030) for the repository
-    /// `name`, over `changes`.
-    #[must_use]
-    pub fn with_changes(mut self, name: &str, changes: Arc<dyn ChangesBackend>) -> Self {
-        self.changes.insert(name.to_owned(), changes);
-        self
-    }
-
     fn empty() -> Self {
         Self {
             repos: BTreeMap::new(),

@@ -160,6 +160,14 @@ pub fn event(kind: proto::event::Kind) -> proto::Event {
     proto::Event { kind: Some(kind) }
 }
 
+impl proto::EventEnvelope {
+    /// What happened, if the envelope carries an event with a kind.
+    #[must_use]
+    pub fn kind(&self) -> Option<&proto::event::Kind> {
+        self.event.as_ref()?.kind.as_ref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,10 +21,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hord_core::{ChangeId, ChangeRecord, NodeId, RepoPath};
+use hord_core::{ChangeId, ChangeRecord, NodeId, RepoPath, Timestamp};
 use hord_verify_rust::libtest::strip_ansi;
 
-use crate::repo::{Inner, fs_path, now};
+use crate::repo::{Inner, fs_path};
 use crate::{Error, Result};
 
 /// How long the pinned run may take before it counts as failed.
@@ -140,7 +140,7 @@ impl Inner {
             "{}-{}-{}",
             record.result.to_hex(),
             if overlay { "pinned" } else { "as-left" },
-            now().as_millis()
+            Timestamp::now().as_millis()
         ));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch)?;

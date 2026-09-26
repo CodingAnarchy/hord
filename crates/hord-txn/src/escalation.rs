@@ -31,14 +31,14 @@ use std::sync::Mutex;
 use hord_core::sign::{self, PublicKey, SigningKey};
 use hord_core::{
     Acceptance, Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, NodeId, ObjectId,
-    Provenance, RepoPath, Signature, SnapshotId,
+    Provenance, RepoPath, Signature, SnapshotId, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::events;
 use crate::lander::{QueueEntry, QueueStatus};
 use crate::pinned::Pinned;
-use crate::repo::{Base, BeginOptions, Inner, Repo, blocking, lock, now};
+use crate::repo::{Base, BeginOptions, Inner, Repo, blocking, lock};
 use crate::summary::ConflictSummary;
 use crate::{Error, Result};
 
@@ -427,7 +427,7 @@ impl Inner {
 
     /// Write `entry` with a fresh `updated_at`.
     fn rewrite(&self, entry: &mut QueueEntry) -> Result<()> {
-        entry.updated_at = now();
+        entry.updated_at = Timestamp::now();
         self.put_entry(entry)
     }
 
@@ -1172,7 +1172,7 @@ fn keep_ours(
         provenance: Provenance {
             actor: by.clone(),
             toolchain,
-            created_at: now(),
+            created_at: Timestamp::now(),
             session: None,
             parent_intent: None,
             voucher: None,

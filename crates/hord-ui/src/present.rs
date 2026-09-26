@@ -123,7 +123,7 @@ pub fn status(entry: &proto::QueueEntry) -> String {
 /// report's verification failure and unmet policy spelled out.
 #[must_use]
 pub fn park_reason(view: &proto::ChangeView) -> String {
-    let parked = view.history.iter().rev().find_map(|e| match kind(e) {
+    let parked = view.history.iter().rev().find_map(|e| match e.kind() {
         Some(Kind::Parked(p)) => Some(p),
         _ => None,
     });
@@ -149,10 +149,6 @@ pub fn park_reason(view: &proto::ChangeView) -> String {
     out
 }
 
-fn kind(envelope: &proto::EventEnvelope) -> Option<&Kind> {
-    envelope.event.as_ref()?.kind.as_ref()
-}
-
 /// The events of a change's history as rungs of the escalation ladder
 /// (spec §6.4): conflict check, verification, replay attempts and their
 /// outcomes, parking, arbitration, landing. Times are seconds since the
@@ -169,7 +165,7 @@ pub fn rungs(
             "+{:.1}s",
             envelope.at_ms.saturating_sub(start) as f64 / 1000.0
         );
-        let (rung, outcome) = match kind(envelope) {
+        let (rung, outcome) = match envelope.kind() {
             Some(Kind::Submitted(s)) => (
                 "submitted".to_owned(),
                 format!("submission #{}", s.submission),

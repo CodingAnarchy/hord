@@ -1,24 +1,14 @@
 //! One-commit landings, the queue name index, and log slices (M3 perf
 //! review #6 and #7, `docs/review/perf.md`).
 
+mod common;
+
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hord_core::{Actor, ChangeRecord, Intent, NodeId, ObjectId, Provenance, SnapshotId, Timestamp};
 use hord_store::{Landing, Store};
 
-fn temp_repo(tag: &str) -> std::io::Result<PathBuf> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-store-land-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
+use common::temp_repo;
 
 fn oid(n: u8) -> ObjectId {
     ObjectId::from_bytes([n; 32])
@@ -108,7 +98,7 @@ fn a_landing_survives_an_abort_right_after_land() -> Result<(), Box<dyn std::err
         // No drop, no flush: the process dies with the store open.
         std::process::abort();
     }
-    let dir = temp_repo("abort")?;
+    let dir = temp_repo()?;
     drop(Store::create(&dir)?);
     let status = std::process::Command::new(std::env::current_exe()?)
         .args([
@@ -133,7 +123,7 @@ fn a_landing_survives_an_abort_right_after_land() -> Result<(), Box<dyn std::err
 
 #[test]
 fn land_writes_the_entry_log_head_and_history_together() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = temp_repo("together")?;
+    let dir = temp_repo()?;
     let store = Store::create(&dir)?;
     // A buffered log entry from before (git import) lands first, in order.
     let earlier = oid(5);
@@ -171,7 +161,7 @@ fn land_writes_the_entry_log_head_and_history_together() -> Result<(), Box<dyn s
 
 #[test]
 fn a_rebased_landing_is_found_by_both_ids() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = temp_repo("rebased")?;
+    let dir = temp_repo()?;
     let store = Store::create(&dir)?;
     let (submitted, landed, node) = queue_and_land(&store, true)?;
     assert_ne!(submitted, landed);
@@ -186,7 +176,7 @@ fn a_rebased_landing_is_found_by_both_ids() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn queue_names_are_sorted_sets_and_survive_reopen() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = temp_repo("names")?;
+    let dir = temp_repo()?;
     let store = Store::create(&dir)?;
     assert!(store.queue_names_indexed()?);
     let a = oid(1);
@@ -212,7 +202,7 @@ fn queue_names_are_sorted_sets_and_survive_reopen() -> Result<(), Box<dyn std::e
 
 #[test]
 fn checked_marks_persist() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = temp_repo("checked")?;
+    let dir = temp_repo()?;
     let store = Store::create(&dir)?;
     assert!(!store.is_checked(oid(1))?);
     store.mark_checked(oid(1))?;

@@ -8,15 +8,12 @@
 //!   `hord.proto` (the ADR 0030 check).
 //! - With auth on, the pages need the `read` scope.
 
+mod common;
+
 use std::collections::VecDeque;
-use std::env;
-use std::fs;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process;
+use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,7 +24,7 @@ use hord_api::{ChangesBackend, RepoBackend, proto, wire};
 use hord_core::sign::SigningKey;
 use hord_core::{Actor, Bytes, ChangeId, Intent, RepoPath};
 use hord_remote::RemoteRepo;
-use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig};
+use hord_server::{AuthStore, Hosts, Server, ServerConfig};
 use hord_txn::{BeginOptions, QueueStatus, ReplayFuture, ReplayHarness, Repo, RepoOptions};
 use hord_ui::UI_TOKEN_COOKIE;
 use hord_ui::audit::{AuditLog, Audited, unlisted};
@@ -36,11 +33,10 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::handshake;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tower::ServiceExt;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+use common::{Dir, Running, TestResult, temp};
 
 /// `parse` before its rename, with a function that keeps it company.
 const LIB: &str = "pub fn parse(input: &str) -> usize {\n    let trimmed = input.trim();\n    trimmed.len() + 1\n}\n\npub fn keep() -> u32 {\n    7\n}\n";
@@ -54,33 +50,6 @@ const LIB_AFTER_MOVE: &str = "pub fn keep() -> u32 {\n    7\n}\n";
 /// `parse_all` moved unchanged (ADR 0033), beside a caller and a test.
 const UTIL: &str = "pub fn parse_all(input: &str) -> usize {\n    let trimmed = input.trim();\n    trimmed.len() + 1\n}\n\npub fn twice(input: &str) -> usize {\n    parse_all(input) * 2\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn parses() {\n        assert_eq!(parse_all(\" a \"), 2);\n    }\n}\n";
 
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    /// A failed removal is reported, not raised: a drop cannot return it.
-    fn drop(&mut self) {
-        if let Err(err) = fs::remove_dir_all(&self.0)
-            && err.kind() != ErrorKind::NotFound
-        {
-            eprintln!("remove temp dir {}: {err}", self.0.display());
-        }
-    }
-}
-
-fn temp(tag: &str) -> std::io::Result<Dir> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = env::temp_dir().join(format!(
-        "hord-browse-{tag}-{}-{}",
-        process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    if path.exists() {
-        fs::remove_dir_all(&path)?;
-    }
-    fs::create_dir_all(&path)?;
-    Ok(Dir(path))
-}
-
 fn agent(id: &str) -> Actor {
     Actor::Agent {
         id: id.into(),
@@ -92,27 +61,6 @@ fn agent(id: &str) -> Actor {
 
 fn path(p: &str) -> TestResult<RepoPath> {
     Ok(p.parse()?)
-}
-
-struct Running {
-    addr: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Running {
-    fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    async fn stop(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
 }
 
 async fn serve(root: &Path, setup: impl FnOnce(Server) -> Server) -> TestResult<Running> {
@@ -133,23 +81,7 @@ async fn serve_harness(
         },
     )
     .await?;
-    let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
-    let addr = listener.local_addr()?;
-    let (stop, stopped) = oneshot::channel::<()>();
-    let server = setup(Server::new(hosts, ServerConfig::default()));
-    let task = tokio::spawn(async move {
-        server
-            .serve(listener, async {
-                let _ = stopped.await;
-            })
-            .await
-            .expect("serve the test server");
-    });
-    Ok(Running {
-        addr,
-        stop: Some(stop),
-        task: Some(task),
-    })
+    Running::start(setup(Server::new(hosts, ServerConfig::default()))).await
 }
 
 /// Write `files` (deleting those given as `None`) in a workspace at head
