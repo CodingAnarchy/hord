@@ -622,6 +622,10 @@ pub fn graph_page(base: &str, reply: &proto::NodeEdgesResponse) -> GraphPage {
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::Query;
+    use axum::http::Uri;
+    use serde::Deserialize;
+
     use super::*;
 
     fn node(id: &str, name: &str, path: &str) -> proto::NodeRef {
@@ -705,6 +709,57 @@ mod tests {
         assert_eq!(c.len(), 3);
         assert_eq!(c[1].path, "src/a");
         assert!(crumbs("").is_empty());
+    }
+
+    /// The `path` query value each `href` in `html` carries once a
+    /// browser has decoded the attribute and the server its query.
+    fn linked_paths(html: &str) -> Vec<String> {
+        #[derive(Deserialize)]
+        struct PathQuery {
+            path: String,
+        }
+        html.split("href=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .map(|href| {
+                href.replace("&#38;", "&")
+                    .replace("&amp;", "&")
+                    .replace("&#39;", "'")
+                    .replace("&#34;", "\"")
+                    .replace("&quot;", "\"")
+            })
+            // The browser does not send the fragment.
+            .map(|href| href.split('#').next().unwrap_or_default().to_owned())
+            .filter_map(|href| href.parse::<Uri>().ok())
+            .filter_map(|uri| Query::<PathQuery>::try_from_uri(&uri).ok())
+            .map(|query| query.0.path)
+            .collect()
+    }
+
+    #[test]
+    fn path_links_survive_names_with_url_syntax() -> Result<(), Box<dyn std::error::Error>> {
+        let names = ["src/+page.svelte", "a&b=c.md", "notes #1.md", "100%.txt"];
+        let page = TreePage {
+            title: String::new(),
+            base: String::new(),
+            snapshot: "s".into(),
+            crumbs: crumbs("src/a b+c"),
+            entries: names
+                .iter()
+                .map(|path| proto::TreeItem {
+                    name: (*path).to_owned(),
+                    path: (*path).to_owned(),
+                    dir: path.ends_with(".md"),
+                    blob: None,
+                })
+                .collect(),
+        };
+        let linked = linked_paths(&page.render()?);
+        assert_eq!(
+            linked,
+            ["src", "src/a b+c", "src/+page.svelte", "a&b=c.md", "notes #1.md", "100%.txt"]
+        );
+        Ok(())
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ node.label }}</h1>
-<p class="legend">{{ kind }}{% if let Some(p) = node.path %} · <a href="{{ base }}/file/{{ snapshot }}?path={{ p }}">{{ p }}</a>{% endif %} · snapshot <code>{{ snapshot }}</code></p>
+<p class="legend">{{ kind }}{% if let Some(p) = node.path %} · <a href="{{ base }}/file/{{ snapshot }}?path={{ p|urlencode }}">{{ p }}</a>{% endif %} · snapshot <code>{{ snapshot }}</code></p>
 <p class="links"><a href="{{ base }}/nodes/{{ node.id }}">lineage</a></p>
 <svg class="graph" viewBox="0 0 {{ width }} {{ height }}" width="100%" role="img" aria-label="references and tests around {{ node.label }}">
   {% for n in drawn %}<line class="edge edge-{{ n.class }}" x1="{{ n.edge_x }}" y1="{{ n.y - 4 }}" x2="{% if n.anchor == "end" %}280{% else %}480{% endif %}" y2="{{ centre }}"/>

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<h1><a href="{{ base }}/tree/{{ snapshot }}">/</a>{% for c in crumbs %}{% if loop.last %}{{ c.name }}{% else %}<a href="{{ base }}/tree/{{ snapshot }}?path={{ c.path }}">{{ c.name }}</a>/{% endif %}{% endfor %}</h1>
+<h1><a href="{{ base }}/tree/{{ snapshot }}">/</a>{% for c in crumbs %}{% if loop.last %}{{ c.name }}{% else %}<a href="{{ base }}/tree/{{ snapshot }}?path={{ c.path|urlencode }}">{{ c.name }}</a>/{% endif %}{% endfor %}</h1>
 <p class="legend">snapshot <code>{{ snapshot }}</code> · blob <code>{{ blob }}</code> · {{ size }} bytes</p>
 <div class="browse">
 <section class="defs">
