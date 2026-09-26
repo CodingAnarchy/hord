@@ -23,13 +23,6 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// The last `n` first-parent commits of `HEAD` that have a parent, oldest
-/// first.
-#[allow(dead_code)]
-pub(crate) fn first_parent_commits(dir: &Path, n: usize) -> Result<Vec<String>> {
-    first_parent_window(dir, "HEAD", 0, n)
-}
-
 /// An era window: `n` consecutive first-parent commits of `head` (each with
 /// a parent), after skipping the newest `skip`; oldest first.
 pub(crate) fn first_parent_window(
