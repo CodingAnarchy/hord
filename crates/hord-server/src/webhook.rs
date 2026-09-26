@@ -21,7 +21,7 @@ use crate::config::WebhookConfig;
 
 /// Names of the event kinds, as `server.toml` filters them: the `Event`
 /// oneof fields of `hord.proto`.
-pub const EVENT_KINDS: [&str; 10] = [
+pub const EVENT_KINDS: [&str; 11] = [
     "submitted",
     "conflict_check",
     "verifying",
@@ -32,6 +32,7 @@ pub const EVENT_KINDS: [&str; 10] = [
     "landed",
     "rejected",
     "head_moved",
+    "bridge_checked",
 ];
 
 /// How long one delivery may take.
@@ -51,6 +52,7 @@ pub fn event_kind_name(kind: &Kind) -> &'static str {
         Kind::Landed(_) => "landed",
         Kind::Rejected(_) => "rejected",
         Kind::HeadMoved(_) => "head_moved",
+        Kind::BridgeChecked(_) => "bridge_checked",
     }
 }
 

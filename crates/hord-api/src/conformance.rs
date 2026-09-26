@@ -195,6 +195,7 @@ impl Fixture {
                 created_at: Timestamp::from_millis(1),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: Default::default(),
             write_set: [NodeId::file_root(&repo_path)].into_iter().collect(),

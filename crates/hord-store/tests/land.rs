@@ -39,6 +39,7 @@ fn record(base: SnapshotId, result: SnapshotId, write: NodeId) -> ChangeRecord {
             created_at: Timestamp::from_millis(0),
             session: None,
             parent_intent: None,
+            voucher: None,
         },
         read_set: Default::default(),
         write_set: [write].into_iter().collect(),

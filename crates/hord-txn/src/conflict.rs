@@ -289,6 +289,7 @@ mod tests {
                 created_at: Timestamp::from_millis(0),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: reads.iter().copied().map(nid).collect(),
             write_set: writes.iter().copied().map(nid).collect(),

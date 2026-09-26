@@ -331,7 +331,7 @@ pub fn names_any(envelope: &proto::EventEnvelope, ids: &BTreeSet<String>) -> boo
             v
         }
         Kind::Rejected(e) => vec![&e.change],
-        Kind::HeadMoved(_) => vec![],
+        Kind::HeadMoved(_) | Kind::BridgeChecked(_) => vec![],
     };
     named.into_iter().any(|id| ids.contains(id))
 }

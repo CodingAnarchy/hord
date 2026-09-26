@@ -639,6 +639,7 @@ impl Inner {
                 created_at: now(),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: Default::default(),
             write_set: Default::default(),
