@@ -602,7 +602,7 @@ impl Bridge {
         let voucher = self.options.voucher.clone();
         let mut store = CacheStore::new(Arc::clone(&self.cache), Handle::current());
         let git_dir = self.export_dir().to_owned();
-        let (change, store) = blocking(move || {
+        let (change, mut store) = blocking(move || {
             let change = propose_git_commit(
                 &mut store,
                 &git_dir,
@@ -610,10 +610,15 @@ impl Bridge {
                 base,
                 intent,
                 voucher,
-            )?;
+            );
             Ok((change, store))
         })
         .await?;
+        // Not the pull request's fault: retried on the next pass.
+        if let Some(err) = store.take_failure() {
+            return Err(err);
+        }
+        let change = change?;
         self.cache.upload(&store.written).await?;
         self.backend
             .submit(proto::SubmitRequest {

@@ -14,8 +14,8 @@ use gix::bstr::{BString, ByteSlice};
 use gix::refs::transaction::PreviousValue;
 use hord_api::proto::event::Kind;
 use hord_api::proto::{self, BridgeCheckTrigger, QueueStatus};
-use hord_api::{RepoBackend, wire};
-use hord_core::{Actor, ChangeId, ChangeRecord, Intent, IntentRef, RepoPath};
+use hord_api::{ApiError, ApiResult, EventStream, RepoBackend, wire};
+use hord_core::{Actor, ChangeId, ChangeRecord, Intent, IntentRef, RepoPath, Snapshot};
 use hord_git::sync::{
     Bridge, BridgeOptions, PullRequest, PullRequests, Reported, ScriptedPulls, StatusState,
 };
@@ -671,5 +671,142 @@ async fn a_newer_push_survives_its_earlier_proposal_landing() -> TestResult {
         .ok_or("the newer push was proposed")?;
     assert_eq!(number, 7);
     assert_ne!(newer, earlier);
+    Ok(())
+}
+
+/// A backend that fails reading one object, once, as a server might during
+/// a restart.
+struct Flaky {
+    inner: Arc<LocalRepo>,
+    fail: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait::async_trait]
+impl RepoBackend for Flaky {
+    async fn get_objects(
+        &self,
+        request: proto::GetObjectsRequest,
+    ) -> ApiResult<proto::GetObjectsResponse> {
+        let failing = {
+            let mut fail = self
+                .fail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let hit = fail.as_ref().is_some_and(|id| request.ids.contains(id));
+            if hit { fail.take() } else { None }
+        };
+        if let Some(id) = failing {
+            return Err(ApiError::Unavailable(format!(
+                "{id}: the server is restarting"
+            )));
+        }
+        self.inner.get_objects(request).await
+    }
+    async fn put_objects(
+        &self,
+        request: proto::PutObjectsRequest,
+    ) -> ApiResult<proto::PutObjectsResponse> {
+        self.inner.put_objects(request).await
+    }
+    async fn has(&self, request: proto::HasRequest) -> ApiResult<proto::HasResponse> {
+        self.inner.has(request).await
+    }
+    async fn head(&self, request: proto::HeadRequest) -> ApiResult<proto::HeadResponse> {
+        self.inner.head(request).await
+    }
+    async fn log(&self, request: proto::LogQuery) -> ApiResult<proto::LogPage> {
+        self.inner.log(request).await
+    }
+    async fn refs(&self, request: proto::RefsRequest) -> ApiResult<proto::RefsResponse> {
+        self.inner.refs(request).await
+    }
+    async fn submit(&self, request: proto::SubmitRequest) -> ApiResult<proto::SubmitResponse> {
+        self.inner.submit(request).await
+    }
+    async fn queue(&self, request: proto::QueueQuery) -> ApiResult<proto::QueueResponse> {
+        self.inner.queue(request).await
+    }
+    async fn arbitrate(
+        &self,
+        request: proto::ArbitrateRequest,
+    ) -> ApiResult<proto::ArbitrateResponse> {
+        self.inner.arbitrate(request).await
+    }
+    async fn node_history(
+        &self,
+        request: proto::NodeHistoryRequest,
+    ) -> ApiResult<proto::NodeHistoryResponse> {
+        self.inner.node_history(request).await
+    }
+    async fn edges(&self, request: proto::EdgesRequest) -> ApiResult<proto::EdgesResponse> {
+        self.inner.edges(request).await
+    }
+    async fn resolve_name(
+        &self,
+        request: proto::ResolveNameRequest,
+    ) -> ApiResult<proto::ResolveNameResponse> {
+        self.inner.resolve_name(request).await
+    }
+    async fn attach_evidence(
+        &self,
+        request: proto::AttachEvidenceRequest,
+    ) -> ApiResult<proto::AttachEvidenceResponse> {
+        self.inner.attach_evidence(request).await
+    }
+    async fn events(&self, request: proto::EventsRequest) -> ApiResult<EventStream> {
+        self.inner.events(request).await
+    }
+    async fn record_bridge_check(
+        &self,
+        request: proto::BridgeChecked,
+    ) -> ApiResult<proto::RecordBridgeCheckResponse> {
+        self.inner.record_bridge_check(request).await
+    }
+}
+
+/// A failed read from the repository while a pull request is proposed is
+/// the connection's fault, not the pull request's: nothing is reported on
+/// it, and the next pass proposes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_failure_while_proposing_is_retried_not_reported() -> TestResult {
+    let t = Setup::new("flaky").await?;
+    let flaky = Arc::new(Flaky {
+        inner: t.backend.clone(),
+        fail: std::sync::Mutex::new(None),
+    });
+    let backend: Arc<dyn RepoBackend> = flaky.clone();
+    let pulls: Arc<dyn PullRequests> = t.pulls.clone();
+    let mut bridge = Bridge::open(backend, Some(pulls), t.options()).await?;
+    bridge.sync_once().await?;
+    let main = t.main()?.ok_or("main after the first sync")?;
+    let head = t.push_commit(
+        main,
+        "notes.txt",
+        "alpha\nbeta (fixed)\ngamma\n",
+        "fix beta\n",
+        "refs/pull/7/head",
+    )?;
+    t.pulls.open(t.pull(7, head, "Fix the notes"));
+
+    // Proposing reads the base's identity tree from the backend.
+    let base = *t.log()?.last().ok_or("a landed change")?;
+    let record: ChangeRecord = Store::get_object(t.repo.store(), base)?;
+    let snapshot: Snapshot = Store::get_object(t.repo.store(), record.result)?;
+    let identity = snapshot
+        .index
+        .identity
+        .ok_or("the base has an identity tree")?;
+    *flaky
+        .fail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(wire::id(identity));
+
+    assert!(
+        bridge.sync_once().await.is_err(),
+        "the failed read is an error"
+    );
+    assert_eq!(t.pulls.reported_on(7), [], "and not the pull request's");
+    let report = bridge.sync_once().await?;
+    assert_eq!(report.proposed.len(), 1, "retried: {report:?}");
     Ok(())
 }

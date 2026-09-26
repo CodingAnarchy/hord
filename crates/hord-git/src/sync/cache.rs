@@ -202,6 +202,9 @@ pub(crate) struct CacheStore {
     cache: Arc<ObjectCache>,
     runtime: Handle,
     pub(crate) written: Vec<ObjectId>,
+    /// The first read from the backend that failed: [`Store`] can only say
+    /// so as an [`Error::Git`], which reads like a fault in the objects.
+    failed: Mutex<Option<SyncError>>,
 }
 
 impl CacheStore {
@@ -210,7 +213,14 @@ impl CacheStore {
             cache,
             runtime,
             written: Vec::new(),
+            failed: Mutex::new(None),
         }
+    }
+
+    /// The first read from the backend that failed, if any: the step failed
+    /// because of the connection, whatever it made of the missing object.
+    pub(crate) fn take_failure(&mut self) -> Option<SyncError> {
+        lock(&self.failed).take()
     }
 }
 
@@ -231,9 +241,11 @@ impl Store for CacheStore {
         if let Some(bytes) = self.cache.cached(id) {
             return Ok(bytes);
         }
-        self.runtime
-            .block_on(self.cache.fetch(&[id]))
-            .map_err(|err| Error::Git(format!("fetch {id}: {err}")))?;
+        if let Err(err) = self.runtime.block_on(self.cache.fetch(&[id])) {
+            let message = format!("fetch {id}: {err}");
+            lock(&self.failed).get_or_insert(err);
+            return Err(Error::Git(message));
+        }
         self.cache.cached(id).ok_or(Error::Missing(id))
     }
 
