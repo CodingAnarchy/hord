@@ -7,8 +7,8 @@ use gix::bstr::{BString, ByteSlice};
 use gix::objs::tree::EntryKind;
 use hord_core::{ChangeRecord, IdentityTree, IntentRef, Snapshot};
 use hord_git::{
-    ExportCache, MemoryStore, Store, export_change, export_tree, git_tree_sha, import_git,
-    import_git_window, snapshot_root,
+    ExportCache, MemoryStore, Store, export_change, export_changes, export_tree, git_tree_sha,
+    import_git, import_git_window, snapshot_root,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -322,6 +322,24 @@ fn export_change_writes_hord_trailers() -> TestResult {
     assert!(text.contains(&format!("Hord-Change: {head}")));
     assert!(text.contains("Hord-Intent: merge side"));
     assert!(text.contains("Hord-Actor: Ada Lovelace <ada@example.com>"));
+    Ok(())
+}
+
+/// Exporting a run of changes at once writes the commits exporting each
+/// alone would.
+#[test]
+fn export_changes_matches_exporting_each() -> TestResult {
+    let (src, _fx) = build_history()?;
+    let mut store = MemoryStore::new();
+    import_git(&mut store, src.path())?;
+    let log = store.log()?;
+    let each = TempDir::new("export-each")?;
+    let one_by_one = log
+        .iter()
+        .map(|id| export_change(&store, *id, each.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = TempDir::new("export-batch")?;
+    assert_eq!(export_changes(&store, &log, batch.path())?, one_by_one);
     Ok(())
 }
 
