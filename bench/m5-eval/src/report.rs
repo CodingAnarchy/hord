@@ -251,9 +251,23 @@ pub fn write_review(out: &Path, results: &[(Case, CaseResult)]) -> Result<()> {
         }
         let _ = writeln!(
             md,
-            "\n```text\n{}\n```\n\nSufficient to resolve: [ ] yes  [ ] no",
+            "\n```text\n{}\n```",
             r.summary.as_deref().unwrap_or("(no summary)").trim_end()
         );
+        // What the replays did, and a harness's explanation when it gave up
+        // (for example, why the intents contradict).
+        if !r.attempts.is_empty() {
+            let _ = writeln!(md, "\nReplay attempts:\n");
+            for a in &r.attempts {
+                let detail = a
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(": {}", d.replace('\n', " ")))
+                    .unwrap_or_default();
+                let _ = writeln!(md, "- {} {}{detail}", a.attempt, a.outcome);
+            }
+        }
+        let _ = writeln!(md, "\nSufficient to resolve: [ ] yes  [ ] no");
         let _ = writeln!(csv, "{},{},{},,", r.id, r.kind, r.ambiguous);
     }
     std::fs::write(out.join("review.md"), md)?;

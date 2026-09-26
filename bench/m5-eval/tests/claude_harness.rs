@@ -172,3 +172,49 @@ fn the_wrapper_runs_claude_with_limited_tools_and_writes_usage() -> TestResult {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+/// `claude.sh --extract-message`: the JSON result's final text, at most
+/// 1,000 characters, with and without jq.
+fn extract_message(input: &str, jq: bool) -> TestResult<Output> {
+    let mut command = Command::new("sh");
+    command
+        .arg(harness_dir().join("claude.sh"))
+        .arg("--extract-message")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !jq {
+        command.env("HORD_M5_NO_JQ", "1");
+    }
+    let mut child = command.spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("stdin")?
+        .write_all(input.as_bytes())?;
+    Ok(child.wait_with_output()?)
+}
+
+#[test]
+fn the_final_message_is_extracted_and_capped() -> TestResult {
+    let long = "x".repeat(3000);
+    let result = format!(
+        r#"{{"type":"result","is_error":false,"result":"{long}","total_cost_usd":0.1,"usage":{{"input_tokens":1,"output_tokens":1}}}}"#
+    );
+    for jq in modes() {
+        let out = extract_message(&sample()?, jq)?;
+        assert!(out.status.success(), "jq {jq}: {out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout)?.trim_end(),
+            "Updated scale_plus_one to call scale(x, 2) and ran cargo test.",
+            "jq {jq}"
+        );
+        let out = extract_message(&result, jq)?;
+        assert_eq!(
+            String::from_utf8(out.stdout)?.trim_end().chars().count(),
+            1000,
+            "jq {jq}"
+        );
+    }
+    Ok(())
+}

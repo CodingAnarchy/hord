@@ -16,8 +16,14 @@
 # directory and ignores user and project settings; --permission-mode dontAsk
 # denies anything not allowed here instead of prompting.
 #
-# `claude.sh --extract-usage < output.json` prints the usage JSON for a
-# saved `claude -p --output-format json` result (used by the tests).
+# The model's final message (the JSON result's text, cut at 1,000
+# characters) goes to $HORD_REPLAY_MESSAGE when hord-replay-ref sets it: when
+# the model changes nothing because the intents contradict, that is its
+# explanation for the arbiter.
+#
+# `claude.sh --extract-usage < output.json` prints the usage JSON, and
+# `claude.sh --extract-message < output.json` the final message, for a saved
+# `claude -p --output-format json` result (used by the tests).
 set -eu
 
 model="${HORD_M5_MODEL:-claude-sonnet-5}"
@@ -62,8 +68,33 @@ extract_usage() {
     printf '{"tokens":%s,"cost_usd":%s,"model":"%s"}\n' "$tokens" "$cost" "$model"
 }
 
+# The final message of a claude -p --output-format json result on stdin,
+# at most 1,000 characters. Empty when there is none.
+extract_message() {
+    out=$(cat)
+    if command -v jq >/dev/null 2>&1 && [ -z "${HORD_M5_NO_JQ:-}" ]; then
+        printf '%s' "$out" | jq -r '(.result // "") | .[0:1000]'
+        return
+    fi
+    # Without jq: the "result" string, escapes kept as written.
+    printf '%s' "$out" | tr -d '\n' |
+        sed -En 's/.*"result"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p' |
+        cut -c1-1000
+}
+
+# Write the final message where hord-replay-ref reads it, if it asked.
+report_message() {
+    if [ -n "${HORD_REPLAY_MESSAGE:-}" ]; then
+        printf '%s' "$1" | extract_message >"$HORD_REPLAY_MESSAGE" 2>/dev/null || true
+    fi
+}
+
 if [ "${1:-}" = "--extract-usage" ]; then
     extract_usage
+    exit 0
+fi
+if [ "${1:-}" = "--extract-message" ]; then
+    extract_message
     exit 0
 fi
 
@@ -90,8 +121,10 @@ result=$("${HORD_M5_CLAUDE:-claude}" "$@") || {
     status=$?
     # Report what was spent, if the CLI said, before failing the attempt.
     printf '%s' "$result" | extract_usage >"$HORD_REPLAY_USAGE" 2>/dev/null || true
+    report_message "$result"
     fail "claude exited with status $status: $result"
 }
+report_message "$result"
 printf '%s' "$result" | extract_usage >"$HORD_REPLAY_USAGE"
 if printf '%s' "$result" | grep -q '"is_error"[[:space:]]*:[[:space:]]*true'; then
     fail "claude reported an error: $result"

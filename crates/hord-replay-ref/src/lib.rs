@@ -19,10 +19,18 @@
 //! | `HORD_WORKSPACE`, `HORD_WORKSPACE_PATH` | the workspace id and directory |
 //! | `HORD_REPO` | the repository root |
 //! | `HORD_REPLAY_COST_USD`, `HORD_REPLAY_TOKENS` | the attempt's cost and token budget, when it has one |
+//! | `HORD_REPLAY_MESSAGE` | where it may write its final message: why it changed nothing, or what it did |
 //!
 //! Its stdout goes to this process's stderr, so the protocol line stays
 //! alone on stdout. A command that exits non-zero, or leaves nothing to
-//! propose, gives up. Budget enforcement is the lander's (ADR 0028): it
+//! propose, gives up, with its final message (cut at 1,000 characters) as
+//! the reason: a model that finds the intents contradict says why, and the
+//! arbiter reads it.
+//!
+//! The prompt ([`prompt`]) is this reference harness's, written for a
+//! model CLI working in the workspace: what to do, the tests it must keep,
+//! the integrity rules the lander enforces (ADR 0034), and the honest exit
+//! when the intents contradict. Other harnesses need their own. Budget enforcement is the lander's (ADR 0028): it
 //! kills this process when the attempt runs out of time, and rejects usage
 //! over budget.
 //!
@@ -32,6 +40,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -148,10 +157,64 @@ pub fn prompt(request: &ReplayRequest) -> String {
             let _ = writeln!(text, "- {test}");
         }
     }
+    let _ = writeln!(text, "\n{INTEGRITY}");
+    let _ = writeln!(text, "\n{HONEST_EXIT}");
     if let Some(note) = &request.note {
         let _ = writeln!(text, "\n## Note from the arbiter\n\n{note}");
     }
     text
+}
+
+/// The prompt's integrity rules (ADR 0034): what the lander checks.
+const INTEGRITY: &str = "## Integrity\n\nFix the code under test, never what the tests see. In particular:\n- no stubs, mocks, or modules in test files that shadow the crate or its items;\n- no behavior that differs under test (`cfg(test)`, checking the binary name or the environment);\n- no `#[ignore]`, and no edits to `Cargo.toml` test targets.\n\nBefore your change can land, hord re-runs the protected tests from their original files against your code, and rejects any change that games them.";
+
+/// The prompt's honest exit: a contradiction goes to a person.
+const HONEST_EXIT: &str = "## If the intents contradict\n\nSome conflicts are genuine contradictions: both intents cannot be met at once. If so, change no files, and end with a short explanation of the contradiction. The change then goes to a human arbiter with your explanation, and that is a correct outcome, not a failure.";
+
+/// Every file under `dir` (build output under `target/` left out) with its
+/// length and modification time: enough to tell whether a command changed
+/// anything.
+fn files_of(dir: &Path) -> BTreeMap<PathBuf, (u64, Option<SystemTime>)> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                if entry.file_name() != "target" {
+                    stack.push(path);
+                }
+            } else {
+                out.insert(path, (meta.len(), meta.modified().ok()));
+            }
+        }
+    }
+    out
+}
+
+/// Longest final message kept as a reason, in characters.
+const MESSAGE_LIMIT: usize = 1_000;
+
+/// The command's final message, trimmed and cut at [`MESSAGE_LIMIT`]
+/// characters; `None` when it wrote none.
+fn final_message(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut out: String = text.chars().take(MESSAGE_LIMIT).collect();
+    if text.chars().count() > MESSAGE_LIMIT {
+        out.push('…');
+    }
+    Some(out)
 }
 
 /// The intent file `hord propose` gets: the original intent, with a ref to
@@ -244,8 +307,10 @@ pub fn replay(request: &ReplayRequest, options: &Options) -> Result<ReplayResult
     let prompt_text = prompt(request);
     let prompt_file = scratch.0.join("prompt.md");
     let usage_file = scratch.0.join("usage.json");
+    let message_file = scratch.0.join("message.txt");
     std::fs::write(&prompt_file, &prompt_text).map_err(io("write the prompt"))?;
     let workspace = Path::new(&request.workspace_path);
+    let before = files_of(workspace);
     let mut command = shell(&options.cmd);
     // The attempt's budget, so a model command can stop itself before the
     // lander rejects the attempt (ADR 0028).
@@ -263,6 +328,7 @@ pub fn replay(request: &ReplayRequest, options: &Options) -> Result<ReplayResult
         .current_dir(workspace)
         .env("HORD_REPLAY_PROMPT_FILE", &prompt_file)
         .env("HORD_REPLAY_USAGE", &usage_file)
+        .env("HORD_REPLAY_MESSAGE", &message_file)
         .env("HORD_REPLAY_CHANGE", &request.change)
         .env("HORD_REPLAY_ATTEMPT", request.attempt.to_string())
         .env("HORD_WORKSPACE", &request.workspace)
@@ -295,10 +361,20 @@ pub fn replay(request: &ReplayRequest, options: &Options) -> Result<ReplayResult
         result.model = usage.model.clone().or_else(|| options.model.clone());
         result
     };
+    let message = final_message(&message_file);
     if !status.success() {
-        return Ok(with_usage(gave_up(format!(
-            "the command exited with {status}"
-        ))));
+        return Ok(with_usage(gave_up(match message {
+            Some(message) => format!("{message} (the command exited with {status})"),
+            None => format!("the command exited with {status}"),
+        })));
+    }
+    // The workspace may hold files the lander put there (the change's own
+    // tests, ADR 0034), so "nothing to propose" is not how to tell that the
+    // command changed nothing: compare the files before and after.
+    if files_of(workspace) == before {
+        return Ok(with_usage(gave_up(
+            message.unwrap_or_else(|| "the command changed nothing".into()),
+        )));
     }
     let intent_path = scratch.0.join("intent.md");
     std::fs::write(&intent_path, intent_file(request)?).map_err(io("write the intent file"))?;
@@ -316,7 +392,19 @@ pub fn replay(request: &ReplayRequest, options: &Options) -> Result<ReplayResult
         .map_err(io(format!("run {}", options.hord.display())))?;
     if !out.status.success() {
         let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-        return Ok(with_usage(gave_up(format!("hord propose failed: {why}"))));
+        // Changing nothing is the honest exit: the command's message says
+        // why.
+        let reason = if why.contains("nothing to propose") {
+            message.unwrap_or_else(|| "the command changed nothing".into())
+        } else {
+            match message {
+                Some(message) => {
+                    format!("hord propose failed: {why} (the command said: {message})")
+                }
+                None => format!("hord propose failed: {why}"),
+            }
+        };
+        return Ok(with_usage(gave_up(reason)));
     }
     let proposed: proto::ProposeResponse =
         serde_json::from_slice(&out.stdout).map_err(|source| Error::Json {
@@ -376,6 +464,15 @@ mod tests {
             "Tests you must not change",
             "- beta_is_20",
             "already in this directory",
+            "## Integrity",
+            "Fix the code under test, never what the tests see",
+            "shadow the crate",
+            "`cfg(test)`",
+            "no `#[ignore]`, and no edits to `Cargo.toml` test targets",
+            "re-runs the protected tests from their original files",
+            "## If the intents contradict",
+            "change no files, and end with a short explanation",
+            "a correct outcome, not a failure",
         ] {
             assert!(text.contains(needle), "{needle:?} in {text}");
         }
