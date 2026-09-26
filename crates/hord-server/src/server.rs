@@ -199,16 +199,17 @@ impl Server {
     fn open_audit_keys(&self) -> Option<Arc<AuthStore>> {
         self.auth.clone().or_else(|| {
             let file = &self.config.auth.as_ref()?.file;
-            match AuthStore::open(file) {
-                Ok(store) => Some(Arc::new(store)),
-                Err(err) => {
-                    eprintln!(
-                        "hord serve: audit without key bindings: {}: {err}",
-                        file.display()
-                    );
-                    None
-                }
+            // A file that cannot be read now is read again when it changes
+            // (the reload task), and an audit meanwhile reports that it
+            // could not check keys: never an audit without bindings.
+            let (store, err) = AuthStore::open_retrying(file);
+            if let Some(err) = err {
+                eprintln!(
+                    "hord serve: key bindings for audits: {}: {err}; retrying when it changes",
+                    file.display()
+                );
             }
+            Some(Arc::new(store))
         })
     }
 

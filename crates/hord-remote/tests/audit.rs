@@ -931,3 +931,29 @@ async fn a_revoked_key_fails_only_what_it_signed_afterwards() -> TestResult {
     assert!(report.changes.iter().any(|c| c.change == before));
     Ok(())
 }
+
+/// An audit whose auth file cannot be read (half-written by an editor, say)
+/// fails and says key checks were skipped, rather than passing without
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_auth_file_fails_the_audit() -> TestResult {
+    let dir = temp("unreadable")?;
+    let repo = Repo::create(dir.0.join("repo")).await?;
+    let auth = dir.0.join("auth.toml");
+    AuthStore::add_user(&auth, "root", "pw", &[Scope::Admin])?;
+    let store = Arc::new(AuthStore::open(&auth)?);
+    std::fs::write(&auth, "[[user]\nname = ")?;
+    let report = LocalAudit::new(Arc::new(LocalRepo::without_lander(repo)), Some(store))
+        .audit_log(window(0)?)
+        .await?;
+    assert!(!report.ok);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|v| v.detail.starts_with("key checks were skipped")),
+        "{:#?}",
+        report.violations
+    );
+    Ok(())
+}

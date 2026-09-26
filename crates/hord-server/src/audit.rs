@@ -168,6 +168,9 @@ pub struct AuditFacts {
     pub require_bridge: bool,
     /// Whether keys were checked against an auth file.
     pub bindings_checked: bool,
+    /// Why the auth file the audit was to check keys against could not be
+    /// read: key checks were skipped, which fails the audit.
+    pub auth_error: Option<String>,
     /// Changes that landed in the window, in log order.
     pub changes: Vec<LandedFacts>,
     /// Arbitrations in the window.
@@ -255,7 +258,13 @@ pub fn judge(facts: &AuditFacts) -> proto::AuditReport {
             ),
         ));
     }
-    if !facts.bindings_checked {
+    if let Some(reason) = &facts.auth_error {
+        violations.push(finding(
+            AuditCriterion::Unspecified,
+            None,
+            format!("key checks were skipped: the auth file could not be read: {reason}"),
+        ));
+    } else if !facts.bindings_checked {
         notes.push(finding(
             AuditCriterion::Unspecified,
             None,
@@ -686,16 +695,21 @@ pub async fn gather(
     // The bindings as the file holds them now, read once on the blocking
     // pool: every lookup below is in memory (a miss on a live store would
     // re-read the file on this async worker, under its lock).
-    let bindings = match auth {
+    // A file that cannot be read is reported, never audited around: key
+    // checks were skipped, and the audit fails.
+    let (bindings, auth_error) = match auth {
         Some(auth) => {
             let path = auth.path().to_owned();
+            let shown = path.display().to_string();
             let opened = tokio::task::spawn_blocking(move || AuthStore::open(&path))
                 .await
-                .map_err(internal)?
                 .map_err(internal)?;
-            Some(opened)
+            match opened {
+                Ok(store) => (Some(store), None),
+                Err(err) => (None, Some(format!("{shown}: {err}"))),
+            }
         }
-        None => None,
+        None => (None, None),
     };
     let auth = bindings.as_ref();
     let since_ms = request.since_ms;
@@ -887,6 +901,7 @@ pub async fn gather(
         max_bridge_gap_ms: request.max_bridge_gap_ms,
         require_bridge: request.require_bridge,
         bindings_checked: auth.is_some(),
+        auth_error,
         changes,
         arbitrations,
         unrecorded,
@@ -1175,6 +1190,7 @@ mod tests {
                 })
                 .collect(),
             uncounted_bridge_checks: 0,
+            auth_error: None,
         }
     }
 
@@ -1433,6 +1449,22 @@ mod tests {
                 .any(|n| n.detail.starts_with("2 bridge check(s)")),
             "{:?}",
             report.notes
+        );
+    }
+
+    #[test]
+    fn an_unreadable_auth_file_fails_the_audit() {
+        let mut facts = clean();
+        facts.bindings_checked = false;
+        facts.auth_error = Some("auth.toml: does not parse".into());
+        let report = judge(&facts);
+        assert!(!report.ok);
+        assert!(
+            report.violations[0]
+                .detail
+                .starts_with("key checks were skipped"),
+            "{:?}",
+            report.violations
         );
     }
 

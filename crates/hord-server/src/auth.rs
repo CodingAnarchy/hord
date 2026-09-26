@@ -301,6 +301,27 @@ impl AuthStore {
         })
     }
 
+    /// [`Self::open`], or when the file cannot be read now, an empty table
+    /// that the next [`Self::reload_if_changed`] reads again, and why it
+    /// could not be read. For a store only audits read (a daemon's key
+    /// bindings), which must not give up on the file for good.
+    pub fn open_retrying(path: &Path) -> (Self, Option<AuthError>) {
+        match Self::open(path) {
+            Ok(store) => (store, None),
+            Err(err) => {
+                let store = Self {
+                    path: path.to_path_buf(),
+                    state: Mutex::new(Loaded {
+                        file: AuthFile::default(),
+                        // No file has this stamp: the next check reads it.
+                        stamp: Some((None, u64::MAX)),
+                    }),
+                };
+                (store, Some(err))
+            }
+        }
+    }
+
     /// Re-read the file now, dropping every token, key, and user it no
     /// longer holds. A file that does not parse (for example half-written
     /// by an editor) is an error, and what was read before stays in force.
@@ -830,6 +851,24 @@ mod tests {
         for file in [&path, &elsewhere, &tmp] {
             let _ = std::fs::remove_file(file);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_that_could_not_open_reads_the_file_once_it_parses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("retrying");
+        std::fs::write(&path, "[[user]\n")?;
+        let (store, err) = AuthStore::open_retrying(&path);
+        assert!(matches!(err, Some(AuthError::Invalid { .. })), "{err:?}");
+        assert!(store.reload_if_changed().is_err(), "still broken");
+        std::fs::remove_file(&path)?;
+        AuthStore::add_user(&path, "ada", "pw", &[Scope::Read])?;
+        assert!(store.reload_if_changed()?, "read once it parses");
+        let key = SigningKey::generate()?.public().key_id();
+        store.login("ada", "pw", &key)?;
+        assert!(store.key_binding(&key).is_some());
+        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
