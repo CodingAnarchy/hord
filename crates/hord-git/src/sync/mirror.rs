@@ -102,7 +102,9 @@ impl Mirror {
         Ok(id)
     }
 
-    /// Push `commit` to `main`: fast-forward only, or `force`d.
+    /// Push `commit` to `main`: fast-forward only, or `force`d. A push the
+    /// remote refuses for another reason (a hook, branch protection) is an
+    /// error.
     pub(crate) async fn push(
         &self,
         commit: gix::ObjectId,
@@ -115,12 +117,27 @@ impl Mirror {
         if out.status.success() {
             return Ok(Pushed::Updated);
         }
-        // `--porcelain` flags a refused ref with `!`.
+        // `--porcelain` flags a refused ref with `!`: `[rejected]` when
+        // `main` has commits the push lacks, `[remote rejected]` or
+        // `[remote failure]` when the remote refused it for its own reasons.
         let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(line) = stdout.lines().find(|l| l.starts_with('!')) {
+        if let Some(line) = stdout
+            .lines()
+            .find(|l| l.starts_with('!') && l.contains("[rejected]"))
+        {
             return Ok(Pushed::Rejected(line.to_owned()));
         }
-        checked("push", out).map(|_| Pushed::Updated)
+        let refused = stdout.lines().find(|l| l.starts_with('!'));
+        Err(SyncError::Command {
+            command: "push".into(),
+            detail: [
+                refused.unwrap_or_default(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ]
+            .join("\n")
+            .trim()
+            .to_owned(),
+        })
     }
 
     async fn run(&self, what: &str, args: &[&str]) -> Result<Output, SyncError> {

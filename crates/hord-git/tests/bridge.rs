@@ -598,3 +598,29 @@ fn the_round_trip_reproduces_every_tree_sha_of_hord_itself() -> TestResult {
     assert_eq!(checked, commits, "every commit of HEAD's history");
     Ok(())
 }
+
+/// A push the remote refuses for a reason other than a non-fast-forward
+/// (a hook, or branch protection that does not admit the bridge) is an
+/// error, not a quiet "main lags the log" on every pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_the_remote_refuses_is_an_error() -> TestResult {
+    let t = Setup::new("refused").await?;
+    t.land("tidy the readme", "README.md", "hello, hord\n")
+        .await?;
+    let hook = t.mirror.join("hooks").join("pre-receive");
+    fs::create_dir_all(t.mirror.join("hooks"))?;
+    fs::write(&hook, "#!/bin/sh\necho 'main is protected' >&2\nexit 1\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+    }
+    let mut bridge = t.bridge().await?;
+    let err = match bridge.sync_once().await {
+        Ok(report) => return Err(format!("the refused push passed: {report:?}").into()),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("main is protected"), "{err}");
+    assert_eq!(t.main()?, None, "nothing was pushed");
+    Ok(())
+}
