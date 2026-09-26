@@ -264,6 +264,9 @@ struct CaseRepo {
 
 impl CaseRepo {
     async fn stop(mut self) {
+        if let Some(pid) = self.server.id() {
+            crate::cleanup::unregister(pid);
+        }
         // `hord serve` stops on Ctrl-C; SIGINT lets it close its store.
         #[cfg(unix)]
         if let Some(pid) = self.server.id() {
@@ -365,6 +368,9 @@ async fn build(cfg: &Config, path: &Path, case: &Case) -> Result<CaseRepo> {
         .kill_on_drop(true)
         .spawn()
         .context("start the case's hord serve")?;
+    if let Some(pid) = server.id() {
+        crate::cleanup::register(pid);
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     let (remote, ui) = loop {
         // Its first line names the address: `hord serve: http://<addr> (...)`.

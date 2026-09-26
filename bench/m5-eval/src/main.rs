@@ -28,6 +28,7 @@
 //! --release -p hord-cli -p hord-replay-ref`), git, and cargo with
 //! cargo-llvm-cov (the lander's verifier runs the tests, ADR 0022).
 
+mod cleanup;
 mod corpus;
 mod generate;
 mod report;
@@ -163,7 +164,11 @@ fn main() -> Result<()> {
         Command::Run(args) => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run(*args)),
+            .block_on(async {
+                // Stopped (Ctrl-C or SIGTERM): stop every child before exiting.
+                tokio::spawn(cleanup::on_signal());
+                run(*args).await
+            }),
     }
 }
 
