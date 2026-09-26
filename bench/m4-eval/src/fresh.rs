@@ -26,7 +26,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -45,6 +46,7 @@ use crate::prepare::{CommitFacts, Prepared};
 use crate::run::{
     Ctx, Fault, Grader, Unit, Worker, cargo, corpus_env, count, elapsed, runner_env, units,
 };
+use crate::{SampleResult, pct, read_json, write_json};
 
 /// The chain's state after a commit, persisted so a run resumes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,28 +196,14 @@ pub(crate) struct FreshRun<'a> {
     pub disk: &'a Monitor,
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
-}
-
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(tmp, path)?;
-    Ok(())
-}
-
 /// Run the chain on `chain_worker` and grade on `graders` as steps arrive.
 pub(crate) fn run(run: &FreshRun<'_>, chain_workers: &[Worker], graders: &[Worker]) -> Result<()> {
     let chain_dir = run.work.join("chain");
     let results_dir = run.work.join("fresh-results");
     fs::create_dir_all(&chain_dir)?;
     let (tx, rx) = mpsc::channel::<ChainStep>();
-    let rx = std::sync::Mutex::new(rx);
-    std::thread::scope(|scope| -> Result<()> {
+    let rx = Mutex::new(rx);
+    thread::scope(|scope| -> Result<()> {
         let chain_dir = &chain_dir;
         // The chain owns the sender: when it finishes, the graders' queue
         // closes after the last step.
@@ -337,7 +325,7 @@ fn chain(
         lines_of_interest: BTreeMap::new(),
         cancel: Default::default(),
     };
-    std::thread::scope(|scope| -> Result<()> {
+    thread::scope(|scope| -> Result<()> {
         let spawn_build = |i: usize| {
             let (worker, target) = (&workers[i % 2], &targets[i % 2]);
             let facts = &commits[i];
@@ -1000,7 +988,7 @@ pub(crate) struct FreshReport {
     /// without a fault, with how many faults they did so for.
     pub unrelated_failures: BTreeMap<String, usize>,
     pub quarantine: Vec<String>,
-    pub sample: Vec<crate::SampleResult>,
+    pub sample: Vec<SampleResult>,
     pub profraw_in_cwd: Vec<String>,
     /// ADR 0023 gate: zero misses, and a median ≤ 20% for write sets ≤ 5.
     pub safety_gate: bool,
@@ -1193,7 +1181,7 @@ pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshRe
     let mut steps = Vec::new();
     let mut chain_steps: Vec<(PathBuf, Vec<ChainStep>)> = Vec::new();
     let mut results = Vec::new();
-    let mut sample: Vec<crate::SampleResult> = Vec::new();
+    let mut sample: Vec<SampleResult> = Vec::new();
     for dir in dirs {
         if dir.join("chain").is_dir() {
             let (c, s, r) = chain_report(dir);
@@ -1204,7 +1192,7 @@ pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshRe
         }
         if let Ok(entries) = fs::read_dir(dir.join("sample")) {
             for e in entries.flatten() {
-                if let Some(r) = read_json::<crate::SampleResult>(&e.path()) {
+                if let Some(r) = read_json::<SampleResult>(&e.path()) {
                     sample.push(r);
                 }
             }
@@ -1275,10 +1263,6 @@ pub(crate) fn report(dirs: &[PathBuf], quarantine: &BTreeSet<String>) -> FreshRe
         chains,
         results,
     }
-}
-
-fn pct(m: Option<f64>) -> String {
-    m.map_or("n/a".to_owned(), |m| format!("{:.1}%", m * 100.0))
 }
 
 /// Print the report, and return its Markdown summary.

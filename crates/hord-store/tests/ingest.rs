@@ -1,30 +1,13 @@
 //! Bulk ingest tests and a 10k-put microbench (M0 git-import hot path).
 
-use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+
 use std::time::Instant;
 
 use hord_core::ObjectId;
 use hord_store::Store;
 
-fn temp_repo() -> std::io::Result<PathBuf> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-store-ingest-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
-struct Guard(PathBuf);
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use common::{Guard, temp_repo};
 
 fn payload(i: u32) -> [u8; 8] {
     u64::from(i).to_le_bytes()

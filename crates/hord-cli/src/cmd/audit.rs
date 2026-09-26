@@ -19,7 +19,7 @@ use time::{Date, OffsetDateTime, Time};
 
 use crate::output;
 use crate::session::{Session, Target};
-use crate::txn::block_on;
+use crate::txn::{block_on, short};
 
 /// `date` (`YYYY-MM-DD`, midnight UTC) or an RFC 3339 time, in ms since
 /// the Unix epoch.
@@ -70,11 +70,6 @@ fn criterion_name(criterion: AuditCriterion) -> &'static str {
         AuditCriterion::BridgeGap => "bridge checks",
         AuditCriterion::Unspecified => "note",
     }
-}
-
-/// The first 12 characters of an id.
-fn short(id: &str) -> String {
-    id.chars().take(12).collect()
 }
 
 fn print_finding(finding: &proto::AuditFinding) {

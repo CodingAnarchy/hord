@@ -1,42 +1,18 @@
 //! Tiny git fixture: import then export must reproduce every tree SHA.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::objs::tree::EntryKind;
 use hord_core::{ChangeRecord, IdentityTree, IntentRef, Snapshot};
 use hord_git::{
-    ExportCache, MemoryStore, Store, export_change, export_tree, git_tree_sha, import_git,
-    import_git_window, snapshot_root,
+    ExportCache, MemoryStore, Store, export_change, export_changes, export_tree, git_tree_sha,
+    import_git, import_git_window, snapshot_root,
 };
 
+use common::TempDir;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> std::io::Result<Self> {
-        let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("hord-git-{prefix}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct Fixture {
     repo: gix::Repository,
@@ -322,6 +298,24 @@ fn export_change_writes_hord_trailers() -> TestResult {
     assert!(text.contains(&format!("Hord-Change: {head}")));
     assert!(text.contains("Hord-Intent: merge side"));
     assert!(text.contains("Hord-Actor: Ada Lovelace <ada@example.com>"));
+    Ok(())
+}
+
+/// Exporting a run of changes at once writes the commits exporting each
+/// alone would.
+#[test]
+fn export_changes_matches_exporting_each() -> TestResult {
+    let (src, _fx) = build_history()?;
+    let mut store = MemoryStore::new();
+    import_git(&mut store, src.path())?;
+    let log = store.log()?;
+    let each = TempDir::new("export-each")?;
+    let one_by_one = log
+        .iter()
+        .map(|id| export_change(&store, *id, each.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = TempDir::new("export-batch")?;
+    assert_eq!(export_changes(&store, &log, batch.path())?, one_by_one);
     Ok(())
 }
 

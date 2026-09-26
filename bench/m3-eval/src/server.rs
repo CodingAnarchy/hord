@@ -215,7 +215,7 @@ pub(crate) async fn run(
                 .context("event stream ended")??;
             recording.record(&next)?;
             count += 1;
-            let settled_change = match next.event.as_ref().and_then(|e| e.kind.as_ref()) {
+            let settled_change = match next.kind() {
                 Some(Kind::Landed(l)) => {
                     Some(l.submitted.clone().unwrap_or_else(|| l.change.clone()))
                 }
@@ -320,7 +320,7 @@ pub(crate) async fn run(
     let mut recorded_landed = HashSet::new();
     let mut recorded_stopped = HashSet::new();
     for event in &events {
-        match event.event.as_ref().and_then(|e| e.kind.as_ref()) {
+        match event.kind() {
             Some(Kind::Landed(l)) => {
                 recorded_landed.insert(l.change.clone());
             }

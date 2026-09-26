@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use hord_api::proto::event::Kind;
 use hord_api::{ApiError, EventCursor, EventStream, proto, wire};
-use hord_core::{ChangeId, Evidence, ObjectId, Provenance};
+use hord_core::{ChangeId, Evidence, ObjectId, Provenance, Timestamp};
 use prost::Message;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use tokio::sync::{broadcast, mpsc};
@@ -24,7 +24,7 @@ use tokio_util::task::TaskTracker;
 use crate::conflict::{ConflictReport, MergeSeverity};
 use crate::escalation::Arbiter;
 use crate::lander::{QueueEntry, QueueStatus};
-use crate::repo::{Inner, lock, now};
+use crate::repo::{Inner, lock};
 use crate::{Error, Result};
 
 /// File name of the event log under `.hord/`.
@@ -103,7 +103,7 @@ impl EventLog {
             return Ok(Vec::new());
         }
         let mut last = lock(&self.last);
-        let at_ms = now().as_millis();
+        let at_ms = Timestamp::now().as_millis();
         let envelopes: Vec<_> = events
             .into_iter()
             .enumerate()

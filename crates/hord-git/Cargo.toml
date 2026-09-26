@@ -19,7 +19,6 @@ hord-encoding.workspace = true
 hord-store.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
 rustls.workspace = true

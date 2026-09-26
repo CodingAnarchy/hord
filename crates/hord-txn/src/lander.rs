@@ -66,7 +66,7 @@ use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRe
 use crate::pinned::Pinned;
 use crate::propose::declared;
 use crate::rebase::rebase;
-use crate::repo::{Head, Inner, Repo, blocking, lock, now};
+use crate::repo::{Head, Inner, Repo, blocking, lock};
 use crate::sets::sets_between;
 use crate::{Error, Result};
 
@@ -610,7 +610,7 @@ impl Inner {
         {
             return Ok(entry);
         }
-        let at = now();
+        let at = Timestamp::now();
         let stored = StoredEntry {
             change,
             status: QueueStatus::Queued,
@@ -872,7 +872,7 @@ impl Inner {
     /// arbitration when no replay is allowed): it is never visible, or
     /// announced, as conflicted in between ([`Inner::enter_ladder`]).
     fn settle(&self, mut entry: QueueEntry) -> Result<QueueEntry> {
-        entry.updated_at = now();
+        entry.updated_at = Timestamp::now();
         if let Some(jobs) = self.enter_ladder(&mut entry)? {
             crate::repo::lock(&self.pending_replays).extend(jobs);
             return Ok(entry);
@@ -1038,7 +1038,7 @@ impl Inner {
     /// The lander's `Rebase` attestation for `submitted` landing as
     /// `result` (ADR 0018 amendment). A pure function of the two records,
     /// so the same landing gives the same landed id anywhere: its time is
-    /// the submitted record's `created_at`. Unsigned until M5.
+    /// the submitted record's `created_at`. Unsigned: the lander has no key.
     fn rebase_attestation(
         &self,
         submitted: ChangeId,
@@ -1156,7 +1156,7 @@ impl Inner {
         }
         entry.status = QueueStatus::Landed { landed: landed_id };
         entry.report = Some(report);
-        entry.updated_at = now();
+        entry.updated_at = Timestamp::now();
         let bytes = hord_encoding::encode(&entry.to_stored())?;
         let names: &[ChangeId] = if landed_id == entry.change {
             &[]

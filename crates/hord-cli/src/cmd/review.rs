@@ -10,8 +10,6 @@
 //! by the server once the review is attached. `hord key verify <evidence>`
 //! checks the signature.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Context, Result};
 use hord_api::auth::Scope;
 use hord_api::{proto, wire};
@@ -60,7 +58,7 @@ pub fn run(json: bool, target: &Target, review: Review) -> Result<()> {
         log: None,
         cost_ms: 0,
         produced_by: signer.actor.clone(),
-        produced_at: now(),
+        produced_at: Timestamp::now(),
         signature: None,
     };
     sign::sign_evidence(&mut evidence, &signer.key)?;
@@ -93,11 +91,4 @@ pub fn run(json: bool, target: &Target, review: Review) -> Result<()> {
         );
         Ok(())
     }
-}
-
-fn now() -> Timestamp {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    Timestamp::from_millis(ms)
 }

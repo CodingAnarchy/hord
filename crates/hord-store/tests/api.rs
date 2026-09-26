@@ -1,35 +1,13 @@
 //! Public API tests for `hord-store`.
 
+mod common;
+
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hord_core::{Blob, ObjectId};
 use hord_store::{Error, Store, WorkspaceId};
 
-fn temp_repo() -> std::io::Result<PathBuf> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-store-api-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
-struct Guard(PathBuf);
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn store() -> Result<(Guard, Store), Box<dyn std::error::Error>> {
-    let path = temp_repo()?;
-    let store = Store::create(&path)?;
-    Ok((Guard(path), store))
-}
+use common::{Guard, store, temp_repo};
 
 #[test]
 fn create_open_round_trip() -> Result<(), Box<dyn std::error::Error>> {

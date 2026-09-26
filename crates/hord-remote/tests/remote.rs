@@ -3,10 +3,11 @@
 //! local endpoint; lazy remote workspaces and `push_change`; the schema
 //! endpoints; gRPC-Web; and webhooks.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,68 +15,11 @@ use hord_api::proto::event::Kind;
 use hord_api::{RepoBackend, proto, wire};
 use hord_core::{Actor, Intent, RepoPath};
 use hord_remote::{RemoteRepo, open_cache, push_change};
-use hord_server::{Hosts, ServeOptions, Server, ServerConfig, WebhookConfig};
+use hord_server::{Hosts, Server, ServerConfig, WebhookConfig};
 use hord_txn::{Base, BeginOptions, Repo, RepoOptions};
 use tokio_stream::StreamExt;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    /// A drop cannot return an error, and panicking there could abort a
-    /// failing test and lose its failure, so a failed removal is reported
-    /// on stderr; `temp` fails loudly if the leftover is still there next
-    /// time.
-    fn drop(&mut self) {
-        if let Err(err) = remove_tree(&self.0) {
-            eprintln!("remove temp dir {}: {err}", self.0.display());
-        }
-    }
-}
-
-/// Remove `path` and everything under it, if it exists. Directory
-/// workspaces keep a read-only pristine checkout under `.hord/pristine/`
-/// (ADR 0016), which `fs::remove_dir_all` alone cannot empty, so write
-/// access is restored to every directory first.
-fn remove_tree(path: &Path) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
-    {
-        return Ok(());
-    }
-    make_writable(path)?;
-    std::fs::remove_dir_all(path)
-}
-
-fn make_writable(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir)?.permissions().mode();
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))?;
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            make_writable(&entry.path())?;
-        }
-    }
-    Ok(())
-}
-
-fn temp(tag: &str) -> std::io::Result<Dir> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-remote-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    // Paths repeat when the OS reuses a pid: clear a stale leftover, or
-    // fail here rather than collide later.
-    remove_tree(&path)?;
-    std::fs::create_dir_all(&path)?;
-    Ok(Dir(path))
-}
+use common::{Running, TestResult, temp};
 
 fn actor(id: &str) -> Actor {
     Actor::Human { id: id.into() }
@@ -89,46 +33,8 @@ fn path(p: &str) -> TestResult<RepoPath> {
     Ok(p.parse()?)
 }
 
-/// A running server: its address and the handle that stops it.
-struct Running {
-    addr: SocketAddr,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Running {
-    fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    async fn stop(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-
 async fn serve(hosts: Hosts, config: ServerConfig) -> TestResult<Running> {
-    let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
-    let addr = listener.local_addr()?;
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = Server::new(hosts, config);
-    let task = tokio::spawn(async move {
-        server
-            .serve(listener, async {
-                let _ = stopped.await;
-            })
-            .await
-            .expect("serve the test server");
-    });
-    Ok(Running {
-        addr,
-        stop: Some(stop),
-        task: Some(task),
-    })
+    Running::start(Server::new(hosts, config)).await
 }
 
 async fn empty_repo(dir: &Path) -> TestResult {

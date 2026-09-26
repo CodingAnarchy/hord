@@ -1,9 +1,8 @@
 //! Edge and node-history index (spec §3.8, §8.1).
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hord_core::{
     Actor, Blob, ChangeRecord, IdentityDelta, Intent, NodeId, ObjectId, Op, Provenance, RepoPath,
@@ -12,29 +11,7 @@ use hord_core::{
 use hord_store::{EdgeKind, Error, Store};
 use proptest::prelude::*;
 
-fn temp_repo() -> std::io::Result<PathBuf> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-store-index-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
-struct Guard(PathBuf);
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn store() -> Result<(Guard, Store), Box<dyn std::error::Error>> {
-    let path = temp_repo()?;
-    let store = Store::create(&path)?;
-    Ok((Guard(path), store))
-}
+use common::{Guard, store, temp_repo};
 
 fn snap(n: u8) -> SnapshotId {
     let mut bytes = [0u8; 32];

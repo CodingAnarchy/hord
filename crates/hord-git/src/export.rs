@@ -201,6 +201,25 @@ pub fn export_change<S: Store>(
     export_change_into(store, change_id, &repo, &cache).map(GitOid::from_gix)
 }
 
+/// Export each of `changes` as [`export_change`] does, in order, into one
+/// repository opened once; their commits, in order.
+///
+/// Trees and blobs are projected once for the whole batch, so exporting a
+/// run of landed changes costs what they changed, not a full tree walk
+/// each.
+pub fn export_changes<S: Store>(
+    store: &S,
+    changes: &[ChangeId],
+    git_dir: impl AsRef<Path>,
+) -> Result<Vec<GitOid>, Error> {
+    let repo = open_or_init(git_dir.as_ref())?;
+    let cache = ExportCache::default();
+    changes
+        .iter()
+        .map(|id| export_change_into(store, *id, &repo, &cache).map(GitOid::from_gix))
+        .collect()
+}
+
 /// Export `change_id` and any unexported ancestors, parents before children.
 ///
 /// Depth-first with an explicit stack: a linear history is as deep as it is
