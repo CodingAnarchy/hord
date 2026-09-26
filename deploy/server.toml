@@ -1,0 +1,24 @@
+# server.toml for a hord team host (docs/hosting.md). Relative paths are
+# relative to this file. Install it as /srv/hord/hord/.hord/server.toml,
+# beside the hosted repository's store, or pass --config.
+
+# TLS lets hord serve bind every interface without --insecure-bind
+# (ADR 0032).
+bind = "0.0.0.0:7878"
+
+# The host's certificate chain (leaf first) and private key, PEM.
+# See docs/hosting.md for a certificate from a public CA, your own CA, or a
+# terminating proxy instead.
+[tls]
+cert = "/etc/hord/tls/cert.pem"
+key = "/etc/hord/tls/key.pem"
+
+# Users and agent tokens (`hord user add`, `hord token mint`). With it, every
+# call needs a bearer token, and the server sets provenance from the token.
+[auth]
+file = "/etc/hord/auth.toml"
+
+# Chat notifications or external CI, if you want them (http:// only).
+# [[webhook]]
+# url = "http://127.0.0.1:9000/hord"
+# kinds = ["parked", "landed", "rejected"]

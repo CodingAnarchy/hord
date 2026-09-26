@@ -1,0 +1,42 @@
+# systemd unit for a hord team host serving one repository (docs/hosting.md).
+#
+#   install -m 0644 deploy/hord.service /etc/systemd/system/hord.service
+#   systemctl daemon-reload && systemctl enable --now hord
+[Unit]
+Description=hord serve: the team host for one hord repository
+Documentation=file:///srv/hord/hord/docs/hosting.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hord
+Group=hord
+# The hosted repository (`hord init --from-git` made it) and its server.toml.
+WorkingDirectory=/srv/hord/hord
+ExecStart=/usr/local/bin/hord serve --repo /srv/hord/hord --config /srv/hord/hord/.hord/server.toml
+# hord serve stops cleanly on SIGINT: it ends event streams, stops the
+# lander, and releases the store.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+# The server's own identity (~/.hord: its key signs web UI reviews).
+Environment=HORD_HOME=/srv/hord/home
+Environment=HORD_ACTOR=hord-host
+# The lander verifies changes with cargo (spec §6.5): a toolchain the hord
+# user owns.
+Environment=CARGO_HOME=/srv/hord/cargo
+Environment=RUSTUP_HOME=/srv/hord/rustup
+Environment=PATH=/srv/hord/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+# Hardening: hord needs its repository, its home, and to read /etc/hord.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/hord
+ReadOnlyPaths=/etc/hord
+
+[Install]
+WantedBy=multi-user.target

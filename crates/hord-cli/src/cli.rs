@@ -209,7 +209,7 @@ pub enum Command {
     },
     /// Log in to a remote: store a bearer token for it (spec §10.5.4).
     Login {
-        /// Remote name, or its http:// address.
+        /// Remote name, or its http[s]:// address.
         #[arg(value_name = "REMOTE")]
         remote: String,
         /// User name in the server's user table (default: `HORD_ACTOR`,
