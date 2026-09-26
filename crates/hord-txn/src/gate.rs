@@ -301,6 +301,14 @@ impl VerifierFactory for RustFactory {
             tool: "rustc".into(),
             message: "no toolchain".into(),
         })?;
+        // Per-test coverage needs cargo-llvm-cov (which the toolchain
+        // records only when it is installed) and a POSIX shell. Without
+        // them the tests run as planned, whole packages or the workspace
+        // (ADR 0022): a missing optional tool must not fail every change.
+        let coverage_tool = cfg!(unix)
+            && toolchain
+                .components
+                .contains_key(hord_verify_rust::coverage::LLVM_COV);
         let workspace = hord_verify_rust::CargoWorkspace::load(&checkout.root)?;
         let mut verifier = hord_verify_rust::RustVerifier::new(toolchain, workspace)?
             .with_coverage(coverage)
@@ -315,7 +323,7 @@ impl VerifierFactory for RustFactory {
             Some(dir) => dir.join("hord-coverage"),
             None => checkout.root.join("target").join("hord-coverage"),
         };
-        let instrumented = RustInstrumented {
+        let instrumented = coverage_tool.then(|| RustInstrumented {
             verifier: verifier.clone(),
             options: hord_verify_rust::CoverageOptions {
                 packages: None,
@@ -327,10 +335,10 @@ impl VerifierFactory for RustFactory {
                 lines_of_interest: BTreeMap::new(),
                 cancel: cancel.clone(),
             },
-        };
+        });
         Ok(Built {
             verifier: Box::new(verifier),
-            instrumented: Some(Box::new(instrumented)),
+            instrumented: instrumented.map(|i| Box::new(i) as Box<dyn InstrumentedTests>),
         })
     }
 }
@@ -1467,5 +1475,44 @@ impl crate::Repo {
             plan,
             verdict,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A toolchain without cargo-llvm-cov verifies tests as planned
+    /// (whole packages or the workspace) instead of failing every change
+    /// on `cargo llvm-cov show-env` (the CI test jobs, which do not
+    /// install it, parked every M5 case).
+    #[test]
+    fn without_cargo_llvm_cov_tests_run_uninstrumented() -> hord_verify::Result<()> {
+        let root = std::env::temp_dir().join(format!("hord-gate-nocov-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )?;
+        std::fs::write(root.join("src/lib.rs"), "")?;
+        let checkout = Checkout {
+            root: root.clone(),
+            snapshot: hord_core::ObjectId::from_bytes([1; 32]),
+        };
+        let built = |components: &[&str]| {
+            let factory = RustFactory::new(root.clone());
+            let mut toolchain = Toolchain::new("rust").with("rustc", "rustc 1.0.0");
+            for c in components {
+                toolchain = toolchain.with(*c, format!("{c} 1.0.0"));
+            }
+            let _ = factory.toolchain.set(Some(toolchain));
+            factory.build(&checkout, None, None, &Cancel::default())
+        };
+        let without = built(&[]);
+        let with = built(&[hord_verify_rust::coverage::LLVM_COV]);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(without?.instrumented.is_none());
+        assert_eq!(with?.instrumented.is_some(), cfg!(unix));
+        Ok(())
     }
 }
