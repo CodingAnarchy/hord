@@ -244,21 +244,28 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Kill `child` and everything it started: its process group on Unix, its
-/// process tree on Windows (which has no process groups), so a hung
-/// grandchild cannot keep holding the output pipes.
+/// Kill `child` and everything it started, so a hung grandchild cannot
+/// keep holding the output pipes.
 fn kill_group(child: &mut std::process::Child) {
+    kill_tree(child.id());
+    let _ = child.kill();
+}
+
+/// Kill process `pid` and everything it started: its process group on Unix
+/// (so `pid` must lead one, spawned with `process_group(0)`), its process
+/// tree on Windows, which has no process groups. A group or tree that is
+/// gone already is not an error.
+pub fn kill_tree(pid: u32) {
     #[cfg(unix)]
-    signal_group(child.id());
+    signal_group(pid);
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
-    let _ = child.kill();
 }
 
 /// `kill` arguments that send SIGKILL to the process group `pgid`.

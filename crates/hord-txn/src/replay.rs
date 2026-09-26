@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use hord_api::{proto, wire};
 use hord_core::{Acceptance, ChangeRecord, IntentRef, ReplayBudget};
+use hord_verify_rust::kill_tree;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::Result;
@@ -161,24 +162,9 @@ struct ProcessGroup(Option<u32>);
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        // The group id is the harness's pid (`process_group(0)`).
         if let Some(pid) = self.0 {
-            // The group id is the harness's pid (`process_group(0)`). A
-            // group that is gone already is not an error.
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        #[cfg(windows)]
-        if let Some(pid) = self.0 {
-            // A tree that is gone already is not an error.
-            let _ = std::process::Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            kill_tree(pid);
         }
     }
 }

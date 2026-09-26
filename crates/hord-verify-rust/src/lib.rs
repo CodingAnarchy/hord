@@ -34,6 +34,8 @@ pub use cancel::Cancel;
 pub use cargo::{CargoWorkspace, Package, Target};
 pub use coverage::{CoverageOptions, CoverageRun, DefinitionIndex, TestFilter};
 pub use facts::{diff_rust_file, rust_traits};
-pub use runner::{CargoRunner, DEFAULT_IDLE_TIMEOUT, DEFAULT_TIMEOUT, RunOutput, detect_toolchain};
+pub use runner::{
+    CargoRunner, DEFAULT_IDLE_TIMEOUT, DEFAULT_TIMEOUT, RunOutput, detect_toolchain, kill_tree,
+};
 pub use select::{Fallback, SelectInput, Selection, select, select_ignoring};
 pub use verifier::{InstrumentedRun, RustVerifier, requirement};
