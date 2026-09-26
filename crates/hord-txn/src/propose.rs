@@ -40,12 +40,12 @@ use std::sync::Arc;
 
 use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, IdentityDelta, Intent, LangId, NodeId, ObjectId, Op,
-    Provenance, RepoPath, SnapshotId, TreeOpKind,
+    Provenance, RepoPath, SnapshotId, Timestamp, TreeOpKind,
 };
 use hord_lang::{Anchor, IdentifiedTree, NodeTree, Site, enclosing_site};
 use serde::{Deserialize, Serialize};
 
-use crate::repo::{Inner, now};
+use crate::repo::Inner;
 use crate::semantic::{FileView, Parsed, RustCtx, carry, enclosing, result_anchor};
 use crate::sets::sets_between;
 use crate::snapshot::IdentityEdits;
@@ -204,7 +204,7 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
         provenance: Provenance {
             actor: input.actor,
             toolchain: inner.toolchain,
-            created_at: now(),
+            created_at: Timestamp::now(),
             session: input.session,
             parent_intent: None,
             voucher: None,

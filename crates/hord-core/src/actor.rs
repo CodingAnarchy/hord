@@ -1,5 +1,7 @@
 //! Actors and timestamps attached to changes and evidence.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 use crate::Bytes;
@@ -55,6 +57,16 @@ impl Timestamp {
     #[must_use]
     pub const fn as_millis(self) -> u64 {
         self.0
+    }
+
+    /// The wall clock now: 0 if it reads before the epoch, and
+    /// `u64::MAX` past the year 584 million.
+    #[must_use]
+    pub fn now() -> Self {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        Self(ms)
     }
 }
 

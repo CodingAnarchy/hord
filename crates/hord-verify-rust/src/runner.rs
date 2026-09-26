@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use hord_core::{Actor, Evidence, EvidenceResult, ObjectId, SnapshotId, Timestamp};
 use hord_verify::{Check, EvidenceFields, EvidenceIndex, Result, Toolchain, put_log};
@@ -234,7 +234,7 @@ impl CargoRunner {
             log: Some(log),
             cost_ms: output.elapsed_ms,
             produced_by: self.actor.clone(),
-            produced_at: now(),
+            produced_at: Timestamp::now(),
         }
         .build())
     }
@@ -286,14 +286,6 @@ fn signal_group(pgid: u32) {
         .args(group_kill_args(pgid))
         .stderr(Stdio::null())
         .status();
-}
-
-pub(crate) fn now() -> Timestamp {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    Timestamp::from_millis(ms)
 }
 
 /// Spawn `cmd` with piped output, read both pipes, and kill it after
