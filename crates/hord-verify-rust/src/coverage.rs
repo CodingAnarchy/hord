@@ -501,6 +501,7 @@ pub fn build_suite_with_env(
             "--message-format=json-render-diagnostics",
         ])
         .current_dir(&root)
+        .env("CARGO_TERM_COLOR", "never")
         .envs(&env)
         .envs(extra_env)
         .stdin(Stdio::null())
@@ -579,6 +580,7 @@ pub fn build_suite_with_env(
             script.display()
         ))
         .current_dir(&root)
+        .env("CARGO_TERM_COLOR", "never")
         .envs(&env)
         .envs(extra_env)
         .env("HORD_CAPTURE_DIR", work.join("capture"))

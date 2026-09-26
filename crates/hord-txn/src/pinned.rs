@@ -22,6 +22,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hord_core::{ChangeId, ChangeRecord, NodeId, RepoPath};
+use hord_verify_rust::libtest::strip_ansi;
 
 use crate::repo::{Inner, fs_path, now};
 use crate::{Error, Result};
@@ -283,27 +284,6 @@ fn parse(output: &str) -> Vec<(String, String, Ran)> {
             continue;
         };
         out.push((target.clone(), name.to_owned(), ran));
-    }
-    out
-}
-
-/// `line` without ANSI escape sequences (`ESC [ … letter`), in case color
-/// reaches the output anyway.
-fn strip_ansi(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        out.push(c);
     }
     out
 }

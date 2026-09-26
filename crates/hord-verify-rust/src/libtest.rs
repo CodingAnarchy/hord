@@ -22,6 +22,8 @@ impl TestReport {
     pub fn parse(stdout: &str) -> Self {
         let mut report = Self::default();
         for line in stdout.lines() {
+            let line = strip_ansi(line);
+            let line = line.as_str();
             if let Some(rest) = line.strip_prefix("test ")
                 && let Some(name) = rest
                     .strip_suffix(" - should panic ... FAILED")
@@ -56,9 +58,32 @@ fn count(summary: &str, word: &str) -> u64 {
 pub fn parse_list(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .filter_map(|l| l.strip_suffix(": test"))
-        .map(str::to_owned)
+        .map(strip_ansi)
+        .filter_map(|l| l.strip_suffix(": test").map(str::to_owned))
         .collect()
+}
+
+/// `text` without ANSI escape sequences (`ESC [ … letter`): cargo and
+/// libtest color their output when told to (CI often sets
+/// `CARGO_TERM_COLOR=always`), and the parsers read plain text.
+#[must_use]
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -77,6 +102,12 @@ mod tests {
             ["a::c".to_owned(), "e".to_owned()].into_iter().collect()
         );
         assert_eq!((r.passed, r.ignored, r.binaries), (5, 1, 2));
+        // Colored output (`--color always`) reads the same.
+        let colored = "test a::c ... \u{1b}[31mFAILED\u{1b}[0m\n\
+                       test result: \u{1b}[31mFAILED\u{1b}[0m. 1 passed; 1 failed; 0 ignored\n";
+        let r = TestReport::parse(colored);
+        assert_eq!(r.failed, ["a::c".to_owned()].into_iter().collect());
+        assert_eq!((r.passed, r.binaries), (1, 1));
     }
 
     #[test]

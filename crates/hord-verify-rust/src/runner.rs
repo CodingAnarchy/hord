@@ -14,7 +14,7 @@ use hord_core::{Actor, Evidence, EvidenceResult, ObjectId, SnapshotId, Timestamp
 use hord_verify::{Check, EvidenceFields, EvidenceIndex, Result, Toolchain, put_log};
 
 use crate::cancel::Cancel;
-use crate::libtest::TestReport;
+use crate::libtest::{TestReport, strip_ansi};
 
 /// Detect the Rust toolchain a checkout builds with (its
 /// `rust-toolchain` file applies, since the tools run in `dir`).
@@ -196,7 +196,9 @@ impl CargoRunner {
             .current_dir(root.join(check.dir.to_string()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Plain output unless the check asks otherwise.
+            .env("CARGO_TERM_COLOR", "never");
         if let Some(dir) = &self.target_dir {
             cmd.env("CARGO_TARGET_DIR", dir);
         }
@@ -391,8 +393,10 @@ pub(crate) fn run_captured(
         signal_group(child.id());
     }
     let drained = Instant::now() + PIPE_GRACE;
-    let stdout = out_reader.collect(drained);
-    let stderr = err_reader.collect(drained);
+    // Plain text whatever colors the command was told to use: the report,
+    // the build check, the failure summary, and the stored log read it.
+    let stdout = strip_ansi(&out_reader.collect(drained));
+    let stderr = strip_ansi(&err_reader.collect(drained));
     let report = TestReport::parse(&stdout);
     let code = if timed_out || cancelled {
         None
@@ -523,6 +527,16 @@ mod tests {
             out.failure_summary()
                 .expect("failure summary")
                 .starts_with("build failed: error[E0308]")
+        );
+        // Colored the way CARGO_TERM_COLOR=always colors it: the same.
+        let colored = sh(
+            "printf '\\033[1m\\033[91merror[E0308]\\033[0m: mismatched types\\n\\033[1m\\033[91merror\\033[0m: could not compile `x`\\n' >&2; exit 101",
+        );
+        let out = runner.run(&root, &colored).expect("run the shell check");
+        assert!(out.build_failed, "{out:?}");
+        assert_eq!(
+            out.failure_summary().as_deref(),
+            Some("build failed: error[E0308]: mismatched types")
         );
 
         let idle = CargoRunner {
