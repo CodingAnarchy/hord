@@ -428,10 +428,14 @@ async fn lineage_trace_and_browser_answer_over_the_wire() -> TestResult {
         assert!(stages.contains(&stage), "{stage:?} in {stages:?}");
     }
     let at = |stage| stages.iter().position(|s| *s == stage);
-    // The lander records `Arbitrated` once the resolution lands, so the
-    // two may come in either order; both follow the park.
+    // Causal order: parked, then the arbiter's decision, then the
+    // resolution landing (the lander records `Arbitrated` after the
+    // landing; the trace must not read that way).
     assert!(at(proto::TraceStage::Parked) < at(proto::TraceStage::Arbitrated));
-    assert!(at(proto::TraceStage::Parked) < at(proto::TraceStage::Landed));
+    assert!(
+        at(proto::TraceStage::Arbitrated) < at(proto::TraceStage::Landed),
+        "{stages:?}"
+    );
     assert!(
         trace.steps.windows(2).all(|w| w[0].at_ms <= w[1].at_ms),
         "the timeline is in time order"
@@ -577,8 +581,15 @@ async fn views_four_to_six_render_and_call_only_listed_rpcs() -> TestResult {
     assert_eq!(status, 200, "{page}");
     has(&page, "Make twice quadruple")?;
     has(&page, "collide with a landed change")?;
-    has(&page, "resolved it as")?;
-    has(&page, "landed at #")?;
+    let decided = page.find("resolved it as").ok_or("the decision")?;
+    let landed = page.find("landed at #").ok_or("the landing")?;
+    let parked = page
+        .find("collide with a landed change")
+        .ok_or("the park")?;
+    assert!(
+        parked < decided && decided < landed,
+        "parked, then decided, then landed"
+    );
     has(&page, "export JSON")?;
     let (status, json) = get(&router, &format!("/trace/{}/json", sc.parked)).await?;
     assert_eq!(status, 200, "{json}");

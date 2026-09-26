@@ -17,7 +17,7 @@ use hord_ui::present::attempt_outcome;
 use hord_ui::view::{actor_label, evidence_kind_label, evidence_result_label, short_id};
 use hord_verify::line_range;
 
-use crate::changes::{LocalChanges, Names, op_view};
+use crate::changes::{LocalChanges, Names, names_any, op_view};
 
 impl LocalChanges {
     /// The snapshot a request names, or head's result when it names none.
@@ -561,12 +561,19 @@ fn trace_steps(
         }
         steps.push(step);
     }
+    // Each step, with whether it is evidence about the record it landed as.
+    let mut steps: Vec<(proto::TraceStep, bool)> = steps.into_iter().map(|s| (s, false)).collect();
     let mut seen = BTreeSet::new();
-    for ev in submitted
+    let evidence = submitted
         .evidence
         .iter()
-        .chain(landed.into_iter().flat_map(|l| l.evidence.iter()))
-    {
+        .map(|ev| (ev, ev.source == "landed"))
+        .chain(
+            landed
+                .into_iter()
+                .flat_map(|l| l.evidence.iter().map(|ev| (ev, true))),
+        );
+    for (ev, of_landed) in evidence {
         if !seen.insert(ev.id.clone()) {
             continue;
         }
@@ -575,27 +582,74 @@ fn trace_steps(
             Some(proto::evidence_kind::Kind::Review(_))
         );
         let (class, result) = evidence_result_label(ev.result.as_ref());
-        steps.push(proto::TraceStep {
-            at_ms: ev.produced_at_ms,
-            stage: if review {
-                proto::TraceStage::Review
-            } else {
-                proto::TraceStage::Evidence
-            }
-            .into(),
-            text: format!(
-                "{}: {result} ({}, {})",
-                evidence_kind_label(ev.kind.as_ref(), ev.qualifier.as_deref()),
-                ev.command,
-                ev.source
-            ),
-            outcome: Some(class.to_owned()),
-            actor: ev.produced_by.clone(),
-            ..Default::default()
-        });
+        steps.push((
+            proto::TraceStep {
+                at_ms: ev.produced_at_ms,
+                stage: if review {
+                    proto::TraceStage::Review
+                } else {
+                    proto::TraceStage::Evidence
+                }
+                .into(),
+                text: format!(
+                    "{}: {result} ({}, {})",
+                    evidence_kind_label(ev.kind.as_ref(), ev.qualifier.as_deref()),
+                    ev.command,
+                    ev.source
+                ),
+                outcome: Some(class.to_owned()),
+                actor: ev.produced_by.clone(),
+                ..Default::default()
+            },
+            of_landed,
+        ));
     }
     // Stable: equal times keep the order above (intent before proposal,
     // events in cursor order).
-    steps.sort_by_key(|s| s.at_ms);
-    steps
+    steps.sort_by_key(|(s, _)| s.at_ms);
+    decisions_first(&mut steps, &submitted.history);
+    steps.into_iter().map(|(s, _)| s).collect()
+}
+
+/// Put each arbitration decision before its resolution, in causal order
+/// (decision → resolution submitted → landed). The lander records
+/// `Arbitrated` only once the resolution lands, so by event time the
+/// landing would come first. The decision moves to the first step about
+/// its resolution (an event naming it, or evidence about the record it
+/// landed as) and takes that step's time: it was made no later.
+fn decisions_first(steps: &mut Vec<(proto::TraceStep, bool)>, history: &[proto::EventEnvelope]) {
+    let event = |cursor: Option<u64>| cursor.and_then(|c| history.iter().find(|e| e.cursor == c));
+    for decision in history {
+        let Some(Kind::Arbitrated(a)) = kind_of(decision) else {
+            continue;
+        };
+        // The resolution's ids: as the arbiter gave it, and as it landed.
+        let mut ids = BTreeSet::from([a.result.clone()]);
+        for e in history {
+            if let Some(Kind::Landed(l)) = kind_of(e)
+                && (ids.contains(&l.change)
+                    || l.submitted.as_ref().is_some_and(|s| ids.contains(s)))
+            {
+                ids.insert(l.change.clone());
+                ids.extend(l.submitted.clone());
+            }
+        }
+        let Some(at) = steps
+            .iter()
+            .position(|(s, _)| s.cursor == Some(decision.cursor))
+        else {
+            continue;
+        };
+        let first = steps[..at].iter().position(|(s, of_landed)| {
+            *of_landed
+                || event(s.cursor).is_some_and(|e| {
+                    !matches!(kind_of(e), Some(Kind::Arbitrated(_))) && names_any(e, &ids)
+                })
+        });
+        if let Some(first) = first {
+            let (mut step, flag) = steps.remove(at);
+            step.at_ms = steps[first].0.at_ms;
+            steps.insert(first, (step, flag));
+        }
+    }
 }

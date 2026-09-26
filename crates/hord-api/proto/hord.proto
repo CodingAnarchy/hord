@@ -1668,7 +1668,10 @@ enum TraceStage {
 
 // One step of a provenance trace.
 message TraceStep {
-  // When it happened.
+  // When it happened. Steps are in causal order: an arbitration decision
+  // comes before its resolution's steps and carries the time of the first
+  // of them, since the lander records `Arbitrated` only once the
+  // resolution lands.
   uint64 at_ms = 1;
   // Its stage.
   TraceStage stage = 2;
