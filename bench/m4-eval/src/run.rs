@@ -109,22 +109,7 @@ pub(crate) fn failure_excerpts(
     max_tests: usize,
     max_lines: usize,
 ) -> Vec<(String, String)> {
-    let mut blocks: Vec<(String, Vec<&str>)> = Vec::new();
-    let mut current: Option<(String, Vec<&str>)> = None;
-    for line in stdout.lines() {
-        let header = line
-            .strip_prefix("---- ")
-            .and_then(|l| l.strip_suffix(" stdout ----"));
-        if let Some(name) = header {
-            blocks.extend(current.take());
-            current = Some((name.to_owned(), Vec::new()));
-        } else if line == "failures:" || line.starts_with("test result:") {
-            blocks.extend(current.take());
-        } else if let Some((_, lines)) = &mut current {
-            lines.push(line);
-        }
-    }
-    blocks.extend(current);
+    let blocks = failure_blocks(stdout);
     let module = |name: &str| name.split("::").next().unwrap_or_default().to_owned();
     let mut picked: Vec<usize> = Vec::new();
     let mut modules = BTreeSet::new();
@@ -143,14 +128,44 @@ pub(crate) fn failure_excerpts(
         .into_iter()
         .map(|i| {
             let (name, lines) = &blocks[i];
-            let mut text: Vec<&str> = lines.iter().take(max_lines).copied().collect();
-            if lines.len() > max_lines {
-                text.push("[...]");
-            }
-            (name.clone(), text.join("\n"))
+            (name.clone(), cut(lines, max_lines))
         })
         .collect()
 }
+
+/// Each failing test's block of libtest's `failures:` section: its name
+/// and output lines.
+fn failure_blocks(stdout: &str) -> Vec<(String, Vec<&str>)> {
+    let mut blocks: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in stdout.lines() {
+        let header = line
+            .strip_prefix("---- ")
+            .and_then(|l| l.strip_suffix(" stdout ----"));
+        if let Some(name) = header {
+            blocks.extend(current.take());
+            current = Some((name.to_owned(), Vec::new()));
+        } else if line == "failures:" || line.starts_with("test result:") {
+            blocks.extend(current.take());
+        } else if let Some((_, lines)) = &mut current {
+            lines.push(line);
+        }
+    }
+    blocks.extend(current);
+    blocks
+}
+
+/// `lines` joined, cut to `max_lines` with a `[...]` marker.
+fn cut(lines: &[&str], max_lines: usize) -> String {
+    let mut text: Vec<&str> = lines.iter().take(max_lines).copied().collect();
+    if lines.len() > max_lines {
+        text.push("[...]");
+    }
+    text.join("\n")
+}
+
+/// Lines kept of each failing test's output in a grader run.
+pub(crate) const GRADER_EXCERPT_LINES: usize = 40;
 
 /// Where one worker builds and runs.
 pub(crate) struct Worker {
@@ -595,9 +610,25 @@ pub(crate) struct Grader<'a> {
     pub failed: BTreeSet<Unit>,
     pub unattributed: bool,
     pub timed_out: bool,
+    /// Each failing test's output (by libtest name), cut to
+    /// [`GRADER_EXCERPT_LINES`]: the first failure kept.
+    pub excerpts: BTreeMap<String, String>,
 }
 
-impl Grader<'_> {
+impl<'a> Grader<'a> {
+    /// A grader that has run nothing yet.
+    pub(crate) fn new(runner: &'a CargoRunner, root: &'a Path) -> Self {
+        Self {
+            runner,
+            root,
+            ran: BTreeSet::new(),
+            failed: BTreeSet::new(),
+            unattributed: false,
+            timed_out: false,
+            excerpts: BTreeMap::new(),
+        }
+    }
+
     /// Run `batch` (in order, one command per test binary, doctest set, or
     /// package filter) until `stop` holds after a command.
     pub(crate) fn run(
@@ -605,6 +636,12 @@ impl Grader<'_> {
         batch: Vec<Unit>,
         stop: &dyn Fn(&BTreeSet<Unit>) -> bool,
     ) -> Result<()> {
+        // A read-only test that failed in an earlier command left its
+        // scratch tree unwritable; open it up so this command's runs of the
+        // same tests start clean (and a clean re-run means something).
+        if let Some(target) = &self.runner.target_dir {
+            crate::disk::restore_permissions(&crate::disk::scratch_dir(target));
+        }
         // Group, keeping the batch's order of first appearance.
         let mut groups: Vec<(String, Vec<Unit>)> = Vec::new();
         for u in batch {
@@ -653,6 +690,11 @@ impl Grader<'_> {
             }
             let out = self.runner.run(self.root, &cargo(args))?;
             self.timed_out |= out.timed_out;
+            for (name, lines) in failure_blocks(&out.stdout) {
+                self.excerpts
+                    .entry(name)
+                    .or_insert_with(|| cut(&lines, GRADER_EXCERPT_LINES));
+            }
             let names = failures(&out, &BTreeSet::new());
             let mut attributed = false;
             for u in &group {
@@ -925,14 +967,7 @@ pub(crate) fn evaluate(
         .collect();
     let mut order: Vec<&str> = VARIANTS.to_vec();
     order.sort_by_key(|v| (sets[v].len(), *v));
-    let mut grader = Grader {
-        runner: &runner,
-        root,
-        ran: BTreeSet::new(),
-        failed: BTreeSet::new(),
-        unattributed: false,
-        timed_out: false,
-    };
+    let mut grader = Grader::new(&runner, root);
     // The probe runs first for everyone. A variant whose selection holds
     // all of (a) cannot miss, so it is not graded further.
     let probe_batch: Vec<Unit> = probe.intersection(&a_set).cloned().collect();
@@ -995,14 +1030,7 @@ pub(crate) fn evaluate(
             .filter(|u| a_set.contains(u) && !sets[v].contains(u))
             .cloned()
             .collect();
-        let mut clean = Grader {
-            runner: &runner,
-            root,
-            ran: BTreeSet::new(),
-            failed: BTreeSet::new(),
-            unattributed: false,
-            timed_out: false,
-        };
+        let mut clean = Grader::new(&runner, root);
         clean.run(missed.clone(), &|_| false)?;
         let confirmed = !missed.is_empty() && clean.failed.is_empty() && !grader.unattributed;
         if let Some(r) = result.variants.get_mut(v) {
