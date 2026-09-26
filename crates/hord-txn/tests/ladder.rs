@@ -1421,3 +1421,144 @@ async fn protected_tests_must_run_and_pass_from_their_protected_files() -> TestR
     );
     Ok(())
 }
+
+/// The summary's text with each change's short id replaced by its name.
+fn summary_text(entry: &QueueEntry, ids: &[(ChangeId, &str)]) -> TestResult<String> {
+    let mut text = escalation(entry)?
+        .summary
+        .as_ref()
+        .ok_or("summary")?
+        .text
+        .clone();
+    for (id, name) in ids {
+        let full = id.to_string();
+        assert!(!text.contains(&full), "a full id in the prose: {text}");
+        text = text.replace(&full[..12], name);
+    }
+    Ok(text)
+}
+
+/// A hard conflict's summary, as `hord conflicts`, the workbench, and the
+/// corpus review sheet show it: short ids, the conflict in plain words,
+/// definitions before files, and each side's tests by name with what they
+/// assert.
+#[tokio::test]
+async fn a_hard_conflict_summary_reads_plainly() -> TestResult {
+    let t = ladder_repo(
+        "[land]\nmax_replay_attempts = 1\n",
+        Some(Arc::new(Scripted::new([Step::GiveUp]))),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (ca, cb) = collide_with_tests(&t.repo).await?;
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    assert_eq!(entry.status, QueueStatus::NeedsArbitration);
+    assert_eq!(
+        summary_text(&entry, &[(ca, "<a>"), (cb, "<b>")])?,
+        "\
+Parked: \"beta returns 21\" (<b>, b)
+Landed: \"beta returns 20\" (<a>, a)
+
+Why:
+  - Both changes rewrote beta (src/lib.rs), and the two rewrites do not combine.
+
+Contested: beta (src/lib.rs)
+
+What the parked change changed:
+  - changed fn beta (src/lib.rs): now `pub fn beta() -> u32 { 21 }`, was `pub fn beta() -> u32 { 2 }`
+  - added test beta_is_21 (tests/b.rs, new file): asserts `fixture::beta()` equals `21`
+
+What the landed change changed:
+  - changed fn beta (src/lib.rs): now `pub fn beta() -> u32 { 20 }`, was `pub fn beta() -> u32 { 2 }`
+  - added test beta_at_least_20 (tests/a.rs, new file): asserts `fixture::beta() >= 20` is true
+"
+    );
+    Ok(())
+}
+
+/// Fails the change with this intent the way the Rust verifier does:
+/// the check's command (with its evidence id), then the failed tests.
+struct FailIntent(&'static str);
+
+impl Verifier for FailIntent {
+    fn verify(&self, request: VerifyRequest) -> VerifyFuture<'_> {
+        let fail = request.change.intent.summary == self.0;
+        Box::pin(async move {
+            if fail {
+                Verdict::Fail {
+                    evidence: Vec::new(),
+                    reason: format!(
+                        "hord-coverage per-test \"2 tests\" {}: 1 failed: beta_is_2",
+                        "74214a02a48688337cb1745f7a91e3370965d4c1511e2086ff82f0ec82a9a6e6"
+                    ),
+                }
+            } else {
+                Verdict::Pass {
+                    evidence: Vec::new(),
+                }
+            }
+        })
+    }
+}
+
+/// A semantic conflict's summary: the failing test by name, where it is,
+/// which side brought it, and what it asserts, without the check's
+/// command or evidence id.
+#[tokio::test]
+async fn a_semantic_conflict_summary_names_the_failing_test() -> TestResult {
+    let t = ladder_repo(
+        "[land]\nmax_replay_attempts = 1\n",
+        Some(Arc::new(Scripted::new([Step::GiveUp]))),
+        Arc::new(FailIntent("pin beta at 2")),
+    )
+    .await?;
+    let mut a = begin(&t.repo, "a").await?;
+    let mut b = begin(&t.repo, "b").await?;
+    edit(&mut a, "src/lib.rs", LIB, "    2\n", "    20\n").await?;
+    a.write_file(
+        &path("tests/a.rs"),
+        test_file("beta_is_20", "assert_eq!(fixture::beta(), 20);"),
+    )
+    .await?;
+    b.write_file(
+        &path("tests/b.rs"),
+        test_file("beta_is_2", "assert_eq!(fixture::beta(), 2);"),
+    )
+    .await?;
+    let ca = submit(&t.repo, &mut a, "beta returns 20").await?;
+    let cb = submit(&t.repo, &mut b, "pin beta at 2").await?;
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    assert_eq!(entry.status, QueueStatus::NeedsArbitration);
+    let text = summary_text(&entry, &[(ca, "<a>"), (cb, "<b>")])?;
+    assert!(!text.contains("74214a02"), "{text}");
+    assert_eq!(
+        text,
+        "\
+Parked: \"pin beta at 2\" (<b>, b)
+Landed: \"beta returns 20\" (<a>, a)
+
+Why:
+  - The changes merge cleanly, but the merged code fails verification.
+  - Test beta_is_2 fails (tests/b.rs, from the parked change): it asserts `fixture::beta()` equals `2`.
+
+What the parked change changed:
+  - added test beta_is_2 (tests/b.rs, new file): asserts `fixture::beta()` equals `2`
+
+What the landed change changed:
+  - changed fn beta (src/lib.rs): now `pub fn beta() -> u32 { 20 }`, was `pub fn beta() -> u32 { 2 }`
+  - added test beta_is_20 (tests/a.rs, new file): asserts `fixture::beta()` equals `20`
+"
+    );
+    // The raw reason, evidence id included, stays in the report.
+    let report = entry.report.as_ref().ok_or("report")?;
+    assert!(
+        report
+            .verification
+            .as_deref()
+            .is_some_and(|v| v.contains("74214a02a486")),
+        "{report:#?}"
+    );
+    Ok(())
+}
