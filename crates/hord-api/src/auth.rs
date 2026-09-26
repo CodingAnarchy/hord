@@ -161,6 +161,8 @@ const TABLE: &[(&str, Req)] = &[
     ("/hord.v1.Auth/MintToken", Req::Admin),
     ("/hord.v1.Auth/WhoAmI", Req::Authenticated),
     ("/hord.v1.Auth/GetKey", Req::Read),
+    // Audit: M6's acceptance auditor (`hord audit`).
+    ("/hord.v1.Audit/AuditLog", Req::Read),
 ];
 
 /// [`TABLE`]'s entries, `const`-constructible.

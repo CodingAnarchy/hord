@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use hord_api::MAX_MESSAGE_BYTES;
+use hord_api::proto::audit_server::AuditServer;
 use hord_api::proto::auth_server::AuthServer;
 use hord_api::proto::changes_server::ChangesServer;
 use hord_api::proto::repo_backend_server::RepoBackendServer;
@@ -15,6 +16,7 @@ use tokio::net::TcpListener;
 use tonic::service::Routes;
 use tonic::transport::{Identity, ServerTlsConfig};
 
+use crate::audit::GrpcAudit;
 use crate::auth::AuthStore;
 use crate::auth_service::GrpcAuth;
 use crate::authz::AuthLayer;
@@ -189,7 +191,11 @@ impl Server {
             .add_service(AuthServer::new(GrpcAuth::new(self.auth.clone())))
             .add_service(ChangesServer::new(GrpcChanges::new(Arc::clone(
                 &self.hosts,
-            ))));
+            ))))
+            .add_service(AuditServer::new(GrpcAudit::new(
+                Arc::clone(&self.hosts),
+                self.auth.clone(),
+            )));
         if let Some(workspaces) = &self.workspaces {
             routes = routes.add_service(
                 WorkspacesServer::new(crate::service::GrpcWorkspaces::new(Arc::clone(workspaces)))

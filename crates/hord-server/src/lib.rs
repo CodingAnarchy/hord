@@ -11,6 +11,7 @@
 //!   and the JSON Schema generated from it;
 //! - `hord.v1.Changes`: read-only change views and flight recordings
 //!   (ADR 0030);
+//! - `hord.v1.Audit`: M6's acceptance auditor (`hord audit`);
 //! - the web UI at `/` (and `/r/<name>/`), `hord-ui`'s routes over the same
 //!   backends (ADR 0030);
 //! - optional webhooks from `server.toml`: the JSON-mapped event POSTed to
@@ -34,6 +35,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod activity;
+mod audit;
 mod auth;
 mod auth_service;
 mod authz;
@@ -50,6 +52,10 @@ mod ui;
 mod webhook;
 
 pub use activity::Activity;
+pub use audit::{
+    ArbitrationFacts, AuditFacts, BridgeCheck, DEFAULT_MAX_BRIDGE_GAP_MS, EvidenceFacts, KeyCheck,
+    LandedFacts, LocalAudit, PolicyJudgement, gather, judge,
+};
 pub use auth::{AuthError, AuthStore, Issued, Principal, same_actor};
 pub use changes::{LocalChanges, RECORDINGS_DIR, save_recording};
 pub use config::{AuthConfig, ServerConfig, TlsConfig, WebhookConfig};

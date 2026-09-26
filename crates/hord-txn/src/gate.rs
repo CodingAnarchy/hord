@@ -1403,6 +1403,33 @@ impl crate::Repo {
         .await
     }
 
+    /// Head's policy for the landed change `landed`, judged again: the
+    /// policy in its landing base (the head it landed on), over its facts
+    /// and the evidence the lander counts for it given its rebase `report`
+    /// (ADR 0026, ADR 0031; without a report, only what is indexed for its
+    /// result). An unparseable policy file is the inner error's message.
+    /// For `hord audit` (spec §12 M6).
+    pub async fn judge_landed(
+        &self,
+        landed: ChangeId,
+        report: Option<ConflictReport>,
+    ) -> Result<std::result::Result<(Decision, PolicySource), String>> {
+        crate::repo::blocking(&self.inner, move |inner| {
+            let record = inner.change_record(landed)?;
+            let (policy, source) = match inner.policy_at(record.base)? {
+                Ok(found) => found,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            let mut facts = inner.policy_facts(&record, false)?;
+            facts.evidence = match &report {
+                Some(report) => inner.candidate_evidence_facts(&record, report)?,
+                None => inner.evidence_facts(record.result)?,
+            };
+            Ok(Ok((policy.evaluate(&facts), source)))
+        })
+        .await
+    }
+
     /// Policy facts for `record` (ADR 0026), with the evidence indexed for
     /// its result snapshot.
     pub async fn policy_facts(&self, record: ChangeRecord) -> Result<Facts> {

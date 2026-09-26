@@ -21,6 +21,7 @@ hex.workspace = true
 hord-api.workspace = true
 hord-core.workspace = true
 hord-encoding.workspace = true
+hord-policy.workspace = true
 hord-store.workspace = true
 hord-txn.workspace = true
 hord-ui.workspace = true

@@ -2430,6 +2430,7 @@ dependencies = [
  "hord-api",
  "hord-core",
  "hord-encoding",
+ "hord-policy",
  "hord-store",
  "hord-txn",
  "hord-ui",

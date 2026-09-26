@@ -8,6 +8,7 @@
 //!   and pbjson `serde` impls, which are the canonical protobuf JSON mapping;
 //! - [`ChangesBackend`]: the read-only `Changes` service (ADR 0030) the
 //!   web UI reads through;
+//! - [`AuditBackend`]: the `Audit` service, M6's acceptance auditor;
 //! - [`WorkspacesBackend`]: the local-only `Workspaces` service (ADR 0024
 //!   amendment) a per-repo daemon serves;
 //! - [`RepoBackend`]: spec §10.5.2's trait, method for method, expressed in
@@ -24,6 +25,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+mod audit;
 pub mod auth;
 mod backend;
 mod changes;
@@ -36,6 +38,7 @@ pub mod schema;
 pub mod wire;
 mod workspaces;
 
+pub use audit::AuditBackend;
 pub use backend::{
     DEFAULT_LOG_LIMIT, EventCursor, EventStream, MAX_BATCH_BYTES, MAX_BATCH_IDS, MAX_MESSAGE_BYTES,
     RepoBackend, SubmissionId,

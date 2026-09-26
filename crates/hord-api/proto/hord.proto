@@ -1731,3 +1731,144 @@ message KeyVerifyResult {
   // The key's actor, when the server knows it.
   Actor actor = 6;
 }
+
+// ---------------------------------------------------------------- audit
+
+// M6's acceptance auditor (`hord audit`, spec §12 M6): checks a window of
+// the log for its measurable criteria. Served beside `RepoBackend`, so a
+// remote audit runs where the store, the event log, and the key bindings
+// are, and a local audit runs the same code in process.
+service Audit {
+  // Audit the landings, reviews, arbitrations, and bridge checks recorded
+  // in a window.
+  rpc AuditLog(AuditRequest) returns (AuditReport);
+}
+
+// Arguments to AuditLog.
+message AuditRequest {
+  // Start of the window (inclusive), in ms since the Unix epoch.
+  uint64 since_ms = 1;
+  // End of the window (exclusive); unset: now.
+  optional uint64 until_ms = 2;
+  // The longest allowed time between two bridge checks, and from the
+  // window's ends to the nearest check; 0 means the default (65 minutes:
+  // hourly, with slack).
+  uint64 max_bridge_gap_ms = 3;
+  // A window without any bridge check is a violation, not only a note.
+  bool require_bridge = 4;
+}
+
+// Which acceptance criterion a finding is about.
+enum AuditCriterion {
+  AUDIT_CRITERION_UNSPECIFIED = 0;
+  // A landed change has no intent summary.
+  AUDIT_CRITERION_INTENT = 1;
+  // A landed change lacks provenance: an actor, a toolchain, or a
+  // signature or bridge voucher on the record that was submitted.
+  AUDIT_CRITERION_PROVENANCE = 2;
+  // A landed change has no passing evidence, or has failing evidence.
+  AUDIT_CRITERION_EVIDENCE = 3;
+  // Head's policy at the landing base, judged again, does not allow it.
+  AUDIT_CRITERION_POLICY = 4;
+  // A review is unsigned, or signed by a key not bound to its producer.
+  AUDIT_CRITERION_REVIEW = 5;
+  // An arbitration is unsigned, or signed by a key not bound to its
+  // arbiter.
+  AUDIT_CRITERION_ARBITRATION = 6;
+  // A change is in the log but the lander never recorded landing it: the
+  // store was edited.
+  AUDIT_CRITERION_UNRECORDED_LANDING = 7;
+  // A bridge check found the mirror diverged.
+  AUDIT_CRITERION_BRIDGE_DIVERGED = 8;
+  // Bridge checks were further apart than allowed, or missing.
+  AUDIT_CRITERION_BRIDGE_GAP = 9;
+}
+
+// How a landed change reached the lander.
+enum AuditOrigin {
+  AUDIT_ORIGIN_UNSPECIFIED = 0;
+  // Submitted, signed by its author with a key bound to them.
+  AUDIT_ORIGIN_SIGNED = 1;
+  // Submitted unsigned by the git bridge for a pull request's author, who
+  // vouched with its key (ADR 0037).
+  AUDIT_ORIGIN_BRIDGE_VOUCHED = 2;
+  // A replay the lander's harness proposed (spec §6.6).
+  AUDIT_ORIGIN_REPLAY = 3;
+  // An arbiter's resolution (spec §6.4 rung 3).
+  AUDIT_ORIGIN_ARBITRATION = 4;
+  // Signed, but the key binding was not checked: the repository has no
+  // auth file (a local audit without a server).
+  AUDIT_ORIGIN_SIGNED_UNBOUND = 5;
+  // None of the above.
+  AUDIT_ORIGIN_UNSIGNED = 6;
+}
+
+// One finding that fails the audit, or a note that does not.
+message AuditFinding {
+  // The criterion.
+  AuditCriterion criterion = 1;
+  // The change it is about, when it is about one.
+  optional string change = 2;
+  // What is wrong, in words.
+  string detail = 3;
+}
+
+// One change that landed in the window.
+message AuditedChange {
+  // The landed ChangeId.
+  string change = 1;
+  // Its position in the log.
+  uint64 position = 2;
+  // When it landed (ms since the Unix epoch).
+  uint64 landed_at_ms = 3;
+  // Its intent's summary.
+  string summary = 4;
+  // Its author.
+  Actor actor = 5;
+  // How it reached the lander.
+  AuditOrigin origin = 6;
+  // Pieces of passing evidence counted for it.
+  uint32 passing_evidence = 7;
+  // `head` or `default`: where head's policy came from.
+  string policy_source = 8;
+  // Whether it passed every check.
+  bool ok = 9;
+}
+
+// The bridge's divergence checks in the window (ADR 0036).
+message AuditBridge {
+  // Checks recorded.
+  uint32 checks = 1;
+  // Checks that found divergence.
+  uint32 diverged = 2;
+  // The first and last check.
+  optional uint64 first_at_ms = 3;
+  // The last check.
+  optional uint64 last_at_ms = 4;
+  // The longest time without a check, window ends included.
+  uint64 longest_gap_ms = 5;
+}
+
+// What AuditLog found.
+message AuditReport {
+  // The window audited: from.
+  uint64 since_ms = 1;
+  // The window audited: until.
+  uint64 until_ms = 2;
+  // Changes that landed in the window, in log order.
+  repeated AuditedChange changes = 3;
+  // Reviews found on them.
+  uint32 reviews = 4;
+  // Arbitrations recorded in the window.
+  uint32 arbitrations = 5;
+  // The bridge's checks.
+  AuditBridge bridge = 6;
+  // Whether keys were checked against the server's bindings (an auth file).
+  bool bindings_checked = 7;
+  // Findings that fail the audit.
+  repeated AuditFinding violations = 8;
+  // Findings that do not, such as "no bridge checks recorded".
+  repeated AuditFinding notes = 9;
+  // No violations.
+  bool ok = 10;
+}
