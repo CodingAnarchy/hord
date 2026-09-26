@@ -911,7 +911,7 @@ impl Inner {
         if let Some(Origin::Replay { of }) = entry.origin {
             let touched = self.tampered_tests(of, &record)?;
             if !touched.is_empty() {
-                let names: Vec<&str> = touched.iter().map(|(_, name)| name.as_str()).collect();
+                let names: Vec<&str> = touched.iter().map(|t| t.name.as_str()).collect();
                 return Ok(Prepared::Park(QueueStatus::Rejected {
                     reason: format!("{TAMPERED}: {}", names.join(", ")),
                 }));

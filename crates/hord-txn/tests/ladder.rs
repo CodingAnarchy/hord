@@ -1217,3 +1217,51 @@ async fn a_replay_must_keep_its_own_changes_tests_as_written() -> TestResult {
     assert_eq!(b_now, own_test());
     Ok(())
 }
+
+/// ADR 0034 compares a protected test's content, not ops on its file: a
+/// replay that reformats the landed side's test file and adds a test of its
+/// own beside the protected one is not tampering, and lands. One that
+/// changes the protected test's tokens still is.
+#[tokio::test]
+async fn reformatting_or_adding_beside_a_protected_test_is_not_tampering() -> TestResult {
+    let lib_21 = LIB.replace("    2\n", "    21\n");
+    let reformatted = "#[test]\nfn beta_is_20()\n{\n        assert_eq!( fixture::beta(),  20 );\n}\n\n#[test]\nfn beta_is_not_zero() {\n    assert_ne!(fixture::beta(), 0);\n}\n";
+    let harness = Scripted::new([
+        // Changes the protected test's tokens: tampering.
+        Step::Write(vec![
+            ("src/lib.rs", lib_21.clone()),
+            ("tests/b.rs", own_test()),
+            (
+                "tests/a.rs",
+                test_file("beta_is_20", "assert_eq!(fixture::beta(), 21);"),
+            ),
+        ]),
+        // Reformats it and adds a sibling: allowed.
+        Step::Write(vec![
+            ("src/lib.rs", lib_21),
+            ("tests/b.rs", own_test()),
+            ("tests/a.rs", reformatted.into()),
+        ]),
+    ]);
+    let t = ladder_repo(
+        TWO_ATTEMPTS,
+        Some(Arc::new(harness.clone())),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (_, cb) = collide_with_tests(&t.repo).await?;
+    t.repo.land_local().await?;
+    let entry = t.repo.status(cb).await?;
+    let attempts = &escalation(&entry)?.attempts;
+    let outcomes: Vec<ReplayOutcome> = attempts.iter().map(|a| a.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![ReplayOutcome::Tampered, ReplayOutcome::Proposed],
+        "{attempts:#?}"
+    );
+    assert!(
+        matches!(entry.status, QueueStatus::Replayed { .. }),
+        "{entry:#?}"
+    );
+    Ok(())
+}

@@ -187,13 +187,31 @@ pub struct Arbiter {
     pub signature: Option<Signature>,
 }
 
-/// One of the replayed change's own acceptance tests, as it wrote it.
-struct OwnTest {
+/// A protected test as a replay must keep it (ADR 0034).
+struct Expected {
+    /// The acceptance name.
     name: String,
     qualified: String,
     path: RepoPath,
     node: NodeId,
     normalized: ObjectId,
+    /// Its text, whitespace collapsed.
+    text: String,
+}
+
+/// A protected test a replay changed (ADR 0034).
+#[derive(Debug)]
+#[allow(dead_code)] // `before` and `after` feed the attempt's detail.
+pub(crate) struct Tampered {
+    /// Its id where it is protected.
+    pub node: NodeId,
+    /// Its acceptance name.
+    pub name: String,
+    /// Its text as protected, whitespace collapsed.
+    pub before: String,
+    /// The replay's same-named definition, whitespace collapsed; `None`
+    /// when the replay has none.
+    pub after: Option<String>,
 }
 
 /// How the lander words a replay rejected for changing a protected test
@@ -544,7 +562,7 @@ impl Inner {
                 let tampered = self
                     .tampered_tests(of, &record)?
                     .into_iter()
-                    .map(|(node, _)| node)
+                    .map(|t| t.node)
                     .collect();
                 escalation.attempts.push(ReplayAttempt {
                     attempt,
@@ -784,10 +802,10 @@ impl Inner {
         // satisfy. Rejected before verification, like an over-budget result.
         let touched = self.tampered_tests(of, &record)?;
         if !touched.is_empty() {
-            let names: Vec<&str> = touched.iter().map(|(_, name)| name.as_str()).collect();
+            let names: Vec<&str> = touched.iter().map(|t| t.name.as_str()).collect();
             let why = format!("{TAMPERED}: {} (proposed change {id})", names.join(", "));
             self.emit(vec![events::rejected(id, &why)])?;
-            *tampered = touched.into_iter().map(|(node, _)| node).collect();
+            *tampered = touched.into_iter().map(|t| t.node).collect();
             return Ok(Err((ReplayOutcome::Tampered, why)));
         }
         match record.provenance.parent_intent {
@@ -840,54 +858,66 @@ impl Inner {
         Ok(names)
     }
 
-    /// Names of the protected tests (ADR 0034) that `record`, a replay of
-    /// `of`, changes: in its write set, resolved at its base.
+    /// The protected tests (ADR 0034) that `record`, a replay of `of`,
+    /// changes.
     ///
-    /// Two kinds are protected (ADR 0034). Tests that exist at the replay's
-    /// base (the landed side's, or ones the change inherited) must not be
-    /// in its write set. The replayed change's own tests do not exist
-    /// there, so each must be in the replay's result as the original change
-    /// wrote it: a definition with the same qualified name and the same
-    /// `normalized` content (the tokens, not the layout).
+    /// Each protected test is expected in the replay's result as it was
+    /// written: a definition with its qualified name (in its file, else
+    /// anywhere) and its `normalized` content, the tokens and not the
+    /// layout. A test present at the replay's base (the landed side's, or
+    /// one the change inherited) is expected as it is there; the replayed
+    /// change's own tests, which head lacks, as the original change wrote
+    /// them. Adding tests, reformatting a file, or editing a protected
+    /// test's siblings changes none of them.
     pub(crate) fn tampered_tests(
         &self,
         of: ChangeId,
         record: &ChangeRecord,
-    ) -> Result<Vec<(NodeId, String)>> {
-        let mut out: Vec<(NodeId, String)> = self
-            .protected_tests(of, record.base)?
-            .into_iter()
-            .filter(|(node, _)| record.write_set.contains(node))
-            .collect();
-        let original = self.change_record(of)?;
-        for own in self.own_tests(&original)? {
-            if self.defines(record.result, &own)? {
-                continue;
-            }
-            if !out.iter().any(|(node, _)| *node == own.node) {
-                out.push((own.node, own.name.clone()));
+    ) -> Result<Vec<Tampered>> {
+        let mut out = Vec::new();
+        for expected in self.expected_tests(of, record.base)? {
+            let (kept, now) = self.find_expected(record.result, &expected)?;
+            if !kept {
+                out.push(Tampered {
+                    node: expected.node,
+                    name: expected.name,
+                    before: expected.text,
+                    after: now,
+                });
             }
         }
         Ok(out)
     }
 
-    /// The tests the change's own intent names, as its result defines them.
-    fn own_tests(&self, record: &ChangeRecord) -> Result<Vec<OwnTest>> {
-        let names: Vec<&String> = record
+    /// The protected tests of a replay of `of` onto `base`, as a replay
+    /// must keep them.
+    fn expected_tests(&self, of: ChangeId, base: SnapshotId) -> Result<Vec<Expected>> {
+        let names = self.protected_test_names(of)?;
+        let mut out = self.named_tests(base, &names)?;
+        let original = self.change_record(of)?;
+        let own: Vec<String> = original
             .intent
             .acceptance
             .iter()
             .filter_map(|a| match a {
-                Acceptance::Test { name } => Some(name),
+                Acceptance::Test { name } => Some(name.clone()),
                 _ => None,
             })
+            .filter(|name| !out.iter().any(|e| e.name == *name))
             .collect();
+        out.extend(self.named_tests(original.result, &own)?);
+        Ok(out)
+    }
+
+    /// The definitions in `snapshot` named by `names` (exactly, or ending
+    /// in `::name`), with their content.
+    fn named_tests(&self, snapshot: SnapshotId, names: &[String]) -> Result<Vec<Expected>> {
         let mut out = Vec::new();
         if names.is_empty() {
             return Ok(out);
         }
-        for (path, _) in self.list_files(record.result)? {
-            for def in self.definitions_at(record.result, &path)? {
+        for (path, _) in self.list_files(snapshot)? {
+            for def in self.definitions_at(snapshot, &path)? {
                 let Some(qualified) = def.name.as_ref().map(|n| n.as_str().to_owned()) else {
                     continue;
                 };
@@ -896,41 +926,69 @@ impl Inner {
                 }) else {
                     continue;
                 };
-                if let Some(normalized) = self.normalized_at(record.result, &path, def.node)? {
-                    out.push(OwnTest {
-                        name: (*name).clone(),
-                        qualified,
-                        path: path.clone(),
-                        node: def.node,
-                        normalized,
-                    });
-                }
+                let Some(normalized) = self.normalized_at(snapshot, &path, def.node)? else {
+                    continue;
+                };
+                out.push(Expected {
+                    name: name.clone(),
+                    qualified,
+                    text: self.definition_text(snapshot, &path, &def.span)?,
+                    path: path.clone(),
+                    node: def.node,
+                    normalized,
+                });
             }
         }
         Ok(out)
     }
 
-    /// Whether `snapshot` has `test` as written: a definition with its
-    /// qualified name (in its file, else anywhere) and its `normalized`
-    /// content.
-    fn defines(&self, snapshot: SnapshotId, test: &OwnTest) -> Result<bool> {
-        let mut files = vec![test.path.clone()];
+    /// Whether `snapshot` keeps `expected` (same qualified name, same
+    /// `normalized` content, in its file first, else anywhere), and the
+    /// text of a same-named definition that differs, if there is one.
+    fn find_expected(
+        &self,
+        snapshot: SnapshotId,
+        expected: &Expected,
+    ) -> Result<(bool, Option<String>)> {
+        let mut files = vec![expected.path.clone()];
         files.extend(
             self.list_files(snapshot)?
                 .into_iter()
                 .map(|(path, _)| path)
-                .filter(|path| *path != test.path),
+                .filter(|path| *path != expected.path),
         );
+        let mut differing = None;
         for path in files {
             for def in self.definitions_at(snapshot, &path)? {
-                if def.name.as_ref().map(|n| n.as_str()) == Some(test.qualified.as_str())
-                    && self.normalized_at(snapshot, &path, def.node)? == Some(test.normalized)
-                {
-                    return Ok(true);
+                if def.name.as_ref().map(|n| n.as_str()) != Some(expected.qualified.as_str()) {
+                    continue;
+                }
+                if self.normalized_at(snapshot, &path, def.node)? == Some(expected.normalized) {
+                    return Ok((true, None));
+                }
+                if differing.is_none() {
+                    differing = Some(self.definition_text(snapshot, &path, &def.span)?);
                 }
             }
         }
-        Ok(false)
+        Ok((false, differing))
+    }
+
+    /// The text of the definition at `span` of `path` in `snapshot`, with
+    /// runs of whitespace collapsed to one space.
+    fn definition_text(
+        &self,
+        snapshot: SnapshotId,
+        path: &RepoPath,
+        span: &std::ops::Range<usize>,
+    ) -> Result<String> {
+        let bytes = self.file_bytes(snapshot, path)?.unwrap_or_default();
+        let text = bytes
+            .as_slice()
+            .get(span.clone())
+            .map(String::from_utf8_lossy)
+            .unwrap_or_default();
+        Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
     }
 
     /// The `normalized` hash of definition `node` of `path` in `snapshot`.
@@ -951,19 +1009,6 @@ impl Inner {
             .and_then(|(site, _)| hord_lang::oid_at(&tree.tree, site))
             .and_then(|oid| tree.tree.get(oid))
             .map(|n| n.normalized))
-    }
-
-    /// [`Self::protected_test_names`] resolved to definitions in `snapshot`
-    /// (a replay's base), with their names. A name that resolves to no
-    /// definition there protects nothing (ADR 0034).
-    fn protected_tests(&self, of: ChangeId, snapshot: SnapshotId) -> Result<Vec<(NodeId, String)>> {
-        let mut out = Vec::new();
-        for name in self.protected_test_names(of)? {
-            for node in self.resolve_in(snapshot, &name)? {
-                out.push((node, name.clone()));
-            }
-        }
-        Ok(out)
     }
 }
 
