@@ -33,13 +33,15 @@ Environment=CARGO_HOME=/srv/hord/cargo
 Environment=RUSTUP_HOME=/srv/hord/rustup
 Environment=PATH=/srv/hord/cargo/bin:/usr/local/bin:/usr/bin:/bin
 
-# Hardening: hord needs its repository, its home, and to read /etc/hord.
+# Hardening: hord needs its repository, its home, and /etc/hord. It
+# rewrites the auth file there when it issues a token (`hord login --user`,
+# `hord token mint`), and only reads the TLS files.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/srv/hord
-ReadOnlyPaths=/etc/hord
+ReadWritePaths=/srv/hord /etc/hord
+ReadOnlyPaths=/etc/hord/tls
 
 [Install]
 WantedBy=multi-user.target

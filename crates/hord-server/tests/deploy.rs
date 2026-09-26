@@ -59,3 +59,40 @@ fn the_systemd_unit_serves_the_sample_config() -> TestResult {
     );
     Ok(())
 }
+
+/// The paths a unit's `key=` lines list, space-separated, across every such
+/// line.
+fn unit_paths<'a>(unit: &'a str, key: &str) -> Vec<&'a Path> {
+    unit.lines()
+        .filter_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        .flat_map(str::split_whitespace)
+        .map(Path::new)
+        .collect()
+}
+
+#[test]
+fn the_server_may_write_its_auth_file() -> TestResult {
+    // `hord login --user` and `hord token mint` make the server issue a
+    // token: it rewrites the auth file through a temporary file beside it,
+    // so the file's directory must be writable under the unit's sandbox.
+    let path = deploy().join("server.toml");
+    let config = ServerConfig::parse(&path, &std::fs::read_to_string(&path)?)?;
+    let auth = config.auth.ok_or("the sample requires tokens")?.file;
+    let dir = auth.parent().ok_or("the auth file has a directory")?;
+    let unit = std::fs::read_to_string(deploy().join("hord.service"))?;
+    // systemd applies the most specific of ReadWritePaths and ReadOnlyPaths.
+    let deepest = |key| {
+        unit_paths(&unit, key)
+            .into_iter()
+            .filter(|p| dir.starts_with(p))
+            .map(|p| p.components().count())
+            .max()
+    };
+    let writable = deepest("ReadWritePaths");
+    assert!(
+        writable.is_some() && writable > deepest("ReadOnlyPaths"),
+        "{} is read-only to hord serve",
+        dir.display()
+    );
+    Ok(())
+}

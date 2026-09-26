@@ -26,7 +26,8 @@ State lives in the repository's `.hord/`, plus `/etc/hord` for the auth file and
   ```sh
   useradd --system --home-dir /srv/hord --create-home hord
   install -d -o hord -g hord /srv/hord/home
-  install -d -m 0750 -o root -g hord /etc/hord /etc/hord/tls
+  install -d -m 0700 -o hord -g hord /etc/hord
+  install -d -m 0750 -o root -g hord /etc/hord/tls
   ```
 
 - The `hord` binary, built from this repository:
@@ -104,14 +105,13 @@ Edit `server.toml` for your certificate paths. A test parses the sample, so its 
 
 ## 5. Users and agent tokens
 
-The auth file holds users (Argon2 password hashes), minted tokens (BLAKE3 hashes only), and the public keys bound to each actor (spec §10.5.4). Create it on the host as root:
+The auth file holds users (Argon2 password hashes), minted tokens (BLAKE3 hashes only), and the public keys bound to each actor (spec §10.5.4). The server rewrites it whenever it issues a token (a password login or `hord token mint`), so it belongs to the `hord` user. Create it on the host as that user; hord writes it readable by its owner only:
 
 ```sh
 # People: pick the scopes each person needs.
-hord user add matt --auth-file /etc/hord/auth.toml \
+sudo -u hord hord user add matt --auth-file /etc/hord/auth.toml \
   --scope read --scope propose --scope review:human --scope arbitrate --scope admin
-hord user add ada --auth-file /etc/hord/auth.toml --scope read --scope propose --scope review:human
-chgrp hord /etc/hord/auth.toml && chmod 0640 /etc/hord/auth.toml
+sudo -u hord hord user add ada --auth-file /etc/hord/auth.toml --scope read --scope propose --scope review:human
 ```
 
 A person logs in from their own clone. The login binds their key, `~/.hord/keys/<user>.pem`, created on first use, to their account:
