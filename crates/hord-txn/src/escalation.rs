@@ -187,6 +187,10 @@ pub struct Arbiter {
     pub signature: Option<Signature>,
 }
 
+/// Files that seed a replay workspace with a change's own tests, and the
+/// names of the tests they seed.
+pub(crate) type Seeds = (Vec<(RepoPath, Vec<u8>)>, Vec<String>);
+
 /// A protected test as a replay must keep it (ADR 0034).
 struct Expected {
     /// The acceptance name.
@@ -915,6 +919,62 @@ impl Inner {
             }
         }
         Ok(out)
+    }
+
+    /// The files that put `of`'s own acceptance tests into a workspace on
+    /// `base` as `of` wrote them (ADR 0034), and those tests' names. A file
+    /// `base` lacks is `of`'s whole file; a test missing from a file `base`
+    /// has is appended to it. Tests `base` already has as written need
+    /// nothing.
+    pub(crate) fn seed_own_tests(&self, of: ChangeId, base: SnapshotId) -> Result<Seeds> {
+        let original = self.change_record(of)?;
+        let own: Vec<String> = original
+            .intent
+            .acceptance
+            .iter()
+            .filter_map(|a| match a {
+                Acceptance::Test { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut files: BTreeMap<RepoPath, Vec<u8>> = BTreeMap::new();
+        let mut names = Vec::new();
+        for test in self.named_tests(original.result, &own)? {
+            if self.find_expected(base, &test)?.0 {
+                continue;
+            }
+            let theirs = self
+                .file_bytes(original.result, &test.path)?
+                .unwrap_or_default();
+            match self.file_bytes(base, &test.path)? {
+                None => {
+                    files.insert(test.path.clone(), theirs.as_slice().to_vec());
+                }
+                Some(head) => {
+                    let Some(def) = self
+                        .definitions_at(original.result, &test.path)?
+                        .into_iter()
+                        .find(|d| d.node == test.node)
+                    else {
+                        continue;
+                    };
+                    let body = theirs.as_slice().get(def.span).unwrap_or_default();
+                    let file = files
+                        .entry(test.path.clone())
+                        .or_insert_with(|| head.as_slice().to_vec());
+                    if !file.ends_with(b"\n") {
+                        file.push(b'\n');
+                    }
+                    file.push(b'\n');
+                    file.extend_from_slice(body.trim_ascii());
+                    file.push(b'\n');
+                }
+            }
+            if !names.contains(&test.name) {
+                names.push(test.name.clone());
+            }
+        }
+        Ok((files.into_iter().collect(), names))
     }
 
     /// The protected tests of a replay of `of` onto `base`, as a replay

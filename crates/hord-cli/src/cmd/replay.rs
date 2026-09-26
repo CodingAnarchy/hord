@@ -191,6 +191,9 @@ pub fn run(
         budget: Some(hord_txn::budget_message(&budget)),
         note: note.clone(),
         protected_tests: protected_tests(backend.as_ref(), &record, entry.as_ref())?,
+        // The lander seeds its workspaces with the change's own tests; a
+        // manual replay's harness writes them itself.
+        seeded_tests: Vec::new(),
     };
     let command = CommandHarness::new(shell(&harness)).context("an empty --harness")?;
     let started = Instant::now();

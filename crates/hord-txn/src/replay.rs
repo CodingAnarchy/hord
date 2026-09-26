@@ -389,7 +389,7 @@ async fn run_attempt(
     let lookup = job.clone();
     let inputs = blocking(&repo.inner, move |inner| inner.replay_inputs(&lookup)).await?;
     let budget = inputs.budget.clone();
-    let ws = repo
+    let mut ws = repo
         .begin_directory(BeginOptions {
             base: Base::Head,
             actor: lander_actor(),
@@ -397,7 +397,17 @@ async fn run_attempt(
         })
         .await?;
     let base = ws.base();
-    let request = request_message(repo, job, &inputs, &ws);
+    // ADR 0034: the change's own acceptance tests, which head lacks, are in
+    // the workspace as it wrote them; the harness keeps them, not
+    // re-creates them.
+    let of = job.change;
+    let (seeds, seeded) =
+        blocking(&repo.inner, move |inner| inner.seed_own_tests(of, base)).await?;
+    for (path, bytes) in seeds {
+        ws.write_file(&path, bytes).await?;
+    }
+    let mut request = request_message(repo, job, &inputs, &ws);
+    request.seeded_tests = seeded;
     let started = Instant::now();
     let answer = tokio::time::timeout(
         Duration::from_millis(budget.wall_time_ms),
@@ -448,5 +458,6 @@ fn request_message(
         budget: Some(budget_message(&inputs.budget)),
         note: job.note.clone().filter(|n| !n.is_empty()),
         protected_tests: inputs.protected.clone(),
+        seeded_tests: Vec::new(),
     }
 }

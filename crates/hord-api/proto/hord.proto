@@ -615,6 +615,9 @@ message ReplayRequest {
   // the replayed change's intent and by the intents it collided with. A
   // replay that modifies, deletes, or renames one is rejected.
   repeated string protected_tests = 13;
+  // The replayed change's own acceptance tests, already in the workspace as
+  // the change wrote them (head lacks them); they must stay as they are.
+  repeated string seeded_tests = 14;
 }
 
 // The harness proposed a change.

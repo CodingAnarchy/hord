@@ -139,6 +139,15 @@ pub fn prompt(request: &ReplayRequest) -> String {
             let _ = writeln!(text, "- {test}");
         }
     }
+    if !request.seeded_tests.is_empty() {
+        let _ = writeln!(
+            text,
+            "\nThe change's own acceptance tests are already in this directory, exactly as the change wrote them. Keep them as they are; do not rewrite them:"
+        );
+        for test in &request.seeded_tests {
+            let _ = writeln!(text, "- {test}");
+        }
+    }
     if let Some(note) = &request.note {
         let _ = writeln!(text, "\n## Note from the arbiter\n\n{note}");
     }
@@ -349,6 +358,7 @@ mod tests {
             }),
             note: Some("keep the doc comment".into()),
             protected_tests: vec!["beta_is_21".into(), "beta_is_20".into()],
+            seeded_tests: vec!["beta_is_21".into()],
             ..Default::default()
         }
     }
@@ -365,6 +375,7 @@ mod tests {
             "keep the doc comment",
             "Tests you must not change",
             "- beta_is_20",
+            "already in this directory",
         ] {
             assert!(text.contains(needle), "{needle:?} in {text}");
         }

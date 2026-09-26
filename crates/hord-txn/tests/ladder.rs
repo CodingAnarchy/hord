@@ -36,6 +36,8 @@ enum Step {
     },
     /// Write these whole files and propose.
     Write(Vec<(&'static str, String)>),
+    /// Delete these files, then write these, and propose.
+    Remove(Vec<&'static str>, Vec<(&'static str, String)>),
     /// Give up.
     GiveUp,
 }
@@ -81,6 +83,22 @@ async fn play(
             cost_micros,
         } => (Some((from, to)), Vec::new(), cost_micros),
         Step::Write(files) => (None, files, None),
+        Step::Remove(gone, files) => {
+            let id = request
+                .workspace
+                .parse()
+                .map_err(|e| format!("workspace id: {e}"))?;
+            let mut ws = repo
+                .open_workspace(id, actor("replayer"), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            for file in gone {
+                ws.delete_file(&path(file))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            (None, files, None)
+        }
     };
     let id = request
         .workspace
@@ -1174,7 +1192,7 @@ async fn a_replay_must_keep_its_own_changes_tests_as_written() -> TestResult {
                 test_file("beta_is_21", "assert!(fixture::beta() > 0);"),
             ),
         ]),
-        Step::Write(vec![("src/lib.rs", lib_21.clone())]),
+        Step::Remove(vec!["tests/b.rs"], vec![("src/lib.rs", lib_21.clone())]),
         Step::Write(vec![("src/lib.rs", lib_21), ("tests/b.rs", own_test())]),
     ]);
     let t = ladder_repo(
@@ -1278,6 +1296,41 @@ async fn reformatting_or_adding_beside_a_protected_test_is_not_tampering() -> Te
             "beta_is_20 after: `#[test] fn beta_is_20() { assert_eq!(fixture::beta(), 21); }`"
         ),
         "{detail}"
+    );
+    Ok(())
+}
+
+/// ADR 0034: the replay workspace already has the change's own acceptance
+/// tests, as it wrote them (head lacks them), so a harness that only fixes
+/// the code keeps them and lands; the request names them.
+#[tokio::test]
+async fn the_replay_workspace_is_seeded_with_the_changes_own_tests() -> TestResult {
+    let harness = Scripted::new([Step::Write(vec![(
+        "src/lib.rs",
+        LIB.replace("    2\n", "    21\n"),
+    )])]);
+    let t = ladder_repo(
+        TWO_ATTEMPTS,
+        Some(Arc::new(harness.clone())),
+        Arc::new(StubVerifier),
+    )
+    .await?;
+    let (_, cb) = collide_with_tests(&t.repo).await?;
+    t.repo.land_local().await?;
+    let requests = harness.requests();
+    assert_eq!(
+        requests.first().map(|r| r.seeded_tests.clone()),
+        Some(vec!["beta_is_21".to_owned()])
+    );
+    let entry = t.repo.status(cb).await?;
+    assert!(
+        matches!(entry.status, QueueStatus::Replayed { .. }),
+        "{entry:#?}"
+    );
+    assert_eq!(
+        file_at_head(&t.repo, "tests/b.rs").await?,
+        Some(own_test()),
+        "b's test as b wrote it"
     );
     Ok(())
 }
