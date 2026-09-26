@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use hord_api::auth::Scope;
 
 /// Semantic VCS.
@@ -279,7 +279,7 @@ pub enum Command {
     },
     /// Resolve a parked change (spec §6.4 rung 3). The resolution lands as a
     /// change whose parents include both colliding changes.
-    #[command(group(clap::ArgGroup::new("how").required(true).args(["pick", "edit", "replay"])))]
+    #[command(group(ArgGroup::new("how").required(true).args(["pick", "edit", "replay"])))]
     Arbitrate {
         /// The parked change (64 hex digits).
         #[arg(value_name = "CHANGE")]
@@ -344,7 +344,7 @@ pub enum TokenCommand {
         #[arg(long, value_name = "HARNESS")]
         harness: String,
         /// Scope to grant (repeat): read, propose, review:KIND,
-        /// arbitrate, admin.
+        /// arbitrate, admin, bridge (the git bridge, ADR 0037).
         #[arg(long = "scope", value_name = "SCOPE", required = true)]
         scopes: Vec<Scope>,
         /// Write the private key here instead of printing it.
@@ -509,5 +509,30 @@ pub enum GitCommand {
         /// Hord ref or snapshot to export (for example `head` or `main`).
         #[arg(value_name = "REF")]
         hord_ref: String,
+    },
+    /// Run the git bridge (spec §9, ADR 0036): keep a git remote's `main`
+    /// equal to the export of the log, and take its pull requests as
+    /// proposals. Without a mode flag it runs until interrupted.
+    ///
+    /// The bridge owns `main`: protect it so only the bridge's token may
+    /// push. Setup and the config file are in docs/bridge.md.
+    #[command(group(ArgGroup::new("mode").args(["once", "check", "repair"])))]
+    Sync {
+        /// One pass (export and push what landed, submit new pull
+        /// requests, report outcomes), then exit.
+        #[arg(long)]
+        once: bool,
+        /// Compare `main` with the export of the log, record the check,
+        /// and exit non-zero if `main` has diverged. Changes nothing.
+        #[arg(long)]
+        check: bool,
+        /// FORCE-PUSH the export of the log to `main`, discarding any
+        /// commit on `main` the export does not contain (a manual push,
+        /// say). Use it after `--check` reports divergence.
+        #[arg(long)]
+        repair: bool,
+        /// The bridge's config file [default: .hord/bridge.toml].
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
 }

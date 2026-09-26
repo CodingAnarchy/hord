@@ -233,7 +233,7 @@ pub fn rungs(
             ),
             Some(Kind::Landed(l)) => ("land".to_owned(), format!("landed at #{}", l.position)),
             Some(Kind::Rejected(r)) => ("reject".to_owned(), r.reason.clone()),
-            Some(Kind::HeadMoved(_)) | None => continue,
+            Some(Kind::HeadMoved(_) | Kind::BridgeChecked(_)) | None => continue,
         };
         // Close the previous replay with this event's outcome.
         if let Some(prev) = out.last_mut()

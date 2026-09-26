@@ -351,6 +351,7 @@ fn export_change_handles_a_long_linear_history() -> TestResult {
                 created_at: Timestamp::from_millis(i as u64 * 1000),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: BTreeSet::new(),
             write_set: BTreeSet::new(),

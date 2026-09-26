@@ -45,6 +45,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_api::proto::{self, ReplayRequest, ReplayResult, replay_result::Status};
@@ -269,11 +270,18 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Result<Self, Error> {
+        // Unique per attempt even when two start at once in one process: the
+        // clock alone is too coarse on some platforms (microseconds on macOS),
+        // and two attempts sharing a directory delete each other's files.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let path =
-            std::env::temp_dir().join(format!("hord-replay-ref-{}-{nanos}", std::process::id()));
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hord-replay-ref-{}-{nanos}-{n}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).map_err(io(format!("create {}", path.display())))?;
         Ok(Self(path))
     }

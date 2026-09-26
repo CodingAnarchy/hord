@@ -74,9 +74,9 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// Commands that open the store in this process: a running daemon holds
-/// it, so it is asked to stop first.
+/// it, so it is asked to stop first. `git sync` talks to the daemon.
 fn needs_store(command: &Command) -> bool {
-    matches!(command, Command::Git { .. })
+    matches!(command, Command::Git { command } if !matches!(command, GitCommand::Sync { .. }))
 }
 
 fn run_blocking(cli: Cli) -> Result<()> {
@@ -139,6 +139,20 @@ fn run_blocking(cli: Cli) -> Result<()> {
         Command::Git { command } => match command {
             GitCommand::Import { git_ref } => cmd::git::run_import(json, git_ref),
             GitCommand::Export { hord_ref } => cmd::git::run_export(json, hord_ref),
+            GitCommand::Sync {
+                once,
+                check,
+                repair,
+                config,
+            } => {
+                let mode = match (once, check, repair) {
+                    (true, _, _) => cmd::git_sync::Mode::Once,
+                    (_, true, _) => cmd::git_sync::Mode::Check,
+                    (_, _, true) => cmd::git_sync::Mode::Repair,
+                    _ => cmd::git_sync::Mode::Daemon,
+                };
+                cmd::git_sync::run(json, &target, mode, config)
+            }
         },
         Command::Review {
             change,

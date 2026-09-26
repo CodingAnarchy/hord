@@ -486,7 +486,8 @@ fn trace_steps(
                 );
             }
             // Evidence steps come from the evidence itself, below.
-            Some(Kind::EvidenceAttached(_) | Kind::HeadMoved(_)) | None => continue,
+            Some(Kind::EvidenceAttached(_) | Kind::HeadMoved(_) | Kind::BridgeChecked(_))
+            | None => continue,
             Some(Kind::Replaying(r)) => {
                 step.stage = proto::TraceStage::Replay.into();
                 let attempt =

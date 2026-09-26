@@ -365,6 +365,13 @@ impl RepoBackend for RemoteRepo {
         let stream = call!(self, events, request)?;
         Ok(Box::pin(stream.map(|item| item.map_err(ApiError::from))))
     }
+
+    async fn record_bridge_check(
+        &self,
+        request: proto::BridgeChecked,
+    ) -> ApiResult<proto::RecordBridgeCheckResponse> {
+        call!(self, record_bridge_check, request)
+    }
 }
 
 /// Open the client-side repository at `root` (created if missing) whose

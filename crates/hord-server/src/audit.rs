@@ -401,21 +401,32 @@ fn judge_bridge(
     bridge
 }
 
-/// The divergence check an event records, if it is one (ADR 0036). The
-/// bridge's `BridgeChecked` event kind is defined by the bridge's slice of
-/// `hord.proto`; until it is part of this schema, no event is one, and the
-/// report says "no bridge checks recorded".
+/// The divergence check an event records, if it is one: a `BridgeChecked`
+/// event (ADR 0036). With none in the window the report says "no bridge
+/// checks recorded".
 fn bridge_check(envelope: &proto::EventEnvelope) -> Option<BridgeCheck> {
-    let _ = envelope;
-    None
+    let Some(proto::event::Kind::BridgeChecked(c)) =
+        envelope.event.as_ref().and_then(|e| e.kind.as_ref())
+    else {
+        return None;
+    };
+    let commit = |c: &Option<String>| c.as_deref().unwrap_or("none").to_owned();
+    Some(BridgeCheck {
+        at_ms: envelope.at_ms,
+        diverged: c.diverged,
+        detail: format!(
+            "{}: main at {}, export at {}",
+            c.remote,
+            commit(&c.actual),
+            commit(&c.expected)
+        ),
+    })
 }
 
 /// Who vouched for an unsigned submitted change, if the git bridge did
-/// (ADR 0037): the key id on its `Submitted` event. Like
-/// [`bridge_check`], it reads the bridge's field once the schema has it.
+/// (ADR 0037): the key id on its `Submitted` event.
 fn bridge_voucher(submitted: &proto::Submitted) -> Option<String> {
-    let _ = submitted;
-    None
+    submitted.voucher.clone()
 }
 
 /// Check `signature` over an object claimed by `actor`: `verify` checks it
