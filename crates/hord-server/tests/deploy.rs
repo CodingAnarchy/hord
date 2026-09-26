@@ -96,3 +96,19 @@ fn the_server_may_write_its_auth_file() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn backups_are_readable_by_their_owner_only() -> TestResult {
+    // The archive holds the auth file and the TLS private key.
+    let script = std::fs::read_to_string(deploy().join("hord-backup.sh"))?;
+    let umask = script
+        .lines()
+        .position(|line| line.trim() == "umask 077")
+        .ok_or("hord-backup.sh sets umask 077")?;
+    let tar = script
+        .lines()
+        .position(|line| line.trim_start().starts_with("tar "))
+        .ok_or("hord-backup.sh runs tar")?;
+    assert!(umask < tar, "umask 077 comes before the archive is written");
+    Ok(())
+}

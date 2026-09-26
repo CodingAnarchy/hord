@@ -9,6 +9,8 @@
 # <dest-dir>/hord-<UTC time>.tar.gz with the repository's .hord/ and
 # /etc/hord (auth file, TLS files).
 set -eu
+# The archive holds the auth file and the TLS private key: owner only.
+umask 077
 repo=${1:?usage: hord-backup.sh <repo> <dest-dir>}
 dest=${2:?usage: hord-backup.sh <repo> <dest-dir>}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
