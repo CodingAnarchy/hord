@@ -4,34 +4,13 @@
 
 mod common;
 
+use common::TempDir;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{self, Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::process::{Command, Output};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        common::clear_stale(&path)?;
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        common::drop_tree(&self.0);
-    }
-}
 
 fn describe(out: &Output) -> String {
     format!(

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hord_core::{Evidence, EvidenceKind, ObjectId, RepoPath, SnapshotId};
+use hord_core::{Evidence, EvidenceKind, ObjectId, RepoPath, SnapshotId, Timestamp};
 use hord_verify::{
     Check, Checkout, CoverageRecord, Drift, Error, EvidenceIndex, ImpactSet, Result, TestRef,
     Toolchain, Verifier, VerifyPlan, VerifyPolicy,
@@ -353,7 +353,7 @@ impl RustVerifier {
                 log: Some(log),
                 cost_ms: coverage.elapsed_ms,
                 produced_by: self.runner.actor.clone(),
-                produced_at: crate::runner::now(),
+                produced_at: Timestamp::now(),
             }
             .build(),
         ];

@@ -314,7 +314,7 @@ impl LocalChanges {
 /// Whether an event is about one of `ids`.
 pub fn names_any(envelope: &proto::EventEnvelope, ids: &BTreeSet<String>) -> bool {
     use proto::event::Kind;
-    let Some(kind) = envelope.event.as_ref().and_then(|e| e.kind.as_ref()) else {
+    let Some(kind) = envelope.kind() else {
         return false;
     };
     let named: Vec<&str> = match kind {

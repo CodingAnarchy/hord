@@ -11,16 +11,12 @@
 //!   edit twice, a scripted verifier fails replays, the two attempts are
 //!   one candidate on the workbench, and picking it lands it.
 
+mod common;
+
 use std::collections::VecDeque;
-use std::env;
 use std::fmt::Debug;
-use std::fs;
-use std::io;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,7 +28,7 @@ use hord_api::{ApiError, ChangesBackend, RepoBackend, proto, wire};
 use hord_core::sign::SigningKey;
 use hord_core::{Actor, Bytes, ChangeId, Intent, RepoPath, Signature};
 use hord_remote::RemoteRepo;
-use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig, UiSigner};
+use hord_server::{AuthStore, Hosts, Server, ServerConfig, UiSigner};
 use hord_txn::{
     Arbitration, BeginOptions, ReplayFuture, ReplayHarness, Repo, RepoOptions, StubVerifier,
     Verdict, Verifier, VerifyFuture, VerifyRequest, sign_arbitration, verify_arbitration,
@@ -42,38 +38,10 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::handshake;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+use common::{Running, TestResult, temp};
 
 const LIB: &str = "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    2\n}\n";
-
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    /// A failed removal is reported, not raised: a drop cannot return it.
-    fn drop(&mut self) {
-        if let Err(err) = fs::remove_dir_all(&self.0)
-            && err.kind() != ErrorKind::NotFound
-        {
-            eprintln!("remove temp dir {}: {err}", self.0.display());
-        }
-    }
-}
-
-fn temp(tag: &str) -> io::Result<Dir> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = env::temp_dir().join(format!(
-        "hord-arbitration-{tag}-{}-{}",
-        process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    if path.exists() {
-        fs::remove_dir_all(&path)?;
-    }
-    fs::create_dir_all(&path)?;
-    Ok(Dir(path))
-}
 
 fn agent(id: &str) -> Actor {
     Actor::Agent {
@@ -92,28 +60,6 @@ fn lib_path() -> TestResult<RepoPath> {
     Ok("src/lib.rs".parse()?)
 }
 
-/// A running server: its address and the handle that stops it.
-struct Running {
-    addr: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Running {
-    fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    async fn stop(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-
 /// Serve `root` with `verifier` and `harness`, configured by `setup`.
 async fn serve(
     root: &Path,
@@ -130,23 +76,7 @@ async fn serve(
         },
     )
     .await?;
-    let listener = Server::bind("127.0.0.1:0".parse()?, &ServeOptions::default()).await?;
-    let addr = listener.local_addr()?;
-    let (stop, stopped) = oneshot::channel::<()>();
-    let server = setup(Server::new(hosts, ServerConfig::default()));
-    let task = tokio::spawn(async move {
-        server
-            .serve(listener, async {
-                let _ = stopped.await;
-            })
-            .await
-            .expect("serve the test server");
-    });
-    Ok(Running {
-        addr,
-        stop: Some(stop),
-        task: Some(task),
-    })
+    Running::start(setup(Server::new(hosts, ServerConfig::default()))).await
 }
 
 async fn propose(repo: &Repo, who: &str, body: &str, summary: &str) -> TestResult<ChangeId> {
@@ -224,11 +154,9 @@ async fn arbitrated_event(remote: &RemoteRepo, parked: &str) -> TestResult<proto
                 change: parked.to_owned(),
             })
             .await?;
-        let found = view.history.iter().find_map(|e| {
-            match e.event.as_ref().and_then(|e| e.kind.as_ref()) {
-                Some(Kind::Arbitrated(a)) => Some(a.clone()),
-                _ => None,
-            }
+        let found = view.history.iter().find_map(|e| match e.kind() {
+            Some(Kind::Arbitrated(a)) => Some(a.clone()),
+            _ => None,
         });
         if let Some(found) = found {
             return Ok(found);

@@ -247,7 +247,7 @@ impl Bridge {
     }
 
     async fn on_event(&mut self, envelope: proto::EventEnvelope) -> Result<(), SyncError> {
-        let kind = envelope.event.as_ref().and_then(|e| e.kind.as_ref());
+        let kind = envelope.kind();
         let relevant = matches!(
             kind,
             Some(

@@ -33,6 +33,7 @@ use hord_api::{ApiError, ApiResult, AuditBackend, proto, wire};
 use hord_core::sign::{self, SignError};
 use hord_core::{
     Actor, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, ObjectId, Signature,
+    Timestamp,
 };
 use hord_policy::{Decision, EvidenceTag};
 use hord_txn::{LocalRepo, Origin, QueueEntry, QueueStatus, Repo};
@@ -415,9 +416,7 @@ fn span(ms: u64) -> String {
 /// event (ADR 0036). With none in the window the report says "no bridge
 /// checks recorded".
 fn bridge_check(envelope: &proto::EventEnvelope) -> Option<BridgeCheck> {
-    let Some(proto::event::Kind::BridgeChecked(c)) =
-        envelope.event.as_ref().and_then(|e| e.kind.as_ref())
-    else {
+    let Some(proto::event::Kind::BridgeChecked(c)) = envelope.kind() else {
         return None;
     };
     let commit = |c: &Option<String>| c.as_deref().unwrap_or("none").to_owned();
@@ -530,7 +529,7 @@ pub async fn gather(
         {
             bridge_checks.push(check);
         }
-        let Some(kind) = envelope.event.as_ref().and_then(|e| e.kind.as_ref()) else {
+        let Some(kind) = envelope.kind() else {
             continue;
         };
         match kind {
@@ -768,12 +767,6 @@ async fn unrecorded(
     Ok(out)
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
 /// [`AuditBackend`] over a local repository, with the server's key
 /// bindings when it has an auth file.
 #[derive(Clone, Debug)]
@@ -793,7 +786,13 @@ impl LocalAudit {
 #[async_trait]
 impl AuditBackend for LocalAudit {
     async fn audit_log(&self, request: proto::AuditRequest) -> ApiResult<proto::AuditReport> {
-        let facts = gather(self.local.repo(), self.auth.as_deref(), &request, now_ms()).await?;
+        let facts = gather(
+            self.local.repo(),
+            self.auth.as_deref(),
+            &request,
+            Timestamp::now().as_millis(),
+        )
+        .await?;
         Ok(judge(&facts))
     }
 }

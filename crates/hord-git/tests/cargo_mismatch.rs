@@ -2,11 +2,15 @@
 //!
 //! Requires the bare clone at `~/.cache/hord/corpora/cargo.git`. Skipped if absent.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
 use hord_core::{ChangeRecord, IntentRef};
 use hord_git::{MemoryStore, Store, export_tree, import_git_window};
+
+use common::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -104,7 +108,7 @@ fn cargo_ee1a81a_gitlink_tree_sha() -> TestResult {
     let mut store = MemoryStore::new();
     import_git_window(&mut store, &git_dir, FAILING_GITLINK, 1)?;
     import_git_window(&mut store, &git_dir, FAILING_CHMOD, 1)?;
-    let dest = tempfile()?;
+    let dest = TempDir::new("cargo-mismatch")?;
     for sha in [FAILING_GITLINK, FAILING_CHMOD] {
         let mut change_id = None;
         for id in store.log()? {
@@ -152,7 +156,7 @@ fn round_trip_one(git_dir: &Path, orig: &gix::Repository, sha: &str) -> TestResu
         "imported the requested commit {sha}"
     );
 
-    let dest = tempfile()?;
+    let dest = TempDir::new("cargo-mismatch")?;
     let exported = export_tree(&store, change.result, dest.path())?;
     if exported.as_gix() != orig_tree {
         let exp_repo = gix::open_opts(dest.path(), gix::open::Options::isolated())?;
@@ -164,33 +168,4 @@ fn round_trip_one(git_dir: &Path, orig: &gix::Repository, sha: &str) -> TestResu
         "export(import({sha})) must match git tree SHA"
     );
     Ok(())
-}
-
-fn tempfile() -> TestResult<TempDir> {
-    TempDir::new("cargo-mismatch")
-}
-
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "hord-git-{prefix}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }

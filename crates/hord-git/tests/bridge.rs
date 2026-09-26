@@ -2,12 +2,11 @@
 //! its lander running, a bare git repository as the mirror, and a scripted
 //! pull request host. No network.
 
+mod common;
+
 use std::collections::BTreeSet;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gix::bstr::{BString, ByteSlice};
@@ -25,29 +24,9 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_stream::StreamExt;
 
+use common::TempDir;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> io::Result<Self> {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "hord-bridge-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 const NOTES: &str = "alpha\nbeta\ngamma\n";
 

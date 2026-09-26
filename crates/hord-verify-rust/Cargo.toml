@@ -10,14 +10,9 @@ workspace = true
 
 [dependencies]
 hord-core.workspace = true
-hord-encoding.workspace = true
 hord-lang.workspace = true
 hord-lang-rust.workspace = true
 hord-verify.workspace = true
 rustc-demangle.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
-hord-store.workspace = true

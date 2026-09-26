@@ -58,9 +58,10 @@ pub fn hex(id: ObjectId) -> String {
     id.to_hex()
 }
 
-/// The first 12 digits of a wire id, for text output.
+/// The first 12 digits of a wire id, for text output (all of it if it is
+/// shorter, or not hex as it should be).
 pub fn short(id: &str) -> &str {
-    &id[..12.min(id.len())]
+    id.get(..12).unwrap_or(id)
 }
 
 /// Text form of a definition: its name and file, when they are known.

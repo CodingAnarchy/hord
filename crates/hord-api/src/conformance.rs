@@ -313,10 +313,7 @@ async fn until(
 }
 
 fn kinds(events: &[proto::EventEnvelope]) -> Vec<&Kind> {
-    events
-        .iter()
-        .filter_map(|e| e.event.as_ref().and_then(|e| e.kind.as_ref()))
-        .collect()
+    events.iter().filter_map(|e| e.kind()).collect()
 }
 
 fn expect_err<T: std::fmt::Debug>(

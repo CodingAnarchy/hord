@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
@@ -379,14 +378,6 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-pub(crate) fn now() -> Timestamp {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    Timestamp::from_millis(ms)
-}
-
 /// Toolchain descriptor hashed into `provenance.toolchain` (spec §3.5).
 #[derive(serde::Serialize)]
 struct Toolchain<'a> {
@@ -636,7 +627,7 @@ impl Inner {
             provenance: Provenance {
                 actor,
                 toolchain: self.toolchain,
-                created_at: now(),
+                created_at: Timestamp::now(),
                 session: None,
                 parent_intent: None,
                 voucher: None,
