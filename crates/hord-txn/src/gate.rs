@@ -692,6 +692,14 @@ fn policy_path() -> Result<RepoPath> {
 /// where it came from, or why the file does not parse.
 pub(crate) type HeadPolicy = std::result::Result<(Arc<CompiledPolicy>, PolicySource), String>;
 
+/// Whether `policy` can require nothing of any change (no `land.require`,
+/// no `max_write_set`, no rules): it allows every change whatever its
+/// facts, so they need not be read.
+fn requires_nothing(policy: &CompiledPolicy) -> bool {
+    let p = policy.policy();
+    p.land.require.is_empty() && p.land.max_write_set.is_none() && p.rules.is_empty()
+}
+
 impl Inner {
     /// The policy in `snapshot` (ADR 0026). An unparseable file is an
     /// error message: the change is judged by nothing weaker.
@@ -722,8 +730,7 @@ impl Inner {
         policy: &CompiledPolicy,
         record: &ChangeRecord,
     ) -> Result<(Option<Facts>, BTreeSet<String>)> {
-        let p = policy.policy();
-        if p.land.require.is_empty() && p.land.max_write_set.is_none() && p.rules.is_empty() {
+        if requires_nothing(policy) {
             return Ok((None, BTreeSet::new()));
         }
         let facts = self.policy_facts(record, false)?;
@@ -1420,6 +1427,9 @@ impl crate::Repo {
                 Ok(found) => found,
                 Err(reason) => return Ok(Err(reason)),
             };
+            if requires_nothing(&policy) {
+                return Ok(Ok((Decision::Allow, source)));
+            }
             let mut facts = inner.policy_facts(&record, false)?;
             facts.evidence = match &report {
                 Some(report) => inner.candidate_evidence_facts(&record, report)?,
