@@ -109,22 +109,7 @@ pub(crate) fn failure_excerpts(
     max_tests: usize,
     max_lines: usize,
 ) -> Vec<(String, String)> {
-    let mut blocks: Vec<(String, Vec<&str>)> = Vec::new();
-    let mut current: Option<(String, Vec<&str>)> = None;
-    for line in stdout.lines() {
-        let header = line
-            .strip_prefix("---- ")
-            .and_then(|l| l.strip_suffix(" stdout ----"));
-        if let Some(name) = header {
-            blocks.extend(current.take());
-            current = Some((name.to_owned(), Vec::new()));
-        } else if line == "failures:" || line.starts_with("test result:") {
-            blocks.extend(current.take());
-        } else if let Some((_, lines)) = &mut current {
-            lines.push(line);
-        }
-    }
-    blocks.extend(current);
+    let blocks = failure_blocks(stdout);
     let module = |name: &str| name.split("::").next().unwrap_or_default().to_owned();
     let mut picked: Vec<usize> = Vec::new();
     let mut modules = BTreeSet::new();
@@ -143,14 +128,44 @@ pub(crate) fn failure_excerpts(
         .into_iter()
         .map(|i| {
             let (name, lines) = &blocks[i];
-            let mut text: Vec<&str> = lines.iter().take(max_lines).copied().collect();
-            if lines.len() > max_lines {
-                text.push("[...]");
-            }
-            (name.clone(), text.join("\n"))
+            (name.clone(), cut(lines, max_lines))
         })
         .collect()
 }
+
+/// Each failing test's block of libtest's `failures:` section: its name
+/// and output lines.
+fn failure_blocks(stdout: &str) -> Vec<(String, Vec<&str>)> {
+    let mut blocks: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in stdout.lines() {
+        let header = line
+            .strip_prefix("---- ")
+            .and_then(|l| l.strip_suffix(" stdout ----"));
+        if let Some(name) = header {
+            blocks.extend(current.take());
+            current = Some((name.to_owned(), Vec::new()));
+        } else if line == "failures:" || line.starts_with("test result:") {
+            blocks.extend(current.take());
+        } else if let Some((_, lines)) = &mut current {
+            lines.push(line);
+        }
+    }
+    blocks.extend(current);
+    blocks
+}
+
+/// `lines` joined, cut to `max_lines` with a `[...]` marker.
+fn cut(lines: &[&str], max_lines: usize) -> String {
+    let mut text: Vec<&str> = lines.iter().take(max_lines).copied().collect();
+    if lines.len() > max_lines {
+        text.push("[...]");
+    }
+    text.join("\n")
+}
+
+/// Lines kept of each failing test's output in a grader run.
+pub(crate) const GRADER_EXCERPT_LINES: usize = 40;
 
 /// Where one worker builds and runs.
 pub(crate) struct Worker {
@@ -595,6 +610,9 @@ pub(crate) struct Grader<'a> {
     pub failed: BTreeSet<Unit>,
     pub unattributed: bool,
     pub timed_out: bool,
+    /// Each failing test's output (by libtest name), cut to
+    /// [`GRADER_EXCERPT_LINES`]: the first failure kept.
+    pub excerpts: BTreeMap<String, String>,
 }
 
 impl<'a> Grader<'a> {
@@ -607,6 +625,7 @@ impl<'a> Grader<'a> {
             failed: BTreeSet::new(),
             unattributed: false,
             timed_out: false,
+            excerpts: BTreeMap::new(),
         }
     }
 
@@ -671,6 +690,11 @@ impl<'a> Grader<'a> {
             }
             let out = self.runner.run(self.root, &cargo(args))?;
             self.timed_out |= out.timed_out;
+            for (name, lines) in failure_blocks(&out.stdout) {
+                self.excerpts
+                    .entry(name)
+                    .or_insert_with(|| cut(&lines, GRADER_EXCERPT_LINES));
+            }
             let names = failures(&out, &BTreeSet::new());
             let mut attributed = false;
             for u in &group {
