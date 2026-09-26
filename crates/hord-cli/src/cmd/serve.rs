@@ -1,6 +1,8 @@
 //! `hord serve [--repo <path>|--root <dir>] [--bind <addr>]` (spec
 //! §10.5.1, ADR 0024): gRPC and gRPC-Web on one port, one lander per
-//! repository. Loopback only unless `--insecure-bind`. `--auth <file>` (or
+//! repository. TLS from `--tls-cert`/`--tls-key` or `server.toml`'s `[tls]`
+//! (ADR 0032); without it, loopback only unless `--insecure-bind`.
+//! `--auth <file>` (or
 //! `server.toml`'s `[auth] file`) requires bearer tokens (spec §10.5.4). `--daemon` runs the
 //! repository's per-repo daemon instead ([`crate::daemon`]).
 
@@ -10,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use hord_api::WorkspacesBackend;
-use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig, UiSigner};
+use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig, TlsConfig, UiSigner};
 
 use crate::workspaces::LocalWorkspaces;
 use crate::{identity, repo, txn};
@@ -18,11 +20,13 @@ use crate::{identity, repo, txn};
 /// The address when neither `--bind` nor `server.toml` gives one.
 const DEFAULT_BIND: &str = "127.0.0.1:7878";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     repo_path: Option<PathBuf>,
     root: Option<PathBuf>,
     bind: Option<String>,
     insecure_bind: bool,
+    tls: Option<TlsConfig>,
     auth: Option<PathBuf>,
     config: Option<PathBuf>,
     daemon: bool,
@@ -49,8 +53,13 @@ pub async fn run(
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid bind address {bind:?}"))?;
+    let tls = tls.or_else(|| config.tls.clone());
+    let options = ServeOptions {
+        insecure_bind,
+        tls: tls.is_some(),
+    };
     // Fail on a bad address before opening anything.
-    hord_server::check_bind(addr, insecure_bind)?;
+    hord_server::check_bind(addr, &options)?;
     let hosts = match (&repo_root, &root) {
         (Some(path), _) => {
             Hosts::open_repo(path, crate::cmd::replay::lander_options(path)?).await?
@@ -65,12 +74,18 @@ pub async fn run(
         (None, None) => unreachable!("one of --repo or --root"),
     };
     let names: Vec<String> = hosts.names().map(str::to_owned).collect();
-    let listener = Server::bind(addr, &ServeOptions { insecure_bind }).await?;
+    let listener = Server::bind(addr, &options).await?;
     let local = listener.local_addr()?;
     let auth = auth.or_else(|| config.auth.as_ref().map(|a| a.file.clone()));
     let (stop_local, local_endpoints) = serve_local_endpoints(&hosts);
     let mut server = Server::new(hosts, config);
     let mut note = String::new();
+    if let Some(tls) = &tls {
+        server = server
+            .with_tls(tls)
+            .with_context(|| format!("TLS from {}", tls.cert.display()))?;
+        note.push_str(&format!(", TLS from {}", tls.cert.display()));
+    }
     if let Some(path) = auth {
         let store =
             AuthStore::open(&path).with_context(|| format!("open auth file {}", path.display()))?;
@@ -84,7 +99,11 @@ pub async fn run(
         server = server.with_ui_signer(signer);
     }
     // The first line: tests read the address from it.
-    eprintln!("hord serve: http://{local} ({}{note})", names.join(", "));
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    eprintln!(
+        "hord serve: {scheme}://{local} ({}{note})",
+        names.join(", ")
+    );
     server
         .serve(listener, async {
             let _ = tokio::signal::ctrl_c().await;

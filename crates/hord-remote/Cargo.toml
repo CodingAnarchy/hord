@@ -20,7 +20,7 @@ hyper-util.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }
 tokio-stream.workspace = true
-tonic.workspace = true
+tonic = { workspace = true, features = ["tls-ring", "tls-native-roots"] }
 tower.workspace = true
 
 [dev-dependencies]
@@ -32,4 +32,5 @@ hord-ui.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 prost.workspace = true
+rcgen.workspace = true
 serde_json.workspace = true

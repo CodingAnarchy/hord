@@ -460,6 +460,7 @@ async fn webhooks_receive_the_events_they_ask_for() -> TestResult {
             repos: vec![],
         }],
         auth: None,
+        tls: None,
     };
     let running = serve(hosts, config).await?;
     let remote = RemoteRepo::connect(&running.url()).await?;

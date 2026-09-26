@@ -22,8 +22,10 @@
 //! attached evidence must be the token actor's own, signed with a key bound
 //! to it. The caller's [`Principal`] is in each request's extensions.
 //!
-//! A TCP listener binds loopback only unless [`ServeOptions::insecure_bind`]
-//! is set (there is no TLS). [`Server::serve_local`] listens on the repository's
+//! [`Server::with_tls`] serves TLS on the TCP listener (ADR 0032), in
+//! process with `rustls` through tonic, from `server.toml`'s `[tls]`. A
+//! plaintext TCP listener binds loopback only unless
+//! [`ServeOptions::insecure_bind`] is set. [`Server::serve_local`] listens on the repository's
 //! local endpoint instead: a Unix socket, or a named pipe on Windows
 //! (ADR 0021's per-repo daemon).
 
@@ -50,7 +52,7 @@ mod webhook;
 pub use activity::Activity;
 pub use auth::{AuthError, AuthStore, Issued, Principal, same_actor};
 pub use changes::{LocalChanges, RECORDINGS_DIR, save_recording};
-pub use config::{AuthConfig, ServerConfig, WebhookConfig};
+pub use config::{AuthConfig, ServerConfig, TlsConfig, WebhookConfig};
 pub use error::{Error, Result};
 pub use hosts::Hosts;
 pub use server::{ServeOptions, Server, check_bind};

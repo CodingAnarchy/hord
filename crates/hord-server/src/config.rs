@@ -1,7 +1,11 @@
-//! `server.toml` (spec §10.5.1): the bind address and webhooks.
+//! `server.toml` (spec §10.5.1): the bind address, TLS, auth, and webhooks.
 //!
 //! ```toml
-//! bind = "127.0.0.1:7878"
+//! bind = "0.0.0.0:7878"
+//!
+//! [tls]                          # ADR 0032: TLS for `hord serve` (M6)
+//! cert = "tls/cert.pem"          # PEM chain, leaf first; relative to this file
+//! key = "tls/key.pem"            # PEM private key (PKCS#8, PKCS#1 or SEC1)
 //!
 //! [auth]
 //! file = "auth.toml"             # relative to this file; see `AuthStore`
@@ -32,6 +36,21 @@ pub struct ServerConfig {
     /// Require bearer tokens (spec §10.5.4).
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    /// Serve TLS on the TCP listener (ADR 0032).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// `[tls]`: the server's certificate chain and private key, PEM files. A
+/// relative path is relative to `server.toml`'s directory once
+/// [`ServerConfig::load`] has read it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// The certificate chain, leaf first.
+    pub cert: PathBuf,
+    /// The private key.
+    pub key: PathBuf,
 }
 
 /// `[auth]`: where the auth file is ([`crate::AuthStore`]).
@@ -68,8 +87,14 @@ impl ServerConfig {
             Err(err) => return Err(err.into()),
         };
         let mut config = Self::parse(path, &text)?;
-        if let (Some(auth), Some(dir)) = (&mut config.auth, path.parent()) {
-            auth.file = dir.join(&auth.file);
+        if let Some(dir) = path.parent() {
+            if let Some(auth) = &mut config.auth {
+                auth.file = dir.join(&auth.file);
+            }
+            if let Some(tls) = &mut config.tls {
+                tls.cert = dir.join(&tls.cert);
+                tls.key = dir.join(&tls.key);
+            }
         }
         Ok(config)
     }
@@ -122,11 +147,13 @@ mod tests {
             Some(Path::new("auth.toml"))
         );
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:1"));
+        assert_eq!(config.tls, None);
         assert_eq!(config.webhooks[0].kinds, ["landed"]);
         for bad in [
             "[[webhook]]\nurl = \"http://h\"\nkinds = [\"nope\"]\n",
             "[[webhook]]\nurl = \"https://h\"\n",
             "port = 1\n",
+            "[tls]\ncert = \"c.pem\"\n",
         ] {
             assert!(ServerConfig::parse(path, bad).is_err(), "{bad}");
         }
@@ -134,6 +161,28 @@ mod tests {
             ServerConfig::load(Path::new("/no/such/server.toml"))?,
             ServerConfig::default()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_and_auth_paths_are_relative_to_the_file() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("hord-server-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("server.toml");
+        let key = std::env::temp_dir().join("elsewhere").join("key.pem");
+        std::fs::write(
+            &path,
+            format!(
+                "[tls]\ncert = \"tls/cert.pem\"\nkey = '{}'\n[auth]\nfile = \"auth.toml\"\n",
+                key.display()
+            ),
+        )?;
+        let config = ServerConfig::load(&path)?;
+        let _ = std::fs::remove_dir_all(&dir);
+        let tls = config.tls.ok_or("no [tls]")?;
+        assert_eq!(tls.cert, dir.join("tls/cert.pem"));
+        assert_eq!(tls.key, key);
+        assert_eq!(config.auth.map(|a| a.file), Some(dir.join("auth.toml")));
         Ok(())
     }
 }

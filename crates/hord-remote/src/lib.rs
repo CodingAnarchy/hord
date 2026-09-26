@@ -10,7 +10,9 @@
 //!
 //! Addresses are `http://host:port` for a server hosting one repository,
 //! `http://host:port/r/<name>` for one of several, or a repository's local
-//! endpoint ([`RemoteRepo::connect_local`], ADR 0021).
+//! endpoint ([`RemoteRepo::connect_local`], ADR 0021). `https://` connects
+//! over TLS (ADR 0032), trusting the system's roots plus an optional CA
+//! certificate ([`ConnectOptions::ca_pem`]).
 //!
 //! [`RemoteRepo::connect_with_token`] sends a bearer token on every call,
 //! and [`RemoteRepo::auth`] reaches the server's `Auth` service (spec
@@ -43,7 +45,7 @@ mod workspaces;
 
 pub use auth::RemoteAuth;
 pub use changes::RemoteChanges;
-pub use client::{RemoteRepo, open_cache};
+pub use client::{ConnectOptions, RemoteRepo, open_cache};
 pub use push::push_change;
 pub use workspaces::RemoteWorkspaces;
 
@@ -51,9 +53,20 @@ pub use workspaces::RemoteWorkspaces;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The address is not `http://host:port[/r/<name>]`.
-    #[error("invalid remote address {0:?}: expected http://host:port or http://host:port/r/<name>")]
+    /// The address is not `http[s]://host:port[/r/<name>]`.
+    #[error(
+        "invalid remote address {0:?}: expected http[s]://host:port or http[s]://host:port/r/<name>"
+    )]
     InvalidUrl(String),
+    /// TLS could not be set up: no trusted roots, or a CA certificate
+    /// that is not PEM.
+    #[error("TLS for {url}: {reason}")]
+    Tls {
+        /// Where.
+        url: String,
+        /// Why.
+        reason: String,
+    },
     /// A bearer token that cannot travel in a header.
     #[error("invalid token: not a valid header value")]
     InvalidToken,

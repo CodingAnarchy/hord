@@ -32,6 +32,7 @@ mod workspaces;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use hord_server::TlsConfig;
 
 use cli::{
     Cli, Command, GitCommand, KeyCommand, PolicyCommand, RemoteCommand, TokenCommand, UserCommand,
@@ -55,12 +56,17 @@ async fn run(cli: Cli) -> Result<()> {
         root,
         bind,
         insecure_bind,
+        tls_cert,
+        tls_key,
         auth,
         config,
         daemon,
     } = cli.command
     {
-        return cmd::serve::run(repo, root, bind, insecure_bind, auth, config, daemon).await;
+        let tls = tls_cert
+            .zip(tls_key)
+            .map(|(cert, key)| TlsConfig { cert, key });
+        return cmd::serve::run(repo, root, bind, insecure_bind, tls, auth, config, daemon).await;
     }
     tokio::task::spawn_blocking(move || run_blocking(cli))
         .await
@@ -120,7 +126,9 @@ fn run_blocking(cli: Cli) -> Result<()> {
             from,
         } => cmd::watch::run(json, &target, queue, change, from),
         Command::Remote { command } => match command {
-            RemoteCommand::Add { name, url } => cmd::remote::run_add(json, name, url),
+            RemoteCommand::Add { name, url, ca_file } => {
+                cmd::remote::run_add(json, name, url, ca_file)
+            }
             RemoteCommand::Rm { name } => cmd::remote::run_rm(json, name),
             RemoteCommand::List => cmd::remote::run_list(json),
             RemoteCommand::SetDefault { name, clear } => {

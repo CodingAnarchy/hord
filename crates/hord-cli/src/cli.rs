@@ -163,10 +163,17 @@ pub enum Command {
         /// Address to listen on (default: server.toml's, else 127.0.0.1:7878).
         #[arg(long, value_name = "ADDR")]
         bind: Option<String>,
-        /// Allow a non-loopback address (there is no TLS: tokens travel in
-        /// the clear).
+        /// Allow a non-loopback address without TLS (tokens travel in the
+        /// clear). Not needed with TLS.
         #[arg(long)]
         insecure_bind: bool,
+        /// Serve TLS with this PEM certificate chain (ADR 0032; default:
+        /// server.toml's `[tls] cert`). Needs `--tls-key`.
+        #[arg(long, value_name = "FILE", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// The PEM private key for `--tls-cert`.
+        #[arg(long, value_name = "FILE", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
         /// Require bearer tokens, checked against this auth file (spec
         /// §10.5.4; default: server.toml's `[auth] file`, else none).
         #[arg(long, value_name = "FILE")]
@@ -408,7 +415,7 @@ pub enum WsCommand {
 /// `hord remote` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
-    /// Add a remote: `http://host:port`, or `http://host:port/r/<name>`.
+    /// Add a remote: `http[s]://host:port`, or `http[s]://host:port/r/<name>`.
     Add {
         /// Its name.
         #[arg(value_name = "NAME")]
@@ -416,6 +423,10 @@ pub enum RemoteCommand {
         /// Its address.
         #[arg(value_name = "URL")]
         url: String,
+        /// For `https`: a PEM CA certificate to trust besides the system's
+        /// roots, such as a team host's own CA (ADR 0032).
+        #[arg(long, value_name = "FILE")]
+        ca_file: Option<PathBuf>,
     },
     /// Remove a remote.
     Rm {
