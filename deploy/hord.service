@@ -18,6 +18,9 @@ ExecStart=/usr/local/bin/hord serve --repo /srv/hord/hord --config /srv/hord/hor
 # hord serve stops cleanly on SIGINT: it ends event streams, stops the
 # lander, and releases the store.
 KillSignal=SIGINT
+# `systemctl reload hord` re-reads the auth file at once. The server also
+# picks up changes to it within a second on its own.
+ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5

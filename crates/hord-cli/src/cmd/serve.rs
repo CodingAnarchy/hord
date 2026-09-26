@@ -3,7 +3,8 @@
 //! repository. TLS from `--tls-cert`/`--tls-key` or `server.toml`'s `[tls]`
 //! (ADR 0032); without it, loopback only unless `--insecure-bind`.
 //! `--auth <file>` (or
-//! `server.toml`'s `[auth] file`) requires bearer tokens (spec §10.5.4). `--daemon` runs the
+//! `server.toml`'s `[auth] file`) requires bearer tokens (spec §10.5.4); the
+//! file is reloaded when it changes and on SIGHUP. `--daemon` runs the
 //! repository's per-repo daemon instead ([`crate::daemon`]).
 
 use std::net::SocketAddr;
@@ -106,16 +107,46 @@ pub async fn run(
         "hord serve: {scheme}://{local} ({}{note})",
         names.join(", ")
     );
+    #[cfg(unix)]
+    let hangup = server
+        .auth_store()
+        .map(|store| tokio::spawn(reload_on_hangup(store)));
     server
         .serve(listener, async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    #[cfg(unix)]
+    if let Some(hangup) = hangup {
+        hangup.abort();
+    }
     let _ = stop_local.send(true);
     for task in local_endpoints {
         let _ = task.await;
     }
     Ok(())
+}
+
+/// Reload the auth file on SIGHUP (`systemctl reload hord`), besides the
+/// server's own check for changes every second.
+#[cfg(unix)]
+async fn reload_on_hangup(store: Arc<AuthStore>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangups = match signal(SignalKind::hangup()) {
+        Ok(hangups) => hangups,
+        Err(err) => {
+            eprintln!("hord serve: no SIGHUP reload: {err}");
+            return;
+        }
+    };
+    while hangups.recv().await.is_some() {
+        let reload = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || reload.reload()).await {
+            Ok(Ok(())) => eprintln!("hord serve: reloaded {}", store.path().display()),
+            Ok(Err(err)) => eprintln!("hord serve: SIGHUP: {err}"),
+            Err(err) => eprintln!("hord serve: SIGHUP: {err}"),
+        }
+    }
 }
 
 /// Serve each hosted repository on its local endpoint too, with its

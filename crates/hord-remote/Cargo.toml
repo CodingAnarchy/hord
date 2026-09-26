@@ -33,4 +33,5 @@ http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 prost.workspace = true
 rcgen.workspace = true
+toml.workspace = true
 serde_json.workspace = true

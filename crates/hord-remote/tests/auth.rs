@@ -443,3 +443,62 @@ async fn arbitration_is_scoped_and_signed_by_the_arbiter() -> TestResult {
     hord_txn::verify_arbitration(parked, &theirs, &signature, &ann_key.public())?;
     Ok(())
 }
+
+/// Revoking an agent's token takes effect on a running server: the operator
+/// deletes it from the auth file, and within the server's reload check the
+/// token is refused. Other tokens keep working, and no restart is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_token_is_refused_without_a_restart() -> TestResult {
+    let dir = temp("revoke")?;
+    let repo_dir = dir.0.join("repo");
+    drop(Repo::create(&repo_dir).await?);
+    let auth = dir.0.join("auth.toml");
+    AuthStore::add_user(&auth, "root", "pw", &[Scope::Admin, Scope::Read])?;
+    let (url, _stop) = serve(&repo_dir, &auth).await?;
+    let root_token = RemoteRepo::connect(&url)
+        .await?
+        .auth()
+        .login(proto::LoginRequest {
+            user: "root".into(),
+            password: "pw".into(),
+            key_id: SigningKey::generate()?.public().key_id(),
+        })
+        .await?
+        .token;
+    let root = RemoteRepo::connect_with_token(&url, &root_token).await?;
+    let minted = root
+        .auth()
+        .mint_token(proto::MintTokenRequest {
+            agent_id: "bot-1".into(),
+            model: "m1".into(),
+            harness: "h1".into(),
+            scopes: vec!["read".into()],
+        })
+        .await?;
+    let agent = RemoteRepo::connect_with_token(&url, &minted.token).await?;
+    agent.head(proto::HeadRequest {}).await?;
+
+    // The operator deletes bot-1's token from the file.
+    let mut file: toml::Table = std::fs::read_to_string(&auth)?.parse()?;
+    let tokens = file
+        .get_mut("token")
+        .and_then(toml::Value::as_array_mut)
+        .ok_or("the auth file lists tokens")?;
+    let before = tokens.len();
+    tokens.retain(|t| t.get("actor").and_then(|a| a.get("id")) != Some(&"bot-1".into()));
+    assert_eq!(tokens.len(), before - 1);
+    std::fs::write(&auth, toml::to_string(&file)?)?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match agent.head(proto::HeadRequest {}).await {
+            Err(ApiError::Unauthenticated(_)) => break,
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            other => return Err(format!("the revoked token still works: {other:?}").into()),
+        }
+    }
+    root.head(proto::HeadRequest {}).await?;
+    Ok(())
+}

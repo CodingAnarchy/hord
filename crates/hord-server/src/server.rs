@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::routing::get;
 use hord_api::MAX_MESSAGE_BYTES;
@@ -30,6 +30,9 @@ use crate::{Error, Result};
 
 /// How long shutdown waits for open calls (such as event streams) to end.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a serving server checks whether its auth file changed.
+const AUTH_RELOAD_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How often shutdown checks that the served routes released the hosts.
 const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
@@ -90,6 +93,7 @@ pub struct Server {
     auth: Option<Arc<AuthStore>>,
     ui_signer: Option<UiSigner>,
     tls: Option<ServerTlsConfig>,
+    audit_keys: OnceLock<Option<Arc<AuthStore>>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -117,6 +121,7 @@ impl Server {
             auth: None,
             ui_signer: None,
             tls: None,
+            audit_keys: OnceLock::new(),
         }
     }
 
@@ -128,6 +133,13 @@ impl Server {
     pub fn with_tls(mut self, tls: &TlsConfig) -> Result<Self> {
         self.tls = Some(load_tls(tls)?);
         Ok(self)
+    }
+
+    /// The auth file tokens are checked against, if any: `hord serve`
+    /// reloads it on SIGHUP ([`AuthStore::reload`]).
+    #[must_use]
+    pub fn auth_store(&self) -> Option<Arc<AuthStore>> {
+        self.auth.clone()
     }
 
     /// Whether [`Self::serve`] serves TLS.
@@ -179,6 +191,12 @@ impl Server {
     /// (a daemon or local endpoint, which takes no tokens, still reads the
     /// bindings), else none.
     fn audit_keys(&self) -> Option<Arc<AuthStore>> {
+        self.audit_keys
+            .get_or_init(|| self.open_audit_keys())
+            .clone()
+    }
+
+    fn open_audit_keys(&self) -> Option<Arc<AuthStore>> {
         self.auth.clone().or_else(|| {
             let file = &self.config.auth.as_ref()?.file;
             match AuthStore::open(file) {
@@ -305,6 +323,14 @@ impl Server {
                 ))
             })
             .collect();
+        // Revoked tokens and keys stop working, and new ones start, without
+        // a restart: reload the auth files when they change.
+        let reloader = tokio::spawn(reload_auth(
+            [self.auth.clone(), self.audit_keys()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ));
         let (stop, mut stopped) = tokio::sync::watch::channel(());
         let mut builder = tonic::transport::Server::builder();
         if let Some(tls) = tls {
@@ -340,6 +366,8 @@ impl Server {
         // Nothing may hold a repository once this returns, so a caller can
         // reopen it at once: the webhook tasks, the landers and every task
         // the repositories spawned, and then the services' own handles.
+        reloader.abort();
+        let _ = reloader.await;
         for hook in hooks {
             hook.abort();
             let _ = hook.await;
@@ -366,6 +394,46 @@ impl Server {
                 return;
             }
             tokio::time::sleep(RELEASE_POLL).await;
+        }
+    }
+}
+
+/// Every [`AUTH_RELOAD_POLL`], reload each of `stores` whose file changed.
+/// A file that does not parse (mid-edit) keeps what was read before and is
+/// reported once until it parses again.
+async fn reload_auth(mut stores: Vec<Arc<AuthStore>>) {
+    stores.dedup_by(|a, b| Arc::ptr_eq(a, b));
+    if stores.is_empty() {
+        return;
+    }
+    let mut failing = vec![false; stores.len()];
+    let mut tick = tokio::time::interval(AUTH_RELOAD_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        for (store, failing) in stores.iter().zip(&mut failing) {
+            let store = Arc::clone(store);
+            let reloaded = tokio::task::spawn_blocking(move || {
+                let result = store.reload_if_changed();
+                (store, result)
+            })
+            .await;
+            match reloaded {
+                Ok((store, Ok(changed))) => {
+                    if changed {
+                        eprintln!("hord serve: reloaded {}", store.path().display());
+                    }
+                    *failing = false;
+                }
+                Ok((store, Err(err))) if !*failing => {
+                    eprintln!(
+                        "hord serve: keeping the previous {}: {err}",
+                        store.path().display()
+                    );
+                    *failing = true;
+                }
+                Ok(_) | Err(_) => {}
+            }
         }
     }
 }

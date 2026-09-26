@@ -22,12 +22,16 @@
 //! actor = { kind = "human", id = "ada" }
 //! ```
 //!
-//! Other processes (`hord user add`) may write the file while a server
-//! runs: every change re-reads it first, and a token or key the server has
-//! not seen makes it re-read before refusing.
+//! Other processes (`hord user add`, an operator's editor) may write the
+//! file while a server runs: every change re-reads it first, and a token or
+//! key the server has not seen makes it re-read before refusing. Removing a
+//! token or key takes effect at the next [`AuthStore::reload_if_changed`]
+//! (a running server checks every second) or [`AuthStore::reload`] (`hord
+//! serve` on SIGHUP), without a restart.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::SystemTime;
 
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
@@ -174,11 +178,41 @@ struct Key {
     actor: StoredActor,
 }
 
+/// What the file looked like when it was last read: its modification time
+/// and size. `None` when it did not exist.
+type Stamp = Option<(Option<SystemTime>, u64)>;
+
+fn stamp(path: &Path) -> Result<Stamp, AuthError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some((meta.modified().ok(), meta.len()))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(AuthError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// The file as last read, and its [`Stamp`] then.
+#[derive(Debug)]
+struct Loaded {
+    file: AuthFile,
+    stamp: Stamp,
+}
+
+impl std::ops::Deref for Loaded {
+    type Target = AuthFile;
+
+    fn deref(&self) -> &AuthFile {
+        &self.file
+    }
+}
+
 /// The auth file of a running server.
 #[derive(Debug)]
 pub struct AuthStore {
     path: PathBuf,
-    state: Mutex<AuthFile>,
+    state: Mutex<Loaded>,
 }
 
 /// A new token and its principal.
@@ -193,11 +227,29 @@ pub struct Issued {
 impl AuthStore {
     /// Open the auth file at `path`; a missing file is an empty table.
     pub fn open(path: &Path) -> Result<Self, AuthError> {
-        let state = read(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            state: Mutex::new(state),
+            state: Mutex::new(load(path)?),
         })
+    }
+
+    /// Re-read the file now, dropping every token, key, and user it no
+    /// longer holds. A file that does not parse (for example half-written
+    /// by an editor) is an error, and what was read before stays in force.
+    pub fn reload(&self) -> Result<(), AuthError> {
+        let loaded = load(&self.path)?;
+        *self.lock() = loaded;
+        Ok(())
+    }
+
+    /// [`Self::reload`] if the file's modification time or size changed
+    /// since it was last read. Whether it reloaded.
+    pub fn reload_if_changed(&self) -> Result<bool, AuthError> {
+        if stamp(&self.path)? == self.lock().stamp {
+            return Ok(false);
+        }
+        self.reload()?;
+        Ok(true)
     }
 
     /// The file.
@@ -206,7 +258,7 @@ impl AuthStore {
         &self.path
     }
 
-    fn lock(&self) -> MutexGuard<'_, AuthFile> {
+    fn lock(&self) -> MutexGuard<'_, Loaded> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -216,9 +268,10 @@ impl AuthStore {
         f: impl FnOnce(&mut AuthFile) -> Result<T, AuthError>,
     ) -> Result<T, AuthError> {
         let mut state = self.lock();
-        *state = read(&self.path)?;
-        let out = f(&mut state)?;
-        write(&self.path, &state)?;
+        *state = load(&self.path)?;
+        let out = f(&mut state.file)?;
+        write(&self.path, &state.file)?;
+        state.stamp = stamp(&self.path)?;
         Ok(out)
     }
 
@@ -237,7 +290,7 @@ impl AuthStore {
         if let Some(found) = find_token(&state, &hash) {
             return Ok(Some(found));
         }
-        *state = read(&self.path)?;
+        *state = load(&self.path)?;
         Ok(find_token(&state, &hash))
     }
 
@@ -247,7 +300,7 @@ impl AuthStore {
         if let Some(actor) = find_key(&state, key_id) {
             return Ok(Some(actor));
         }
-        *state = read(&self.path)?;
+        *state = load(&self.path)?;
         Ok(find_key(&state, key_id))
     }
 
@@ -389,6 +442,16 @@ fn token_hash(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
 }
 
+/// Read the file with its [`Stamp`], taken first: a write racing the read
+/// leaves a stale stamp, so the next check reads again.
+fn load(path: &Path) -> Result<Loaded, AuthError> {
+    let stamp = stamp(path)?;
+    Ok(Loaded {
+        file: read(path)?,
+        stamp,
+    })
+}
+
 fn read(path: &Path) -> Result<AuthFile, AuthError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -444,6 +507,46 @@ mod tests {
 
     fn temp_file(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("hord-auth-{tag}-{}.toml", std::process::id()))
+    }
+
+    #[test]
+    fn a_revoked_token_is_refused_once_the_file_is_reloaded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("revoke");
+        let _ = std::fs::remove_file(&path);
+        AuthStore::add_user(&path, "ada", "pw", &[Scope::Read])?;
+        let store = AuthStore::open(&path)?;
+        let key = SigningKey::generate()?.public().key_id();
+        let kept = store.login("ada", "pw", &key)?;
+        let revoked = store.login("ada", "pw", &key)?;
+        assert!(
+            !store.reload_if_changed()?,
+            "its own writes are not a change"
+        );
+
+        // An operator deletes one token from the file.
+        let mut file = read(&path)?;
+        file.tokens.retain(|t| t.hash != token_hash(&revoked.token));
+        write(&path, &file)?;
+        assert!(
+            store.authenticate_cached(&revoked.token).is_some(),
+            "cached"
+        );
+        assert!(store.reload_if_changed()?);
+        assert_eq!(store.authenticate_cached(&revoked.token), None);
+        assert_eq!(store.authenticate(&revoked.token)?, None);
+        assert_eq!(
+            store.authenticate(&kept.token)?,
+            Some(kept.principal.clone())
+        );
+        assert!(!store.reload_if_changed()?);
+
+        // A file that does not parse keeps what was read before.
+        std::fs::write(&path, "[[token]\nhash = ")?;
+        assert!(store.reload_if_changed().is_err());
+        assert_eq!(store.authenticate_cached(&kept.token), Some(kept.principal));
+        let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]

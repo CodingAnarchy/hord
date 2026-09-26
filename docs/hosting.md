@@ -131,7 +131,7 @@ hord token mint --agent bridge --model none --harness hord-git-sync \
   --scope bridge --key-out bridge.pem     # the git bridge (ADR 0037)
 ```
 
-Hand each agent its token and key file over a private channel. The server keeps neither in the clear. To revoke a token, remove it from the auth file and restart.
+Hand each agent its token and key file over a private channel. The server keeps neither in the clear. To revoke a token, delete its `[[token]]` entry from the auth file. Entries name the actor, and a token is stored only as its hash. The running server notices the change within a second, or at once with `systemctl reload hord` (SIGHUP), and refuses the token from then on. Deleting the actor's `[[key]]` entries as well unbinds its signing key. New users and tokens need no reload.
 
 ## 6. How agents and people contribute
 
