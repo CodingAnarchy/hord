@@ -8,14 +8,16 @@
 //!   `hord.proto` (the ADR 0030 check).
 //! - With auth on, the pages need the `read` scope.
 
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{self, Body};
@@ -26,7 +28,7 @@ use hord_core::sign::SigningKey;
 use hord_core::{Actor, Bytes, ChangeId, Intent, RepoPath};
 use hord_remote::RemoteRepo;
 use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig};
-use hord_txn::{BeginOptions, QueueStatus, Repo, RepoOptions};
+use hord_txn::{BeginOptions, QueueStatus, ReplayFuture, ReplayHarness, Repo, RepoOptions};
 use hord_ui::UI_TOKEN_COOKIE;
 use hord_ui::audit::{AuditLog, Audited, unlisted};
 use hord_ui::{SingleRepo, UiRepo};
@@ -114,10 +116,19 @@ impl Running {
 }
 
 async fn serve(root: &Path, setup: impl FnOnce(Server) -> Server) -> TestResult<Running> {
+    serve_harness(root, None, setup).await
+}
+
+async fn serve_harness(
+    root: &Path,
+    harness: Option<Arc<dyn ReplayHarness>>,
+    setup: impl FnOnce(Server) -> Server,
+) -> TestResult<Running> {
     let hosts = Hosts::open_repo(
         root,
         RepoOptions {
             verifier: Some(Arc::new(hord_txn::StubVerifier)),
+            harness,
             ..RepoOptions::default()
         },
     )
@@ -184,9 +195,10 @@ struct Scenario {
     parked: String,
 }
 
-async fn scenario() -> TestResult<Scenario> {
-    let dir = temp("scenario")?;
-    let (a, b) = {
+/// The history in `dir`, and two proposals that change `twice` from
+/// head: (triple, quadruple).
+async fn seeded(dir: &Dir) -> TestResult<(String, String)> {
+    Ok({
         let repo = Repo::create(&dir.0).await?;
         repo.bootstrap(
             vec![(path("src/lib.rs")?, LIB.as_bytes().to_vec())],
@@ -240,17 +252,27 @@ async fn scenario() -> TestResult<Scenario> {
         )
         .await?;
         (wire::id(a), wire::id(b))
-    };
+    })
+}
 
+/// Submit both; the first lands, the second parks on a hard conflict.
+async fn park(remote: &RemoteRepo, a: &str, b: &str) -> TestResult {
+    for change in [a, b] {
+        remote
+            .submit(proto::SubmitRequest {
+                change: change.to_owned(),
+            })
+            .await?;
+    }
+    wait_for(remote, b, |s| s == proto::QueueStatus::Conflicted).await
+}
+
+async fn scenario() -> TestResult<Scenario> {
+    let dir = temp("scenario")?;
+    let (a, b) = seeded(&dir).await?;
     let running = serve(&dir.0, |s| s).await?;
     let remote = RemoteRepo::connect(&running.url()).await?;
-    remote
-        .submit(proto::SubmitRequest { change: a.clone() })
-        .await?;
-    remote
-        .submit(proto::SubmitRequest { change: b.clone() })
-        .await?;
-    wait_for(&remote, &b, |s| s == proto::QueueStatus::Conflicted).await?;
+    park(&remote, &a, &b).await?;
     // Unsigned: a server without auth accepts it.
     remote
         .arbitrate(proto::ArbitrateRequest {
@@ -293,6 +315,7 @@ async fn wait_for(
     change: &str,
     done: impl Fn(proto::QueueStatus) -> bool,
 ) -> TestResult {
+    let mut last = None;
     for _ in 0..600 {
         let queue = remote
             .queue(proto::QueueQuery {
@@ -305,9 +328,10 @@ async fn wait_for(
         {
             return Ok(());
         }
+        last = queue.entries.last().cloned();
         sleep(Duration::from_millis(50)).await;
     }
-    Err(format!("{change} never settled").into())
+    Err(format!("{change} never settled: {last:?}").into())
 }
 
 /// The definition named `name` in `file` at head.
@@ -723,5 +747,208 @@ async fn with_auth_views_four_to_six_need_the_read_scope() -> TestResult {
         .list_tree(proto::ListTreeRequest::default())
         .await?;
     running.stop().await;
+    Ok(())
+}
+
+/// One scripted replay: give up (`None`), or replace `from` with `to` in
+/// `src/util.rs`.
+type Step = Option<(&'static str, &'static str)>;
+
+/// A replay harness that plays a script in process and reports its spend.
+#[derive(Clone, Default)]
+struct Scripted {
+    steps: Arc<Mutex<VecDeque<Step>>>,
+}
+
+impl ReplayHarness for Scripted {
+    fn name(&self) -> String {
+        "scripted".into()
+    }
+
+    fn replay(&self, request: proto::ReplayRequest, repo: Repo) -> ReplayFuture {
+        let step = self.steps.lock().ok().and_then(|mut s| s.pop_front());
+        Box::pin(async move {
+            use proto::replay_result::Status;
+            let Some(Some((from, to))) = step else {
+                return Ok(proto::ReplayResult {
+                    status: Some(Status::GaveUp(proto::ReplayGaveUp {
+                        reason: "the script says no".into(),
+                    })),
+                    tokens: Some(10),
+                    cost_micros: Some(500),
+                    model: Some("scripted-model".into()),
+                });
+            };
+            let id = request
+                .workspace
+                .parse()
+                .map_err(|e| format!("workspace: {e:?}"))?;
+            let mut ws = repo
+                .open_workspace(id, agent("replayer"), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let file: RepoPath = "src/util.rs".parse().map_err(|e| format!("{e:?}"))?;
+            let text = ws
+                .read_file(&file)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("src/util.rs")?;
+            let text = String::from_utf8(text.as_slice().to_vec()).map_err(|e| e.to_string())?;
+            ws.write_file(&file, text.replacen(from, to, 1))
+                .await
+                .map_err(|e| e.to_string())?;
+            let proposal = ws
+                .propose(Intent::from_summary("replay: quadruple on top of triple"))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(proto::ReplayResult {
+                status: Some(Status::Proposed(proto::ReplayProposed {
+                    change: proposal.change.to_hex(),
+                })),
+                tokens: Some(42),
+                cost_micros: Some(1_500),
+                model: Some("scripted-model".into()),
+            })
+        })
+    }
+}
+
+/// The trace of a change resolved by replay: each attempt with its
+/// outcome, spend, and model, in order, then the replay landing, and the
+/// landed replay tied to the original by `parent_intent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_change_traces_each_attempt_and_its_landing() -> TestResult {
+    let dir = temp("replay")?;
+    let (a, b) = seeded(&dir).await?;
+    let harness = Scripted {
+        steps: Arc::new(Mutex::new(VecDeque::from([
+            None,
+            Some(("parse_all(input) * 3", "parse_all(input) * 4")),
+        ]))),
+    };
+    let running = serve_harness(
+        &dir.0,
+        Some(Arc::new(harness) as Arc<dyn ReplayHarness>),
+        |s| s,
+    )
+    .await?;
+    let remote = RemoteRepo::connect(&running.url()).await?;
+    // With a harness, the ladder replays a parked change by itself
+    // (spec §6.4 rung 2): the first attempt gives up, the second lands.
+    for change in [&a, &b] {
+        remote
+            .submit(proto::SubmitRequest {
+                change: change.clone(),
+            })
+            .await?;
+    }
+    wait_for(&remote, &b, |s| s == proto::QueueStatus::Replayed).await?;
+
+    let trace = remote
+        .changes()
+        .change_trace(proto::ChangeTraceRequest { change: b.clone() })
+        .await?;
+    let replays: Vec<&proto::TraceStep> = trace
+        .steps
+        .iter()
+        .filter(|s| s.stage() == proto::TraceStage::Replay)
+        .collect();
+    assert_eq!(replays.len(), 2, "{:?}", trace.steps);
+    let (gave_up, proposed) = (replays[0], replays[1]);
+    assert!(
+        gave_up.text.starts_with("replay #1 (scripted"),
+        "{}",
+        gave_up.text
+    );
+    assert!(
+        gave_up.text.contains("gave up: the script says no"),
+        "{}",
+        gave_up.text
+    );
+    assert!(gave_up.text.contains("10 tokens"), "{}", gave_up.text);
+    assert!(gave_up.text.contains("$0.0005"), "{}", gave_up.text);
+    assert!(
+        gave_up.text.contains("model scripted-model"),
+        "{}",
+        gave_up.text
+    );
+    assert_eq!(gave_up.outcome.as_deref(), Some("fail"));
+    assert!(
+        proposed.text.starts_with("replay #2 (scripted"),
+        "{}",
+        proposed.text
+    );
+    assert!(
+        proposed.text.contains("proposed a change"),
+        "{}",
+        proposed.text
+    );
+    assert!(
+        proposed
+            .text
+            .contains("42 tokens · $0.0015 · model scripted-model"),
+        "{}",
+        proposed.text
+    );
+    assert_eq!(proposed.outcome.as_deref(), Some("pass"));
+    let proposal = proposed.change.clone().ok_or("the replay's proposal")?;
+
+    // The conflict, then the attempts in order, then the replay landing.
+    let at = |stage: proto::TraceStage| trace.steps.iter().position(|s| s.stage() == stage);
+    let first_replay = trace
+        .steps
+        .iter()
+        .position(|s| ptr::eq(s, gave_up))
+        .ok_or("attempt 1")?;
+    let second_replay = trace
+        .steps
+        .iter()
+        .position(|s| ptr::eq(s, proposed))
+        .ok_or("attempt 2")?;
+    let landed_at = trace
+        .steps
+        .iter()
+        .rposition(|s| s.stage() == proto::TraceStage::Landed)
+        .ok_or("a landed step")?;
+    assert!(at(proto::TraceStage::Conflict) < Some(first_replay));
+    assert!(first_replay < second_replay && second_replay < landed_at);
+
+    // The proposal and the record it landed as both name the original.
+    let parent = |view: &proto::ChangeView| {
+        view.provenance
+            .as_ref()
+            .and_then(|p| p.parent_intent.clone())
+    };
+    let replayed = trace
+        .replays
+        .iter()
+        .find(|v| v.change == proposal)
+        .ok_or("the proposal is among the trace's sources")?;
+    assert_eq!(parent(replayed), Some(b.clone()));
+    let landed = trace.landed.as_ref().ok_or("the replay it landed as")?;
+    assert_eq!(parent(landed), Some(b.clone()));
+    assert_eq!(
+        trace.steps[landed_at].change.as_deref(),
+        Some(landed.change.as_str())
+    );
+
+    // On the page: both attempts, then the landing.
+    let router = hord_ui::router(Arc::new(SingleRepo(UiRepo {
+        backend: Arc::new(remote.clone()),
+        changes: Arc::new(remote.changes()),
+        review: None,
+        arbiter: None,
+        name: "browse-test".into(),
+        base: String::new(),
+    })));
+    let (status, page) = get(&router, &format!("/trace/{b}")).await?;
+    assert_eq!(status, 200, "{page}");
+    let one = page.find("replay #1").ok_or("attempt 1 on the page")?;
+    let two = page.find("replay #2").ok_or("attempt 2 on the page")?;
+    let landing = page.find("landed at #").ok_or("the landing on the page")?;
+    assert!(one < two && two < landing);
+    has(&page, "replay proposal")?;
+    running.stop().await;
+    drop(dir);
     Ok(())
 }
