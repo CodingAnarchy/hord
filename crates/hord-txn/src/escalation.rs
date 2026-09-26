@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events;
 use crate::lander::{QueueEntry, QueueStatus};
+use crate::pinned::Pinned;
 use crate::repo::{Base, BeginOptions, Inner, Repo, blocking, lock, now};
 use crate::summary::ConflictSummary;
 use crate::{Error, Result};
@@ -592,7 +593,12 @@ impl Inner {
         ) {
             return Ok(Vec::new());
         }
-        let settled = settled_text(&replay.status);
+        let mut settled = settled_text(&replay.status);
+        if replay.status == QueueStatus::Conflicted
+            && let Some(why) = replay.report.as_ref().and_then(|r| r.verification.as_ref())
+        {
+            settled.push_str(&format!(": {why}"));
+        }
         let escalation = entry.escalation.get_or_insert_with(Escalation::default);
         match escalation
             .attempts
@@ -855,16 +861,24 @@ impl Inner {
             return Ok(Err((ReplayOutcome::Tampered, why)));
         }
         // ADR 0034 amendment: the protected tests must also run and pass
-        // from their protected files.
-        let failed = self.pinned_run(of, &record)?;
-        if !failed.is_empty() {
-            let why = format!("{} (proposed change {id})", pinned_report(&failed));
-            self.emit(vec![events::rejected(id, &why)])?;
-            *tampered = failed.into_iter().map(|(node, _)| node).collect();
-            return Ok(Err((ReplayOutcome::Tampered, why)));
-        }
+        // from their protected files. Failing only there is tampering;
+        // failing either way is a wrong replay, which is submitted and
+        // conflicts at prepare with the failing tests.
+        let verdict = match self.pinned_check(of, &record)? {
+            Pinned::Tampered(failed) => {
+                let why = format!("{} (proposed change {id})", pinned_report(&failed));
+                self.emit(vec![events::rejected(id, &why)])?;
+                *tampered = failed.into_iter().map(|(node, _)| node).collect();
+                return Ok(Err((ReplayOutcome::Tampered, why)));
+            }
+            Pinned::Fails(fails) => Some(fails.join("; ")),
+            Pinned::Passed => None,
+        };
         match record.provenance.parent_intent {
-            Some(parent) if parent == of => return Ok(Ok(id)),
+            Some(parent) if parent == of => {
+                lock(&self.pinned).insert(id, verdict);
+                return Ok(Ok(id));
+            }
             Some(other) => {
                 return Ok(Err((
                     ReplayOutcome::Failed,
@@ -880,6 +894,7 @@ impl Inner {
             // Same base, result, and ops as the checked record.
             self.store.mark_checked(replay_id)?;
         }
+        lock(&self.pinned).insert(replay_id, verdict);
         Ok(Ok(replay_id))
     }
 }
@@ -942,17 +957,6 @@ impl Inner {
             }
         }
         Ok(out)
-    }
-
-    /// Whether `replay` was proposed by an attempt the ladder ran for `of`
-    /// (its checks ran in the attempt).
-    pub(crate) fn ran_in_ladder(&self, of: ChangeId, replay: ChangeId) -> Result<bool> {
-        let Ok(entry) = self.submitted_entry(of) else {
-            return Ok(false);
-        };
-        Ok(entry
-            .escalation
-            .is_some_and(|e| e.attempts.iter().any(|a| a.change == Some(replay))))
     }
 
     /// The files that put `of`'s own acceptance tests into a workspace on

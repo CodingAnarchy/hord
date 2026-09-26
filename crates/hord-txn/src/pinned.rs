@@ -37,58 +37,140 @@ enum Ran {
     Ignored,
 }
 
+/// The pinned run's verdict on a replay (ADR 0034 as amended).
+#[derive(Debug)]
+pub(crate) enum Pinned {
+    /// Every protected test ran and passed from its protected file (or
+    /// nothing is protected).
+    Passed,
+    /// The replay changed what a protected test sees, or kept it from
+    /// running: failing from its protected file but passing as the replay
+    /// left it, ignored, or its target disabled. Each test with why.
+    Tampered(Vec<(NodeId, String)>),
+    /// The replay is simply wrong: these protected tests fail either way.
+    /// An ordinary failure (the replay conflicts), not tampering.
+    Fails(Vec<String>),
+}
+
+/// How one protected test fared in one run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Fared {
+    Passed,
+    Failed,
+    Ignored,
+    /// Not run although the build succeeded: its target is disabled.
+    Disabled,
+    /// Not run: the build failed or the run timed out.
+    Broken,
+}
+
 impl Inner {
-    /// The protected tests of `record`, a replay of `of`, that did not run
-    /// and pass from their protected sources, each with why. Empty when all
-    /// did, when nothing is protected, or when the result is not a Cargo
-    /// package.
-    pub(crate) fn pinned_run(
-        &self,
-        of: ChangeId,
-        record: &ChangeRecord,
-    ) -> Result<Vec<(NodeId, String)>> {
+    /// The pinned acceptance run of `record`, a replay of `of`: every
+    /// protected test from its protected file, overlaid on the replay's
+    /// result. A test that does not pass that way runs again as the replay
+    /// left it, which tells tampering from a replay that is simply wrong.
+    /// [`Pinned::Passed`] when nothing is protected or the result is not a
+    /// Cargo package.
+    pub(crate) fn pinned_check(&self, of: ChangeId, record: &ChangeRecord) -> Result<Pinned> {
         let expected = self.expected_tests(of, record.base)?;
         if expected.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Pinned::Passed);
         }
         let manifest: RepoPath = "Cargo.toml"
             .parse()
             .map_err(|_| Error::InvalidPath("Cargo.toml".into()))?;
         if self.blob_id(record.result, &manifest)?.is_none() {
-            return Ok(Vec::new());
+            return Ok(Pinned::Passed);
         }
+        let pinned = self.run_tests(record, &expected, true)?;
+        let mut tampered = Vec::new();
+        let mut suspects = Vec::new();
+        for (test, (fared, why)) in expected.iter().zip(&pinned) {
+            match fared {
+                Fared::Passed => {}
+                Fared::Ignored | Fared::Disabled => {
+                    tampered.push((test.node, format!("{} {why}", test.name)));
+                }
+                Fared::Failed | Fared::Broken => suspects.push((test, why.clone())),
+            }
+        }
+        if !suspects.is_empty() {
+            let as_left = self.run_tests(record, &expected, false)?;
+            let mut fails = Vec::new();
+            for (test, why) in suspects {
+                let passes_as_left = expected
+                    .iter()
+                    .zip(&as_left)
+                    .any(|(t, (fared, _))| std::ptr::eq(t, test) && *fared == Fared::Passed);
+                if passes_as_left {
+                    tampered.push((
+                        test.node,
+                        format!(
+                            "{} {why}, but passes as the replay left it: the replay changed what \
+                             the test sees",
+                            test.name
+                        ),
+                    ));
+                } else {
+                    fails.push(format!("{} {why}", test.name));
+                }
+            }
+            if tampered.is_empty() {
+                return Ok(Pinned::Fails(fails));
+            }
+        }
+        if tampered.is_empty() {
+            Ok(Pinned::Passed)
+        } else {
+            Ok(Pinned::Tampered(tampered))
+        }
+    }
+
+    /// Run the tests of `record`'s result, with each protected test's file
+    /// as protected when `overlay`, else as the replay left it. How each of
+    /// `expected` fared, with why, in order.
+    fn run_tests(
+        &self,
+        record: &ChangeRecord,
+        expected: &[crate::escalation::Expected],
+        overlay: bool,
+    ) -> Result<Vec<(Fared, String)>> {
         let scratch = self.store.hord_dir().join("pinned").join(format!(
-            "{}-{}",
+            "{}-{}-{}",
             record.result.to_hex(),
+            if overlay { "pinned" } else { "as-left" },
             now().as_millis()
         ));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch)?;
-        let outcome = self.run_pinned(record, &expected, &scratch);
+        let outcome = self.run_tests_in(record, expected, overlay, &scratch);
         let _ = std::fs::remove_dir_all(&scratch);
         outcome
     }
 
-    fn run_pinned(
+    fn run_tests_in(
         &self,
         record: &ChangeRecord,
         expected: &[crate::escalation::Expected],
+        overlay: bool,
         scratch: &Path,
-    ) -> Result<Vec<(NodeId, String)>> {
+    ) -> Result<Vec<(Fared, String)>> {
         let tree = scratch.join("tree");
         self.checkout(record.result, &tree)?;
-        // Each protected test's file, as it is protected.
-        let mut overlaid: BTreeMap<&RepoPath, ()> = BTreeMap::new();
-        for test in expected {
-            if overlaid.insert(&test.path, ()).is_some() {
-                continue;
-            }
-            if let Some(bytes) = self.file_bytes(test.source, &test.path)? {
-                let target = fs_path(&tree, &test.path);
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
+        if overlay {
+            // Each protected test's file, as it is protected.
+            let mut overlaid: BTreeMap<&RepoPath, ()> = BTreeMap::new();
+            for test in expected {
+                if overlaid.insert(&test.path, ()).is_some() {
+                    continue;
                 }
-                std::fs::write(&target, bytes.as_slice())?;
+                if let Some(bytes) = self.file_bytes(test.source, &test.path)? {
+                    let target = fs_path(&tree, &test.path);
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&target, bytes.as_slice())?;
+                }
             }
         }
         let log_path = scratch.join("cargo-test.log");
@@ -117,26 +199,39 @@ impl Inner {
             std::thread::sleep(Duration::from_millis(50));
         };
         let output = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let build_failed = output.contains("error: could not compile");
         let results = parse(&output);
-        let mut out = Vec::new();
-        for test in expected {
-            let found = results.iter().find(|(target, name, _)| {
-                in_target(target, &test.path)
-                    && (name == &test.name || name.ends_with(&format!("::{}", test.name)))
-            });
-            let why = match found.map(|(_, _, ran)| *ran) {
-                Some(Ran::Passed) => continue,
-                Some(Ran::Failed) => "failed when run from its protected file".to_owned(),
-                Some(Ran::Ignored) => "is ignored".to_owned(),
-                None if timed_out => format!("did not finish within {}s", LIMIT.as_secs()),
-                None => format!(
-                    "did not run (its test target is disabled, or the build failed: {})",
-                    last_error(&output)
-                ),
-            };
-            out.push((test.node, format!("{} {why}", test.name)));
-        }
-        Ok(out)
+        let whence = if overlay {
+            "from its protected file"
+        } else {
+            "as the replay left it"
+        };
+        Ok(expected
+            .iter()
+            .map(|test| {
+                let found = results.iter().find(|(target, name, _)| {
+                    in_target(target, &test.path)
+                        && (name == &test.name || name.ends_with(&format!("::{}", test.name)))
+                });
+                match found.map(|(_, _, ran)| *ran) {
+                    Some(Ran::Passed) => (Fared::Passed, String::new()),
+                    Some(Ran::Failed) => (Fared::Failed, format!("fails when run {whence}")),
+                    Some(Ran::Ignored) => (Fared::Ignored, "is ignored".to_owned()),
+                    None if timed_out => (
+                        Fared::Broken,
+                        format!("did not finish within {}s", LIMIT.as_secs()),
+                    ),
+                    None if build_failed => (
+                        Fared::Broken,
+                        format!("does not build {whence}: {}", last_error(&output)),
+                    ),
+                    None => (
+                        Fared::Disabled,
+                        "did not run: its test target is disabled".to_owned(),
+                    ),
+                }
+            })
+            .collect())
     }
 }
 

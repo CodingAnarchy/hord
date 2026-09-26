@@ -1361,11 +1361,17 @@ async fn protected_tests_must_run_and_pass_from_their_protected_files() -> TestR
             ("tests/b.rs", own_test()),
             ("Cargo.toml", manifest.into()),
         ]),
+        // Honest but wrong: beta 22 fails b's test either way. An ordinary
+        // failure (the replay conflicts), not tampering.
+        Step::Write(vec![
+            ("src/lib.rs", LIB.replace("    2\n", "    22\n")),
+            ("tests/b.rs", own_test()),
+        ]),
         // Honest.
         Step::Write(vec![("src/lib.rs", lib_21), ("tests/b.rs", own_test())]),
     ]);
     let t = ladder_repo(
-        "[land]\nmax_replay_attempts = 4\n",
+        "[land]\nmax_replay_attempts = 5\n",
         Some(Arc::new(harness.clone())),
         Arc::new(StubVerifier),
     )
@@ -1381,15 +1387,23 @@ async fn protected_tests_must_run_and_pass_from_their_protected_files() -> TestR
             ReplayOutcome::Tampered,
             ReplayOutcome::Tampered,
             ReplayOutcome::Tampered,
+            ReplayOutcome::Proposed,
             ReplayOutcome::Proposed
         ],
         "{attempts:#?}"
     );
     let detail = |i: usize| attempts[i].detail.clone().unwrap_or_default();
     assert!(
-        detail(0).contains("pinned acceptance run") && detail(0).contains("beta_is_21 failed"),
+        detail(0).contains("pinned acceptance run")
+            && detail(0).contains("passes as the replay left it"),
         "{}",
         detail(0)
+    );
+    // The wrong replay was submitted and conflicted, naming the failing test.
+    assert!(
+        detail(3).starts_with("conflicted") && detail(3).contains("beta_is_21 fails"),
+        "{}",
+        detail(3)
     );
     assert!(detail(1).contains("beta_is_21"), "{}", detail(1));
     assert!(

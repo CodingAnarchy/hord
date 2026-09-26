@@ -63,6 +63,7 @@ use crate::escalation::{Escalation, Origin, pinned_report, tamper_report};
 use crate::events;
 use crate::files::{validate, validate_except};
 use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRequest};
+use crate::pinned::Pinned;
 use crate::propose::declared;
 use crate::rebase::rebase;
 use crate::repo::{Head, Inner, Repo, blocking, lock, now};
@@ -908,6 +909,7 @@ impl Inner {
         }
         // ADR 0034: a replay, however it was submitted, may not change the
         // acceptance tests it must satisfy.
+        let mut pinned_fails = None;
         if let Some(Origin::Replay { of }) = entry.origin {
             let touched = self.tampered_tests(of, &record)?;
             if !touched.is_empty() {
@@ -915,22 +917,35 @@ impl Inner {
                     reason: tamper_report(&touched),
                 }));
             }
-            // A replay the ladder ran had its pinned acceptance run in its
-            // attempt; one submitted by hand has it here.
-            if !self.ran_in_ladder(of, entry.change)? {
-                let failed = self.pinned_run(of, &record)?;
-                if !failed.is_empty() {
-                    return Ok(Prepared::Park(QueueStatus::Rejected {
-                        reason: pinned_report(&failed),
-                    }));
-                }
-            }
+            // The pinned acceptance run: the ladder's attempt ran it and
+            // left its verdict; otherwise (by hand, or after a restart) it
+            // runs here.
+            let cached = lock(&self.pinned).remove(&entry.change);
+            pinned_fails = match cached {
+                Some(verdict) => verdict,
+                None => match self.pinned_check(of, &record)? {
+                    Pinned::Tampered(failed) => {
+                        return Ok(Prepared::Park(QueueStatus::Rejected {
+                            reason: pinned_report(&failed),
+                        }));
+                    }
+                    Pinned::Fails(fails) => Some(fails.join("; ")),
+                    Pinned::Passed => None,
+                },
+            };
         }
         // ADR 0026: the landing base's policy judges the change.
         let policy = self.policy_at(head.snapshot)?;
         let (set_report, landed_writes) =
             self.set_check(entry.change, &record, head, staged, &policy)?;
         let report = report.insert(set_report);
+        if let Some(fails) = pinned_fails {
+            // A wrong replay (ADR 0034): its protected tests fail either way.
+            report.verification = Some(format!(
+                "protected acceptance tests fail (ADR 0034): {fails}"
+            ));
+            return Ok(Prepared::Park(QueueStatus::Conflicted));
+        }
         if let Err(reason) = &policy {
             // Nothing weaker than a readable policy judges a change.
             return Ok(Prepared::Park(QueueStatus::Parked {

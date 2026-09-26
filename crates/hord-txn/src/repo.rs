@@ -237,6 +237,10 @@ pub(crate) struct Inner {
     /// Replays of changes that entered the ladder as they settled, for the
     /// lander to start ([`crate::lander`]).
     pub pending_replays: Mutex<Vec<crate::escalation::ReplayJob>>,
+    /// The pinned acceptance run's verdict on replays the ladder submitted
+    /// (ADR 0034): `None` passed, `Some` the tests that fail either way.
+    /// Read, and dropped, when the lander prepares the replay.
+    pub pinned: Mutex<HashMap<ChangeId, Option<String>>>,
 }
 
 impl Drop for Inner {
@@ -438,6 +442,7 @@ impl Inner {
             ladder: Mutex::new(()),
             replays: crate::escalation::Replays::default(),
             pending_replays: Mutex::new(Vec::new()),
+            pinned: Mutex::new(HashMap::new()),
         })
     }
 
