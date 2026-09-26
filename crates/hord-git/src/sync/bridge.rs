@@ -30,6 +30,10 @@ use crate::{Error, GitOid};
 /// Where exported changes are named in the bridge's export repository.
 const CHANGE_REFS: &str = "refs/hord/changes/";
 
+/// How long opening a bridge waits for another to release its work
+/// directory.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
 /// How the bridge runs.
 #[derive(Clone)]
 pub struct BridgeOptions {
@@ -944,7 +948,8 @@ async fn next_event(
 }
 
 /// Take the exclusive lock on `path`, created if needed; it is released
-/// when the file is closed, including when the process dies.
+/// when the file is closed, including when the process dies. Waits up to
+/// [`LOCK_WAIT`] for a holder that is going away.
 fn lock_work_dir(path: &Path) -> Result<File, SyncError> {
     let io = |source| SyncError::Io {
         path: path.to_owned(),
@@ -956,10 +961,18 @@ fn lock_work_dir(path: &Path) -> Result<File, SyncError> {
         .write(true)
         .open(path)
         .map_err(io)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(SyncError::Busy(path.to_owned())),
-        Err(TryLockError::Error(err)) => Err(io(err)),
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            // A process that just released it, or a child forked in that
+            // moment, which holds a copy of the descriptor until it execs.
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(TryLockError::WouldBlock) => return Err(SyncError::Busy(path.to_owned())),
+            Err(TryLockError::Error(err)) => return Err(io(err)),
+        }
     }
 }
 
