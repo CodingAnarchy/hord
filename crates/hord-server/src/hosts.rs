@@ -166,6 +166,21 @@ impl Hosts {
             .ok_or_else(|| ApiError::NotFound(format!("no repository {name:?} on this server")))
     }
 
+    /// The local repository a request names, or the only one.
+    pub(crate) fn resolve_local(
+        &self,
+        name: Option<&RepoName>,
+    ) -> Result<Arc<LocalRepo>, ApiError> {
+        let name = self.addressed(name)?;
+        self.locals
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, local)| Arc::clone(local))
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("no local repository {name:?} on this server"))
+            })
+    }
+
     /// The `Changes` backend a request names, or the only one.
     pub(crate) fn resolve_changes(
         &self,

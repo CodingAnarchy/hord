@@ -1,7 +1,10 @@
 //! `hord serve [--repo <path>|--root <dir>] [--bind <addr>]` (spec
 //! §10.5.1, ADR 0024): gRPC and gRPC-Web on one port, one lander per
-//! repository. Loopback only unless `--insecure-bind`. `--auth <file>` (or
-//! `server.toml`'s `[auth] file`) requires bearer tokens (spec §10.5.4). `--daemon` runs the
+//! repository. TLS from `--tls-cert`/`--tls-key` or `server.toml`'s `[tls]`
+//! (ADR 0032); without it, loopback only unless `--insecure-bind`.
+//! `--auth <file>` (or
+//! `server.toml`'s `[auth] file`) requires bearer tokens (spec §10.5.4); the
+//! file is reloaded when it changes and on SIGHUP. `--daemon` runs the
 //! repository's per-repo daemon instead ([`crate::daemon`]).
 
 use std::net::SocketAddr;
@@ -10,7 +13,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use hord_api::WorkspacesBackend;
-use hord_server::{AuthStore, Hosts, ServeOptions, Server, ServerConfig, UiSigner};
+use hord_server::{
+    AuthConfig, AuthStore, Hosts, ServeOptions, Server, ServerConfig, TlsConfig, UiSigner,
+};
 
 use crate::workspaces::LocalWorkspaces;
 use crate::{identity, repo, txn};
@@ -18,11 +23,13 @@ use crate::{identity, repo, txn};
 /// The address when neither `--bind` nor `server.toml` gives one.
 const DEFAULT_BIND: &str = "127.0.0.1:7878";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     repo_path: Option<PathBuf>,
     root: Option<PathBuf>,
     bind: Option<String>,
     insecure_bind: bool,
+    tls: Option<TlsConfig>,
     auth: Option<PathBuf>,
     config: Option<PathBuf>,
     daemon: bool,
@@ -49,8 +56,13 @@ pub async fn run(
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid bind address {bind:?}"))?;
+    let tls = tls.or_else(|| config.tls.clone());
+    let options = ServeOptions {
+        insecure_bind,
+        tls: tls.is_some(),
+    };
     // Fail on a bad address before opening anything.
-    hord_server::check_bind(addr, insecure_bind)?;
+    hord_server::check_bind(addr, &options)?;
     let hosts = match (&repo_root, &root) {
         (Some(path), _) => {
             Hosts::open_repo(path, crate::cmd::replay::lander_options(path)?).await?
@@ -65,12 +77,18 @@ pub async fn run(
         (None, None) => unreachable!("one of --repo or --root"),
     };
     let names: Vec<String> = hosts.names().map(str::to_owned).collect();
-    let listener = Server::bind(addr, &ServeOptions { insecure_bind }).await?;
+    let listener = Server::bind(addr, &options).await?;
     let local = listener.local_addr()?;
     let auth = auth.or_else(|| config.auth.as_ref().map(|a| a.file.clone()));
-    let (stop_local, local_endpoints) = serve_local_endpoints(&hosts);
+    let (stop_local, local_endpoints) = serve_local_endpoints(&hosts, auth.as_deref());
     let mut server = Server::new(hosts, config);
     let mut note = String::new();
+    if let Some(tls) = &tls {
+        server = server
+            .with_tls(tls)
+            .with_context(|| format!("TLS from {}", tls.cert.display()))?;
+        note.push_str(&format!(", TLS from {}", tls.cert.display()));
+    }
     if let Some(path) = auth {
         let store =
             AuthStore::open(&path).with_context(|| format!("open auth file {}", path.display()))?;
@@ -84,12 +102,24 @@ pub async fn run(
         server = server.with_ui_signer(signer);
     }
     // The first line: tests read the address from it.
-    eprintln!("hord serve: http://{local} ({}{note})", names.join(", "));
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    eprintln!(
+        "hord serve: {scheme}://{local} ({}{note})",
+        names.join(", ")
+    );
+    #[cfg(unix)]
+    let hangup = server
+        .auth_store()
+        .map(|store| tokio::spawn(reload_on_hangup(store)));
     server
         .serve(listener, async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    #[cfg(unix)]
+    if let Some(hangup) = hangup {
+        hangup.abort();
+    }
     let _ = stop_local.send(true);
     for task in local_endpoints {
         let _ = task.await;
@@ -97,13 +127,38 @@ pub async fn run(
     Ok(())
 }
 
+/// Reload the auth file on SIGHUP (`systemctl reload hord`), besides the
+/// server's own check for changes every second.
+#[cfg(unix)]
+async fn reload_on_hangup(store: Arc<AuthStore>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangups = match signal(SignalKind::hangup()) {
+        Ok(hangups) => hangups,
+        Err(err) => {
+            eprintln!("hord serve: no SIGHUP reload: {err}");
+            return;
+        }
+    };
+    while hangups.recv().await.is_some() {
+        let reload = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || reload.reload()).await {
+            Ok(Ok(())) => eprintln!("hord serve: reloaded {}", store.path().display()),
+            Ok(Err(err)) => eprintln!("hord serve: SIGHUP: {err}"),
+            Err(err) => eprintln!("hord serve: SIGHUP: {err}"),
+        }
+    }
+}
+
 /// Serve each hosted repository on its local endpoint too, with its
 /// workspace commands, as its daemon would (ADR 0021): this process holds
 /// the store, so `hord` commands in the repository, including a replay
 /// harness's `hord propose`, reach it there. They share the lander. The
 /// endpoint takes no tokens, like the daemon's; it is the local user's.
+///
+/// `auth` is not enforced there; `hord audit` reads its key bindings.
 fn serve_local_endpoints(
     hosts: &Hosts,
+    auth: Option<&std::path::Path>,
 ) -> (
     tokio::sync::watch::Sender<bool>,
     Vec<tokio::task::JoinHandle<()>>,
@@ -121,9 +176,15 @@ fn serve_local_endpoints(
         };
         let workspaces: Arc<dyn WorkspacesBackend> =
             Arc::new(LocalWorkspaces::local(local.repo().clone(), None));
+        let config = ServerConfig {
+            auth: auth.map(|file| AuthConfig {
+                file: file.to_path_buf(),
+            }),
+            ..ServerConfig::default()
+        };
         let server = Server::new(
             Hosts::from_local(name.to_owned(), Arc::clone(local)),
-            ServerConfig::default(),
+            config,
         )
         .with_workspaces(workspaces);
         let mut stopped = stopped.clone();

@@ -66,6 +66,7 @@ fn record(
             created_at: Timestamp::from_millis(0),
             session: None,
             parent_intent: None,
+            voucher: None,
         },
         read_set: read.into_iter().collect(),
         write_set: write.into_iter().collect(),

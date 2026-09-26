@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use hord_api::auth::Scope;
 
 /// Semantic VCS.
@@ -163,10 +163,17 @@ pub enum Command {
         /// Address to listen on (default: server.toml's, else 127.0.0.1:7878).
         #[arg(long, value_name = "ADDR")]
         bind: Option<String>,
-        /// Allow a non-loopback address (there is no TLS: tokens travel in
-        /// the clear).
+        /// Allow a non-loopback address without TLS (tokens travel in the
+        /// clear). Not needed with TLS.
         #[arg(long)]
         insecure_bind: bool,
+        /// Serve TLS with this PEM certificate chain (ADR 0032; default:
+        /// server.toml's `[tls] cert`). Needs `--tls-key`.
+        #[arg(long, value_name = "FILE", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// The PEM private key for `--tls-cert`.
+        #[arg(long, value_name = "FILE", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
         /// Require bearer tokens, checked against this auth file (spec
         /// §10.5.4; default: server.toml's `[auth] file`, else none).
         #[arg(long, value_name = "FILE")]
@@ -202,7 +209,7 @@ pub enum Command {
     },
     /// Log in to a remote: store a bearer token for it (spec §10.5.4).
     Login {
-        /// Remote name, or its http:// address.
+        /// Remote name, or its http:// or https:// address.
         #[arg(value_name = "REMOTE")]
         remote: String,
         /// User name in the server's user table (default: `HORD_ACTOR`,
@@ -272,7 +279,7 @@ pub enum Command {
     },
     /// Resolve a parked change (spec §6.4 rung 3). The resolution lands as a
     /// change whose parents include both colliding changes.
-    #[command(group(clap::ArgGroup::new("how").required(true).args(["pick", "edit", "replay"])))]
+    #[command(group(ArgGroup::new("how").required(true).args(["pick", "edit", "replay"])))]
     Arbitrate {
         /// The parked change (64 hex digits).
         #[arg(value_name = "CHANGE")]
@@ -297,6 +304,28 @@ pub enum Command {
         #[arg(long, value_name = "TEXT", requires = "replay")]
         note: Option<String>,
     },
+    /// Check M6's acceptance criteria over a window of the log (spec §12
+    /// M6): every landed change has an intent, provenance and passing
+    /// evidence that satisfies head's policy; reviews and arbitrations are
+    /// signed by bound keys; nothing landed outside the lander; and the git
+    /// bridge's checks ran hourly and passed. Exits non-zero on a
+    /// violation. Works locally or against `--remote`.
+    Audit {
+        /// Start of the window: a date (`2026-09-01`, midnight UTC) or an
+        /// RFC 3339 time (`2026-09-01T12:00:00Z`).
+        #[arg(long, value_name = "DATE")]
+        since: String,
+        /// End of the window (exclusive), in the same forms (default: now).
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+        /// The longest allowed time between bridge checks, in minutes
+        /// (default: 65, hourly with slack).
+        #[arg(long, value_name = "MINUTES")]
+        max_bridge_gap: Option<u64>,
+        /// Fail when no bridge check was recorded in the window.
+        #[arg(long)]
+        require_bridge: bool,
+    },
 }
 
 /// `hord token` subcommands.
@@ -315,7 +344,7 @@ pub enum TokenCommand {
         #[arg(long, value_name = "HARNESS")]
         harness: String,
         /// Scope to grant (repeat): read, propose, review:KIND,
-        /// arbitrate, admin.
+        /// arbitrate, admin, bridge (the git bridge, ADR 0037).
         #[arg(long = "scope", value_name = "SCOPE", required = true)]
         scopes: Vec<Scope>,
         /// Write the private key here instead of printing it.
@@ -408,7 +437,7 @@ pub enum WsCommand {
 /// `hord remote` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
-    /// Add a remote: `http://host:port`, or `http://host:port/r/<name>`.
+    /// Add a remote: `http[s]://host:port`, or `http[s]://host:port/r/<name>`.
     Add {
         /// Its name.
         #[arg(value_name = "NAME")]
@@ -416,6 +445,10 @@ pub enum RemoteCommand {
         /// Its address.
         #[arg(value_name = "URL")]
         url: String,
+        /// For `https`: a PEM CA certificate to trust besides the system's
+        /// roots, such as a team host's own CA (ADR 0032).
+        #[arg(long, value_name = "FILE")]
+        ca_file: Option<PathBuf>,
     },
     /// Remove a remote.
     Rm {
@@ -476,5 +509,30 @@ pub enum GitCommand {
         /// Hord ref or snapshot to export (for example `head` or `main`).
         #[arg(value_name = "REF")]
         hord_ref: String,
+    },
+    /// Run the git bridge (spec §9, ADR 0036): keep a git remote's `main`
+    /// equal to the export of the log, and take its pull requests as
+    /// proposals. Without a mode flag it runs until interrupted.
+    ///
+    /// The bridge owns `main`: protect it so only the bridge's token may
+    /// push. Setup and the config file are in docs/bridge.md.
+    #[command(group(ArgGroup::new("mode").args(["once", "check", "repair"])))]
+    Sync {
+        /// One pass (export and push what landed, submit new pull
+        /// requests, report outcomes), then exit.
+        #[arg(long)]
+        once: bool,
+        /// Compare `main` with the export of the log, record the check,
+        /// and exit non-zero if `main` has diverged. Changes nothing.
+        #[arg(long)]
+        check: bool,
+        /// FORCE-PUSH the export of the log to `main`, discarding any
+        /// commit on `main` the export does not contain (a manual push,
+        /// say). Use it after `--check` reports divergence.
+        #[arg(long)]
+        repair: bool,
+        /// The bridge's config file [default: .hord/bridge.toml].
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
 }

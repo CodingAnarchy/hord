@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ node.label }}</h1>
+<p class="legend">{{ kind }}{% if let Some(p) = node.path %} · <a href="{{ base }}/file/{{ snapshot }}?path={{ p }}">{{ p }}</a>{% endif %} · snapshot <code>{{ snapshot }}</code></p>
+<p class="links"><a href="{{ base }}/nodes/{{ node.id }}">lineage</a></p>
+<svg class="graph" viewBox="0 0 {{ width }} {{ height }}" width="100%" role="img" aria-label="references and tests around {{ node.label }}">
+  {% for n in drawn %}<line class="edge edge-{{ n.class }}" x1="{{ n.edge_x }}" y1="{{ n.y - 4 }}" x2="{% if n.anchor == "end" %}280{% else %}480{% endif %}" y2="{{ centre }}"/>
+  {% endfor %}
+  <rect class="centre" x="280" y="{{ centre - 16 }}" width="200" height="32" rx="6"/>
+  <text class="centre" x="380" y="{{ centre + 5 }}" text-anchor="middle">{{ centre_label }}</text>
+  {% for n in drawn %}<a href="{{ base }}/graph/{{ snapshot }}/{{ n.id }}"><text class="nb nb-{{ n.class }}" x="{{ n.x }}" y="{{ n.y }}" text-anchor="{{ n.anchor }}"><title>{{ n.title }}</title>{{ n.label }}</text></a>
+  {% endfor %}
+</svg>
+<p class="legend">Left: what names it, and tests that exercise it. Right: what it names, what it tests, what it contains. {% if hidden > 0 %}{{ hidden }} more are listed below.{% endif %}</p>
+<div class="sets">
+{% for g in groups %}<div><h3>{{ g.label }}</h3><ul>{% for n in g.nodes %}<li><a href="{{ base }}/graph/{{ snapshot }}/{{ n.id }}">{{ n.label }}</a>{% if let Some(p) = n.path %} <small>{{ p }}</small>{% endif %}</li>{% else %}<li class="legend">none</li>{% endfor %}</ul></div>
+{% endfor %}
+{% if !unmapped.is_empty() %}<div><h3>covered by (by test name)</h3><ul>{% for t in unmapped %}<li><code>{{ t }}</code></li>{% endfor %}</ul></div>{% endif %}
+</div>
+{% endblock %}

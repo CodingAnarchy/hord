@@ -35,6 +35,7 @@ fn changes(kind: &Kind) -> Vec<&str> {
         }
         Kind::Rejected(e) => vec![&e.change],
         Kind::HeadMoved(e) => vec![&e.to],
+        Kind::BridgeChecked(_) => vec![],
     }
 }
 
@@ -70,6 +71,11 @@ fn text(kind: &Kind) -> String {
         Kind::Landed(e) => format!("landed {} at {}", short(&e.change), e.position),
         Kind::Rejected(e) => format!("rejected {}: {}", short(&e.change), e.reason),
         Kind::HeadMoved(e) => format!("head {}", short(&e.to)),
+        Kind::BridgeChecked(e) => format!(
+            "bridge check {}: {}",
+            if e.diverged { "DIVERGED" } else { "ok" },
+            e.detail
+        ),
     }
 }
 

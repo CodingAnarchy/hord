@@ -228,6 +228,15 @@ impl GrpcTrait for GrpcRepoBackend {
             stream.map(|item| item.map_err(Status::from)),
         )))
     }
+
+    async fn record_bridge_check(
+        &self,
+        request: Request<proto::BridgeChecked>,
+    ) -> GrpcResult<proto::RecordBridgeCheckResponse> {
+        let backend = self.backend(&request)?;
+        let reply = backend.record_bridge_check(request.into_inner()).await?;
+        Ok(Response::new(reply))
+    }
 }
 
 /// Submit `change` again if its latest queue entry is parked for missing

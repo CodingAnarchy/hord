@@ -207,6 +207,7 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
             created_at: now(),
             session: input.session,
             parent_intent: None,
+            voucher: None,
         },
         read_set,
         write_set,

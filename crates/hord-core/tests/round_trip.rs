@@ -152,6 +152,7 @@ fn sample_change() -> ChangeRecord {
             created_at: Timestamp::from_millis(1_700_000_000_000),
             session: Some("sess-1".into()),
             parent_intent: None,
+            voucher: None,
         },
         read_set: BTreeSet::from([n]),
         write_set: BTreeSet::from([n, p]),

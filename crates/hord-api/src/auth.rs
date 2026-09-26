@@ -35,11 +35,16 @@ pub enum Scope {
     Arbitrate,
     /// Mint tokens. Grants nothing else.
     Admin,
+    /// The git bridge (ADR 0037): put objects, submit a pull request's
+    /// unsigned change on behalf of its git author, and record divergence
+    /// checks. Not submitting as an agent or without a git commit ref, not
+    /// reviewing, not arbitrating.
+    Bridge,
 }
 
 /// A scope string that is none of the forms [`Scope`] names.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-#[error("unknown scope {0:?}: one of read, propose, review:<kind>, arbitrate, admin")]
+#[error("unknown scope {0:?}: one of read, propose, review:<kind>, arbitrate, admin, bridge")]
 pub struct ParseScopeError(pub String);
 
 impl FromStr for Scope {
@@ -52,6 +57,7 @@ impl FromStr for Scope {
             "propose" => Ok(Self::Propose),
             "arbitrate" => Ok(Self::Arbitrate),
             "admin" => Ok(Self::Admin),
+            "bridge" => Ok(Self::Bridge),
             _ => {
                 let kind = s.strip_prefix("review:").ok_or_else(bad)?;
                 let valid = !kind.is_empty()
@@ -76,6 +82,7 @@ impl fmt::Display for Scope {
             Self::Review(kind) => write!(f, "review:{kind}"),
             Self::Arbitrate => f.write_str("arbitrate"),
             Self::Admin => f.write_str("admin"),
+            Self::Bridge => f.write_str("bridge"),
         }
     }
 }
@@ -93,6 +100,9 @@ pub enum Requirement {
     /// of that kind. The route admits a token with either; the service
     /// checks the evidence itself.
     Evidence,
+    /// `PutObjects` and `Submit`: `propose`, or `bridge` (ADR 0037). The
+    /// server's ingest check decides what a `bridge` token may submit.
+    Submit,
 }
 
 impl Requirement {
@@ -106,6 +116,9 @@ impl Requirement {
             Self::Evidence => scopes
                 .iter()
                 .any(|s| matches!(s, Scope::Propose | Scope::Review(_))),
+            Self::Submit => scopes
+                .iter()
+                .any(|s| matches!(s, Scope::Propose | Scope::Bridge)),
         }
     }
 }
@@ -117,6 +130,7 @@ impl fmt::Display for Requirement {
             Self::Authenticated => f.write_str("a token"),
             Self::Scope(scope) => write!(f, "scope {scope}"),
             Self::Evidence => f.write_str("scope propose or review:<kind>"),
+            Self::Submit => f.write_str("scope propose or bridge"),
         }
     }
 }
@@ -125,13 +139,13 @@ impl fmt::Display for Requirement {
 const TABLE: &[(&str, Req)] = &[
     // RepoBackend (spec §10.5.2).
     ("/hord.v1.RepoBackend/GetObjects", Req::Read),
-    ("/hord.v1.RepoBackend/PutObjects", Req::Propose),
+    ("/hord.v1.RepoBackend/PutObjects", Req::Submit),
     ("/hord.v1.RepoBackend/Has", Req::Read),
     ("/hord.v1.RepoBackend/StreamObjects", Req::Read),
     ("/hord.v1.RepoBackend/Head", Req::Read),
     ("/hord.v1.RepoBackend/Log", Req::Read),
     ("/hord.v1.RepoBackend/Refs", Req::Read),
-    ("/hord.v1.RepoBackend/Submit", Req::Propose),
+    ("/hord.v1.RepoBackend/Submit", Req::Submit),
     ("/hord.v1.RepoBackend/Queue", Req::Read),
     ("/hord.v1.RepoBackend/Arbitrate", Req::Arbitrate),
     ("/hord.v1.RepoBackend/NodeHistory", Req::Read),
@@ -139,6 +153,8 @@ const TABLE: &[(&str, Req)] = &[
     ("/hord.v1.RepoBackend/ResolveName", Req::Read),
     ("/hord.v1.RepoBackend/AttachEvidence", Req::Evidence),
     ("/hord.v1.RepoBackend/Events", Req::Read),
+    // Git bridge (ADR 0036, ADR 0037).
+    ("/hord.v1.RepoBackend/RecordBridgeCheck", Req::Bridge),
     // Workspaces: a repository's daemon only (ADR 0024 amendment).
     ("/hord.v1.Workspaces/WsNew", Req::Propose),
     ("/hord.v1.Workspaces/WsList", Req::Read),
@@ -156,11 +172,18 @@ const TABLE: &[(&str, Req)] = &[
     ("/hord.v1.Changes/ChangeDiff", Req::Read),
     ("/hord.v1.Changes/ListRecordings", Req::Read),
     ("/hord.v1.Changes/GetRecording", Req::Read),
+    ("/hord.v1.Changes/NodeLineage", Req::Read),
+    ("/hord.v1.Changes/ChangeTrace", Req::Read),
+    ("/hord.v1.Changes/ListTree", Req::Read),
+    ("/hord.v1.Changes/GetFile", Req::Read),
+    ("/hord.v1.Changes/NodeEdges", Req::Read),
     // Auth.
     ("/hord.v1.Auth/Login", Req::Public),
     ("/hord.v1.Auth/MintToken", Req::Admin),
     ("/hord.v1.Auth/WhoAmI", Req::Authenticated),
     ("/hord.v1.Auth/GetKey", Req::Read),
+    // Audit: M6's acceptance auditor (`hord audit`).
+    ("/hord.v1.Audit/AuditLog", Req::Read),
 ];
 
 /// [`TABLE`]'s entries, `const`-constructible.
@@ -173,6 +196,8 @@ enum Req {
     Arbitrate,
     Admin,
     Evidence,
+    Submit,
+    Bridge,
 }
 
 impl From<Req> for Requirement {
@@ -185,6 +210,8 @@ impl From<Req> for Requirement {
             Req::Arbitrate => Self::Scope(Scope::Arbitrate),
             Req::Admin => Self::Scope(Scope::Admin),
             Req::Evidence => Self::Evidence,
+            Req::Submit => Self::Submit,
+            Req::Bridge => Self::Scope(Scope::Bridge),
         }
     }
 }
@@ -246,6 +273,7 @@ mod tests {
             "review:agent-reviewer",
             "arbitrate",
             "admin",
+            "bridge",
         ] {
             assert_eq!(text.parse::<Scope>()?.to_string(), text);
         }
@@ -258,6 +286,13 @@ mod tests {
         assert!(!Requirement::Evidence.admits(&[Scope::Read]));
         // Admin grants nothing else.
         assert!(!Requirement::Scope(Scope::Read).admits(&[Scope::Admin]));
+        // Bridge submits (the ingest check narrows it) but does not review
+        // or arbitrate (ADR 0037).
+        assert!(Requirement::Submit.admits(&[Scope::Bridge]));
+        assert!(Requirement::Submit.admits(&[Scope::Propose]));
+        assert!(!Requirement::Submit.admits(&[Scope::Read]));
+        assert!(!Requirement::Evidence.admits(&[Scope::Bridge]));
+        assert!(!Requirement::Scope(Scope::Arbitrate).admits(&[Scope::Bridge]));
         Ok(())
     }
 

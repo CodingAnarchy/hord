@@ -293,13 +293,23 @@ pub struct OpLine {
     pub op: String,
     /// One line, with names where known.
     pub text: String,
+    /// The definition it is about, for a link to its lineage.
+    pub node: Option<String>,
 }
 
 impl From<&proto::OpView> for OpLine {
     fn from(op: &proto::OpView) -> Self {
+        // An insert's `node` is the inserted object; its definition is the
+        // parent.
+        let node = match op.op.as_str() {
+            "insert" => op.parent.clone(),
+            "blob" | "tree" => None,
+            _ => op.node.clone(),
+        };
         Self {
             op: op.op.clone(),
             text: op.text.clone(),
+            node,
         }
     }
 }
@@ -333,6 +343,8 @@ pub struct ChangePage {
     pub side: ChangeSide,
     /// Where it is in the lander, in words, when queued.
     pub status: Option<String>,
+    /// Its result snapshot, for the repository browser.
+    pub result: Option<String>,
     /// Evidence for its result snapshot (ADR 0025) and the author's.
     pub evidence: Vec<EvidenceView>,
     /// Provenance lines: toolchain, harness, created, parents, rebased from.
@@ -558,6 +570,7 @@ mod tests {
             ops: vec![OpLine {
                 op: "replace".into(),
                 text: "replace fn parse".into(),
+                node: Some("n1".into()),
             }],
             ..Default::default()
         };
@@ -566,6 +579,7 @@ mod tests {
             base: String::new(),
             side: side.clone(),
             status: None,
+            result: Some("r".into()),
             evidence: Vec::new(),
             provenance: vec![("harness".into(), "h".into())],
             reads: Vec::new(),

@@ -36,6 +36,7 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 argon2 = "0.6"
+base64 = "0.22"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
 askama = "0.16"
 async-trait = "0.1"
@@ -54,6 +55,8 @@ http = "1"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+# ring and native roots: the provider and roots tonic's TLS uses (M6).
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"] }
 hord-api = { path = "crates/hord-api" }
 hord-core = { path = "crates/hord-core" }
 hord-diff = { path = "crates/hord-diff" }
@@ -79,6 +82,8 @@ prost-types = "0.14"
 protoc-bin-vendored = "3"
 lasso = { version = "0.7", features = ["multi-threaded"] }
 proptest = "1"
+# ring, not aws-lc-rs: the same crypto provider tonic's `tls-ring` uses.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 semver = "1"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
@@ -87,12 +92,14 @@ tree-sitter-rust = "0.24"
 # `tree-sitter-toml-ng` 0.7, which matches this pin and tree-sitter 0.25.
 tree-sitter-toml = { package = "tree-sitter-toml-ng", version = "0.7" }
 redb = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustc-demangle = "0.1"
 reflink-copy = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 thiserror = "2"
+time = "0.3"
 toml = "1"
 tonic = "0.14"
 tonic-prost = "0.14"

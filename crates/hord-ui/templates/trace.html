@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Trace: {{ summary }}</h1>
+<p class="legend">change <code>{{ change }}</code> · {{ actor }}{% if let Some(s) = status %} · {{ s }}{% endif %}</p>
+<p class="links"><a href="{{ base }}/changes/{{ change }}">semantic change</a>{% if parked %} · <a href="{{ base }}/arbitrate/{{ change }}">open workbench</a>{% endif %} · <a href="{{ base }}/trace/{{ change }}/json" download>export JSON</a></p>
+<ol class="timeline">
+{% for s in steps %}<li class="step stage-{{ s.class }}">
+  <span class="at">{{ s.at }}</span>
+  <strong>{{ s.stage }}</strong>
+  <span class="ev-{{ s.outcome }}">{{ s.text }}</span>
+  {% if let Some(a) = s.actor %}<small>by {{ a }}</small>{% endif %}
+  {% if let Some(c) = s.change %}<a href="{{ base }}/changes/{{ c }}"><code>{{ c|truncate(12) }}</code></a>{% endif %}
+</li>
+{% endfor %}
+</ol>
+<h2>Built from</h2>
+<ul>{% for s in sources %}<li>{{ s.role }}: <a href="{{ base }}/changes/{{ s.change }}">{{ s.summary }}</a> <code>{{ s.change }}</code></li>{% endfor %}</ul>
+{% endblock %}

@@ -4,7 +4,7 @@
 //! `queue`, `land --local`, `conflicts`, `log`, `blame`, `query`, `watch`,
 //! `remote add|rm|list|set-default`, `serve`, `git import`, `git export`,
 //! `policy check`, `replay`, `arbitrate`, `review`, `login`, `token mint`,
-//! `user add`, `key show|verify`.
+//! `user add`, `key show|verify`, `audit`.
 //!
 //! `--json` is the canonical agent output: the protobuf JSON mapping of the
 //! command's `hord.proto` message (ADR 0024). Human-oriented text is
@@ -32,6 +32,7 @@ mod workspaces;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use hord_server::TlsConfig;
 
 use cli::{
     Cli, Command, GitCommand, KeyCommand, PolicyCommand, RemoteCommand, TokenCommand, UserCommand,
@@ -55,12 +56,17 @@ async fn run(cli: Cli) -> Result<()> {
         root,
         bind,
         insecure_bind,
+        tls_cert,
+        tls_key,
         auth,
         config,
         daemon,
     } = cli.command
     {
-        return cmd::serve::run(repo, root, bind, insecure_bind, auth, config, daemon).await;
+        let tls = tls_cert
+            .zip(tls_key)
+            .map(|(cert, key)| TlsConfig { cert, key });
+        return cmd::serve::run(repo, root, bind, insecure_bind, tls, auth, config, daemon).await;
     }
     tokio::task::spawn_blocking(move || run_blocking(cli))
         .await
@@ -68,9 +74,9 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// Commands that open the store in this process: a running daemon holds
-/// it, so it is asked to stop first.
+/// it, so it is asked to stop first. `git sync` talks to the daemon.
 fn needs_store(command: &Command) -> bool {
-    matches!(command, Command::Git { .. })
+    matches!(command, Command::Git { command } if !matches!(command, GitCommand::Sync { .. }))
 }
 
 fn run_blocking(cli: Cli) -> Result<()> {
@@ -120,7 +126,9 @@ fn run_blocking(cli: Cli) -> Result<()> {
             from,
         } => cmd::watch::run(json, &target, queue, change, from),
         Command::Remote { command } => match command {
-            RemoteCommand::Add { name, url } => cmd::remote::run_add(json, name, url),
+            RemoteCommand::Add { name, url, ca_file } => {
+                cmd::remote::run_add(json, name, url, ca_file)
+            }
             RemoteCommand::Rm { name } => cmd::remote::run_rm(json, name),
             RemoteCommand::List => cmd::remote::run_list(json),
             RemoteCommand::SetDefault { name, clear } => {
@@ -131,6 +139,20 @@ fn run_blocking(cli: Cli) -> Result<()> {
         Command::Git { command } => match command {
             GitCommand::Import { git_ref } => cmd::git::run_import(json, git_ref),
             GitCommand::Export { hord_ref } => cmd::git::run_export(json, hord_ref),
+            GitCommand::Sync {
+                once,
+                check,
+                repair,
+                config,
+            } => {
+                let mode = match (once, check, repair) {
+                    (true, _, _) => cmd::git_sync::Mode::Once,
+                    (_, true, _) => cmd::git_sync::Mode::Check,
+                    (_, _, true) => cmd::git_sync::Mode::Repair,
+                    _ => cmd::git_sync::Mode::Daemon,
+                };
+                cmd::git_sync::run(json, &target, mode, config)
+            }
         },
         Command::Review {
             change,
@@ -226,5 +248,18 @@ fn run_blocking(cli: Cli) -> Result<()> {
             replay,
             note,
         } => cmd::arbitrate::run(json, &target, change, pick, edit, replay, note),
+        Command::Audit {
+            since,
+            until,
+            max_bridge_gap,
+            require_bridge,
+        } => cmd::audit::run(
+            json,
+            &target,
+            &since,
+            until.as_deref(),
+            max_bridge_gap,
+            require_bridge,
+        ),
     }
 }

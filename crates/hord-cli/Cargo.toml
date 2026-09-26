@@ -29,6 +29,7 @@ rpassword = "7"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
+time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = ["signal", "time"] }
 tokio-stream.workspace = true
 toml.workspace = true
@@ -40,3 +41,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 hord-identity.workspace = true
 hord-lang.workspace = true
 hord-lang-rust.workspace = true
+rcgen.workspace = true

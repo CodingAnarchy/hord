@@ -84,7 +84,7 @@ pub use local::{
 };
 pub use materialize::MaterializeMode;
 pub use propose::ReadDeclaration;
-pub use query::{Query, line_start};
+pub use query::{Query, TestEdges, line_start};
 pub use replay::{
     CommandHarness, ReplayFuture, ReplayHarness, budget_message, intent_message, over_budget,
     provenance_message, summary_message,
