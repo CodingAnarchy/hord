@@ -20,6 +20,9 @@
 //! [[key]]
 //! id = "ed25519:<hex>"
 //! actor = { kind = "human", id = "ada" }
+//!
+//! [[lander]]                     # a lander key `hord audit` trusts (ADR 0038)
+//! id = "ed25519:<hex>"
 //! ```
 //!
 //! Other processes (`hord user add`, an operator's editor) may write the
@@ -153,6 +156,16 @@ struct AuthFile {
     tokens: Vec<Token>,
     #[serde(default, rename = "key")]
     keys: Vec<Key>,
+    #[serde(default, rename = "lander")]
+    landers: Vec<Lander>,
+}
+
+/// A lander key whose signatures on `Landed` events the audit trusts
+/// (ADR 0038). Kept after a rotation, so older landings still verify.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Lander {
+    id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -312,6 +325,31 @@ impl AuthStore {
         }
         *state = load(&self.path)?;
         Ok(find_key(&state, key_id))
+    }
+
+    /// Whether `key_id` is a lander key the file lists (ADR 0038), as this
+    /// process last read it: no I/O.
+    #[must_use]
+    pub fn lander_listed(&self, key_id: &str) -> bool {
+        self.lock().landers.iter().any(|l| l.id == key_id)
+    }
+
+    /// List `key_id` as a lander key (ADR 0038); nothing if it is listed.
+    /// Whether it was added.
+    pub fn add_lander(&self, key_id: &str) -> Result<bool, AuthError> {
+        PublicKey::from_key_id(key_id).map_err(|err| AuthError::Rejected(err.to_string()))?;
+        if self.lander_listed(key_id) {
+            return Ok(false);
+        }
+        self.update(|state| {
+            if state.landers.iter().any(|l| l.id == key_id) {
+                return Ok(false);
+            }
+            state.landers.push(Lander {
+                id: key_id.to_owned(),
+            });
+            Ok(true)
+        })
     }
 
     /// Check a user's password; bind `key_id` to them and issue a token

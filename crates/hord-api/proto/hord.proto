@@ -1009,6 +1009,12 @@ message Landed {
   optional string submitted = 3;
   // Evidence the lander attached to the landed snapshot (ADR 0025).
   repeated string evidence = 4;
+  // Id of the lander's key that made `lander_signature` (ADR 0038): the
+  // repository's own, listed in the server's auth file as `[[lander]]`.
+  optional string lander_key_id = 5;
+  // The lander's Ed25519 signature over the landed id and `position`
+  // (domain `hord.landed`). Unset on events recorded before ADR 0038.
+  optional bytes lander_signature = 6;
 }
 
 // A change was rejected.
@@ -2035,6 +2041,9 @@ enum AuditCriterion {
   AUDIT_CRITERION_BRIDGE_DIVERGED = 8;
   // Bridge checks were further apart than allowed, or missing.
   AUDIT_CRITERION_BRIDGE_GAP = 9;
+  // A `Landed` event is not signed by the lander, or by a lander key the
+  // auth file does not list (ADR 0038).
+  AUDIT_CRITERION_LANDER = 10;
 }
 
 // How a landed change reached the lander.

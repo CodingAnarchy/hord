@@ -53,6 +53,15 @@ pub enum Error {
         /// What is wrong.
         reason: String,
     },
+    /// A hosted repository's lander key could not be listed in the auth
+    /// file (ADR 0038).
+    #[error("repository {repo}: list its lander key: {reason}")]
+    Lander {
+        /// The repository's name.
+        repo: String,
+        /// Why.
+        reason: String,
+    },
     /// Socket or file I/O.
     #[error(transparent)]
     Io(#[from] std::io::Error),

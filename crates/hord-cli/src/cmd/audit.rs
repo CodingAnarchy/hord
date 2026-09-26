@@ -68,6 +68,7 @@ fn criterion_name(criterion: AuditCriterion) -> &'static str {
         AuditCriterion::UnrecordedLanding => "store edit",
         AuditCriterion::BridgeDiverged => "bridge diverged",
         AuditCriterion::BridgeGap => "bridge checks",
+        AuditCriterion::Lander => "lander signature",
         AuditCriterion::Unspecified => "note",
     }
 }

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use hord_core::sign::{self, SigningKey};
 use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
     RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
@@ -206,6 +207,8 @@ pub(crate) struct Inner {
     pub wake: tokio::sync::Notify,
     /// The persisted event log (spec §10.5.3), opened on first use.
     pub events: Mutex<Option<Arc<crate::events::EventLog>>>,
+    /// The lander's key (ADR 0038), read or created on first landing.
+    pub lander_key: Mutex<Option<Arc<SigningKey>>>,
     /// Every task this repository spawns that holds it: blocking store
     /// work, verification, and replays. [`Repo::close`] waits for them.
     pub tasks: TaskTracker,
@@ -420,6 +423,7 @@ impl Inner {
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
             wake: tokio::sync::Notify::new(),
             events: Mutex::new(None),
+            lander_key: Mutex::new(None),
             tasks: TaskTracker::new(),
             closing: CancellationToken::new(),
             verify_cancel: Cancel::new(),
@@ -639,6 +643,7 @@ impl Inner {
             signature: None,
             rebased_from: None,
         };
+        let lander_key = self.lander_key()?;
         let change = self.store.put_object(&record)?;
         self.store.append_log(change)?;
         self.store.set_head(change)?;
@@ -647,7 +652,15 @@ impl Inner {
             change: Some(change),
             snapshot: result,
         });
-        self.emit(crate::events::landed(change, 0, None, &[], None))?;
+        let signature = sign::sign_landing(change, 0, &lander_key);
+        self.emit(crate::events::landed(
+            change,
+            0,
+            None,
+            &[],
+            &signature,
+            None,
+        ))?;
         Ok(change)
     }
 
@@ -923,6 +936,15 @@ impl Repo {
     /// Submitting a change that is already queued returns its entry.
     pub async fn submit(&self, change: ChangeId) -> Result<QueueEntry> {
         blocking(&self.inner, move |inner| inner.submit(change)).await
+    }
+
+    /// The id of this repository's lander key (ADR 0038), which signs its
+    /// `Landed` events; the key is created if the repository has none yet.
+    pub async fn lander_key_id(&self) -> Result<String> {
+        blocking(&self.inner, |inner| {
+            Ok(inner.lander_key()?.public().key_id())
+        })
+        .await
     }
 
     /// Every lander queue entry in submission order (`hord queue`).

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use hord_api::proto::event::Kind;
 use hord_api::{ApiError, EventCursor, EventStream, proto, wire};
-use hord_core::{ChangeId, Evidence, ObjectId, Provenance, Timestamp};
+use hord_core::{ChangeId, Evidence, ObjectId, Provenance, Signature, Timestamp};
 use prost::Message;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use tokio::sync::{broadcast, mpsc};
@@ -456,6 +456,7 @@ pub(crate) fn landed(
     position: u64,
     submitted: Option<ChangeId>,
     evidence: &[ObjectId],
+    lander: &Signature,
     previous: Option<ChangeId>,
 ) -> Vec<Kind> {
     vec![
@@ -464,6 +465,8 @@ pub(crate) fn landed(
             position,
             submitted: submitted.map(wire::id),
             evidence: evidence.iter().copied().map(wire::id).collect(),
+            lander_key_id: Some(lander.key_id.clone()),
+            lander_signature: Some(lander.bytes.to_vec()),
         }),
         Kind::HeadMoved(proto::HeadMoved {
             from: previous.map(wire::id),

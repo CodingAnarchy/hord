@@ -222,8 +222,10 @@ It checks:
 - every landed change has an intent and provenance: a record signed by its author with a key bound to them, vouched for by the bridge, replayed by the harness, or resolved by an arbiter;
 - every landed change has passing evidence, and head's policy at its landing base allows it when judged again;
 - every review and arbitration is signed by a key bound to the actor who made it;
-- nothing is in the log without the lander's `Landed` event;
+- nothing is in the log without the lander's `Landed` event, and every `Landed` event is signed by the repository's lander key (ADR 0038);
 - the bridge's divergence checks all passed, with none more than 65 minutes apart (`--max-bridge-gap`).
+
+Each repository's lander signs its landings with its own key, `.hord/lander.pem`, created on the first landing. `hord serve` lists that key in the auth file as `[[lander]] id = "ed25519:…"` when it starts, and the audit trusts only listed lander keys. If the key is ever replaced, leave the old `[[lander]]` entry in place, so landings it signed still verify.
 
 Bridge-vouched changes are counted apart from signed ones. Until the bridge has recorded a check, the report says "no bridge checks recorded". That is a note, and becomes a violation only with `--require-bridge`.
 

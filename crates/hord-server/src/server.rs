@@ -295,6 +295,31 @@ impl Server {
         self.serve_incoming(incoming, None, shutdown).await
     }
 
+    /// List each hosted repository's lander key in the auth file (ADR
+    /// 0038), so `hord audit` trusts the landings it signs.
+    async fn list_landers(&self) -> Result<()> {
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        for (name, local) in self.hosts.locals() {
+            let failed = |reason: String| Error::Lander {
+                repo: name.to_owned(),
+                reason,
+            };
+            let key_id = local
+                .repo()
+                .lander_key_id()
+                .await
+                .map_err(|err| failed(err.to_string()))?;
+            let auth = Arc::clone(auth);
+            tokio::task::spawn_blocking(move || auth.add_lander(&key_id))
+                .await
+                .map_err(|err| failed(err.to_string()))?
+                .map_err(|err| failed(err.to_string()))?;
+        }
+        Ok(())
+    }
+
     async fn serve_incoming<I, IO, IE>(
         &self,
         incoming: I,
@@ -311,6 +336,7 @@ impl Server {
             + 'static,
         IE: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        self.list_landers().await?;
         let hooks: Vec<_> = self
             .hosts
             .backends()

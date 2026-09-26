@@ -594,3 +594,95 @@ async fn a_voucher_bound_to_no_one_fails_provenance() -> TestResult {
     );
     Ok(())
 }
+
+/// Every landing's `Landed` event is signed by the repository's lander key
+/// (ADR 0038). The audit trusts the key only when the auth file lists it,
+/// so a landing signed by another key, as by a store edited with a new
+/// `lander.pem`, fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn landings_are_signed_by_a_listed_lander_key() -> TestResult {
+    let dir = temp("lander")?;
+    let repo_dir = dir.0.join("repo");
+    let repo = Repo::create(&repo_dir).await?;
+    repo.bootstrap(
+        vec![(
+            "src/lib.rs".parse::<RepoPath>()?,
+            b"pub fn a() -> u32 {\n    1\n}\n".to_vec(),
+        )],
+        Intent::from_summary("seed"),
+        Actor::Human { id: "seed".into() },
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let since = now_ms()?;
+    let land = |body: &'static str| {
+        let repo = repo.clone();
+        async move {
+            let mut ws = repo
+                .begin(BeginOptions::at_head(Actor::Human { id: "ada".into() }))
+                .await?;
+            ws.write_file(&"src/lib.rs".parse()?, body).await?;
+            let proposal = ws.propose(Intent::from_summary(body)).await?;
+            repo.submit(proposal.change).await?;
+            repo.land_local().await?;
+            TestResult::Ok(())
+        }
+    };
+    land("pub fn a() -> u32 {\n    2\n}\n").await?;
+
+    let auth = dir.0.join("auth.toml");
+    AuthStore::add_user(&auth, "root", "pw", &[Scope::Admin])?;
+    let lander = |report: &proto::AuditReport| -> Vec<String> {
+        report
+            .violations
+            .iter()
+            .filter(|v| v.criterion() == AuditCriterion::Lander)
+            .map(|v| v.detail.clone())
+            .collect()
+    };
+    let audit = |auth: Option<Arc<AuthStore>>| {
+        LocalAudit::new(Arc::new(LocalRepo::without_lander(repo.clone())), auth)
+    };
+
+    // The key is not listed yet: the landing is not trusted.
+    let report = audit(Some(Arc::new(AuthStore::open(&auth)?)))
+        .audit_log(window(since)?)
+        .await?;
+    let key_id = repo.lander_key_id().await?;
+    assert!(
+        lander(&report).len() == 1 && lander(&report)[0].contains(&key_id),
+        "{:#?}",
+        report.violations
+    );
+    // Listed, it is.
+    assert!(AuthStore::open(&auth)?.add_lander(&key_id)?);
+    let report = audit(Some(Arc::new(AuthStore::open(&auth)?)))
+        .audit_log(window(since)?)
+        .await?;
+    assert_eq!(lander(&report), Vec::<String>::new());
+    // Without an auth file the signature is still verified.
+    let report = audit(None).audit_log(window(since)?).await?;
+    assert_eq!(lander(&report), Vec::<String>::new());
+
+    // Another key lands the next change: that landing is not trusted.
+    repo.close().await;
+    drop(repo);
+    std::fs::remove_file(repo_dir.join(".hord").join("lander.pem"))?;
+    let repo = Repo::open(&repo_dir).await?;
+    let mut ws = repo
+        .begin(BeginOptions::at_head(Actor::Human { id: "ada".into() }))
+        .await?;
+    ws.write_file(&"src/lib.rs".parse()?, "pub fn a() -> u32 {\n    3\n}\n")
+        .await?;
+    let proposal = ws.propose(Intent::from_summary("three")).await?;
+    repo.submit(proposal.change).await?;
+    repo.land_local().await?;
+    let report = LocalAudit::new(
+        Arc::new(LocalRepo::without_lander(repo.clone())),
+        Some(Arc::new(AuthStore::open(&auth)?)),
+    )
+    .audit_log(window(since)?)
+    .await?;
+    assert_eq!(lander(&report).len(), 1, "{:#?}", report.violations);
+    Ok(())
+}

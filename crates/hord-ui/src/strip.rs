@@ -532,6 +532,7 @@ mod tests {
                 position: 0,
                 submitted: Some("s1".into()),
                 evidence: vec!["e1".into(), "e2".into()],
+                ..Default::default()
             }),
         ));
         let row = strip.row("l1").expect("the landed id names the row");
@@ -627,6 +628,7 @@ mod tests {
                 position: 3,
                 submitted: Some("s".into()),
                 evidence: Vec::new(),
+                ..Default::default()
             }),
         ));
         let row = strip.row("l").expect("landed id is indexed");

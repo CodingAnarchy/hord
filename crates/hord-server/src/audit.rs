@@ -32,8 +32,8 @@ use hord_api::proto::{AuditCriterion, AuditOrigin};
 use hord_api::{ApiError, ApiResult, AuditBackend, proto, wire};
 use hord_core::sign::{self, SignError};
 use hord_core::{
-    Actor, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IntentRef, ObjectId,
-    Signature, Timestamp,
+    Actor, Bytes, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IntentRef,
+    ObjectId, Signature, Timestamp,
 };
 use hord_policy::{Decision, EvidenceTag};
 use hord_txn::{LocalRepo, Origin, QueueEntry, QueueStatus, Repo};
@@ -117,6 +117,9 @@ pub struct LandedFacts {
     /// record's signature, checked against its author. For
     /// [`AuditOrigin::BridgeVouched`]: its voucher, checked as ingest checks it.
     pub key: KeyCheck,
+    /// The lander's signature on its `Landed` event (ADR 0038), checked
+    /// against the auth file's `[[lander]]` keys.
+    pub lander: KeyCheck,
     /// Its evidence.
     pub evidence: Vec<EvidenceFacts>,
     /// Head's policy, judged again.
@@ -266,6 +269,19 @@ fn key_problem(key: &KeyCheck, what: &str) -> Option<String> {
 
 fn judge_change(landed: &LandedFacts, violations: &mut Vec<proto::AuditFinding>) {
     let change = Some(landed.change.as_str());
+    match &landed.lander {
+        KeyCheck::Bound | KeyCheck::Unchecked => {}
+        KeyCheck::Unsigned => violations.push(finding(
+            AuditCriterion::Lander,
+            change,
+            "its Landed event carries no lander signature".into(),
+        )),
+        KeyCheck::Bad(reason) => violations.push(finding(
+            AuditCriterion::Lander,
+            change,
+            format!("its Landed event: {reason}"),
+        )),
+    }
     if landed.summary.trim().is_empty() {
         violations.push(finding(
             AuditCriterion::Intent,
@@ -482,6 +498,33 @@ fn check_voucher(auth: Option<&AuthStore>, record: &ChangeRecord, voucher: &str)
     }
 }
 
+/// Check the lander's signature on `event` (ADR 0038): it verifies over
+/// the landed id and position, and `auth`, when present, lists its key.
+fn check_lander(auth: Option<&AuthStore>, event: &proto::Landed) -> KeyCheck {
+    let (Some(key_id), Some(bytes)) = (&event.lander_key_id, &event.lander_signature) else {
+        return KeyCheck::Unsigned;
+    };
+    let signature = Signature {
+        key_id: key_id.clone(),
+        bytes: Bytes::from(bytes.clone()),
+    };
+    let verified = wire::object_id("landed", &event.change)
+        .map_err(|err| err.to_string())
+        .and_then(|id| {
+            sign::verify_landing(id, event.position, &signature).map_err(|err| err.to_string())
+        });
+    if let Err(err) = verified {
+        return KeyCheck::Bad(format!("bad lander signature by {key_id}: {err}"));
+    }
+    match auth {
+        None => KeyCheck::Unchecked,
+        Some(auth) if auth.lander_listed(key_id) => KeyCheck::Bound,
+        Some(_) => KeyCheck::Bad(format!(
+            "signed by lander key {key_id}, which the auth file does not list"
+        )),
+    }
+}
+
 /// Check `signature` over an object claimed by `actor`: `verify` checks it
 /// cryptographically with the key it names; `auth`, when present, says
 /// whom the key is bound to.
@@ -694,6 +737,7 @@ pub async fn gather(
             actor,
             origin,
             key,
+            lander: check_lander(auth, &event),
             evidence,
             policy,
         });
@@ -921,6 +965,7 @@ mod tests {
             actor: ada(),
             origin: AuditOrigin::Signed,
             key: KeyCheck::Bound,
+            lander: KeyCheck::Bound,
             evidence: vec![passing("test"), passing("review:human")],
             policy: PolicyJudgement::Allow("head".into()),
         }
@@ -1116,6 +1161,24 @@ mod tests {
                 (AuditCriterion::UnrecordedLanding, Some("edited".into())),
             ]
         );
+    }
+
+    #[test]
+    fn every_landing_is_signed_by_a_listed_lander_key() {
+        let mut facts = clean();
+        facts.changes[1].lander = KeyCheck::Unsigned;
+        facts.changes[3].lander = KeyCheck::Bad("not listed".into());
+        assert_eq!(
+            criteria(&judge(&facts)),
+            [
+                (AuditCriterion::Lander, Some("change-1".into())),
+                (AuditCriterion::Lander, Some("change-3".into())),
+            ]
+        );
+        // Without an auth file the signature still verified.
+        facts.changes[1].lander = KeyCheck::Unchecked;
+        facts.changes[3].lander = KeyCheck::Unchecked;
+        assert!(judge(&facts).ok);
     }
 
     #[test]
