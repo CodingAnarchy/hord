@@ -374,12 +374,9 @@ async fn build(cfg: &Config, path: &Path, case: &Case) -> Result<CaseRepo> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let (remote, ui) = loop {
         // Its first line names the address: `hord serve: http://<addr> (...)`.
-        let ui = std::fs::read_to_string(&log_path).ok().and_then(|text| {
-            text.lines()
-                .find_map(|l| l.strip_prefix("hord serve: "))
-                .and_then(|rest| rest.split_whitespace().next())
-                .map(str::to_owned)
-        });
+        let ui = std::fs::read_to_string(&log_path)
+            .ok()
+            .and_then(|text| served_address(&text));
         if let Some(ui) = ui
             && let Ok(remote) = RemoteRepo::connect_local(&dir).await
             && remote.head(proto::HeadRequest {}).await.is_ok()
@@ -401,6 +398,17 @@ async fn build(cfg: &Config, path: &Path, case: &Case) -> Result<CaseRepo> {
         ui,
         server,
     })
+}
+
+/// The address `hord serve` announced in its log, from a complete line
+/// only: the log is read while the server writes it, and a line cut short
+/// would give a truncated address.
+fn served_address(log: &str) -> Option<String> {
+    log.split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .find_map(|line| line.strip_prefix("hord serve: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_owned)
 }
 
 /// The latest queue entry submitted as `change`.
@@ -930,6 +938,17 @@ mod tests {
             tokens: Some(tokens),
             ..Default::default()
         }
+    }
+
+    /// The address comes only from a complete log line (the m5-022 flake:
+    /// a line read half-written gave the host `127.0.0`).
+    #[test]
+    fn the_served_address_is_read_from_complete_lines_only() {
+        assert_eq!(served_address("hord serve: http://127.0.0"), None);
+        assert_eq!(
+            served_address("hord serve: http://127.0.0.1:5000 (m5-022)\n"),
+            Some("http://127.0.0.1:5000".into())
+        );
     }
 
     /// A workbench that does not answer is an error, so the runner reports
