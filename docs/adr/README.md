@@ -13,6 +13,8 @@ Dependency additions (one line each):
 - `toml` 1 (`hord-lang-toml`, feature `preserve_order`): decodes and prints TOML values for the generic lockfile merge (ADR 0013). It is Cargo's own TOML crate, so printed values match what Cargo writes, and it avoids a hand-rolled TOML value decoder.
 - `semver` 1 (`hord-lang-rust`): orders `Cargo.lock` packages by semver version, as Cargo's `PackageId` does (ADR 0013).
 
+`time` 0.3 (hord-server, features `parsing` and `formatting`; already hord-cli's): reads and writes the auth file's RFC 3339 `revoked_at` times (ADR 0038).
+
 `reflink-copy` 0.1 (hord-txn only, ADR 0016): safe wrapper over `clonefile(2)` / `FICLONE` for copy-on-write workspace checkouts, so no hord crate needs `unsafe` outside `hord-vfs`.
 
 `windows-sys` 0.61 (hord-cli, Windows only, feature `Win32_Foundation`, ADR 0027): `SetHandleInformation`, so the daemon does not inherit the CLI's stdio.

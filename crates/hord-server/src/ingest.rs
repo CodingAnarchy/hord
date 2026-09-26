@@ -248,6 +248,12 @@ fn signed_by(
                 describe(&principal.actor)
             )));
         }
+        None if auth.key_binding(&signature.key_id).is_some() => {
+            return Err(Status::permission_denied(format!(
+                "key {} was revoked: it signs nothing more (ADR 0038)",
+                signature.key_id
+            )));
+        }
         None => {
             return Err(Status::permission_denied(format!(
                 "key {} is not bound to any actor on this server",

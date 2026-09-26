@@ -789,3 +789,80 @@ async fn evidence_attached_after_landing_changes_nothing() -> TestResult {
     assert_eq!(evidence_findings(&after), [wire::id(a.change)]);
     Ok(())
 }
+
+/// Revoking a key does not reach back (ADR 0038): what it signed before
+/// the revocation still audits clean, and what it signed after does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_key_fails_only_what_it_signed_afterwards() -> TestResult {
+    let dir = temp("revoked")?;
+    let repo = Repo::create(dir.0.join("repo")).await?;
+    repo.bootstrap(
+        vec![(
+            "src/lib.rs".parse::<RepoPath>()?,
+            b"pub fn a() -> u32 {\n    1\n}\n".to_vec(),
+        )],
+        Intent::from_summary("seed"),
+        Actor::Human { id: "seed".into() },
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let since = now_ms()?;
+    let auth = dir.0.join("auth.toml");
+    AuthStore::add_user(&auth, "ada", "pw", &[Scope::Read, Scope::Propose])?;
+    let key = SigningKey::generate()?;
+    AuthStore::open(&auth)?.login("ada", "pw", &key.public().key_id())?;
+    // Signed and submitted where no token is checked, as a daemon does.
+    let land_signed = |body: &'static str| {
+        let (repo, key) = (repo.clone(), &key);
+        async move {
+            let mut ws = repo
+                .begin(BeginOptions::at_head(Actor::Human { id: "ada".into() }))
+                .await?;
+            ws.write_file(&"src/lib.rs".parse()?, body).await?;
+            let mut record = ws.propose(Intent::from_summary(body)).await?.record;
+            sign::sign_change(&mut record, key)?;
+            let bytes = hord_encoding::encode(&record)?;
+            let change = wire::id(wire::verified_object(&wire::object(bytes.clone()))?);
+            let local = LocalRepo::without_lander(repo.clone());
+            local
+                .put_objects(proto::PutObjectsRequest {
+                    objects: vec![wire::object(bytes)],
+                })
+                .await?;
+            local
+                .submit(proto::SubmitRequest {
+                    change: change.clone(),
+                })
+                .await?;
+            repo.land_local().await?;
+            TestResult::Ok(change)
+        }
+    };
+    let before = land_signed("pub fn a() -> u32 {\n    2\n}\n").await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    AuthStore::revoke_key(&auth, &key.public().key_id())?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let after = land_signed("pub fn a() -> u32 {\n    3\n}\n").await?;
+
+    let report = LocalAudit::new(
+        Arc::new(LocalRepo::without_lander(repo.clone())),
+        Some(Arc::new(AuthStore::open(&auth)?)),
+    )
+    .audit_log(window(since)?)
+    .await?;
+    let provenance: Vec<(Option<String>, String)> = report
+        .violations
+        .iter()
+        .filter(|v| v.criterion() == AuditCriterion::Provenance)
+        .map(|v| (v.change.clone(), v.detail.clone()))
+        .collect();
+    assert_eq!(provenance.len(), 1, "{provenance:#?}");
+    assert_eq!(provenance[0].0.as_deref(), Some(after.as_str()));
+    assert!(
+        provenance[0].1.contains("after it was revoked"),
+        "{provenance:#?}"
+    );
+    // What the key signed before its revocation passes provenance.
+    assert!(report.changes.iter().any(|c| c.change == before));
+    Ok(())
+}

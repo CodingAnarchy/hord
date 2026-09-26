@@ -57,7 +57,7 @@ pub use audit::{
     ArbitrationFacts, AuditFacts, BridgeCheck, DEFAULT_MAX_BRIDGE_GAP_MS, EvidenceFacts, KeyCheck,
     LandedFacts, LocalAudit, PolicyJudgement, gather, judge, span,
 };
-pub use auth::{AuthError, AuthStore, Issued, Principal, same_actor};
+pub use auth::{AuthError, AuthStore, Issued, KeyBinding, Principal, same_actor};
 pub use changes::{LocalChanges, RECORDINGS_DIR, save_recording};
 pub use config::{AuthConfig, ServerConfig, TlsConfig, WebhookConfig};
 pub use error::{Error, Result};

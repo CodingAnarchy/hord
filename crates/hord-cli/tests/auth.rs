@@ -327,9 +327,23 @@ impl World {
         Ok(str_field(&login, "keyId")?.to_owned())
     }
 
-    /// As `home`: a workspace at head, `from` replaced by `to` in `file`,
-    /// proposed and submitted. The change id.
+    /// As `home`: [`Self::propose`], then submitted. The change id.
     fn submit(
+        &self,
+        home: &Path,
+        file: &str,
+        from: &str,
+        to: &str,
+        summary: &str,
+    ) -> TestResult<String> {
+        let change = self.propose(home, file, from, to, summary)?;
+        json(&self.clone.0, home, &["submit", &change])?;
+        Ok(change)
+    }
+
+    /// As `home`: a workspace at head, `from` replaced by `to` in `file`,
+    /// proposed. The change id.
+    fn propose(
         &self,
         home: &Path,
         file: &str,
@@ -351,9 +365,7 @@ impl World {
         fs::write(&intent, format!("---\nsummary: {summary}\n---\nWhy.\n"))?;
         let intent = intent.to_str().ok_or("intent path is UTF-8")?;
         let proposed = json(dir, home, &["propose", "-w", &id, "--intent", intent])?;
-        let change = str_field(&proposed, "change")?.to_owned();
-        json(dir, home, &["submit", &change])?;
-        Ok(change)
+        Ok(str_field(&proposed, "change")?.to_owned())
     }
 }
 
@@ -705,5 +717,52 @@ fn daemon_proposals_are_signed_with_the_users_key() -> TestResult {
     let direct = propose(true, "    2\n", "    20\n", "beta")?;
     let verified = daemon_json(dir, &home.0, &["key", "verify", &direct, "--key", &key])?;
     assert_eq!(verified["verified"], true, "{verified:#}");
+    Ok(())
+}
+
+/// `hord token revoke` and `hord key revoke` (ADR 0038) mark entries
+/// revoked instead of deleting them: a revoked token is refused, and a
+/// revoked key signs nothing more, once the server reloads the file.
+#[test]
+fn revoked_tokens_and_keys_are_refused_and_kept() -> TestResult {
+    let w = world()?;
+    let dir = &w.clone.0;
+    let auth = w.homes.0.join("auth.toml");
+    let auth_arg = auth.to_str().ok_or("auth path is UTF-8")?;
+    w.login(&w.eve, "eve")?;
+    json(dir, &w.eve, &["queue"])?;
+
+    let revoked = json(
+        dir,
+        &w.nobody,
+        &["key", "revoke", &w.bot_key, "--auth-file", auth_arg],
+    )?;
+    assert_eq!(str_field(&revoked, "keyId")?, w.bot_key);
+    let revoked = json(
+        dir,
+        &w.nobody,
+        &["token", "revoke", "--actor", "eve", "--auth-file", auth_arg],
+    )?;
+    assert_eq!(revoked["revoked"], 1, "{revoked:#}");
+    let text = fs::read_to_string(&auth)?;
+    assert!(text.contains(&w.bot_key), "the key's entry stays: {text}");
+    assert_eq!(text.matches("revoked_at").count(), 2, "{text}");
+
+    // The server reloads the file within a second: eve's token stops.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = run(dir, &w.eve, &["queue"], "")?;
+        if !out.status.success() {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err("the revoked token still works".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The same reload revoked the bot's key: what it signs is refused.
+    let change = w.propose(&w.bot, "src/lib.rs", "    1\n", "    10\n", "alpha ten")?;
+    let err = fails(dir, &w.bot, &["submit", &change])?;
+    assert!(err.contains("was revoked"), "{err}");
     Ok(())
 }

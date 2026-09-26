@@ -351,6 +351,17 @@ pub enum TokenCommand {
         #[arg(long, value_name = "FILE")]
         key_out: Option<PathBuf>,
     },
+    /// Revoke every token of an actor in an auth file (run where the
+    /// server's auth file is): they are refused from now on (ADR 0038). The
+    /// entries stay. Revoke the actor's key too with `hord key revoke`.
+    Revoke {
+        /// The actor id (an agent's id, or a user name).
+        #[arg(long, value_name = "ID")]
+        actor: String,
+        /// The server's auth file (`[auth] file` in server.toml).
+        #[arg(long, value_name = "FILE")]
+        auth_file: PathBuf,
+    },
 }
 
 /// `hord user` subcommands.
@@ -392,6 +403,17 @@ pub enum KeyCommand {
         /// signature names, which proves only that it signed).
         #[arg(long, value_name = "KEY_ID")]
         key: Option<String>,
+    },
+    /// Revoke a signing key in an auth file (run where the server's auth
+    /// file is): it signs nothing from now on, and what it signed before
+    /// still verifies (ADR 0038). The entry stays; never delete it.
+    Revoke {
+        /// Key id (`ed25519:<hex>`).
+        #[arg(value_name = "KEY_ID")]
+        key_id: String,
+        /// The server's auth file (`[auth] file` in server.toml).
+        #[arg(long, value_name = "FILE")]
+        auth_file: PathBuf,
     },
 }
 

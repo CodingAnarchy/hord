@@ -131,7 +131,14 @@ hord token mint --agent bridge --model none --harness hord-git-sync \
   --scope bridge --key-out bridge.pem     # the git bridge (ADR 0037)
 ```
 
-Hand each agent its token and key file over a private channel. The server keeps neither in the clear. To revoke a token, delete its `[[token]]` entry from the auth file. Entries name the actor, and a token is stored only as its hash. The running server notices the change within a second, or at once with `systemctl reload hord` (SIGHUP), and refuses the token from then on. Deleting the actor's `[[key]]` entries as well unbinds its signing key. New users and tokens need no reload.
+Hand each agent its token and key file over a private channel. The server keeps neither in the clear. Revoke; never delete entries (ADR 0038). A revoked entry stays in the auth file with the time it was revoked, so what the actor signed before then still passes `hord audit`:
+
+```sh
+sudo -u hord hord token revoke --actor coder-1 --auth-file /etc/hord/auth.toml    # its tokens are refused
+sudo -u hord hord key revoke ed25519:… --auth-file /etc/hord/auth.toml            # its key signs nothing more
+```
+
+Revoke the key too when it may have leaked: a signature it makes after the revocation fails ingest and the audit. The running server notices the change within a second, or at once with `systemctl reload hord` (SIGHUP). New users and tokens need no reload.
 
 ## 6. How agents and people contribute
 

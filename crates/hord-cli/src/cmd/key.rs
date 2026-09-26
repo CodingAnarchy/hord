@@ -1,14 +1,17 @@
 //! `hord key show` and `hord key verify <object> [--key <key-id>]` (spec
 //! §10.5.4): this user's key id, and checking a signed change or evidence
 //! (such as a review) against a public key. Exits 1 when it does not
-//! verify.
+//! verify. `hord key revoke <key-id> --auth-file <file>` revokes a key in
+//! the server's auth file (ADR 0038).
 
+use std::path::Path;
 use std::process;
 
 use anyhow::{Context, Result, anyhow, bail};
 use hord_api::{RepoBackend, proto, wire};
 use hord_core::sign::{self, PublicKey};
 use hord_core::{ChangeRecord, Evidence, ObjectId, Signature};
+use hord_server::AuthStore;
 
 use crate::session::{Session, Target};
 use crate::txn::{self, block_on};
@@ -135,5 +138,18 @@ pub fn run_verify(json: bool, target: &Target, object: String, key: Option<Strin
     if !result.verified {
         process::exit(1);
     }
+    Ok(())
+}
+
+pub fn run_revoke(json: bool, key_id: &str, auth_file: &Path) -> Result<()> {
+    AuthStore::revoke_key(auth_file, key_id).with_context(|| format!("revoke key {key_id}"))?;
+    let result = proto::KeyRevokeResult {
+        key_id: key_id.to_owned(),
+        auth_file: auth_file.display().to_string(),
+    };
+    if json {
+        return output::print_json(&result);
+    }
+    println!("revoked key {} in {}", result.key_id, result.auth_file);
     Ok(())
 }

@@ -204,6 +204,9 @@ fn run_blocking(cli: Cli) -> Result<()> {
                     key_out,
                 },
             ),
+            TokenCommand::Revoke { actor, auth_file } => {
+                cmd::token::run_revoke(json, &actor, &auth_file)
+            }
         },
         Command::User { command } => match command {
             UserCommand::Add {
@@ -216,6 +219,9 @@ fn run_blocking(cli: Cli) -> Result<()> {
         Command::Key { command } => match command {
             KeyCommand::Show { name } => cmd::key::run_show(json, name),
             KeyCommand::Verify { object, key } => cmd::key::run_verify(json, &target, object, key),
+            KeyCommand::Revoke { key_id, auth_file } => {
+                cmd::key::run_revoke(json, &key_id, &auth_file)
+            }
         },
         Command::Policy { command } => match command {
             PolicyCommand::Check { workspace, policy } => {

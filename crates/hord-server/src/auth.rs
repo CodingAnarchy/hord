@@ -44,6 +44,8 @@ use hord_core::sign::{PublicKey, SigningKey};
 use hord_core::{Actor, Bytes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// Failure to read, write, or use the auth file.
 #[derive(Debug, Error)]
@@ -182,6 +184,9 @@ struct Token {
     hash: String,
     scopes: Vec<String>,
     actor: StoredActor,
+    /// When it was revoked (RFC 3339, ADR 0038): refused from then on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -189,6 +194,54 @@ struct Token {
 struct Key {
     id: String,
     actor: StoredActor,
+    /// When it was revoked (RFC 3339, ADR 0038): a signature it made
+    /// before then still verifies; none made after does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked_at: Option<String>,
+}
+
+/// A key's binding (ADR 0038): the actor it is bound to, and when it was
+/// revoked, if it was.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyBinding {
+    /// The actor.
+    pub actor: Actor,
+    /// When it was revoked, in ms since the Unix epoch.
+    pub revoked_at_ms: Option<u64>,
+}
+
+impl KeyBinding {
+    /// Whether a signature made at `at_ms` counts: before any revocation.
+    #[must_use]
+    pub fn valid_at(&self, at_ms: u64) -> bool {
+        self.revoked_at_ms.is_none_or(|revoked| at_ms < revoked)
+    }
+}
+
+/// `revoked_at` in ms since the Unix epoch; `read` checked that it parses.
+fn revoked_ms(revoked_at: Option<&str>) -> Option<u64> {
+    revoked_at.map(|at| parse_time(at).unwrap_or(0))
+}
+
+/// An RFC 3339 time in ms since the Unix epoch.
+fn parse_time(at: &str) -> Option<u64> {
+    let parsed = OffsetDateTime::parse(at, &Rfc3339).ok()?;
+    u64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
+/// Now, in ms since the Unix epoch.
+fn now_ms() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+}
+
+/// Now, as `revoked_at` stores it.
+fn now_rfc3339() -> Result<String, AuthError> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|err| AuthError::Invalid {
+            path: PathBuf::new(),
+            reason: err.to_string(),
+        })
 }
 
 /// What the file looked like when it was last read: its modification time
@@ -310,11 +363,17 @@ impl AuthStore {
         Ok(find_token(&state, &hash))
     }
 
-    /// The actor `key_id` is bound to if this process has already read
-    /// the binding: no I/O.
+    /// `key_id`'s binding, revoked or not, as this process last read the
+    /// file: no I/O. For judging a signature by when it was made (ADR
+    /// 0038).
     #[must_use]
-    pub fn key_actor_cached(&self, key_id: &str) -> Option<Actor> {
-        find_key(&self.lock(), key_id)
+    pub fn key_binding(&self, key_id: &str) -> Option<KeyBinding> {
+        let state = self.lock();
+        let key = state.keys.iter().find(|k| k.id == key_id)?;
+        Some(KeyBinding {
+            actor: Actor::from(&key.actor),
+            revoked_at_ms: revoked_ms(key.revoked_at.as_deref()),
+        })
     }
 
     /// The actor `key_id` is bound to, if any.
@@ -397,6 +456,49 @@ impl AuthStore {
         Ok((issued, key))
     }
 
+    /// Revoke `key_id` in the auth file at `path` now (`hord key revoke`,
+    /// ADR 0038): it signs nothing from now on, and what it signed before
+    /// still verifies. Its entry stays. Revoking a revoked key keeps the
+    /// first time.
+    pub fn revoke_key(path: &Path, key_id: &str) -> Result<(), AuthError> {
+        let mut state = read(path)?;
+        let key = state
+            .keys
+            .iter_mut()
+            .find(|k| k.id == key_id)
+            .ok_or_else(|| AuthError::Rejected(format!("no key {key_id} in {}", path.display())))?;
+        if key.revoked_at.is_none() {
+            key.revoked_at = Some(now_rfc3339()?);
+        }
+        write(path, &state)
+    }
+
+    /// Revoke every token of the actor `actor_id` in the auth file at
+    /// `path` now (`hord token revoke`, ADR 0038). Their entries stay. The
+    /// number revoked.
+    pub fn revoke_tokens(path: &Path, actor_id: &str) -> Result<usize, AuthError> {
+        let mut state = read(path)?;
+        let now = now_rfc3339()?;
+        let mut revoked = 0;
+        for token in &mut state.tokens {
+            let id = match &token.actor {
+                StoredActor::Human { id } | StoredActor::Agent { id, .. } => id,
+            };
+            if id == actor_id && token.revoked_at.is_none() {
+                token.revoked_at = Some(now.clone());
+                revoked += 1;
+            }
+        }
+        if revoked == 0 {
+            return Err(AuthError::Rejected(format!(
+                "no unrevoked token of {actor_id} in {}",
+                path.display()
+            )));
+        }
+        write(path, &state)?;
+        Ok(revoked)
+    }
+
     /// Add a user to the auth file at `path` (`hord user add`), creating
     /// it if needed.
     pub fn add_user(
@@ -431,7 +533,11 @@ impl AuthStore {
 }
 
 fn find_token(state: &AuthFile, hash: &str) -> Option<Principal> {
-    let token = state.tokens.iter().find(|t| t.hash == hash)?;
+    let now = now_ms();
+    let token = state
+        .tokens
+        .iter()
+        .find(|t| t.hash == hash && revoked_ms(t.revoked_at.as_deref()).is_none_or(|r| now < r))?;
     Some(Principal {
         actor: Actor::from(&token.actor),
         // Scopes were checked when issued; one edited into something
@@ -440,11 +546,14 @@ fn find_token(state: &AuthFile, hash: &str) -> Option<Principal> {
     })
 }
 
+/// The actor `key_id` is bound to, unless it is revoked: what may sign
+/// now.
 fn find_key(state: &AuthFile, key_id: &str) -> Option<Actor> {
+    let now = now_ms();
     state
         .keys
         .iter()
-        .find(|k| k.id == key_id)
+        .find(|k| k.id == key_id && revoked_ms(k.revoked_at.as_deref()).is_none_or(|r| now < r))
         .map(|k| Actor::from(&k.actor))
 }
 
@@ -452,6 +561,9 @@ fn find_key(state: &AuthFile, key_id: &str) -> Option<Actor> {
 /// refused.
 fn bind_key(state: &mut AuthFile, key_id: &str, actor: &StoredActor) -> Result<(), AuthError> {
     match state.keys.iter().find(|k| k.id == key_id) {
+        Some(key) if key.revoked_at.is_some() => Err(AuthError::Rejected(format!(
+            "key {key_id} was revoked; use a new key"
+        ))),
         Some(key) if &key.actor == actor => Ok(()),
         Some(_) => Err(AuthError::Rejected(format!(
             "key {key_id} is bound to another actor"
@@ -460,6 +572,7 @@ fn bind_key(state: &mut AuthFile, key_id: &str, actor: &StoredActor) -> Result<(
             state.keys.push(Key {
                 id: key_id.to_owned(),
                 actor: actor.clone(),
+                revoked_at: None,
             });
             Ok(())
         }
@@ -482,6 +595,7 @@ fn issue(
         hash: token_hash(&token),
         scopes,
         actor,
+        revoked_at: None,
     });
     Ok(Issued { token, principal })
 }
@@ -515,6 +629,19 @@ fn read(path: &Path) -> Result<AuthFile, AuthError> {
         path: path.to_path_buf(),
         reason: err.to_string(),
     })?;
+    let times = file
+        .tokens
+        .iter()
+        .map(|t| t.revoked_at.as_deref())
+        .chain(file.keys.iter().map(|k| k.revoked_at.as_deref()));
+    for at in times.flatten() {
+        if parse_time(at).is_none() {
+            return Err(AuthError::Invalid {
+                path: path.to_path_buf(),
+                reason: format!("revoked_at {at:?} is not an RFC 3339 time"),
+            });
+        }
+    }
     for user in &file.users {
         for scope in &user.scopes {
             scope.parse::<Scope>().map_err(|err| AuthError::Invalid {
@@ -593,6 +720,47 @@ mod tests {
         std::fs::write(&path, "[[token]\nhash = ")?;
         assert!(store.reload_if_changed().is_err());
         assert_eq!(store.authenticate_cached(&kept.token), Some(kept.principal));
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn revoking_keeps_the_entry_and_dates_it() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("revoke-at");
+        let _ = std::fs::remove_file(&path);
+        AuthStore::add_user(&path, "ada", "pw", &[Scope::Read])?;
+        let store = AuthStore::open(&path)?;
+        let key = SigningKey::generate()?.public().key_id();
+        let issued = store.login("ada", "pw", &key)?;
+        let before = now_ms();
+
+        AuthStore::revoke_key(&path, &key)?;
+        assert_eq!(AuthStore::revoke_tokens(&path, "ada")?, 1);
+        assert!(AuthStore::revoke_tokens(&path, "ada").is_err(), "none left");
+        store.reload()?;
+        let binding = store.key_binding(&key).ok_or("the key's entry stays")?;
+        assert_eq!(binding.actor, Actor::Human { id: "ada".into() });
+        let revoked = binding.revoked_at_ms.ok_or("dated")?;
+        assert!(revoked >= before);
+        assert!(binding.valid_at(revoked - 1), "signed before: valid");
+        assert!(!binding.valid_at(revoked), "signed after: not");
+        // Nothing signs or authenticates with them now.
+        assert_eq!(store.key_actor(&key)?, None);
+        assert_eq!(store.authenticate(&issued.token)?, None);
+        assert!(matches!(
+            store.login("ada", "pw", &key),
+            Err(AuthError::Rejected(_))
+        ));
+
+        // A revocation time that does not parse is an invalid file.
+        let text = std::fs::read_to_string(&path)?;
+        let (head, tail) = text.split_once("revoked_at = \"").ok_or("a revoked_at")?;
+        let tail = tail.split_once('"').ok_or("quoted")?.1;
+        std::fs::write(&path, format!("{head}revoked_at = \"yesterday\"{tail}"))?;
+        assert!(matches!(
+            AuthStore::open(&path),
+            Err(AuthError::Invalid { .. })
+        ));
         let _ = std::fs::remove_file(&path);
         Ok(())
     }

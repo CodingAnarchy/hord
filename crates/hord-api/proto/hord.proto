@@ -1968,6 +1968,24 @@ message UserAddResult {
   string auth_file = 3;
 }
 
+// `hord key revoke` (ADR 0038).
+message KeyRevokeResult {
+  // The revoked key.
+  string key_id = 1;
+  // The auth file written.
+  string auth_file = 2;
+}
+
+// `hord token revoke` (ADR 0038).
+message TokenRevokeResult {
+  // The actor whose tokens were revoked.
+  string actor = 1;
+  // How many were revoked.
+  uint32 revoked = 2;
+  // The auth file written.
+  string auth_file = 3;
+}
+
 // `hord review`.
 message ReviewResult {
   // The change reviewed.

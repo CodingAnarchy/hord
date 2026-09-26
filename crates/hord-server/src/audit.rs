@@ -39,7 +39,7 @@ use hord_policy::{Decision, EvidenceTag};
 use hord_txn::{LocalRepo, Origin, QueueEntry, QueueStatus, Repo};
 use tonic::{Request, Response, Status};
 
-use crate::auth::{AuthStore, same_actor};
+use crate::auth::{AuthStore, KeyBinding, same_actor};
 use crate::hosts::Hosts;
 use crate::route::RepoName;
 
@@ -489,7 +489,12 @@ fn bridge_voucher(submitted: &proto::Submitted) -> Option<String> {
 /// change submitted where no token is involved (a daemon, a local
 /// endpoint) was not checked at ingest, so a voucher string alone proves
 /// nothing.
-fn check_voucher(auth: Option<&AuthStore>, record: &ChangeRecord, voucher: &str) -> KeyCheck {
+fn check_voucher(
+    auth: Option<&AuthStore>,
+    record: &ChangeRecord,
+    voucher: &str,
+    at_ms: u64,
+) -> KeyCheck {
     if !matches!(record.provenance.actor, Actor::Human { .. }) {
         return KeyCheck::Bad(format!(
             "a bridge vouches only for a git author's change, not agent {}",
@@ -509,12 +514,21 @@ fn check_voucher(auth: Option<&AuthStore>, record: &ChangeRecord, voucher: &str)
     let Some(auth) = auth else {
         return KeyCheck::Unchecked;
     };
-    match auth.key_actor_cached(voucher) {
-        Some(_) => KeyCheck::Bound,
+    match auth.key_binding(voucher) {
+        Some(binding) if binding.valid_at(at_ms) => KeyCheck::Bound,
+        Some(binding) => KeyCheck::Bad(revoked(voucher, at_ms, &binding)),
         None => KeyCheck::Bad(format!(
             "vouched for by key {voucher}, which is not bound to any actor"
         )),
     }
+}
+
+/// Why a signature made at `at_ms` by a revoked key does not count.
+fn revoked(key_id: &str, at_ms: u64, binding: &KeyBinding) -> String {
+    format!(
+        "signed by key {key_id} at {at_ms} ms, after it was revoked at {} ms",
+        binding.revoked_at_ms.unwrap_or(0)
+    )
 }
 
 /// Check the lander's signature on `event` (ADR 0038): it verifies over
@@ -544,13 +558,15 @@ fn check_lander(auth: Option<&AuthStore>, event: &proto::Landed) -> KeyCheck {
     }
 }
 
-/// Check `signature` over an object claimed by `actor`: `verify` checks it
-/// cryptographically with the key it names; `auth`, when present, says
-/// whom the key is bound to.
+/// Check `signature` over an object claimed by `actor`, made by `at_ms`:
+/// `verify` checks it cryptographically with the key it names; `auth`,
+/// when present, says whom the key is bound to, and whether it was
+/// revoked by then (ADR 0038).
 fn check_key(
     auth: Option<&AuthStore>,
     actor: &Actor,
     signature: Option<&Signature>,
+    at_ms: u64,
     verify: impl FnOnce(&sign::PublicKey) -> Result<(), SignError>,
 ) -> KeyCheck {
     let Some(signature) = signature else {
@@ -560,21 +576,25 @@ fn check_key(
     if let Err(err) = verified {
         return KeyCheck::Bad(format!("bad signature by {}: {err}", signature.key_id));
     }
-    bound(auth, actor, &signature.key_id)
+    bound(auth, actor, &signature.key_id, at_ms)
 }
 
-/// Whether `key_id` is bound to `actor` in `auth`.
-fn bound(auth: Option<&AuthStore>, actor: &Actor, key_id: &str) -> KeyCheck {
+/// Whether `key_id` is bound to `actor` in `auth` for a signature made at
+/// `at_ms`: before any revocation (ADR 0038).
+fn bound(auth: Option<&AuthStore>, actor: &Actor, key_id: &str, at_ms: u64) -> KeyCheck {
     let Some(auth) = auth else {
         return KeyCheck::Unchecked;
     };
-    match auth.key_actor_cached(key_id) {
-        Some(owner) if same_actor(actor, &owner) => KeyCheck::Bound,
-        Some(owner) => KeyCheck::Bad(format!(
+    match auth.key_binding(key_id) {
+        Some(binding) if !same_actor(actor, &binding.actor) => KeyCheck::Bad(format!(
             "signed by key {key_id}, which is bound to {}, not {}",
-            owner.id(),
+            binding.actor.id(),
             actor.id()
         )),
+        Some(binding) if !binding.valid_at(at_ms) => {
+            KeyCheck::Bad(revoked(key_id, at_ms, &binding))
+        }
+        Some(_) => KeyCheck::Bound,
         None => KeyCheck::Bad(format!(
             "signed by key {key_id}, which is not bound to any actor"
         )),
@@ -640,8 +660,8 @@ pub async fn gather(
     let events = all_events(repo).await?;
     let mut landed_ever = BTreeSet::new();
     let mut landed = Vec::new();
-    // Each evidence id's first `EvidenceAttached` cursor.
-    let mut attached: BTreeMap<String, u64> = BTreeMap::new();
+    // Each evidence id's first `EvidenceAttached`: its cursor and time.
+    let mut attached: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut submitted = BTreeMap::new();
     let mut arbitrations = Vec::new();
     let mut bridge_checks = Vec::new();
@@ -664,10 +684,10 @@ pub async fn gather(
             proto::event::Kind::EvidenceAttached(event) => {
                 attached
                     .entry(event.evidence.clone())
-                    .or_insert(envelope.cursor);
+                    .or_insert((envelope.cursor, envelope.at_ms));
             }
             proto::event::Kind::Submitted(event) => {
-                submitted.insert(event.change.clone(), event.clone());
+                submitted.insert(event.change.clone(), (event.clone(), envelope.at_ms));
             }
             proto::event::Kind::Arbitrated(event) if within(envelope.at_ms) => {
                 let by = event
@@ -676,7 +696,7 @@ pub async fn gather(
                     .map(|a| wire::actor_from("by", a))
                     .transpose()?;
                 let key = match (&by, &event.key_id, &event.signature) {
-                    (Some(by), Some(key_id), Some(_)) => bound(auth, by, key_id),
+                    (Some(by), Some(key_id), Some(_)) => bound(auth, by, key_id, envelope.at_ms),
                     (None, _, _) => KeyCheck::Bad("no arbiter recorded".into()),
                     _ => KeyCheck::Unsigned,
                 };
@@ -715,15 +735,17 @@ pub async fn gather(
             repo.change(submitted_id).await.map_err(internal)?
         };
         let actor = record.provenance.actor.clone();
+        let submission = submitted.get(&wire::id(submitted_id));
+        // Signed by the time it was submitted, else by the time it landed.
+        let submitted_at = submission.map_or(at_ms, |(_, at)| *at);
         let key = check_key(
             auth,
             &submitted_record.provenance.actor,
             submitted_record.signature.as_ref(),
+            submitted_at,
             |key| sign::verify_change(&submitted_record, key),
         );
-        let voucher = submitted
-            .get(&wire::id(submitted_id))
-            .and_then(bridge_voucher);
+        let voucher = submission.and_then(|(event, _)| bridge_voucher(event));
         let (origin, key) = match (entry.and_then(|e| e.origin.as_ref()), key, voucher) {
             (Some(Origin::Replay { .. }), key, _) => (AuditOrigin::Replay, key),
             (Some(Origin::Arbitration { .. }), key, _) => (AuditOrigin::Arbitration, key),
@@ -731,7 +753,7 @@ pub async fn gather(
             (None, key @ KeyCheck::Unchecked, _) => (AuditOrigin::SignedUnbound, key),
             (None, KeyCheck::Unsigned, Some(voucher)) => (
                 AuditOrigin::BridgeVouched,
-                check_voucher(auth, &submitted_record, &voucher),
+                check_voucher(auth, &submitted_record, &voucher, submitted_at),
             ),
             (None, key @ KeyCheck::Bad(_), _) => (AuditOrigin::Signed, key),
             (None, key @ KeyCheck::Unsigned, None) => (AuditOrigin::Unsigned, key),
@@ -760,7 +782,8 @@ pub async fn gather(
                 )
             }
         };
-        let evidence = landed_evidence(repo, auth, record.result, counted.clone()).await?;
+        let evidence =
+            landed_evidence(repo, auth, record.result, counted.clone(), &attached, at_ms).await?;
         let policy = match repo.judge_landed(id, counted).await.map_err(internal)? {
             Ok((Decision::Allow, source)) => PolicyJudgement::Allow(source.as_str().into()),
             Ok((Decision::Deny { reasons }, source)) => PolicyJudgement::Deny(
@@ -848,7 +871,7 @@ async fn candidate_evidence(
 fn attached_before(
     candidates: &[ObjectId],
     listed: &[ObjectId],
-    attached: &BTreeMap<String, u64>,
+    attached: &BTreeMap<String, (u64, u64)>,
     landed_at: u64,
 ) -> Vec<ObjectId> {
     let mut seen = BTreeSet::new();
@@ -857,7 +880,7 @@ fn attached_before(
         .filter(|id| {
             attached
                 .get(&wire::id(**id))
-                .is_some_and(|cursor| *cursor < landed_at)
+                .is_some_and(|(cursor, _)| *cursor < landed_at)
         })
         .chain(listed)
         .copied()
@@ -866,12 +889,16 @@ fn attached_before(
 }
 
 /// Facts about the evidence `ids`, for a change whose result is
-/// `landed_result`.
+/// `landed_result` and which landed at `landed_at_ms`. A signature counts
+/// if its key was not revoked when the evidence was first attached
+/// (`attached`: cursor and time by id), else when the change landed.
 async fn landed_evidence(
     repo: &Repo,
     auth: Option<&AuthStore>,
     landed_result: ObjectId,
     ids: Vec<ObjectId>,
+    attached: &BTreeMap<String, (u64, u64)>,
+    landed_at_ms: u64,
 ) -> ApiResult<Vec<EvidenceFacts>> {
     let store_repo = repo.clone();
     let loaded = tokio::task::spawn_blocking(move || {
@@ -892,10 +919,14 @@ async fn landed_evidence(
         .into_iter()
         .map(|(id, evidence)| {
             let review = evidence.kind == EvidenceKind::Review;
+            let signed_at = attached
+                .get(&wire::id(id))
+                .map_or(landed_at_ms, |(_, at)| *at);
             let key = check_key(
                 auth,
                 &evidence.produced_by,
                 evidence.signature.as_ref(),
+                signed_at,
                 |key| sign::verify_evidence(&evidence, key),
             );
             EvidenceFacts {
@@ -1247,7 +1278,7 @@ mod tests {
     fn the_fallback_counts_only_evidence_attached_before_the_landing() {
         let [early, late, never, listed] =
             [b"early", b"late!", b"never", b"liste"].map(|b| ObjectId::from_canonical(b));
-        let attached = BTreeMap::from([(wire::id(early), 3), (wire::id(late), 9)]);
+        let attached = BTreeMap::from([(wire::id(early), (3, 30)), (wire::id(late), (9, 90))]);
         assert_eq!(
             attached_before(&[early, late, never, listed], &[listed], &attached, 5),
             [early, listed]
