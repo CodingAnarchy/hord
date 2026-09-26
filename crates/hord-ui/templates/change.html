@@ -2,6 +2,7 @@
 {% block content %}
 <h1>{{ side.summary }}</h1>
 <p class="legend">change <code>{{ side.change }}</code> · {{ side.actor }}{% if let Some(status) = status %} · {{ status }}{% endif %}</p>
+<p class="links"><a href="{{ base }}/trace/{{ side.change }}">provenance trace</a>{% if let Some(result) = result %} · <a href="{{ base }}/tree/{{ result }}">browse its result</a>{% endif %}</p>
 {% if let Some(flash) = flash %}<p class="flash">{{ flash }}</p>{% endif %}
 <div class="tabs">
   <input type="radio" name="tab" id="tab-semantic" checked><label for="tab-semantic">semantic</label>
@@ -11,7 +12,7 @@
     {% if !side.body.is_empty() %}<pre class="intent">{{ side.body }}</pre>{% endif %}
     {% if !side.acceptance.is_empty() %}<ul class="acceptance">{% for a in side.acceptance %}<li>{{ a }}</li>{% endfor %}</ul>{% endif %}
     <h2>Operations</h2>
-    <ul class="ops">{% for op in side.ops %}<li class="op op-{{ op.op }}">{{ op.text }}</li>{% endfor %}</ul>
+    <ul class="ops">{% for op in side.ops %}{% include "op.html" %}{% endfor %}</ul>
     <h2>Evidence</h2>
     <ul class="evidence">{% for ev in evidence %}<li class="ev ev-{{ ev.class }}" title="{{ ev.id }}">{{ ev.kind }}: {{ ev.result }}</li>{% endfor %}</ul>
     <h2>Provenance</h2>
@@ -20,8 +21,8 @@
     <ol class="ladder">{% for r in history %}<li><span class="at">{{ r.at }}</span> <strong>{{ r.rung }}</strong>: {{ r.outcome }}</li>{% endfor %}</ol>
     <h2>Read and write sets</h2>
     <div class="sets">
-      <div><h3>reads</h3><ul>{% for n in reads %}<li title="{{ n.id }}">{{ n.label }}{% if let Some(p) = n.path %} <small>{{ p }}</small>{% endif %}</li>{% endfor %}</ul></div>
-      <div><h3>writes</h3><ul>{% for n in writes %}<li title="{{ n.id }}">{{ n.label }}{% if let Some(p) = n.path %} <small>{{ p }}</small>{% endif %}</li>{% endfor %}</ul></div>
+      <div><h3>reads</h3><ul>{% for n in reads %}<li>{% include "node_link.html" %}</li>{% endfor %}</ul></div>
+      <div><h3>writes</h3><ul>{% for n in writes %}<li>{% include "node_link.html" %}</li>{% endfor %}</ul></div>
     </div>
   </section>
   <section class="tab text">

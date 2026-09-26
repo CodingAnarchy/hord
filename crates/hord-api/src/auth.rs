@@ -156,6 +156,11 @@ const TABLE: &[(&str, Req)] = &[
     ("/hord.v1.Changes/ChangeDiff", Req::Read),
     ("/hord.v1.Changes/ListRecordings", Req::Read),
     ("/hord.v1.Changes/GetRecording", Req::Read),
+    ("/hord.v1.Changes/NodeLineage", Req::Read),
+    ("/hord.v1.Changes/ChangeTrace", Req::Read),
+    ("/hord.v1.Changes/ListTree", Req::Read),
+    ("/hord.v1.Changes/GetFile", Req::Read),
+    ("/hord.v1.Changes/NodeEdges", Req::Read),
     // Auth.
     ("/hord.v1.Auth/Login", Req::Public),
     ("/hord.v1.Auth/MintToken", Req::Admin),

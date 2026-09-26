@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Lineage: {{ node.label }}</h1>
+<p class="legend">definition <code>{{ node.id }}</code>{% if let Some(p) = node.path %} · {{ p }}{% endif %} · {% if live %}at head · <a href="{{ base }}/graph/head/{{ node.id }}">graph</a>{% else %}no longer at head{% endif %}</p>
+<p class="legend">Every landed change that touched this definition, newest first. Identity follows renames and moves (spec §3.4); splits and derivations link to the other definitions.</p>
+<ol class="lineage" reversed>
+{% for r in rows %}<li class="card">
+  <p><a class="label" href="{{ base }}/changes/{{ r.change }}">{{ r.summary }}</a> <small>#{{ r.position }} · {{ r.actor }} · <code>{{ r.short }}</code> · <a href="{{ base }}/trace/{{ r.change }}">trace</a> · {% if let Some(f) = r.file %}<a href="{{ base }}/file/{{ r.result }}?path={{ f }}">snapshot</a>{% else %}<a href="{{ base }}/tree/{{ r.result }}">snapshot</a>{% endif %}</small></p>
+  <p class="what">{% for w in r.what %}<span class="tag">{{ w }}</span> {% endfor %}</p>
+  {% if r.before != r.after %}<p class="legend">{% if let Some(b) = r.before %}was {{ b }}{% endif %}{% if r.before.is_some() && r.after.is_some() %} · {% endif %}{% if let Some(a) = r.after %}now {{ a }}{% endif %}</p>{% else %}{% if let Some(a) = r.after %}<p class="legend">{{ a }}</p>{% endif %}{% endif %}
+  {% if !r.ops.is_empty() %}<ul class="ops">{% for op in r.ops %}<li class="op op-{{ op.op }}">{{ op.text }}</li>{% endfor %}</ul>{% endif %}
+  {% if !r.related.is_empty() %}<p>related: {% for n in r.related %}{% include "node_link.html" %}{% if !loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+  <ul class="evidence">{% for ev in r.evidence %}<li class="ev ev-{{ ev.class }}" title="{{ ev.id }}">{{ ev.kind }}: {{ ev.result }}</li>{% endfor %}</ul>
+</li>
+{% else %}<li>No landed change touched it.</li>
+{% endfor %}
+</ol>
+{% endblock %}

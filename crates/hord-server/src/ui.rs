@@ -372,6 +372,67 @@ impl ChangesBackend for Caller {
             m
         )
     }
+
+    async fn node_lineage(
+        &self,
+        m: proto::NodeLineageRequest,
+    ) -> ApiResult<proto::NodeLineageResponse> {
+        via!(
+            self,
+            changes,
+            ChangesTrait,
+            "/hord.v1.Changes/NodeLineage",
+            node_lineage,
+            m
+        )
+    }
+
+    async fn change_trace(
+        &self,
+        m: proto::ChangeTraceRequest,
+    ) -> ApiResult<proto::ChangeTraceResponse> {
+        via!(
+            self,
+            changes,
+            ChangesTrait,
+            "/hord.v1.Changes/ChangeTrace",
+            change_trace,
+            m
+        )
+    }
+
+    async fn list_tree(&self, m: proto::ListTreeRequest) -> ApiResult<proto::ListTreeResponse> {
+        via!(
+            self,
+            changes,
+            ChangesTrait,
+            "/hord.v1.Changes/ListTree",
+            list_tree,
+            m
+        )
+    }
+
+    async fn get_file(&self, m: proto::GetFileRequest) -> ApiResult<proto::GetFileResponse> {
+        via!(
+            self,
+            changes,
+            ChangesTrait,
+            "/hord.v1.Changes/GetFile",
+            get_file,
+            m
+        )
+    }
+
+    async fn node_edges(&self, m: proto::NodeEdgesRequest) -> ApiResult<proto::NodeEdgesResponse> {
+        via!(
+            self,
+            changes,
+            ChangesTrait,
+            "/hord.v1.Changes/NodeEdges",
+            node_edges,
+            m
+        )
+    }
 }
 
 /// Signs `Evidence { kind: Review, qualifier: human }` against the change's
