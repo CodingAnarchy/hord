@@ -263,14 +263,16 @@ async fn a_bridge_token_lands_a_pull_request_as_its_git_author_and_nothing_else(
     let mut events = bridge_remote
         .events(proto::EventsRequest { from: Some(0) })
         .await?;
-    let mut voucher = None;
-    while let Ok(Some(item)) = timeout(Duration::from_millis(300), events.next()).await {
-        if let Some(Kind::Submitted(s)) = item?.event.and_then(|e| e.kind)
+    let voucher = loop {
+        let item = timeout(Duration::from_secs(30), events.next())
+            .await?
+            .ok_or("the event stream ended")??;
+        if let Some(Kind::Submitted(s)) = item.event.and_then(|e| e.kind)
             && s.change == wire::id(change)
         {
-            voucher = s.voucher;
+            break s.voucher;
         }
-    }
+    };
     assert_eq!(voucher.as_deref(), Some(bridge_key.as_str()));
 
     // Variations on the vouched record, each refused.

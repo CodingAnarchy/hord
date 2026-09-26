@@ -17,7 +17,7 @@ use hord_api::proto::{self, BridgeCheckTrigger, QueueStatus};
 use hord_api::{ApiError, ApiResult, EventStream, RepoBackend, wire};
 use hord_core::{Actor, ChangeId, ChangeRecord, Intent, IntentRef, RepoPath, Snapshot};
 use hord_git::sync::{
-    Bridge, BridgeOptions, PullRequest, PullRequests, Reported, ScriptedPulls, StatusState,
+    Bridge, BridgeOptions, Check, PullRequest, PullRequests, Reported, ScriptedPulls, StatusState,
 };
 use hord_git::{ExportCache, MemoryStore, Store, git_tree_sha, import_git, import_git_window};
 use hord_txn::{BeginOptions, LocalRepo, Repo, RepoOptions, StubVerifier};
@@ -228,20 +228,26 @@ impl Setup {
         }
     }
 
-    /// Every `BridgeChecked` event recorded so far.
-    async fn checks(&self) -> TestResult<Vec<proto::BridgeChecked>> {
+    /// Every `BridgeChecked` event recorded up to `check`'s, which must
+    /// have been recorded.
+    async fn checks(&self, check: &Check) -> TestResult<Vec<proto::BridgeChecked>> {
+        let through = check.recorded.ok_or("the check was recorded")?;
         let mut stream = self
             .backend
             .events(proto::EventsRequest { from: Some(0) })
             .await?;
         let mut out = Vec::new();
-        // Recorded events come first; stop at the first quiet pause.
-        while let Ok(Some(item)) = timeout(Duration::from_millis(300), stream.next()).await {
-            if let Some(Kind::BridgeChecked(check)) = item?.event.and_then(|e| e.kind) {
+        loop {
+            let item = timeout(Duration::from_secs(30), stream.next())
+                .await?
+                .ok_or("the event stream ended")??;
+            if let Some(Kind::BridgeChecked(check)) = item.event.and_then(|e| e.kind) {
                 out.push(check);
             }
+            if item.cursor >= through {
+                return Ok(out);
+            }
         }
-        Ok(out)
     }
 }
 
@@ -305,8 +311,7 @@ async fn landed_changes_reach_main_in_order_with_trailers() -> TestResult {
     // The push was checked, and the check is on the event stream.
     let check = report.checks.last().ok_or("a check after the push")?;
     assert!(!check.diverged, "{check:?}");
-    assert!(check.recorded.is_some());
-    let recorded = t.checks().await?;
+    let recorded = t.checks(check).await?;
     let last = recorded.last().ok_or("a BridgeChecked event")?;
     assert!(!last.diverged);
     assert_eq!(last.trigger(), BridgeCheckTrigger::Push);
@@ -536,7 +541,7 @@ async fn a_manual_push_to_main_is_divergence_until_repaired() -> TestResult {
     assert_eq!(check.actual, Some(manual.to_string()));
     assert_eq!(check.expected, Some(exported.to_string()));
     assert_eq!(t.main()?, Some(manual), "a check never repairs");
-    let recorded = t.checks().await?;
+    let recorded = t.checks(&check).await?;
     let last = recorded.last().ok_or("a BridgeChecked event")?;
     assert!(last.diverged);
     assert_eq!(last.trigger(), BridgeCheckTrigger::Check);
@@ -553,7 +558,7 @@ async fn a_manual_push_to_main_is_divergence_until_repaired() -> TestResult {
     let chain = t.chain()?;
     assert!(chain.iter().all(|(id, ..)| *id != manual));
     assert_eq!(chain.len(), t.log()?.len());
-    let recorded = t.checks().await?;
+    let recorded = t.checks(&repaired).await?;
     assert_eq!(
         recorded.last().map(|c| c.trigger()),
         Some(BridgeCheckTrigger::Repair)
