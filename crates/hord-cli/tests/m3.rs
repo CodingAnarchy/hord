@@ -8,11 +8,11 @@
 
 mod common;
 
+use common::TempDir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -52,28 +52,6 @@ fn log_ids(value: &serde_json::Value) -> TestResult<Vec<String>> {
         })
         .collect::<Result<_, _>>()?;
     Ok(ids)
-}
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        common::drop_tree(&self.0);
-    }
 }
 
 fn run(dir: &Path, args: &[&str]) -> TestResult<Output> {

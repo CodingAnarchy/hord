@@ -3,13 +3,14 @@
 
 mod common;
 
+use common::TempDir;
+
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const LIB: &str = "pub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n";
 const LANDED: &str = "QUEUE_STATUS_LANDED";
@@ -17,29 +18,6 @@ const LANDED: &str = "QUEUE_STATUS_LANDED";
 const POLICY: &str = "[land]\nrequire = [\"check\"]\n";
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // A daemon exits once `.hord/` is gone (or idle).
-        common::drop_tree(&self.0);
-    }
-}
 
 fn hord(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hord"));

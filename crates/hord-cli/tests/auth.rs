@@ -7,11 +7,12 @@
 
 mod common;
 
+use common::TempDir;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hord_api::proto::event::Kind;
@@ -30,28 +31,6 @@ const LANDED: &str = "QUEUE_STATUS_LANDED";
 const PARKED: &str = "QUEUE_STATUS_PARKED";
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-        ));
-        common::clear_stale(&path)?;
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        common::drop_tree(&self.0);
-    }
-}
 
 /// `hord` in `dir` as the identity whose `~/.hord` is `home`.
 fn hord(dir: &Path, home: &Path, args: &[&str]) -> Command {
