@@ -14,9 +14,11 @@
 //! ```
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -83,6 +85,12 @@ fn write_private(path: &Path, bytes: &[u8], new: bool) -> Result<()> {
     let mut file = options
         .open(path)
         .with_context(|| format!("write {}", path.display()))?;
+    // The mode applies only to a file this call creates: an existing one
+    // (from an older hord, or made by hand) is tightened before the secret
+    // is written into it.
+    #[cfg(unix)]
+    file.set_permissions(Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict {} to its owner", path.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("write {}", path.display()))
 }
@@ -219,4 +227,23 @@ pub fn password(from_stdin: bool, prompt: &str) -> Result<String> {
         bail!("empty password");
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_secret_tightens_an_existing_file() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("hord-identity-perms-{}.toml", std::process::id()));
+        std::fs::write(&path, "old")?;
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644))?;
+        write_private(&path, b"token = \"secret\"", false)?;
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
+        Ok(())
+    }
 }
