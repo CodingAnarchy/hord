@@ -20,7 +20,7 @@ use tokio_stream::StreamExt;
 
 use super::SyncError;
 use super::cache::{CacheStore, ObjectCache};
-use super::mirror::{Mirror, Pushed};
+use super::mirror::{Mirror, Pushed, redact};
 use super::pulls::{PullRequest, PullRequests, StatusState};
 use super::state::{PullState, State};
 use crate::export::{export_change, lookup_exported, open_or_init};
@@ -57,7 +57,7 @@ pub struct BridgeOptions {
 impl fmt::Debug for BridgeOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BridgeOptions")
-            .field("remote", &self.remote)
+            .field("remote", &redact(&self.remote))
             .field("token", &self.token.as_ref().map(|_| "…"))
             .field("work_dir", &self.work_dir)
             .field("voucher", &self.voucher)
@@ -184,6 +184,12 @@ impl Bridge {
             options,
             _lock: lock,
         })
+    }
+
+    /// The mirror's URL without any credentials in it, for messages.
+    #[must_use]
+    pub fn remote(&self) -> String {
+        self.mirror.display_url()
     }
 
     /// The bridge's bare export repository.

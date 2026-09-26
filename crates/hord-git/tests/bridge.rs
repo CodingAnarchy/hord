@@ -953,3 +953,17 @@ async fn a_second_bridge_on_the_work_directory_is_refused() -> TestResult {
     t.bridge().await?;
     Ok(())
 }
+
+/// Credentials in the mirror's URL stay out of what the bridge prints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_remote_is_shown_without_credentials() -> TestResult {
+    let t = Setup::new("redact").await?;
+    let mut options = t.options();
+    options.remote = "https://x-access-token:s3cret@github.com/o/r.git".into();
+    assert!(!format!("{options:?}").contains("s3cret"), "{options:?}");
+    let backend: Arc<dyn RepoBackend> = t.backend.clone();
+    let bridge = Bridge::open(backend, None, options).await?;
+    assert_eq!(bridge.remote(), "https://github.com/o/r.git");
+    assert!(!format!("{bridge:?}").contains("s3cret"));
+    Ok(())
+}

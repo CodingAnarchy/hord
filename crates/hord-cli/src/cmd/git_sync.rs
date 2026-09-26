@@ -151,7 +151,7 @@ pub fn run(json: bool, target: &Target, mode: Mode, config: Option<PathBuf>) -> 
         }
         Mode::Daemon => {
             if !json {
-                eprintln!("hord git sync: mirroring to {}", config.remote);
+                eprintln!("hord git sync: mirroring to {}", bridge.remote());
             }
             block_on(bridge.run(async {
                 let _ = tokio::signal::ctrl_c().await;

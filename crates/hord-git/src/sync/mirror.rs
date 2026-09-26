@@ -178,7 +178,7 @@ fn checked(what: &str, out: Output) -> Result<String, SyncError> {
 }
 
 /// `url` without a `user:password@` part.
-fn redact(url: &str) -> String {
+pub(crate) fn redact(url: &str) -> String {
     match url.split_once("://") {
         Some((scheme, rest)) => {
             let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
