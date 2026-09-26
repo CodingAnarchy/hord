@@ -245,10 +245,13 @@ impl AuthStore {
     /// [`Self::reload`] if the file's modification time or size changed
     /// since it was last read. Whether it reloaded.
     pub fn reload_if_changed(&self) -> Result<bool, AuthError> {
-        if stamp(&self.path)? == self.lock().stamp {
+        // Under the lock, like the store's own writes, which update the
+        // stamp before releasing it: they are never seen as a change.
+        let mut state = self.lock();
+        if stamp(&self.path)? == state.stamp {
             return Ok(false);
         }
-        self.reload()?;
+        *state = load(&self.path)?;
         Ok(true)
     }
 
