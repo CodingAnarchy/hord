@@ -325,8 +325,8 @@ fn a_conflicting_pair_is_parked_and_explained() -> TestResult {
     assert!(text.contains("merge hard src/lib.rs"), "{text}");
     assert!(text.contains("no replay harness ran"), "{text}");
     // Spec §6.4 rung 3: the conflict summary names both intents.
-    assert!(text.contains("Parked (theirs)"), "{text}");
-    assert!(text.contains("Landed (ours)"), "{text}");
+    assert!(text.contains("Parked: \"gamma plus three\""), "{text}");
+    assert!(text.contains("Landed: \"gamma plus two\""), "{text}");
     let summary = &result["entry"]["escalation"]["summary"];
     assert_eq!(
         summary["sides"].as_array().map(Vec::len),
