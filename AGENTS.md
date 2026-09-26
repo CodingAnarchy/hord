@@ -10,7 +10,7 @@ Semantic VCS. The spec is the contract: `docs/spec.md`.
 
 ## Current target
 
-M0–M4 acceptance is green. Current work is **M5** (replay, arbitration, and the human loop: `hord-replay-ref`, the arbitration queue and workbench, token auth and scopes, `hord-ui` views 1–3, and the M5 conflict corpus). Do not start M6+ work except as a documented, required dependency of an M5 deliverable.
+M0–M5 acceptance is green. Current work is **M6** (self-hosting: hord's own repository served by `hord serve` on a team host, the git mirror, TLS for `hord serve`, web UI views 4–6, and the usability check moved from M5 by ADR 0035). Do not start M7 work except as a documented, required dependency of an M6 deliverable.
 
 Acceptance harnesses (release mode; corpora in `$HORD_CORPORA` or `~/.cache/hord/corpora`) must stay green:
 
@@ -20,13 +20,22 @@ Acceptance harnesses (release mode; corpora in `$HORD_CORPORA` or `~/.cache/hord
 - M3: `cargo run -p hord-eval-m3 --release` (100-agent concurrency simulation, workspaces, `Cargo.lock`), also with `--server`, `--policy`, and `--server --policy`. CI runs these with `--report-throughput`, because shared runners are too noisy to gate the 20 changes/s target; that gate is checked on an idle machine without the flag.
 - M4: the selection gate is the `M4 selection gate` workflow (`.github/workflows/m4-eval.yml`), dispatched on CI only (15 chains of 10 cargo commits plus full-suite samples, several hours). Do not run it locally. It passes on zero *confirmed* misses and a median selected share of at most 20% for write sets of 5 or fewer (ADR 0023 as amended).
 
+- M5: `cargo run -p hord-eval-m5 --release -- run` (the 100-case conflict corpus with its scripted harness; CI's `M5 conflict corpus` job gates correctness only). The replay-rate criterion needs a real model: see the pilot command in `corpora/m5/README.md`. Never run a model from an agent without the user's go-ahead: it spends their usage.
+
 M4 was accepted on 2026-09-26:
 - Gate run 36214480176 on main `12cbd88`: 0 confirmed misses in 163 graded faults, and a 3.1% median selected share for write sets of 5 or fewer.
 - Idle-machine throughput: 35.8–47.6 changes/s across the six M3 variants, against a target of 20.
 
+M5 was accepted on 2026-09-26:
+- Conflict corpus v4 with Sonnet 5 (`claude-sonnet-5`), $4.09: 76 of 100 resolved by replay (all 76 resolvable cases), against a target of 60%. All 24 contradictions (12 direct, 12 indirect) parked with honest explanations. 0 gamed, 0 tampered, 0 budget violations.
+- Every parked case was resolved from the workbench with a signed `Arbitrated` event.
+- A human rated 24 of 24 parked summaries sufficient to resolve, against a target of 90%.
+- The 5-person usability check moved to M6 (ADR 0035).
+
 Decisions that constrain later work:
 - M3: read sets (ADR 0012), lander merge mode (0014), file-root ids and content-derived write sets (0015), copy-on-write directory workspaces (0016), and the `Cargo.lock` bridge living in `hord-lang-rust` (0013). Language-specific logic belongs only in its language adapter crate.
 - M4: coverage-derived test selection with conservative fallbacks (ADR 0022; its 2026-09-25 amendments end staleness once a test re-ran on the change and scope test-file edits to their module), the selection safety harness (0023; a miss is a confirmed miss), gRPC with `hord.proto` as the one schema and the per-repo daemon (0024, 0021), evidence beside snapshots and the verifier contract (0025), the policy file and evidence qualifiers (0026), and the Windows daemon stdio exception to `forbid(unsafe_code)` (0027).
+- M5: policy stays declarative TOML (ADR 0028), one replay per attempt judged by evidence (0029), the UI as a server-side client of the gRPC API plus the `Changes` service (0030), reviews carrying across a clean rebase (0031), M5 authentication scope with TLS in M6 and OIDC an M7 candidate (0032), exact-body cross-file moves keeping identity (0033), and replays never changing, shadowing, or disabling the acceptance tests they must satisfy, checked by a pinned run (0034).
 
 ## Engineering (spec §11.1)
 
