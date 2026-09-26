@@ -297,6 +297,13 @@ impl AuthStore {
         Ok(find_token(&state, &hash))
     }
 
+    /// The actor `key_id` is bound to if this process has already read
+    /// the binding: no I/O.
+    #[must_use]
+    pub fn key_actor_cached(&self, key_id: &str) -> Option<Actor> {
+        find_key(&self.lock(), key_id)
+    }
+
     /// The actor `key_id` is bound to, if any.
     pub fn key_actor(&self, key_id: &str) -> Result<Option<Actor>, AuthError> {
         let mut state = self.lock();

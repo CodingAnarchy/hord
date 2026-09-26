@@ -472,12 +472,11 @@ fn check_voucher(auth: Option<&AuthStore>, record: &ChangeRecord, voucher: &str)
     let Some(auth) = auth else {
         return KeyCheck::Unchecked;
     };
-    match auth.key_actor(voucher) {
-        Ok(Some(_)) => KeyCheck::Bound,
-        Ok(None) => KeyCheck::Bad(format!(
+    match auth.key_actor_cached(voucher) {
+        Some(_) => KeyCheck::Bound,
+        None => KeyCheck::Bad(format!(
             "vouched for by key {voucher}, which is not bound to any actor"
         )),
-        Err(err) => KeyCheck::Bad(format!("look up key {voucher}: {err}")),
     }
 }
 
@@ -505,17 +504,16 @@ fn bound(auth: Option<&AuthStore>, actor: &Actor, key_id: &str) -> KeyCheck {
     let Some(auth) = auth else {
         return KeyCheck::Unchecked;
     };
-    match auth.key_actor(key_id) {
-        Ok(Some(owner)) if same_actor(actor, &owner) => KeyCheck::Bound,
-        Ok(Some(owner)) => KeyCheck::Bad(format!(
+    match auth.key_actor_cached(key_id) {
+        Some(owner) if same_actor(actor, &owner) => KeyCheck::Bound,
+        Some(owner) => KeyCheck::Bad(format!(
             "signed by key {key_id}, which is bound to {}, not {}",
             owner.id(),
             actor.id()
         )),
-        Ok(None) => KeyCheck::Bad(format!(
+        None => KeyCheck::Bad(format!(
             "signed by key {key_id}, which is not bound to any actor"
         )),
-        Err(err) => KeyCheck::Bad(format!("look up key {key_id}: {err}")),
     }
 }
 
@@ -544,14 +542,29 @@ fn change_id(text: &str) -> ApiResult<ChangeId> {
     wire::object_id("change", text)
 }
 
-/// Read a window's facts from `repo`, checking keys against `auth` when
-/// given. `now_ms` ends a window without `until_ms`.
+/// Read a window's facts from `repo`, checking keys against `auth`'s file
+/// when given. `now_ms` ends a window without `until_ms`.
 pub async fn gather(
     repo: &Repo,
     auth: Option<&AuthStore>,
     request: &proto::AuditRequest,
     now_ms: u64,
 ) -> ApiResult<AuditFacts> {
+    // The bindings as the file holds them now, read once on the blocking
+    // pool: every lookup below is in memory (a miss on a live store would
+    // re-read the file on this async worker, under its lock).
+    let bindings = match auth {
+        Some(auth) => {
+            let path = auth.path().to_owned();
+            let opened = tokio::task::spawn_blocking(move || AuthStore::open(&path))
+                .await
+                .map_err(internal)?
+                .map_err(internal)?;
+            Some(opened)
+        }
+        None => None,
+    };
+    let auth = bindings.as_ref();
     let since_ms = request.since_ms;
     let until_ms = request.until_ms.unwrap_or(now_ms);
     if until_ms < since_ms {
