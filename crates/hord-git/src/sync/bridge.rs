@@ -82,6 +82,10 @@ impl BridgeOptions {
 /// One divergence check, as recorded in the `BridgeChecked` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Check {
+    /// The mirror, without credentials.
+    pub remote: String,
+    /// What made the bridge check.
+    pub trigger: BridgeCheckTrigger,
     /// `main` names a commit the export of the log does not reach.
     pub diverged: bool,
     /// The export of the log's head, hex; unset on an empty log.
@@ -417,6 +421,8 @@ impl Bridge {
             Err(err) => return Err(err.into()),
         };
         Ok(Check {
+            remote: self.mirror.display_url(),
+            trigger,
             diverged,
             expected: expected.map(|c| c.to_string()),
             actual: actual.map(|c| c.to_string()),

@@ -2224,12 +2224,15 @@ name = "hord-git"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
  "bytes",
  "gix",
  "hord-api",
  "hord-core",
  "hord-encoding",
+ "hord-remote",
+ "hord-server",
  "hord-store",
  "hord-txn",
  "http",

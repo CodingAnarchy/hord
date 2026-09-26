@@ -1784,3 +1784,34 @@ message RecordBridgeCheckResponse {
   // EventCursor of the `BridgeChecked` event.
   uint64 cursor = 1;
 }
+
+// A pull request the bridge submitted as a proposal.
+message GitSyncProposal {
+  // The pull request's number.
+  uint64 pull = 1;
+  // The submitted ChangeId.
+  string change = 2;
+}
+
+// An outcome the bridge reported on a pull request.
+message GitSyncReport {
+  // The pull request's number.
+  uint64 pull = 1;
+  // `queued`, `replaying`, `landed`, `conflicted`, `needs_arbitration`,
+  // `parked`, `rejected`, or `error`.
+  string outcome = 2;
+}
+
+// `hord git sync --once`.
+message GitSyncResult {
+  // Landed changes exported, in log order.
+  repeated string exported = 1;
+  // The commit pushed to `main`, if one was.
+  optional string pushed = 2;
+  // Pull requests submitted as proposals.
+  repeated GitSyncProposal proposed = 3;
+  // Outcomes reported on pull requests.
+  repeated GitSyncReport reported = 4;
+  // Divergence checks run after a push.
+  repeated BridgeChecked checks = 5;
+}

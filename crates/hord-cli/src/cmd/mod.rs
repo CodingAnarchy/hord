@@ -3,6 +3,7 @@
 pub mod arbitrate;
 pub mod blame;
 pub mod git;
+pub mod git_sync;
 pub mod init;
 pub mod key;
 pub mod lander;
