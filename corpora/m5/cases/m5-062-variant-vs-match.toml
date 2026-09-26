@@ -1,0 +1,118 @@
+id = "m5-062"
+kind = "variant-vs-match"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: variant-vs-match #7 (Phase::Finish/order)"
+script = ["resolve"]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub enum Phase {
+    Start,
+}
+
+pub fn label(e: &Phase) -> &'static str {
+    match e {
+        Phase::Start => "start",
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "add Phase::Finish, labelled finish"
+body = 'Phase needs a Finish case. Its label is "finish".'
+test = "finish_is_labelled"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn finish_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Phase::Finish), "finish");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Phase {
+    Start,
+    Finish,
+}
+
+pub fn label(e: &Phase) -> &'static str {
+    match e {
+        Phase::Start => "start",
+        Phase::Finish => "finish",
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add order, a number for each Phase"
+body = "Add order(e), which is 1 for Start."
+test = "order_of_start"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn order_of_start() {
+    assert_eq!(fixture::order(&fixture::Phase::Start), 1);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub enum Phase {
+    Start,
+}
+
+pub fn label(e: &Phase) -> &'static str {
+    match e {
+        Phase::Start => "start",
+    }
+}
+
+pub fn order(e: &Phase) -> u32 {
+    match e {
+        Phase::Start => 1,
+    }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub enum Phase {
+    Start,
+    Finish,
+}
+
+pub fn label(e: &Phase) -> &'static str {
+    match e {
+        Phase::Start => "start",
+        Phase::Finish => "finish",
+    }
+}
+
+pub fn order(e: &Phase) -> u32 {
+    match e {
+        Phase::Start => 1,
+        Phase::Finish => 2,
+    }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn order_of_start() {
+    assert_eq!(fixture::order(&fixture::Phase::Start), 1);
+}
+"""

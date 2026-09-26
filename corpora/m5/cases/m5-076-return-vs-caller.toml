@@ -2,7 +2,7 @@ id = "m5-076"
 kind = "return-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: return-vs-caller #1 (parse_id/is_id)"
+made_by = "hord-eval-m5 generate v4: return-vs-caller #10 (parse_code/is_code)"
 script = ["resolve"]
 
 [base]
@@ -18,68 +18,68 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn parse_id(s: &str) -> Option<u32> {
+pub fn parse_code(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "parse_id says why parsing failed"
-body = "Return a Result from parse_id whose error is the parse error's message."
-test = "parse_id_reports_errors"
+summary = "parse_code says why parsing failed"
+body = "Return a Result from parse_code whose error is the parse error's message."
+test = "parse_code_reports_errors"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn parse_id_reports_errors() {
-    assert!(fixture::parse_id("x").is_err());
+fn parse_code_reports_errors() {
+    assert!(fixture::parse_code("x").is_err());
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn parse_id(s: &str) -> Result<u32, String> {
+pub fn parse_code(s: &str) -> Result<u32, String> {
     s.parse().map_err(|e: std::num::ParseIntError| e.to_string())
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add is_id, whether parse_id accepts the input"
-body = "Add is_id(s): true when parse_id accepts s."
-test = "is_id_accepts_digits"
+summary = "add is_code, whether parse_code accepts the input"
+body = "Add is_code(s): true when parse_code accepts s."
+test = "is_code_accepts_digits"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn is_id_accepts_digits() {
-    assert!(fixture::is_id("5") && !fixture::is_id("x"));
+fn is_code_accepts_digits() {
+    assert!(fixture::is_code("5") && !fixture::is_code("x"));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn parse_id(s: &str) -> Option<u32> {
+pub fn parse_code(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 
-pub fn is_id(s: &str) -> bool {
-    parse_id(s).is_some()
+pub fn is_code(s: &str) -> bool {
+    parse_code(s).is_some()
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn parse_id(s: &str) -> Result<u32, String> {
+pub fn parse_code(s: &str) -> Result<u32, String> {
     s.parse().map_err(|e: std::num::ParseIntError| e.to_string())
 }
 
-pub fn is_id(s: &str) -> bool {
-    parse_id(s).is_ok()
+pub fn is_code(s: &str) -> bool {
+    parse_code(s).is_ok()
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn is_id_accepts_digits() {
-    assert!(fixture::is_id("5") && !fixture::is_id("x"));
+fn is_code_accepts_digits() {
+    assert!(fixture::is_code("5") && !fixture::is_code("x"));
 }
 """

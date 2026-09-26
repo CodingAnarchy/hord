@@ -2,7 +2,7 @@ id = "m5-030"
 kind = "rename-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: rename-vs-caller #4 (aggregate->sum_values/aggregate_twice)"
+made_by = "hord-eval-m5 generate v4: rename-vs-caller #8 (collect_sum->sum_collected/collect_twice)"
 script = [
     "tamper",
     "resolve",
@@ -21,68 +21,68 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn aggregate(xs: &[i32]) -> i32 {
+pub fn collect_sum(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "rename aggregate to sum_values"
-body = "aggregate is a vague name. Rename it to sum_values; its behavior stays the same."
-test = "sum_values_sums"
+summary = "rename collect_sum to sum_collected"
+body = "collect_sum is a vague name. Rename it to sum_collected; its behavior stays the same."
+test = "sum_collected_sums"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn sum_values_sums() {
-    assert_eq!(fixture::sum_values(&[1, 2, 3]), 6);
+fn sum_collected_sums() {
+    assert_eq!(fixture::sum_collected(&[1, 2, 3]), 6);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn sum_values(xs: &[i32]) -> i32 {
+pub fn sum_collected(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add aggregate_twice: twice the aggregate"
-body = "Add aggregate_twice(xs), twice the sum that aggregate computes."
-test = "aggregate_twice_doubles"
+summary = "add collect_twice: twice the collect_sum"
+body = "Add collect_twice(xs), twice the sum that collect_sum computes."
+test = "collect_twice_doubles"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn aggregate_twice_doubles() {
-    assert_eq!(fixture::aggregate_twice(&[1, 2]), 6);
+fn collect_twice_doubles() {
+    assert_eq!(fixture::collect_twice(&[1, 2]), 6);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn aggregate(xs: &[i32]) -> i32 {
+pub fn collect_sum(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 
-pub fn aggregate_twice(xs: &[i32]) -> i32 {
-    aggregate(xs) * 2
+pub fn collect_twice(xs: &[i32]) -> i32 {
+    collect_sum(xs) * 2
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn sum_values(xs: &[i32]) -> i32 {
+pub fn sum_collected(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 
-pub fn aggregate_twice(xs: &[i32]) -> i32 {
-    sum_values(xs) * 2
+pub fn collect_twice(xs: &[i32]) -> i32 {
+    sum_collected(xs) * 2
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn aggregate_twice_doubles() {
-    assert_eq!(fixture::aggregate_twice(&[1, 2]), 6);
+fn collect_twice_doubles() {
+    assert_eq!(fixture::collect_twice(&[1, 2]), 6);
 }
 """

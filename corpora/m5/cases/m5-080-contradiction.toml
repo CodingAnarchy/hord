@@ -1,0 +1,62 @@
+id = "m5-080"
+kind = "contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: contradiction #4 (rate x3 or x8)"
+script = [
+    "wrong",
+    "wrong",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub fn rate(x: u32) -> u32 {
+    x * 3
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "rate multiplies by 8"
+body = "The new pricing model needs rate to multiply by 8."
+test = "rate_is_8x"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn rate_is_8x() {
+    assert_eq!(fixture::rate(2), 16);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub fn rate(x: u32) -> u32 {
+    x * 8
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "pin rate at 3x with a test"
+body = "Billing relies on rate multiplying by 3; add a test so it cannot change."
+test = "rate_stays_3x"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn rate_stays_3x() {
+    assert_eq!(fixture::rate(2), 6);
+}
+"""
+
+[tasks.files]

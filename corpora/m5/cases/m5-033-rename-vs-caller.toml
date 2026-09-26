@@ -2,7 +2,7 @@ id = "m5-033"
 kind = "rename-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: rename-vs-caller #7 (summarize->sum_entries/summarize_twice)"
+made_by = "hord-eval-m5 generate v4: rename-vs-caller #11 (measure->sum_measure/measure_twice)"
 script = [
     "give_up",
     "give_up",
@@ -21,68 +21,68 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn summarize(xs: &[i32]) -> i32 {
+pub fn measure(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "rename summarize to sum_entries"
-body = "summarize is a vague name. Rename it to sum_entries; its behavior stays the same."
-test = "sum_entries_sums"
+summary = "rename measure to sum_measure"
+body = "measure is a vague name. Rename it to sum_measure; its behavior stays the same."
+test = "sum_measure_sums"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn sum_entries_sums() {
-    assert_eq!(fixture::sum_entries(&[1, 2, 3]), 6);
+fn sum_measure_sums() {
+    assert_eq!(fixture::sum_measure(&[1, 2, 3]), 6);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn sum_entries(xs: &[i32]) -> i32 {
+pub fn sum_measure(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add summarize_twice: twice the summarize"
-body = "Add summarize_twice(xs), twice the sum that summarize computes."
-test = "summarize_twice_doubles"
+summary = "add measure_twice: twice the measure"
+body = "Add measure_twice(xs), twice the sum that measure computes."
+test = "measure_twice_doubles"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn summarize_twice_doubles() {
-    assert_eq!(fixture::summarize_twice(&[1, 2]), 6);
+fn measure_twice_doubles() {
+    assert_eq!(fixture::measure_twice(&[1, 2]), 6);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn summarize(xs: &[i32]) -> i32 {
+pub fn measure(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 
-pub fn summarize_twice(xs: &[i32]) -> i32 {
-    summarize(xs) * 2
+pub fn measure_twice(xs: &[i32]) -> i32 {
+    measure(xs) * 2
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn sum_entries(xs: &[i32]) -> i32 {
+pub fn sum_measure(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 
-pub fn summarize_twice(xs: &[i32]) -> i32 {
-    sum_entries(xs) * 2
+pub fn measure_twice(xs: &[i32]) -> i32 {
+    sum_measure(xs) * 2
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn summarize_twice_doubles() {
-    assert_eq!(fixture::summarize_twice(&[1, 2]), 6);
+fn measure_twice_doubles() {
+    assert_eq!(fixture::measure_twice(&[1, 2]), 6);
 }
 """

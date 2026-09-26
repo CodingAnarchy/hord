@@ -95,7 +95,7 @@ fn the_claude_wrappers_usage_reaches_the_report() -> TestResult {
     Ok(())
 }
 
-/// The honest exit end to end: on a contradiction (m5-089), a stub
+/// The honest exit end to end: on a contradiction (m5-077), a stub
 /// `claude` changes nothing and explains why. The case parks, the attempt
 /// gave up with that explanation as its reason, and the review sheet shows
 /// it to the person rating the conflict summary.
@@ -122,7 +122,7 @@ fn a_models_explanation_reaches_the_attempt_and_the_review_sheet() -> TestResult
         .args([
             "run",
             "--only",
-            "m5-089",
+            "m5-077",
             "--jobs",
             "1",
             "--max-attempts",

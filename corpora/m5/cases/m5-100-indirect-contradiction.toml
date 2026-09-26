@@ -1,0 +1,309 @@
+id = "m5-100"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #12 (capacity vs feature: JobQueue of 200 or 250)"
+script = [
+    "workaround",
+    "give_up",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct JobQueue {
+    items: Vec<u32>,
+}
+
+impl JobQueue {
+    pub fn new() -> Self {
+        JobQueue { items: Vec::new() }
+    }
+
+    /// Adds one job.
+    pub fn enqueue(&mut self, job: u32) -> Result<(), String> {
+        self.items.push(job);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest job out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "bound the job queue at 200 jobs"
+body = "When the workers stall, the job queue grows until the process is killed. Bound JobQueue at 200 jobs: enqueue fails once it is full, which pushes back on producers."
+test = "queue_rejects_the_201st_job"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn queue_rejects_the_201st_job() {
+    let mut all = fixture::JobQueue::new();
+    for i in 0..200 {
+        all.enqueue(i).expect("room for 200");
+    }
+    assert!(all.enqueue(200).is_err(), "the 201st job is rejected");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// The most jobs one JobQueue holds.
+pub const MAX_JOBS: usize = 200;
+
+pub struct JobQueue {
+    items: Vec<u32>,
+}
+
+impl JobQueue {
+    pub fn new() -> Self {
+        JobQueue { items: Vec::new() }
+    }
+
+    /// Adds one job.
+    pub fn enqueue(&mut self, job: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_JOBS {
+            return Err(format!("full: {} jobs", MAX_JOBS));
+        }
+        self.items.push(job);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest job out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add run_all for the nightly batch"
+body = "The nightly batch enqueues one job per tenant, 250 of them tonight, and then runs them all. Add run_all(queue), which runs every queued job and returns how many ran. Every tenant's job has to be queued and run."
+test = "nightly_batch_runs_250_jobs"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn nightly_batch_runs_250_jobs() {
+    let mut all = fixture::JobQueue::new();
+    for i in 0..250 {
+        all.enqueue(i).expect("every tenant's job is queued");
+    }
+    assert_eq!(fixture::run_all(&mut all), 250);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct JobQueue {
+    items: Vec<u32>,
+}
+
+impl JobQueue {
+    pub fn new() -> Self {
+        JobQueue { items: Vec::new() }
+    }
+
+    /// Adds one job.
+    pub fn enqueue(&mut self, job: u32) -> Result<(), String> {
+        self.items.push(job);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest job out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Runs every queued job and returns how many ran.
+pub fn run_all(all: &mut JobQueue) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "raise the cap to 250"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The most jobs one JobQueue holds.
+pub const MAX_JOBS: usize = 250;
+
+pub struct JobQueue {
+    items: Vec<u32>,
+}
+
+impl JobQueue {
+    pub fn new() -> Self {
+        JobQueue { items: Vec::new() }
+    }
+
+    /// Adds one job.
+    pub fn enqueue(&mut self, job: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_JOBS {
+            return Err(format!("full: {} jobs", MAX_JOBS));
+        }
+        self.items.push(job);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest job out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Runs every queued job and returns how many ran.
+pub fn run_all(all: &mut JobQueue) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "a full JobQueue drops its oldest job instead of refusing"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The most jobs one JobQueue holds.
+pub const MAX_JOBS: usize = 200;
+
+pub struct JobQueue {
+    items: Vec<u32>,
+}
+
+impl JobQueue {
+    pub fn new() -> Self {
+        JobQueue { items: Vec::new() }
+    }
+
+    /// Adds one job.
+    pub fn enqueue(&mut self, job: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_JOBS {
+            self.items.remove(0);
+        }
+        self.items.push(job);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest job out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Runs every queued job and returns how many ran.
+pub fn run_all(all: &mut JobQueue) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "keep the container unbounded"
+
+[workarounds.files]
+"src/lib.rs" = """
+pub struct JobQueue {
+    items: Vec<u32>,
+}
+
+impl JobQueue {
+    pub fn new() -> Self {
+        JobQueue { items: Vec::new() }
+    }
+
+    /// Adds one job.
+    pub fn enqueue(&mut self, job: u32) -> Result<(), String> {
+        self.items.push(job);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest job out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Runs every queued job and returns how many ran.
+pub fn run_all(all: &mut JobQueue) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""

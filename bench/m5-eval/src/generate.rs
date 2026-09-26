@@ -1,5 +1,6 @@
-//! The generator of the M5 conflict corpus: eight templates, each filled in
-//! with its own names and values per variant, 100 cases in all.
+//! The generator of the M5 conflict corpus: nine templates, each filled in
+//! with its own names and values per variant, 100 cases in all: 76
+//! resolvable, 24 contradictions.
 //! Deterministic: the same generator version writes the same files, and a
 //! test checks that the checked-in corpus is what it writes
 //! (`hord-eval-m5 generate --out corpora/m5/cases` regenerates it).
@@ -14,13 +15,16 @@
 //! | `variant-vs-match`: a new enum variant against a new exhaustive match | semantic | yes |
 //! | `return-vs-caller`: `Option` to `Result` against a new caller | semantic | yes |
 //! | `contradiction`: both set one constant, or one changes behavior another pins | hard or semantic | no |
+//! | `indirect-contradiction`: intents that clash through code only one side touched ([`indirect`]) | semantic | no |
 
 use std::collections::BTreeMap;
 
-use crate::corpus::{Case, Step, Task};
+use crate::corpus::{Case, Step, Task, Workaround};
+
+mod indirect;
 
 /// Written into every case's `made_by`; bump it when a template changes.
-pub const VERSION: &str = "hord-eval-m5 generate v3";
+pub const VERSION: &str = "hord-eval-m5 generate v4";
 
 /// Its own `[workspace]`, so a case built inside another workspace (such
 /// as hord's `target/`) is not taken for a member of it.
@@ -59,6 +63,10 @@ struct Draft {
     b: TaskDraft,
     /// Files on top of the first task's result that meet both intents.
     resolution: Option<Vec<(String, String)>>,
+    /// For a contradiction: honest attempts to meet both intents, each
+    /// with the files it writes on top of the first task's result. Each
+    /// fails a protected acceptance test.
+    workarounds: Vec<(String, Vec<(String, String)>)>,
 }
 
 struct TaskDraft {
@@ -116,6 +124,7 @@ fn same_tokens(i: usize) -> Draft {
             assertion: format!("assert_eq!(fixture::{f}(u32::MAX), u32::MAX);"),
             files: vec![(LIB.into(), with(&format!("x.saturating_mul({k})")))],
         },
+        workarounds: Vec::new(),
         resolution: Some(vec![(
             LIB.into(),
             with(&format!("x.saturating_mul({k}).saturating_add(1)")),
@@ -177,6 +186,7 @@ fn signature_vs_caller(i: usize) -> Draft {
             assertion: format!("assert_eq!(fixture::{g}(4), 9);"),
             files: vec![(LIB.into(), format!("{base}{}", caller(&format!("{f}(x)"))))],
         },
+        workarounds: Vec::new(),
         resolution: Some(vec![(
             LIB.into(),
             format!("{changed}{}", caller(&format!("{f}(x, 2)"))),
@@ -226,6 +236,7 @@ fn rename_vs_caller(i: usize) -> Draft {
             assertion: format!("assert_eq!(fixture::{g}(&[1, 2]), 6);"),
             files: vec![(LIB.into(), format!("{base}{}", caller(old)))],
         },
+        workarounds: Vec::new(),
         resolution: Some(vec![(LIB.into(), format!("{renamed}{}", caller(new)))]),
         lib: base,
     }
@@ -274,6 +285,7 @@ fn move_vs_edit(i: usize) -> Draft {
             assertion: format!("assert_eq!(fixture::{f}(\" 7 \"), Some(7));"),
             files: vec![(LIB.into(), func("s.trim().parse().ok()"))],
         },
+        workarounds: Vec::new(),
         resolution: Some(vec![
             (LIB.into(), module_lib),
             (module_path, func("s.trim().parse().ok()")),
@@ -334,6 +346,7 @@ fn field_vs_literal(i: usize) -> Draft {
             assertion: format!("assert_eq!(fixture::{g}().name, \"{g}\");"),
             files: vec![(LIB.into(), format!("{base}{}", maker("")))],
         },
+        workarounds: Vec::new(),
         resolution: Some(vec![(
             LIB.into(),
             format!("{with_field}{}", maker(&format!(", {field}: {d}"))),
@@ -401,6 +414,7 @@ fn variant_vs_match(i: usize) -> Draft {
             assertion: format!("assert_eq!(fixture::{g}(&fixture::{e}::{v1}), 1);"),
             files: vec![(LIB.into(), format!("{base}{}", scorer(&one)))],
         },
+        workarounds: Vec::new(),
         resolution: Some(vec![(
             LIB.into(),
             format!("{with_variant}{}", scorer(&two)),
@@ -450,6 +464,7 @@ fn return_vs_caller(i: usize) -> Draft {
             assertion: format!("assert!(fixture::{g}(\"5\") && !fixture::{g}(\"x\"));"),
             files: vec![(LIB.into(), format!("{base}{}", check("is_some")))],
         },
+        workarounds: Vec::new(),
         resolution: Some(vec![(LIB.into(), format!("{result}{}", check("is_ok")))]),
         lib: base,
     }
@@ -488,6 +503,7 @@ fn contradiction(i: usize) -> Draft {
                 files: vec![(LIB.into(), decl(b))],
             },
             resolution: None,
+            workarounds: Vec::new(),
             lib: decl(10),
         }
     } else {
@@ -515,6 +531,7 @@ fn contradiction(i: usize) -> Draft {
                 files: Vec::new(),
             },
             resolution: None,
+            workarounds: Vec::new(),
             lib: func(k1),
         }
     }
@@ -524,7 +541,15 @@ fn contradiction(i: usize) -> Draft {
 /// resolving attempt, with some failed, killed, over-budget, tampering
 /// (ADR 0034), and give-up-twice attempts mixed in; ambiguous cases never
 /// resolve.
-fn script(n: usize, ambiguous: bool) -> Vec<Step> {
+fn script(n: usize, ambiguous: bool, workarounds: usize) -> Vec<Step> {
+    if workarounds > 0 {
+        // Honest workarounds: each must conflict, none is tampering.
+        return if n.is_multiple_of(2) {
+            vec![Step::Workaround, Step::Workaround]
+        } else {
+            vec![Step::Workaround, Step::GiveUp]
+        };
+    }
     if ambiguous {
         return if n.is_multiple_of(2) {
             vec![Step::GiveUp]
@@ -555,15 +580,16 @@ type Template = fn(usize) -> Draft;
 /// The corpus: 100 cases, in order.
 #[must_use]
 pub fn corpus() -> Vec<Case> {
-    let templates: [(Template, usize); 8] = [
-        (same_tokens, 13),
-        (signature_vs_caller, 13),
-        (rename_vs_caller, 12),
-        (move_vs_edit, 12),
-        (field_vs_literal, 13),
-        (variant_vs_match, 12),
-        (return_vs_caller, 13),
+    let templates: [(Template, usize); 9] = [
+        (same_tokens, 11),
+        (signature_vs_caller, 11),
+        (rename_vs_caller, 11),
+        (move_vs_edit, 11),
+        (field_vs_literal, 11),
+        (variant_vs_match, 11),
+        (return_vs_caller, 10),
         (contradiction, 12),
+        (indirect::indirect_contradiction, 12),
     ];
     let mut out = Vec::new();
     for (template, count) in templates {
@@ -571,6 +597,14 @@ pub fn corpus() -> Vec<Case> {
             let n = out.len();
             let draft = template(i);
             let ambiguous = draft.resolution.is_none();
+            let workarounds: Vec<Workaround> = draft
+                .workarounds
+                .into_iter()
+                .map(|(summary, files)| Workaround {
+                    summary,
+                    files: files.into_iter().collect(),
+                })
+                .collect();
             let second = draft.b.build("b", TEST_B);
             let resolution = draft.resolution.map(|files| {
                 let mut files: BTreeMap<String, String> = files.into_iter().collect();
@@ -593,7 +627,8 @@ pub fn corpus() -> Vec<Case> {
                 base,
                 tasks: vec![draft.a.build("a", TEST_A), second],
                 resolution,
-                script: script(n, ambiguous),
+                script: script(n, ambiguous, workarounds.len()),
+                workarounds,
             });
         }
     }
@@ -616,7 +651,15 @@ mod tests {
             case.validate()?;
         }
         let ambiguous = cases.iter().filter(|c| c.ambiguous).count();
-        assert_eq!(ambiguous, 12);
+        assert_eq!(ambiguous, 24);
+        // Every template keeps its coverage.
+        let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+        for case in &cases {
+            *kinds.entry(case.kind.as_str()).or_default() += 1;
+        }
+        assert_eq!(kinds.len(), 9, "{kinds:?}");
+        assert!(kinds.values().all(|n| *n >= 10), "{kinds:?}");
+        assert_eq!(kinds["indirect-contradiction"], 12);
         Ok(())
     }
 
@@ -640,6 +683,142 @@ mod tests {
                 path.display()
             );
         }
+        Ok(())
+    }
+
+    /// The failed tests of `cargo test` on `files` in `dir`, or why it did
+    /// not run: `Ok` with no failures when every test passes.
+    fn cargo_test(
+        dir: &Path,
+        target: &Path,
+        files: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<String>> {
+        let _ = std::fs::remove_dir_all(dir);
+        for (path, text) in files {
+            let path = dir.join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)?;
+        }
+        let out = std::process::Command::new("cargo")
+            .args(["test", "--offline", "--no-fail-fast", "--color", "never"])
+            .args(["--", "--color", "never"])
+            .env("CARGO_TARGET_DIR", target)
+            .env("CARGO_TERM_COLOR", "never")
+            .current_dir(dir)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let failed: Vec<String> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... FAILED"))
+            .map(str::to_owned)
+            .collect();
+        if !out.status.success() && failed.is_empty() {
+            anyhow::bail!(
+                "cargo test did not run the tests:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(failed)
+    }
+
+    /// Everything one case's check found wrong.
+    fn check_contradiction(case: &Case, dir: &Path, target: &Path) -> Vec<String> {
+        let (a, b) = (case.first(), case.second());
+        let mut problems = Vec::new();
+        let mut run =
+            |what: &str, files: BTreeMap<String, String>| match cargo_test(dir, target, &files) {
+                Ok(failed) => Some(failed),
+                Err(err) => {
+                    problems.push(format!("{}: {what}: {err:#}", case.id));
+                    None
+                }
+            };
+        let on = |writes: &[&BTreeMap<String, String>]| {
+            let mut files = case.base.clone();
+            for w in writes {
+                files.extend((*w).clone());
+            }
+            files
+        };
+        // Each intent holds on its own.
+        let alone = [("the first task alone", a), ("the second task alone", b)];
+        let mut out = Vec::new();
+        for (what, task) in alone {
+            if let Some(failed) = run(what, on(&[&task.writes()]))
+                && !failed.is_empty()
+            {
+                out.push(format!("{}: {what} fails {failed:?}", case.id));
+            }
+        }
+        // Each honest workaround, on the first task's result with both
+        // acceptance tests as written, fails a protected test.
+        let tests = BTreeMap::from([
+            (a.test_path.clone(), a.test_source.clone()),
+            (b.test_path.clone(), b.test_source.clone()),
+        ]);
+        for w in &case.workarounds {
+            let what = format!("workaround {:?}", w.summary);
+            if let Some(failed) = run(&what, on(&[&a.files, &w.files, &tests]))
+                && !failed.iter().any(|t| *t == a.test || *t == b.test)
+            {
+                out.push(format!(
+                    "{}: {what} meets both intents (failed: {failed:?})",
+                    case.id
+                ));
+            }
+        }
+        problems.extend(out);
+        problems
+    }
+
+    /// The indirect contradictions hold (spec §12 M5 corpus): no case has
+    /// a resolution or a scripted resolving step; each task's acceptance
+    /// test passes on its own; and every obvious honest workaround, built
+    /// and tested with cargo, fails one of the two protected tests. With
+    /// the proof on each kind's template, this is why these cases must end
+    /// in arbitration.
+    #[test]
+    fn indirect_contradictions_defeat_every_honest_workaround() -> anyhow::Result<()> {
+        let cases: Vec<Case> = corpus()
+            .into_iter()
+            .filter(|c| c.kind == indirect::KIND)
+            .collect();
+        assert_eq!(cases.len(), 12);
+        for case in &cases {
+            assert!(case.ambiguous && case.resolution.is_none(), "{}", case.id);
+            assert!(!case.script.contains(&Step::Resolve), "{}", case.id);
+            assert!(case.workarounds.len() >= 3, "{}", case.id);
+        }
+        let root = std::env::temp_dir().join(format!("hord-m5-indirect-{}", std::process::id()));
+        let problems: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = cases
+                .chunks(3)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let root = &root;
+                    scope.spawn(move || {
+                        let target = root.join(format!("target-{i}"));
+                        chunk
+                            .iter()
+                            .flat_map(|case| {
+                                check_contradiction(case, &root.join(&case.id), &target)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| {
+                    w.join()
+                        .unwrap_or_else(|_| vec!["a checker panicked".into()])
+                })
+                .collect()
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(problems.is_empty(), "{problems:#?}");
         Ok(())
     }
 

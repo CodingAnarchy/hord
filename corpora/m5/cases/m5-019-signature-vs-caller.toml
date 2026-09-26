@@ -2,7 +2,7 @@ id = "m5-019"
 kind = "signature-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: signature-vs-caller #6 (price/price_with_fee)"
+made_by = "hord-eval-m5 generate v4: signature-vs-caller #8 (cost/cost_with_tax)"
 script = ["resolve"]
 
 [base]
@@ -18,84 +18,84 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn price(x: u32) -> u32 {
+pub fn cost(x: u32) -> u32 {
     x * 2
 }
 
-pub fn price_twice(x: u32) -> u32 {
-    price(price(x))
+pub fn cost_twice(x: u32) -> u32 {
+    cost(cost(x))
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "price takes its factor as a parameter"
-body = "price always doubles. Callers need other factors: add a `factor` parameter and keep price_twice doubling twice."
-test = "price_takes_a_factor"
+summary = "cost takes its factor as a parameter"
+body = "cost always doubles. Callers need other factors: add a `factor` parameter and keep cost_twice doubling twice."
+test = "cost_takes_a_factor"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn price_takes_a_factor() {
-    assert_eq!(fixture::price(3, 8), 24);
+fn cost_takes_a_factor() {
+    assert_eq!(fixture::cost(3, 10), 30);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn price(x: u32, factor: u32) -> u32 {
+pub fn cost(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn price_twice(x: u32) -> u32 {
-    price(price(x, 2), 2)
+pub fn cost_twice(x: u32) -> u32 {
+    cost(cost(x, 2), 2)
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add price_with_fee: price plus one"
-body = "Add price_with_fee(x), which is price(x) plus one."
-test = "price_with_fee_is_one_more"
+summary = "add cost_with_tax: cost plus one"
+body = "Add cost_with_tax(x), which is cost(x) plus one."
+test = "cost_with_tax_is_one_more"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn price_with_fee_is_one_more() {
-    assert_eq!(fixture::price_with_fee(4), 9);
+fn cost_with_tax_is_one_more() {
+    assert_eq!(fixture::cost_with_tax(4), 9);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn price(x: u32) -> u32 {
+pub fn cost(x: u32) -> u32 {
     x * 2
 }
 
-pub fn price_twice(x: u32) -> u32 {
-    price(price(x))
+pub fn cost_twice(x: u32) -> u32 {
+    cost(cost(x))
 }
 
-pub fn price_with_fee(x: u32) -> u32 {
-    price(x) + 1
+pub fn cost_with_tax(x: u32) -> u32 {
+    cost(x) + 1
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn price(x: u32, factor: u32) -> u32 {
+pub fn cost(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn price_twice(x: u32) -> u32 {
-    price(price(x, 2), 2)
+pub fn cost_twice(x: u32) -> u32 {
+    cost(cost(x, 2), 2)
 }
 
-pub fn price_with_fee(x: u32) -> u32 {
-    price(x, 2) + 1
+pub fn cost_with_tax(x: u32) -> u32 {
+    cost(x, 2) + 1
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn price_with_fee_is_one_more() {
-    assert_eq!(fixture::price_with_fee(4), 9);
+fn cost_with_tax_is_one_more() {
+    assert_eq!(fixture::cost_with_tax(4), 9);
 }
 """

@@ -2,7 +2,7 @@ id = "m5-041"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: move-vs-edit #3 (parse_count into counts)"
+made_by = "hord-eval-m5 generate v4: move-vs-edit #8 (parse_rank into ranks)"
 script = [
     "wrong",
     "resolve",
@@ -21,70 +21,70 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn parse_count(s: &str) -> Option<u32> {
+pub fn parse_rank(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "move parse_count into module counts"
-body = "Move parse_count into a new public module `counts`, re-exported at the crate root."
-test = "parse_count_lives_in_counts"
+summary = "move parse_rank into module ranks"
+body = "Move parse_rank into a new public module `ranks`, re-exported at the crate root."
+test = "parse_rank_lives_in_ranks"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn parse_count_lives_in_counts() {
-    assert_eq!(fixture::counts::parse_count("7"), Some(7));
+fn parse_rank_lives_in_ranks() {
+    assert_eq!(fixture::ranks::parse_rank("7"), Some(7));
 }
 """
 
 [tasks.files]
-"src/counts.rs" = """
-pub fn parse_count(s: &str) -> Option<u32> {
+"src/lib.rs" = """
+pub mod ranks;
+
+pub use ranks::parse_rank;
+"""
+"src/ranks.rs" = """
+pub fn parse_rank(s: &str) -> Option<u32> {
     s.parse().ok()
 }
-"""
-"src/lib.rs" = """
-pub mod counts;
-
-pub use counts::parse_count;
 """
 
 [[tasks]]
 name = "b"
-summary = "parse_count ignores surrounding whitespace"
-body = "parse_count rejects input with spaces around the number. Trim it first."
-test = "parse_count_trims"
+summary = "parse_rank ignores surrounding whitespace"
+body = "parse_rank rejects input with spaces around the number. Trim it first."
+test = "parse_rank_trims"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn parse_count_trims() {
-    assert_eq!(fixture::parse_count(" 7 "), Some(7));
+fn parse_rank_trims() {
+    assert_eq!(fixture::parse_rank(" 7 "), Some(7));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn parse_count(s: &str) -> Option<u32> {
+pub fn parse_rank(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 
 [resolution]
-"src/counts.rs" = """
-pub fn parse_count(s: &str) -> Option<u32> {
+"src/lib.rs" = """
+pub mod ranks;
+
+pub use ranks::parse_rank;
+"""
+"src/ranks.rs" = """
+pub fn parse_rank(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
-"src/lib.rs" = """
-pub mod counts;
-
-pub use counts::parse_count;
-"""
 "tests/m5_b.rs" = """
 #[test]
-fn parse_count_trims() {
-    assert_eq!(fixture::parse_count(" 7 "), Some(7));
+fn parse_rank_trims() {
+    assert_eq!(fixture::parse_rank(" 7 "), Some(7));
 }
 """

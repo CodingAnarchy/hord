@@ -2,7 +2,7 @@ id = "m5-007"
 kind = "same-tokens"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: same-tokens #7 (magnify x8)"
+made_by = "hord-eval-m5 generate v4: same-tokens #7 (magnify x8)"
 script = [
     "sleep",
     "resolve",

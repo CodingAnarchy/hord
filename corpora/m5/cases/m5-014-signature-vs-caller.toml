@@ -2,7 +2,7 @@ id = "m5-014"
 kind = "signature-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: signature-vs-caller #1 (scale/scale_plus_one)"
+made_by = "hord-eval-m5 generate v4: signature-vs-caller #3 (stretch/stretch_once_more)"
 script = [
     "wrong",
     "resolve",
@@ -21,84 +21,84 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn scale(x: u32) -> u32 {
+pub fn stretch(x: u32) -> u32 {
     x * 2
 }
 
-pub fn scale_twice(x: u32) -> u32 {
-    scale(scale(x))
+pub fn stretch_twice(x: u32) -> u32 {
+    stretch(stretch(x))
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "scale takes its factor as a parameter"
-body = "scale always doubles. Callers need other factors: add a `factor` parameter and keep scale_twice doubling twice."
-test = "scale_takes_a_factor"
+summary = "stretch takes its factor as a parameter"
+body = "stretch always doubles. Callers need other factors: add a `factor` parameter and keep stretch_twice doubling twice."
+test = "stretch_takes_a_factor"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn scale_takes_a_factor() {
-    assert_eq!(fixture::scale(3, 3), 9);
+fn stretch_takes_a_factor() {
+    assert_eq!(fixture::stretch(3, 5), 15);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn scale(x: u32, factor: u32) -> u32 {
+pub fn stretch(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn scale_twice(x: u32) -> u32 {
-    scale(scale(x, 2), 2)
+pub fn stretch_twice(x: u32) -> u32 {
+    stretch(stretch(x, 2), 2)
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add scale_plus_one: scale plus one"
-body = "Add scale_plus_one(x), which is scale(x) plus one."
-test = "scale_plus_one_is_one_more"
+summary = "add stretch_once_more: stretch plus one"
+body = "Add stretch_once_more(x), which is stretch(x) plus one."
+test = "stretch_once_more_is_one_more"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn scale_plus_one_is_one_more() {
-    assert_eq!(fixture::scale_plus_one(4), 9);
+fn stretch_once_more_is_one_more() {
+    assert_eq!(fixture::stretch_once_more(4), 9);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn scale(x: u32) -> u32 {
+pub fn stretch(x: u32) -> u32 {
     x * 2
 }
 
-pub fn scale_twice(x: u32) -> u32 {
-    scale(scale(x))
+pub fn stretch_twice(x: u32) -> u32 {
+    stretch(stretch(x))
 }
 
-pub fn scale_plus_one(x: u32) -> u32 {
-    scale(x) + 1
+pub fn stretch_once_more(x: u32) -> u32 {
+    stretch(x) + 1
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn scale(x: u32, factor: u32) -> u32 {
+pub fn stretch(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn scale_twice(x: u32) -> u32 {
-    scale(scale(x, 2), 2)
+pub fn stretch_twice(x: u32) -> u32 {
+    stretch(stretch(x, 2), 2)
 }
 
-pub fn scale_plus_one(x: u32) -> u32 {
-    scale(x, 2) + 1
+pub fn stretch_once_more(x: u32) -> u32 {
+    stretch(x, 2) + 1
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn scale_plus_one_is_one_more() {
-    assert_eq!(fixture::scale_plus_one(4), 9);
+fn stretch_once_more_is_one_more() {
+    assert_eq!(fixture::stretch_once_more(4), 9);
 }
 """

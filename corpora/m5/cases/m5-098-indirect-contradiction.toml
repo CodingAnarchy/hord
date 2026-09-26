@@ -1,0 +1,309 @@
+id = "m5-098"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #10 (capacity vs feature: History of 100 or 150)"
+script = [
+    "workaround",
+    "give_up",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct History {
+    items: Vec<u32>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        History { items: Vec::new() }
+    }
+
+    /// Adds one edit.
+    pub fn record(&mut self, edit: u32) -> Result<(), String> {
+        self.items.push(edit);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest edit out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "cap undo history at 100 edits"
+body = "Long editing sessions grow the undo history without bound, and the editor runs out of memory on large documents. Cap History at 100 edits: record returns an error once it is full, so the editor can tell the user."
+test = "history_holds_at_most_100_edits"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn history_holds_at_most_100_edits() {
+    let mut all = fixture::History::new();
+    for i in 0..100 {
+        all.record(i).expect("room for 100");
+    }
+    assert!(all.record(100).is_err(), "the 101st edit is rejected");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// The most edits one History holds.
+pub const MAX_EDITS: usize = 100;
+
+pub struct History {
+    items: Vec<u32>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        History { items: Vec::new() }
+    }
+
+    /// Adds one edit.
+    pub fn record(&mut self, edit: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_EDITS {
+            return Err(format!("full: {} edits", MAX_EDITS));
+        }
+        self.items.push(edit);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest edit out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add undo_all to revert a whole session"
+body = "Users want to throw away a whole editing session in one step. Add undo_all(history), which undoes every recorded edit and returns how many it undid. Sessions of 150 edits are common in our telemetry, and every edit in them has to be recorded and undoable."
+test = "undo_all_reverts_a_150_edit_session"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn undo_all_reverts_a_150_edit_session() {
+    let mut all = fixture::History::new();
+    for i in 0..150 {
+        all.record(i).expect("a long session records every edit");
+    }
+    assert_eq!(fixture::undo_all(&mut all), 150);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct History {
+    items: Vec<u32>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        History { items: Vec::new() }
+    }
+
+    /// Adds one edit.
+    pub fn record(&mut self, edit: u32) -> Result<(), String> {
+        self.items.push(edit);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest edit out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Undoes every recorded edit, newest first, and returns how many it undid.
+pub fn undo_all(all: &mut History) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "raise the cap to 150"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The most edits one History holds.
+pub const MAX_EDITS: usize = 150;
+
+pub struct History {
+    items: Vec<u32>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        History { items: Vec::new() }
+    }
+
+    /// Adds one edit.
+    pub fn record(&mut self, edit: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_EDITS {
+            return Err(format!("full: {} edits", MAX_EDITS));
+        }
+        self.items.push(edit);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest edit out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Undoes every recorded edit, newest first, and returns how many it undid.
+pub fn undo_all(all: &mut History) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "a full History drops its oldest edit instead of refusing"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// The most edits one History holds.
+pub const MAX_EDITS: usize = 100;
+
+pub struct History {
+    items: Vec<u32>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        History { items: Vec::new() }
+    }
+
+    /// Adds one edit.
+    pub fn record(&mut self, edit: u32) -> Result<(), String> {
+        if self.items.len() >= MAX_EDITS {
+            self.items.remove(0);
+        }
+        self.items.push(edit);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest edit out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Undoes every recorded edit, newest first, and returns how many it undid.
+pub fn undo_all(all: &mut History) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""
+
+[[workarounds]]
+summary = "keep the container unbounded"
+
+[workarounds.files]
+"src/lib.rs" = """
+pub struct History {
+    items: Vec<u32>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        History { items: Vec::new() }
+    }
+
+    /// Adds one edit.
+    pub fn record(&mut self, edit: u32) -> Result<(), String> {
+        self.items.push(edit);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Takes the newest edit out.
+    pub fn pop(&mut self) -> Option<u32> {
+        self.items.pop()
+    }
+}
+
+/// Undoes every recorded edit, newest first, and returns how many it undid.
+pub fn undo_all(all: &mut History) -> usize {
+    let mut done = 0;
+    while all.pop().is_some() {
+        done += 1;
+    }
+    done
+}
+"""

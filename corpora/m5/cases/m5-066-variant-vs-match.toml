@@ -2,7 +2,7 @@ id = "m5-066"
 kind = "variant-vs-match"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: variant-vs-match #3 (Status::Closed/weight)"
+made_by = "hord-eval-m5 generate v4: variant-vs-match #11 (Tier::Paid/quota)"
 script = [
     "give_up",
     "give_up",
@@ -21,101 +21,101 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub enum Status {
-    Open,
+pub enum Tier {
+    Free,
 }
 
-pub fn label(e: &Status) -> &'static str {
+pub fn label(e: &Tier) -> &'static str {
     match e {
-        Status::Open => "open",
+        Tier::Free => "free",
     }
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "add Status::Closed, labelled closed"
-body = 'Status needs a Closed case. Its label is "closed".'
-test = "closed_is_labelled"
+summary = "add Tier::Paid, labelled paid"
+body = 'Tier needs a Paid case. Its label is "paid".'
+test = "paid_is_labelled"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn closed_is_labelled() {
-    assert_eq!(fixture::label(&fixture::Status::Closed), "closed");
+fn paid_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Tier::Paid), "paid");
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub enum Status {
-    Open,
-    Closed,
+pub enum Tier {
+    Free,
+    Paid,
 }
 
-pub fn label(e: &Status) -> &'static str {
+pub fn label(e: &Tier) -> &'static str {
     match e {
-        Status::Open => "open",
-        Status::Closed => "closed",
+        Tier::Free => "free",
+        Tier::Paid => "paid",
     }
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add weight, a number for each Status"
-body = "Add weight(e), which is 1 for Open."
-test = "weight_of_open"
+summary = "add quota, a number for each Tier"
+body = "Add quota(e), which is 1 for Free."
+test = "quota_of_free"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn weight_of_open() {
-    assert_eq!(fixture::weight(&fixture::Status::Open), 1);
+fn quota_of_free() {
+    assert_eq!(fixture::quota(&fixture::Tier::Free), 1);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub enum Status {
-    Open,
+pub enum Tier {
+    Free,
 }
 
-pub fn label(e: &Status) -> &'static str {
+pub fn label(e: &Tier) -> &'static str {
     match e {
-        Status::Open => "open",
+        Tier::Free => "free",
     }
 }
 
-pub fn weight(e: &Status) -> u32 {
+pub fn quota(e: &Tier) -> u32 {
     match e {
-        Status::Open => 1,
+        Tier::Free => 1,
     }
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub enum Status {
-    Open,
-    Closed,
+pub enum Tier {
+    Free,
+    Paid,
 }
 
-pub fn label(e: &Status) -> &'static str {
+pub fn label(e: &Tier) -> &'static str {
     match e {
-        Status::Open => "open",
-        Status::Closed => "closed",
+        Tier::Free => "free",
+        Tier::Paid => "paid",
     }
 }
 
-pub fn weight(e: &Status) -> u32 {
+pub fn quota(e: &Tier) -> u32 {
     match e {
-        Status::Open => 1,
-        Status::Closed => 2,
+        Tier::Free => 1,
+        Tier::Paid => 2,
     }
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn weight_of_open() {
-    assert_eq!(fixture::weight(&fixture::Status::Open), 1);
+fn quota_of_free() {
+    assert_eq!(fixture::quota(&fixture::Tier::Free), 1);
 }
 """

@@ -7,7 +7,9 @@
 //! with it, as a hard merge conflict or as a verification failure after a
 //! clean rebase (a semantic conflict, spec §6.5). A case may carry a known
 //! `resolution` that meets both intents (the scripted harness uses it) and
-//! a `script`: what the scripted harness does on each replay attempt.
+//! a `script`: what the scripted harness does on each replay attempt. A
+//! contradiction may carry `workarounds`: honest attempts at meeting both
+//! intents, each of which fails a protected acceptance test.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,9 +40,23 @@ pub struct Case {
     /// Files that meet both intents on top of the first task's result, for
     /// the scripted harness. Absent for ambiguous cases.
     pub resolution: Option<BTreeMap<String, String>>,
-    /// What the scripted harness does on each attempt, in order: `resolve`,
-    /// `wrong`, `give_up`, `sleep`, or `over_budget` ([`Step`]).
+    /// What the scripted harness does on each attempt, in order ([`Step`]).
     pub script: Vec<Step>,
+    /// For a contradiction: honest attempts at meeting both intents, in the
+    /// order `workaround` steps play them. Each fails a protected
+    /// acceptance test (the generator's tests check this with cargo).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workarounds: Vec<Workaround>,
+}
+
+/// An honest attempt at meeting two contradicting intents.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Workaround {
+    /// What it tries, in words.
+    pub summary: String,
+    /// Files it writes on top of the first task's result, by path.
+    pub files: BTreeMap<String, String>,
 }
 
 /// One agent task.
@@ -104,6 +120,9 @@ pub enum Step {
     /// Write the resolution but weaken the second task's own acceptance
     /// test, the one it is replaying (also tampered, ADR 0034).
     TamperOwn,
+    /// Write the case's next workaround: an honest attempt that fails a
+    /// protected test, so the replay conflicts (and is not tampering).
+    Workaround,
 }
 
 impl Case {
@@ -131,7 +150,34 @@ impl Case {
         if self.ambiguous && self.script.contains(&Step::Resolve) {
             bail!("{}: an ambiguous case cannot be resolved", self.id);
         }
+        if !self.workarounds.is_empty() && !self.ambiguous {
+            bail!("{}: workarounds are for contradictions", self.id);
+        }
+        let played = self
+            .script
+            .iter()
+            .filter(|s| **s == Step::Workaround)
+            .count();
+        if played > self.workarounds.len() {
+            bail!(
+                "{}: {played} workaround steps, {} workarounds",
+                self.id,
+                self.workarounds.len()
+            );
+        }
         Ok(())
+    }
+
+    /// The workaround a `workaround` step on attempt `attempt` (from 1)
+    /// plays: the next one after those earlier steps played.
+    pub fn workaround(&self, attempt: usize) -> Option<&Workaround> {
+        let earlier = self
+            .script
+            .iter()
+            .take(attempt.saturating_sub(1))
+            .filter(|s| **s == Step::Workaround)
+            .count();
+        self.workarounds.get(earlier)
     }
 
     /// Whether the scripted harness should resolve it with

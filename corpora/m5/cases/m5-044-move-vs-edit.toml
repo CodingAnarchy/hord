@@ -2,7 +2,7 @@ id = "m5-044"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: move-vs-edit #6 (parse_score into scores)"
+made_by = "hord-eval-m5 generate v4: move-vs-edit #11 (parse_limit into limits)"
 script = [
     "give_up",
     "give_up",
@@ -21,70 +21,70 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn parse_score(s: &str) -> Option<u32> {
+pub fn parse_limit(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "move parse_score into module scores"
-body = "Move parse_score into a new public module `scores`, re-exported at the crate root."
-test = "parse_score_lives_in_scores"
+summary = "move parse_limit into module limits"
+body = "Move parse_limit into a new public module `limits`, re-exported at the crate root."
+test = "parse_limit_lives_in_limits"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn parse_score_lives_in_scores() {
-    assert_eq!(fixture::scores::parse_score("7"), Some(7));
+fn parse_limit_lives_in_limits() {
+    assert_eq!(fixture::limits::parse_limit("7"), Some(7));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub mod scores;
+pub mod limits;
 
-pub use scores::parse_score;
+pub use limits::parse_limit;
 """
-"src/scores.rs" = """
-pub fn parse_score(s: &str) -> Option<u32> {
+"src/limits.rs" = """
+pub fn parse_limit(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "parse_score ignores surrounding whitespace"
-body = "parse_score rejects input with spaces around the number. Trim it first."
-test = "parse_score_trims"
+summary = "parse_limit ignores surrounding whitespace"
+body = "parse_limit rejects input with spaces around the number. Trim it first."
+test = "parse_limit_trims"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn parse_score_trims() {
-    assert_eq!(fixture::parse_score(" 7 "), Some(7));
+fn parse_limit_trims() {
+    assert_eq!(fixture::parse_limit(" 7 "), Some(7));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn parse_score(s: &str) -> Option<u32> {
+pub fn parse_limit(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub mod scores;
+pub mod limits;
 
-pub use scores::parse_score;
+pub use limits::parse_limit;
 """
-"src/scores.rs" = """
-pub fn parse_score(s: &str) -> Option<u32> {
+"src/limits.rs" = """
+pub fn parse_limit(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn parse_score_trims() {
-    assert_eq!(fixture::parse_score(" 7 "), Some(7));
+fn parse_limit_trims() {
+    assert_eq!(fixture::parse_limit(" 7 "), Some(7));
 }
 """

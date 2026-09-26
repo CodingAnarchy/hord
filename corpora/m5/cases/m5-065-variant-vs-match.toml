@@ -2,7 +2,7 @@ id = "m5-065"
 kind = "variant-vs-match"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: variant-vs-match #2 (Color::Red/warmth)"
+made_by = "hord-eval-m5 generate v4: variant-vs-match #10 (Flavor::Sour/strength)"
 script = ["resolve"]
 
 [base]
@@ -18,101 +18,101 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub enum Color {
-    Green,
+pub enum Flavor {
+    Sweet,
 }
 
-pub fn label(e: &Color) -> &'static str {
+pub fn label(e: &Flavor) -> &'static str {
     match e {
-        Color::Green => "green",
+        Flavor::Sweet => "sweet",
     }
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "add Color::Red, labelled red"
-body = 'Color needs a Red case. Its label is "red".'
-test = "red_is_labelled"
+summary = "add Flavor::Sour, labelled sour"
+body = 'Flavor needs a Sour case. Its label is "sour".'
+test = "sour_is_labelled"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn red_is_labelled() {
-    assert_eq!(fixture::label(&fixture::Color::Red), "red");
+fn sour_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Flavor::Sour), "sour");
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub enum Color {
-    Green,
-    Red,
+pub enum Flavor {
+    Sweet,
+    Sour,
 }
 
-pub fn label(e: &Color) -> &'static str {
+pub fn label(e: &Flavor) -> &'static str {
     match e {
-        Color::Green => "green",
-        Color::Red => "red",
+        Flavor::Sweet => "sweet",
+        Flavor::Sour => "sour",
     }
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add warmth, a number for each Color"
-body = "Add warmth(e), which is 1 for Green."
-test = "warmth_of_green"
+summary = "add strength, a number for each Flavor"
+body = "Add strength(e), which is 1 for Sweet."
+test = "strength_of_sweet"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn warmth_of_green() {
-    assert_eq!(fixture::warmth(&fixture::Color::Green), 1);
+fn strength_of_sweet() {
+    assert_eq!(fixture::strength(&fixture::Flavor::Sweet), 1);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub enum Color {
-    Green,
+pub enum Flavor {
+    Sweet,
 }
 
-pub fn label(e: &Color) -> &'static str {
+pub fn label(e: &Flavor) -> &'static str {
     match e {
-        Color::Green => "green",
+        Flavor::Sweet => "sweet",
     }
 }
 
-pub fn warmth(e: &Color) -> u32 {
+pub fn strength(e: &Flavor) -> u32 {
     match e {
-        Color::Green => 1,
+        Flavor::Sweet => 1,
     }
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub enum Color {
-    Green,
-    Red,
+pub enum Flavor {
+    Sweet,
+    Sour,
 }
 
-pub fn label(e: &Color) -> &'static str {
+pub fn label(e: &Flavor) -> &'static str {
     match e {
-        Color::Green => "green",
-        Color::Red => "red",
+        Flavor::Sweet => "sweet",
+        Flavor::Sour => "sour",
     }
 }
 
-pub fn warmth(e: &Color) -> u32 {
+pub fn strength(e: &Flavor) -> u32 {
     match e {
-        Color::Green => 1,
-        Color::Red => 2,
+        Flavor::Sweet => 1,
+        Flavor::Sour => 2,
     }
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn warmth_of_green() {
-    assert_eq!(fixture::warmth(&fixture::Color::Green), 1);
+fn strength_of_sweet() {
+    assert_eq!(fixture::strength(&fixture::Flavor::Sweet), 1);
 }
 """

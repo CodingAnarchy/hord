@@ -2,7 +2,7 @@ id = "m5-032"
 kind = "rename-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: rename-vs-caller #6 (combine->sum_parts/combine_twice)"
+made_by = "hord-eval-m5 generate v4: rename-vs-caller #10 (fold_sum->sum_folded/fold_twice)"
 script = [
     "wrong",
     "resolve",
@@ -21,68 +21,68 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn combine(xs: &[i32]) -> i32 {
+pub fn fold_sum(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "rename combine to sum_parts"
-body = "combine is a vague name. Rename it to sum_parts; its behavior stays the same."
-test = "sum_parts_sums"
+summary = "rename fold_sum to sum_folded"
+body = "fold_sum is a vague name. Rename it to sum_folded; its behavior stays the same."
+test = "sum_folded_sums"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn sum_parts_sums() {
-    assert_eq!(fixture::sum_parts(&[1, 2, 3]), 6);
+fn sum_folded_sums() {
+    assert_eq!(fixture::sum_folded(&[1, 2, 3]), 6);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn sum_parts(xs: &[i32]) -> i32 {
+pub fn sum_folded(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add combine_twice: twice the combine"
-body = "Add combine_twice(xs), twice the sum that combine computes."
-test = "combine_twice_doubles"
+summary = "add fold_twice: twice the fold_sum"
+body = "Add fold_twice(xs), twice the sum that fold_sum computes."
+test = "fold_twice_doubles"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn combine_twice_doubles() {
-    assert_eq!(fixture::combine_twice(&[1, 2]), 6);
+fn fold_twice_doubles() {
+    assert_eq!(fixture::fold_twice(&[1, 2]), 6);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn combine(xs: &[i32]) -> i32 {
+pub fn fold_sum(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 
-pub fn combine_twice(xs: &[i32]) -> i32 {
-    combine(xs) * 2
+pub fn fold_twice(xs: &[i32]) -> i32 {
+    fold_sum(xs) * 2
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn sum_parts(xs: &[i32]) -> i32 {
+pub fn sum_folded(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 
-pub fn combine_twice(xs: &[i32]) -> i32 {
-    sum_parts(xs) * 2
+pub fn fold_twice(xs: &[i32]) -> i32 {
+    sum_folded(xs) * 2
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn combine_twice_doubles() {
-    assert_eq!(fixture::combine_twice(&[1, 2]), 6);
+fn fold_twice_doubles() {
+    assert_eq!(fixture::fold_twice(&[1, 2]), 6);
 }
 """

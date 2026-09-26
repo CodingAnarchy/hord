@@ -2,7 +2,7 @@ id = "m5-040"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: move-vs-edit #2 (parse_port into net)"
+made_by = "hord-eval-m5 generate v4: move-vs-edit #7 (parse_size into sizes)"
 script = ["resolve"]
 
 [base]
@@ -18,70 +18,70 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn parse_port(s: &str) -> Option<u32> {
+pub fn parse_size(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "move parse_port into module net"
-body = "Move parse_port into a new public module `net`, re-exported at the crate root."
-test = "parse_port_lives_in_net"
+summary = "move parse_size into module sizes"
+body = "Move parse_size into a new public module `sizes`, re-exported at the crate root."
+test = "parse_size_lives_in_sizes"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn parse_port_lives_in_net() {
-    assert_eq!(fixture::net::parse_port("7"), Some(7));
+fn parse_size_lives_in_sizes() {
+    assert_eq!(fixture::sizes::parse_size("7"), Some(7));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub mod net;
+pub mod sizes;
 
-pub use net::parse_port;
+pub use sizes::parse_size;
 """
-"src/net.rs" = """
-pub fn parse_port(s: &str) -> Option<u32> {
+"src/sizes.rs" = """
+pub fn parse_size(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "parse_port ignores surrounding whitespace"
-body = "parse_port rejects input with spaces around the number. Trim it first."
-test = "parse_port_trims"
+summary = "parse_size ignores surrounding whitespace"
+body = "parse_size rejects input with spaces around the number. Trim it first."
+test = "parse_size_trims"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn parse_port_trims() {
-    assert_eq!(fixture::parse_port(" 7 "), Some(7));
+fn parse_size_trims() {
+    assert_eq!(fixture::parse_size(" 7 "), Some(7));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn parse_port(s: &str) -> Option<u32> {
+pub fn parse_size(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub mod net;
+pub mod sizes;
 
-pub use net::parse_port;
+pub use sizes::parse_size;
 """
-"src/net.rs" = """
-pub fn parse_port(s: &str) -> Option<u32> {
+"src/sizes.rs" = """
+pub fn parse_size(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn parse_port_trims() {
-    assert_eq!(fixture::parse_port(" 7 "), Some(7));
+fn parse_size_trims() {
+    assert_eq!(fixture::parse_size(" 7 "), Some(7));
 }
 """

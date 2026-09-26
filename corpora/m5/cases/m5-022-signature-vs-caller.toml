@@ -2,7 +2,7 @@ id = "m5-022"
 kind = "signature-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: signature-vs-caller #9 (area/area_with_border)"
+made_by = "hord-eval-m5 generate v4: signature-vs-caller #11 (power/power_offset)"
 script = [
     "give_up",
     "give_up",
@@ -21,84 +21,84 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn area(x: u32) -> u32 {
+pub fn power(x: u32) -> u32 {
     x * 2
 }
 
-pub fn area_twice(x: u32) -> u32 {
-    area(area(x))
+pub fn power_twice(x: u32) -> u32 {
+    power(power(x))
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "area takes its factor as a parameter"
-body = "area always doubles. Callers need other factors: add a `factor` parameter and keep area_twice doubling twice."
-test = "area_takes_a_factor"
+summary = "power takes its factor as a parameter"
+body = "power always doubles. Callers need other factors: add a `factor` parameter and keep power_twice doubling twice."
+test = "power_takes_a_factor"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn area_takes_a_factor() {
-    assert_eq!(fixture::area(3, 11), 33);
+fn power_takes_a_factor() {
+    assert_eq!(fixture::power(3, 13), 39);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn area(x: u32, factor: u32) -> u32 {
+pub fn power(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn area_twice(x: u32) -> u32 {
-    area(area(x, 2), 2)
+pub fn power_twice(x: u32) -> u32 {
+    power(power(x, 2), 2)
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add area_with_border: area plus one"
-body = "Add area_with_border(x), which is area(x) plus one."
-test = "area_with_border_is_one_more"
+summary = "add power_offset: power plus one"
+body = "Add power_offset(x), which is power(x) plus one."
+test = "power_offset_is_one_more"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn area_with_border_is_one_more() {
-    assert_eq!(fixture::area_with_border(4), 9);
+fn power_offset_is_one_more() {
+    assert_eq!(fixture::power_offset(4), 9);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn area(x: u32) -> u32 {
+pub fn power(x: u32) -> u32 {
     x * 2
 }
 
-pub fn area_twice(x: u32) -> u32 {
-    area(area(x))
+pub fn power_twice(x: u32) -> u32 {
+    power(power(x))
 }
 
-pub fn area_with_border(x: u32) -> u32 {
-    area(x) + 1
+pub fn power_offset(x: u32) -> u32 {
+    power(x) + 1
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn area(x: u32, factor: u32) -> u32 {
+pub fn power(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn area_twice(x: u32) -> u32 {
-    area(area(x, 2), 2)
+pub fn power_twice(x: u32) -> u32 {
+    power(power(x, 2), 2)
 }
 
-pub fn area_with_border(x: u32) -> u32 {
-    area(x, 2) + 1
+pub fn power_offset(x: u32) -> u32 {
+    power(x, 2) + 1
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn area_with_border_is_one_more() {
-    assert_eq!(fixture::area_with_border(4), 9);
+fn power_offset_is_one_more() {
+    assert_eq!(fixture::power_offset(4), 9);
 }
 """

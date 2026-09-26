@@ -2,7 +2,7 @@ id = "m5-021"
 kind = "signature-vs-caller"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: signature-vs-caller #8 (cost/cost_with_tax)"
+made_by = "hord-eval-m5 generate v4: signature-vs-caller #10 (speed/speed_boosted)"
 script = ["resolve"]
 
 [base]
@@ -18,84 +18,84 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn cost(x: u32) -> u32 {
+pub fn speed(x: u32) -> u32 {
     x * 2
 }
 
-pub fn cost_twice(x: u32) -> u32 {
-    cost(cost(x))
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x))
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "cost takes its factor as a parameter"
-body = "cost always doubles. Callers need other factors: add a `factor` parameter and keep cost_twice doubling twice."
-test = "cost_takes_a_factor"
+summary = "speed takes its factor as a parameter"
+body = "speed always doubles. Callers need other factors: add a `factor` parameter and keep speed_twice doubling twice."
+test = "speed_takes_a_factor"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn cost_takes_a_factor() {
-    assert_eq!(fixture::cost(3, 10), 30);
+fn speed_takes_a_factor() {
+    assert_eq!(fixture::speed(3, 12), 36);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn cost(x: u32, factor: u32) -> u32 {
+pub fn speed(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn cost_twice(x: u32) -> u32 {
-    cost(cost(x, 2), 2)
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x, 2), 2)
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add cost_with_tax: cost plus one"
-body = "Add cost_with_tax(x), which is cost(x) plus one."
-test = "cost_with_tax_is_one_more"
+summary = "add speed_boosted: speed plus one"
+body = "Add speed_boosted(x), which is speed(x) plus one."
+test = "speed_boosted_is_one_more"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn cost_with_tax_is_one_more() {
-    assert_eq!(fixture::cost_with_tax(4), 9);
+fn speed_boosted_is_one_more() {
+    assert_eq!(fixture::speed_boosted(4), 9);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn cost(x: u32) -> u32 {
+pub fn speed(x: u32) -> u32 {
     x * 2
 }
 
-pub fn cost_twice(x: u32) -> u32 {
-    cost(cost(x))
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x))
 }
 
-pub fn cost_with_tax(x: u32) -> u32 {
-    cost(x) + 1
+pub fn speed_boosted(x: u32) -> u32 {
+    speed(x) + 1
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub fn cost(x: u32, factor: u32) -> u32 {
+pub fn speed(x: u32, factor: u32) -> u32 {
     x * factor
 }
 
-pub fn cost_twice(x: u32) -> u32 {
-    cost(cost(x, 2), 2)
+pub fn speed_twice(x: u32) -> u32 {
+    speed(speed(x, 2), 2)
 }
 
-pub fn cost_with_tax(x: u32) -> u32 {
-    cost(x, 2) + 1
+pub fn speed_boosted(x: u32) -> u32 {
+    speed(x, 2) + 1
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn cost_with_tax_is_one_more() {
-    assert_eq!(fixture::cost_with_tax(4), 9);
+fn speed_boosted_is_one_more() {
+    assert_eq!(fixture::speed_boosted(4), 9);
 }
 """

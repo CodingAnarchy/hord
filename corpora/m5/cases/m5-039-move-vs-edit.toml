@@ -2,7 +2,7 @@ id = "m5-039"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: move-vs-edit #1 (parse_id into ids)"
+made_by = "hord-eval-m5 generate v4: move-vs-edit #6 (parse_score into scores)"
 script = [
     "over_budget",
     "resolve",
@@ -21,70 +21,70 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn parse_id(s: &str) -> Option<u32> {
+pub fn parse_score(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "move parse_id into module ids"
-body = "Move parse_id into a new public module `ids`, re-exported at the crate root."
-test = "parse_id_lives_in_ids"
+summary = "move parse_score into module scores"
+body = "Move parse_score into a new public module `scores`, re-exported at the crate root."
+test = "parse_score_lives_in_scores"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn parse_id_lives_in_ids() {
-    assert_eq!(fixture::ids::parse_id("7"), Some(7));
+fn parse_score_lives_in_scores() {
+    assert_eq!(fixture::scores::parse_score("7"), Some(7));
 }
 """
 
 [tasks.files]
-"src/ids.rs" = """
-pub fn parse_id(s: &str) -> Option<u32> {
+"src/lib.rs" = """
+pub mod scores;
+
+pub use scores::parse_score;
+"""
+"src/scores.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
     s.parse().ok()
 }
-"""
-"src/lib.rs" = """
-pub mod ids;
-
-pub use ids::parse_id;
 """
 
 [[tasks]]
 name = "b"
-summary = "parse_id ignores surrounding whitespace"
-body = "parse_id rejects input with spaces around the number. Trim it first."
-test = "parse_id_trims"
+summary = "parse_score ignores surrounding whitespace"
+body = "parse_score rejects input with spaces around the number. Trim it first."
+test = "parse_score_trims"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn parse_id_trims() {
-    assert_eq!(fixture::parse_id(" 7 "), Some(7));
+fn parse_score_trims() {
+    assert_eq!(fixture::parse_score(" 7 "), Some(7));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn parse_id(s: &str) -> Option<u32> {
+pub fn parse_score(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 
 [resolution]
-"src/ids.rs" = """
-pub fn parse_id(s: &str) -> Option<u32> {
+"src/lib.rs" = """
+pub mod scores;
+
+pub use scores::parse_score;
+"""
+"src/scores.rs" = """
+pub fn parse_score(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
-"src/lib.rs" = """
-pub mod ids;
-
-pub use ids::parse_id;
-"""
 "tests/m5_b.rs" = """
 #[test]
-fn parse_id_trims() {
-    assert_eq!(fixture::parse_id(" 7 "), Some(7));
+fn parse_score_trims() {
+    assert_eq!(fixture::parse_score(" 7 "), Some(7));
 }
 """

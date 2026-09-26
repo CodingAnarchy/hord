@@ -1,0 +1,208 @@
+id = "m5-095"
+kind = "indirect-contradiction"
+conflict = "semantic"
+ambiguous = true
+made_by = "hord-eval-m5 generate v4: indirect-contradiction #7 (shared default: DEFAULT_TIMEOUT_SECS 30 to 60)"
+script = [
+    "workaround",
+    "workaround",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+/// How long a request may take, in seconds, unless the caller says otherwise.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+pub struct Client {
+    timeout_secs: u64,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Client {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "raise the default client timeout to 60 s"
+body = "Report exports routinely take 40 seconds and time out at the 30-second default. Raise the default timeout of Client::new to 60 seconds."
+test = "default_timeout_is_60s"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn default_timeout_is_60s() {
+    assert_eq!(fixture::Client::new().timeout_secs(), 60);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// How long a request may take, in seconds, unless the caller says otherwise.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+pub struct Client {
+    timeout_secs: u64,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Client {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add retry_deadline_secs: when a failing request gives up"
+body = "The status page promises customers that a failing request gives up within 90 seconds. Add retry_deadline_secs(): we try three times, each at the default client's timeout, so it is 3 × Client::new().timeout_secs(). The test pins the promise and how it is computed, so the two cannot drift apart."
+test = "retries_give_up_within_90s"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn retries_give_up_within_90s() {
+    assert_eq!(fixture::retry_deadline_secs(), 90);
+    assert_eq!(fixture::retry_deadline_secs(), 3 * fixture::Client::new().timeout_secs());
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+/// How long a request may take, in seconds, unless the caller says otherwise.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+pub struct Client {
+    timeout_secs: u64,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Client {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+}
+
+/// When a failing request gives up, in seconds: three tries at the default timeout.
+pub fn retry_deadline_secs() -> u64 {
+    3 * Client::new().timeout_secs()
+}
+"""
+
+[[workarounds]]
+summary = "keep the default at 30"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// How long a request may take, in seconds, unless the caller says otherwise.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+pub struct Client {
+    timeout_secs: u64,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Client {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+}
+
+/// When a failing request gives up, in seconds: three tries at the default timeout.
+pub fn retry_deadline_secs() -> u64 {
+    3 * Client::new().timeout_secs()
+}
+"""
+
+[[workarounds]]
+summary = "retry_deadline_secs returns the promised 90 outright"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// How long a request may take, in seconds, unless the caller says otherwise.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+pub struct Client {
+    timeout_secs: u64,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Client {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+}
+
+/// When a failing request gives up, in seconds: three tries at the default timeout.
+pub fn retry_deadline_secs() -> u64 {
+    90
+}
+"""
+
+[[workarounds]]
+summary = "retry_deadline_secs follows the new default"
+
+[workarounds.files]
+"src/lib.rs" = """
+/// How long a request may take, in seconds, unless the caller says otherwise.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+pub struct Client {
+    timeout_secs: u64,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Client {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+}
+
+/// When a failing request gives up, in seconds: three tries at the default timeout.
+pub fn retry_deadline_secs() -> u64 {
+    3 * Client::new().timeout_secs()
+}
+"""

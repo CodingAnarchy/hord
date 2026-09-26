@@ -2,7 +2,7 @@ id = "m5-011"
 kind = "same-tokens"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: same-tokens #11 (grow x12)"
+made_by = "hord-eval-m5 generate v4: same-tokens #11 (grow x12)"
 script = [
     "give_up",
     "give_up",

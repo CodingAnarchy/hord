@@ -2,7 +2,7 @@ id = "m5-043"
 kind = "move-vs-edit"
 conflict = "hard"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: move-vs-edit #5 (parse_level into levels)"
+made_by = "hord-eval-m5 generate v4: move-vs-edit #10 (parse_code into codes)"
 script = ["resolve"]
 
 [base]
@@ -18,70 +18,70 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub fn parse_level(s: &str) -> Option<u32> {
+pub fn parse_code(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "move parse_level into module levels"
-body = "Move parse_level into a new public module `levels`, re-exported at the crate root."
-test = "parse_level_lives_in_levels"
+summary = "move parse_code into module codes"
+body = "Move parse_code into a new public module `codes`, re-exported at the crate root."
+test = "parse_code_lives_in_codes"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn parse_level_lives_in_levels() {
-    assert_eq!(fixture::levels::parse_level("7"), Some(7));
+fn parse_code_lives_in_codes() {
+    assert_eq!(fixture::codes::parse_code("7"), Some(7));
 }
 """
 
 [tasks.files]
-"src/levels.rs" = """
-pub fn parse_level(s: &str) -> Option<u32> {
+"src/codes.rs" = """
+pub fn parse_code(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 """
 "src/lib.rs" = """
-pub mod levels;
+pub mod codes;
 
-pub use levels::parse_level;
+pub use codes::parse_code;
 """
 
 [[tasks]]
 name = "b"
-summary = "parse_level ignores surrounding whitespace"
-body = "parse_level rejects input with spaces around the number. Trim it first."
-test = "parse_level_trims"
+summary = "parse_code ignores surrounding whitespace"
+body = "parse_code rejects input with spaces around the number. Trim it first."
+test = "parse_code_trims"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn parse_level_trims() {
-    assert_eq!(fixture::parse_level(" 7 "), Some(7));
+fn parse_code_trims() {
+    assert_eq!(fixture::parse_code(" 7 "), Some(7));
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub fn parse_level(s: &str) -> Option<u32> {
+pub fn parse_code(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 
 [resolution]
-"src/levels.rs" = """
-pub fn parse_level(s: &str) -> Option<u32> {
+"src/codes.rs" = """
+pub fn parse_code(s: &str) -> Option<u32> {
     s.trim().parse().ok()
 }
 """
 "src/lib.rs" = """
-pub mod levels;
+pub mod codes;
 
-pub use levels::parse_level;
+pub use codes::parse_code;
 """
 "tests/m5_b.rs" = """
 #[test]
-fn parse_level_trims() {
-    assert_eq!(fixture::parse_level(" 7 "), Some(7));
+fn parse_code_trims() {
+    assert_eq!(fixture::parse_code(" 7 "), Some(7));
 }
 """

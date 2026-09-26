@@ -207,13 +207,15 @@ jobs:
       - name: Build hord, the reference harness, and the runner
         run: cargo build --release -p hord-cli -p hord-replay-ref -p hord-eval-m5
 
-      # 100 intent-bearing conflict cases through the escalation ladder,
+      # 100 intent-bearing conflict cases (76 resolvable, 24
+      # contradictions, 12 of them indirect) through the escalation ladder,
       # with hord-replay-ref running the deterministic scripted harness.
       # Gates correctness only: every case collides as designed, no attempt
       # runs past its budget unkilled and no over-budget result is
-      # accepted, every parked case is resolved from the web workbench (a
-      # signed Arbitrate the UI sends), and each case is graded as its
-      # script predicts. The 60%
+      # accepted, no replay lands on a contradiction (gamed), no honest
+      # workaround is taken for tampering, every parked case is resolved
+      # from the web workbench (a signed Arbitrate the UI sends), and each
+      # case is graded as its script predicts. The 60%
       # resolved-by-replay target needs a model and is reported, not gated.
       - name: M5 conflict corpus (scripted harness)
         run: target/release/hord-eval-m5 run --jobs 4 --out target/m5-eval

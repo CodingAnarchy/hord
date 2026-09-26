@@ -79,6 +79,14 @@ pub fn run(case_path: &Path) -> Result<()> {
             write_files(&case.second().writes())?;
             report_usage(TOKENS)
         }
+        Step::Workaround => {
+            let workaround = case
+                .workaround(attempt)
+                .with_context(|| format!("{} has no workaround for attempt {attempt}", case.id))?;
+            write_files(&case.second().writes())?;
+            write_files(&workaround.files)?;
+            report_usage(TOKENS)
+        }
         Step::Sleep => {
             std::thread::sleep(SLEEP);
             bail!("slept through the budget without being killed")

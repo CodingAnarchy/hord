@@ -1,0 +1,114 @@
+id = "m5-050"
+kind = "field-vs-literal"
+conflict = "semantic"
+ambiguous = false
+made_by = "hord-eval-m5 generate v4: field-vs-literal #6 (Invoice.discount/draft_invoice)"
+script = [
+    "wrong",
+    "resolve",
+]
+
+[base]
+".gitignore" = """
+target/
+"""
+"Cargo.toml" = """
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+"""
+"src/lib.rs" = """
+pub struct Invoice {
+    pub name: String,
+}
+
+impl Invoice {
+    pub fn new(name: &str) -> Self {
+        Invoice { name: name.into() }
+    }
+}
+"""
+
+[[tasks]]
+name = "a"
+summary = "Invoice gets a discount field, 30 by default"
+body = "Add `discount: u32` to Invoice. Invoice::new sets it to 30."
+test = "invoice_discount_defaults"
+test_path = "tests/m5_a.rs"
+test_source = """
+#[test]
+fn invoice_discount_defaults() {
+    assert_eq!(fixture::Invoice::new("x").discount, 30);
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Invoice {
+    pub name: String,
+    pub discount: u32,
+}
+
+impl Invoice {
+    pub fn new(name: &str) -> Self {
+        Invoice { name: name.into(), discount: 30 }
+    }
+}
+"""
+
+[[tasks]]
+name = "b"
+summary = "add draft_invoice, a Invoice named draft_invoice"
+body = 'Add draft_invoice(), which builds a Invoice named "draft_invoice".'
+test = "draft_invoice_is_named"
+test_path = "tests/m5_b.rs"
+test_source = """
+#[test]
+fn draft_invoice_is_named() {
+    assert_eq!(fixture::draft_invoice().name, "draft_invoice");
+}
+"""
+
+[tasks.files]
+"src/lib.rs" = """
+pub struct Invoice {
+    pub name: String,
+}
+
+impl Invoice {
+    pub fn new(name: &str) -> Self {
+        Invoice { name: name.into() }
+    }
+}
+
+pub fn draft_invoice() -> Invoice {
+    Invoice { name: "draft_invoice".into() }
+}
+"""
+
+[resolution]
+"src/lib.rs" = """
+pub struct Invoice {
+    pub name: String,
+    pub discount: u32,
+}
+
+impl Invoice {
+    pub fn new(name: &str) -> Self {
+        Invoice { name: name.into(), discount: 30 }
+    }
+}
+
+pub fn draft_invoice() -> Invoice {
+    Invoice { name: "draft_invoice".into(), discount: 30 }
+}
+"""
+"tests/m5_b.rs" = """
+#[test]
+fn draft_invoice_is_named() {
+    assert_eq!(fixture::draft_invoice().name, "draft_invoice");
+}
+"""

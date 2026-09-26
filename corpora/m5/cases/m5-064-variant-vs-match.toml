@@ -2,7 +2,7 @@ id = "m5-064"
 kind = "variant-vs-match"
 conflict = "semantic"
 ambiguous = false
-made_by = "hord-eval-m5 generate v3: variant-vs-match #1 (Shape::Square/sides)"
+made_by = "hord-eval-m5 generate v4: variant-vs-match #9 (Tone::Loud/volume)"
 script = [
     "tamper",
     "resolve",
@@ -21,101 +21,101 @@ edition = "2024"
 [workspace]
 """
 "src/lib.rs" = """
-pub enum Shape {
-    Circle,
+pub enum Tone {
+    Soft,
 }
 
-pub fn label(e: &Shape) -> &'static str {
+pub fn label(e: &Tone) -> &'static str {
     match e {
-        Shape::Circle => "circle",
+        Tone::Soft => "soft",
     }
 }
 """
 
 [[tasks]]
 name = "a"
-summary = "add Shape::Square, labelled square"
-body = 'Shape needs a Square case. Its label is "square".'
-test = "square_is_labelled"
+summary = "add Tone::Loud, labelled loud"
+body = 'Tone needs a Loud case. Its label is "loud".'
+test = "loud_is_labelled"
 test_path = "tests/m5_a.rs"
 test_source = """
 #[test]
-fn square_is_labelled() {
-    assert_eq!(fixture::label(&fixture::Shape::Square), "square");
+fn loud_is_labelled() {
+    assert_eq!(fixture::label(&fixture::Tone::Loud), "loud");
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub enum Shape {
-    Circle,
-    Square,
+pub enum Tone {
+    Soft,
+    Loud,
 }
 
-pub fn label(e: &Shape) -> &'static str {
+pub fn label(e: &Tone) -> &'static str {
     match e {
-        Shape::Circle => "circle",
-        Shape::Square => "square",
+        Tone::Soft => "soft",
+        Tone::Loud => "loud",
     }
 }
 """
 
 [[tasks]]
 name = "b"
-summary = "add sides, a number for each Shape"
-body = "Add sides(e), which is 1 for Circle."
-test = "sides_of_circle"
+summary = "add volume, a number for each Tone"
+body = "Add volume(e), which is 1 for Soft."
+test = "volume_of_soft"
 test_path = "tests/m5_b.rs"
 test_source = """
 #[test]
-fn sides_of_circle() {
-    assert_eq!(fixture::sides(&fixture::Shape::Circle), 1);
+fn volume_of_soft() {
+    assert_eq!(fixture::volume(&fixture::Tone::Soft), 1);
 }
 """
 
 [tasks.files]
 "src/lib.rs" = """
-pub enum Shape {
-    Circle,
+pub enum Tone {
+    Soft,
 }
 
-pub fn label(e: &Shape) -> &'static str {
+pub fn label(e: &Tone) -> &'static str {
     match e {
-        Shape::Circle => "circle",
+        Tone::Soft => "soft",
     }
 }
 
-pub fn sides(e: &Shape) -> u32 {
+pub fn volume(e: &Tone) -> u32 {
     match e {
-        Shape::Circle => 1,
+        Tone::Soft => 1,
     }
 }
 """
 
 [resolution]
 "src/lib.rs" = """
-pub enum Shape {
-    Circle,
-    Square,
+pub enum Tone {
+    Soft,
+    Loud,
 }
 
-pub fn label(e: &Shape) -> &'static str {
+pub fn label(e: &Tone) -> &'static str {
     match e {
-        Shape::Circle => "circle",
-        Shape::Square => "square",
+        Tone::Soft => "soft",
+        Tone::Loud => "loud",
     }
 }
 
-pub fn sides(e: &Shape) -> u32 {
+pub fn volume(e: &Tone) -> u32 {
     match e {
-        Shape::Circle => 1,
-        Shape::Square => 2,
+        Tone::Soft => 1,
+        Tone::Loud => 2,
     }
 }
 """
 "tests/m5_b.rs" = """
 #[test]
-fn sides_of_circle() {
-    assert_eq!(fixture::sides(&fixture::Shape::Circle), 1);
+fn volume_of_soft() {
+    assert_eq!(fixture::volume(&fixture::Tone::Soft), 1);
 }
 """

@@ -154,6 +154,20 @@ fn scripted_expectations(
         .iter()
         .position(|s| *s == Step::Resolve)
         .map_or(played.len(), |i| i + 1);
+    // An honest attempt (a workaround, a wrong replay, anything but a
+    // tampering step) must never be taken for tampering (ADR 0034 as
+    // amended: failing a protected test either way is a failure).
+    if !played.contains(&Step::Tamper)
+        && !played.contains(&Step::TamperOwn)
+        && let Some(a) = r.attempts.iter().find(|a| a.outcome == "tampered")
+    {
+        failures.push(format!(
+            "{}: honest attempt {} was taken for tampering: {}",
+            r.id,
+            a.attempt,
+            a.detail.as_deref().unwrap_or("")
+        ));
+    }
     for (step, outcome) in [
         (Step::Sleep, "killed"),
         (Step::OverBudget, "over_budget"),
