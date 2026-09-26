@@ -66,8 +66,8 @@ pub struct AuthConfig {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
-    /// `http://` URL to POST to. (`https` needs TLS, which M4 does not
-    /// ship.)
+    /// `http://` URL to POST to. (The webhook client does not speak TLS;
+    /// post to a local relay.)
     pub url: String,
     /// Event kinds to send, by their `Event` oneof field names in
     /// `hord.proto` (`landed`, `parked`, …); empty sends every kind.
@@ -109,7 +109,7 @@ impl ServerConfig {
         for hook in &config.webhooks {
             if !hook.url.starts_with("http://") {
                 return Err(bad(format!(
-                    "webhook {}: only http:// URLs are supported (no TLS in M4)",
+                    "webhook {}: only http:// URLs are supported (webhooks do not speak TLS)",
                     hook.url
                 )));
             }
