@@ -436,128 +436,12 @@ fn trace_steps(
         ..Default::default()
     });
     let escalation = submitted.queue.as_ref().and_then(|q| q.escalation.as_ref());
-    for envelope in &submitted.history {
-        let mut step = proto::TraceStep {
-            at_ms: envelope.at_ms,
-            cursor: Some(envelope.cursor),
-            ..Default::default()
-        };
-        match envelope.kind() {
-            Some(Kind::Submitted(s)) => {
-                step.stage = proto::TraceStage::Submitted.into();
-                step.text = format!(
-                    "submitted as #{} by {}",
-                    s.submission,
-                    actor_label(s.actor.as_ref())
-                );
-                step.change = Some(s.change.clone());
-            }
-            Some(Kind::ConflictCheck(c)) => {
-                step.stage = proto::TraceStage::Conflict.into();
-                let (outcome, words) = match c.result() {
-                    proto::ConflictOutcome::Clean => ("pass", "clean"),
-                    proto::ConflictOutcome::Overlap => ("pass", "overlap, rebased"),
-                    proto::ConflictOutcome::Hard => ("fail", "hard conflict"),
-                    proto::ConflictOutcome::Unspecified => ("skip", "checked"),
-                };
-                step.outcome = Some(outcome.into());
-                step.text = format!(
-                    "{words}: {} set conflicts, {} merge conflicts",
-                    c.set_conflicts, c.merge_conflicts
-                );
-            }
-            Some(Kind::Verifying(v)) => {
-                step.stage = proto::TraceStage::Verify.into();
-                step.change = Some(v.change.clone());
-                step.text = v.plan.as_ref().map_or_else(
-                    || "verification started".to_owned(),
-                    |p| {
-                        format!(
-                            "verifying: {} ({} selected tests, {} reused)",
-                            p.commands.join("; "),
-                            p.selected_tests,
-                            p.reused
-                        )
-                    },
-                );
-            }
-            // Evidence steps come from the evidence itself, below.
-            Some(Kind::EvidenceAttached(_) | Kind::HeadMoved(_) | Kind::BridgeChecked(_))
-            | None => continue,
-            Some(Kind::Replaying(r)) => {
-                step.stage = proto::TraceStage::Replay.into();
-                let attempt =
-                    escalation.and_then(|e| e.attempts.iter().find(|a| a.attempt == r.attempt));
-                step.text = match attempt {
-                    Some(a) => {
-                        let mut spent = vec![format!("{:.1}s", a.elapsed_ms as f64 / 1000.0)];
-                        if let Some(tokens) = a.tokens {
-                            spent.push(format!("{tokens} tokens"));
-                        }
-                        if let Some(micros) = a.cost_micros {
-                            spent.push(format!("${:.4}", micros as f64 / 1_000_000.0));
-                        }
-                        if let Some(model) = &a.model {
-                            spent.push(format!("model {model}"));
-                        }
-                        step.change = a.change.clone();
-                        step.outcome = match a.outcome() {
-                            proto::ReplayOutcome::Proposed => Some("pass".into()),
-                            proto::ReplayOutcome::Running | proto::ReplayOutcome::Unspecified => {
-                                None
-                            }
-                            _ => Some("fail".into()),
-                        };
-                        let note = a
-                            .note
-                            .as_ref()
-                            .map(|n| format!(", with the note \"{n}\""))
-                            .unwrap_or_default();
-                        format!(
-                            "replay #{} ({}{note}): {} [{}]",
-                            r.attempt,
-                            r.harness,
-                            attempt_outcome(a),
-                            spent.join(" · ")
-                        )
-                    }
-                    None => format!("replay #{} ({})", r.attempt, r.harness),
-                };
-            }
-            Some(Kind::Parked(p)) => {
-                step.stage = proto::TraceStage::Parked.into();
-                step.park = Some(p.reason);
-                step.outcome = Some("fail".into());
-                step.text = p.detail.clone();
-            }
-            Some(Kind::Arbitrated(a)) => {
-                step.stage = proto::TraceStage::Arbitrated.into();
-                step.actor = a.by.clone();
-                step.change = Some(a.result.clone());
-                step.text = format!(
-                    "{} resolved it as {} ({})",
-                    actor_label(a.by.as_ref()),
-                    short_id(&a.result),
-                    match (&a.key_id, &a.signature) {
-                        (Some(key), Some(_)) => format!("signed with {key}"),
-                        _ => "unsigned".to_owned(),
-                    }
-                );
-            }
-            Some(Kind::Landed(l)) => {
-                step.stage = proto::TraceStage::Landed.into();
-                step.outcome = Some("pass".into());
-                step.change = Some(l.change.clone());
-                step.text = format!("landed at #{} as {}", l.position, short_id(&l.change));
-            }
-            Some(Kind::Rejected(r)) => {
-                step.stage = proto::TraceStage::Rejected.into();
-                step.outcome = Some("fail".into());
-                step.text = r.reason.clone();
-            }
-        }
-        steps.push(step);
-    }
+    steps.extend(
+        submitted
+            .history
+            .iter()
+            .filter_map(|envelope| event_step(envelope, escalation)),
+    );
     // Each step, with whether it is evidence about the record it landed as.
     let mut steps: Vec<(proto::TraceStep, bool)> = steps.into_iter().map(|s| (s, false)).collect();
     let mut seen = BTreeSet::new();
@@ -574,38 +458,167 @@ fn trace_steps(
         if !seen.insert(ev.id.clone()) {
             continue;
         }
-        let review = matches!(
-            ev.kind.as_ref().and_then(|k| k.kind.as_ref()),
-            Some(proto::evidence_kind::Kind::Review(_))
-        );
-        let (class, result) = evidence_result_label(ev.result.as_ref());
-        steps.push((
-            proto::TraceStep {
-                at_ms: ev.produced_at_ms,
-                stage: if review {
-                    proto::TraceStage::Review
-                } else {
-                    proto::TraceStage::Evidence
-                }
-                .into(),
-                text: format!(
-                    "{}: {result} ({}, {})",
-                    evidence_kind_label(ev.kind.as_ref(), ev.qualifier.as_deref()),
-                    ev.command,
-                    ev.source
-                ),
-                outcome: Some(class.to_owned()),
-                actor: ev.produced_by.clone(),
-                ..Default::default()
-            },
-            of_landed,
-        ));
+        steps.push((evidence_step(ev), of_landed));
     }
     // Stable: equal times keep the order above (intent before proposal,
     // events in cursor order).
     steps.sort_by_key(|(s, _)| s.at_ms);
     decisions_first(&mut steps, &submitted.history);
     steps.into_iter().map(|(s, _)| s).collect()
+}
+
+/// The step for one event in a change's history, or `None` for an event
+/// the trace does not show.
+fn event_step(
+    envelope: &proto::EventEnvelope,
+    escalation: Option<&proto::Escalation>,
+) -> Option<proto::TraceStep> {
+    let mut step = proto::TraceStep {
+        at_ms: envelope.at_ms,
+        cursor: Some(envelope.cursor),
+        ..Default::default()
+    };
+    match envelope.kind() {
+        Some(Kind::Submitted(s)) => {
+            step.stage = proto::TraceStage::Submitted.into();
+            step.text = format!(
+                "submitted as #{} by {}",
+                s.submission,
+                actor_label(s.actor.as_ref())
+            );
+            step.change = Some(s.change.clone());
+        }
+        Some(Kind::ConflictCheck(c)) => {
+            step.stage = proto::TraceStage::Conflict.into();
+            let (outcome, words) = match c.result() {
+                proto::ConflictOutcome::Clean => ("pass", "clean"),
+                proto::ConflictOutcome::Overlap => ("pass", "overlap, rebased"),
+                proto::ConflictOutcome::Hard => ("fail", "hard conflict"),
+                proto::ConflictOutcome::Unspecified => ("skip", "checked"),
+            };
+            step.outcome = Some(outcome.into());
+            step.text = format!(
+                "{words}: {} set conflicts, {} merge conflicts",
+                c.set_conflicts, c.merge_conflicts
+            );
+        }
+        Some(Kind::Verifying(v)) => {
+            step.stage = proto::TraceStage::Verify.into();
+            step.change = Some(v.change.clone());
+            step.text = v.plan.as_ref().map_or_else(
+                || "verification started".to_owned(),
+                |p| {
+                    format!(
+                        "verifying: {} ({} selected tests, {} reused)",
+                        p.commands.join("; "),
+                        p.selected_tests,
+                        p.reused
+                    )
+                },
+            );
+        }
+        // Evidence steps come from the evidence itself (`evidence_step`).
+        Some(Kind::EvidenceAttached(_) | Kind::HeadMoved(_) | Kind::BridgeChecked(_)) | None => {
+            return None;
+        }
+        Some(Kind::Replaying(r)) => {
+            step.stage = proto::TraceStage::Replay.into();
+            let attempt =
+                escalation.and_then(|e| e.attempts.iter().find(|a| a.attempt == r.attempt));
+            step.text = match attempt {
+                Some(a) => {
+                    let mut spent = vec![format!("{:.1}s", a.elapsed_ms as f64 / 1000.0)];
+                    if let Some(tokens) = a.tokens {
+                        spent.push(format!("{tokens} tokens"));
+                    }
+                    if let Some(micros) = a.cost_micros {
+                        spent.push(format!("${:.4}", micros as f64 / 1_000_000.0));
+                    }
+                    if let Some(model) = &a.model {
+                        spent.push(format!("model {model}"));
+                    }
+                    step.change = a.change.clone();
+                    step.outcome = match a.outcome() {
+                        proto::ReplayOutcome::Proposed => Some("pass".into()),
+                        proto::ReplayOutcome::Running | proto::ReplayOutcome::Unspecified => None,
+                        _ => Some("fail".into()),
+                    };
+                    let note = a
+                        .note
+                        .as_ref()
+                        .map(|n| format!(", with the note \"{n}\""))
+                        .unwrap_or_default();
+                    format!(
+                        "replay #{} ({}{note}): {} [{}]",
+                        r.attempt,
+                        r.harness,
+                        attempt_outcome(a),
+                        spent.join(" · ")
+                    )
+                }
+                None => format!("replay #{} ({})", r.attempt, r.harness),
+            };
+        }
+        Some(Kind::Parked(p)) => {
+            step.stage = proto::TraceStage::Parked.into();
+            step.park = Some(p.reason);
+            step.outcome = Some("fail".into());
+            step.text = p.detail.clone();
+        }
+        Some(Kind::Arbitrated(a)) => {
+            step.stage = proto::TraceStage::Arbitrated.into();
+            step.actor = a.by.clone();
+            step.change = Some(a.result.clone());
+            step.text = format!(
+                "{} resolved it as {} ({})",
+                actor_label(a.by.as_ref()),
+                short_id(&a.result),
+                match (&a.key_id, &a.signature) {
+                    (Some(key), Some(_)) => format!("signed with {key}"),
+                    _ => "unsigned".to_owned(),
+                }
+            );
+        }
+        Some(Kind::Landed(l)) => {
+            step.stage = proto::TraceStage::Landed.into();
+            step.outcome = Some("pass".into());
+            step.change = Some(l.change.clone());
+            step.text = format!("landed at #{} as {}", l.position, short_id(&l.change));
+        }
+        Some(Kind::Rejected(r)) => {
+            step.stage = proto::TraceStage::Rejected.into();
+            step.outcome = Some("fail".into());
+            step.text = r.reason.clone();
+        }
+    }
+    Some(step)
+}
+
+/// The step for one piece of evidence: a review, or any other check.
+fn evidence_step(ev: &proto::ChangeEvidence) -> proto::TraceStep {
+    let review = matches!(
+        ev.kind.as_ref().and_then(|k| k.kind.as_ref()),
+        Some(proto::evidence_kind::Kind::Review(_))
+    );
+    let (class, result) = evidence_result_label(ev.result.as_ref());
+    proto::TraceStep {
+        at_ms: ev.produced_at_ms,
+        stage: if review {
+            proto::TraceStage::Review
+        } else {
+            proto::TraceStage::Evidence
+        }
+        .into(),
+        text: format!(
+            "{}: {result} ({}, {})",
+            evidence_kind_label(ev.kind.as_ref(), ev.qualifier.as_deref()),
+            ev.command,
+            ev.source
+        ),
+        outcome: Some(class.to_owned()),
+        actor: ev.produced_by.clone(),
+        ..Default::default()
+    }
 }
 
 /// Put each arbitration decision before its resolution, in causal order
