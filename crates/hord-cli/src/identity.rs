@@ -229,11 +229,11 @@ pub fn password(from_stdin: bool, prompt: &str) -> Result<String> {
     Ok(text)
 }
 
-#[cfg(test)]
+// Only Unix has permission bits to check.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn saving_a_secret_tightens_an_existing_file() -> Result<()> {
         let path =
