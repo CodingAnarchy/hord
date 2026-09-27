@@ -1,6 +1,6 @@
 # ADR 0042: File modes in trees
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-27
 - **Spec:** §3.2 (`Tree`), §6.1 (materialization), §9 (round trip)
 - **Blocks:** M6 (hord-first development, ADR 0040)
