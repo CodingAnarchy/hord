@@ -1,11 +1,13 @@
 //! Structural 3-way merge (spec §5.2).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::str;
 
 use hord_core::{Bytes, NodeId, ObjectId, Op, RepoPath};
 use hord_lang::{IdentifiedTree, LangAdapter, NodeTree};
 
 use crate::apply::apply_internal;
+use crate::text_merge;
 
 use crate::graft::union_trees;
 
@@ -81,8 +83,9 @@ impl std::fmt::Display for Conflict {
 pub enum MergeMode {
     /// The M1 merge corpus (ADR 0005, ADR 0006). A same-node edit that the
     /// CST and line merges cannot combine keeps ours (landing order) plus
-    /// theirs' new named children, and `git merge-file --ours` resolves
-    /// overlapping hunks. Scores match git's `--ours` labels.
+    /// theirs' new named children, and a line 3-way merge that takes ours on
+    /// each conflict resolves overlapping hunks (ADR 0039). The corpus labels
+    /// are merges equal to `git merge-file --ours` (ADR 0006).
     #[default]
     Corpus,
     /// The lander (spec §6.4 rung 1). Nothing is resolved by keeping one
@@ -204,7 +207,7 @@ fn moved_vs_edited(
 }
 
 /// Keep a structural compose unless it invented a line. In
-/// [`MergeMode::Corpus`] git's `--ours` merge replaces it. In
+/// [`MergeMode::Corpus`] a line merge taking ours on conflict replaces it. In
 /// [`MergeMode::Lander`] (ADR 0014 amendment) only a line merge that keeps
 /// both sides replaces it: it must re-parse and is flagged soft. With no
 /// such merge the result is a hard conflict.
@@ -224,7 +227,7 @@ fn accept_composed<A: LangAdapter + ?Sized>(
         return Ok(ok);
     }
     match mode {
-        MergeMode::Corpus => Ok(git_ours_result(adapter, base, &src).unwrap_or(ok)),
+        MergeMode::Corpus => Ok(ours_result(adapter, base, &src).unwrap_or(ok)),
         MergeMode::Lander => text_merge_result(adapter, base, &src)
             .or_else(|| blob_file_fallback(adapter, base, &src))
             .filter(|merged| {
@@ -241,8 +244,8 @@ fn accept_composed<A: LangAdapter + ?Sized>(
 }
 
 /// Overlapping edits. Keep non-conflicting edits from both sides. In
-/// [`MergeMode::Corpus`], try git's merge with ours' side of each conflict
-/// hunk first; [`MergeMode::Lander`] never takes a side.
+/// [`MergeMode::Corpus`], try the line merge with ours' side of each conflict
+/// first; [`MergeMode::Lander`] never takes a side.
 fn overlap_fallback<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
@@ -252,11 +255,11 @@ fn overlap_fallback<A: LangAdapter + ?Sized>(
     mode: MergeMode,
 ) -> Option<MergeResult> {
     let src = sources(adapter, base, ours, theirs);
-    let git_ours = match mode {
-        MergeMode::Corpus => git_ours_result(adapter, base, &src),
+    let taken = match mode {
+        MergeMode::Corpus => ours_result(adapter, base, &src),
         MergeMode::Lander => None,
     };
-    git_ours
+    taken
         .or_else(|| text_merge_result(adapter, base, &src))
         .or_else(|| cst_file_fallback(adapter, base, ours, theirs, store))
         .or_else(|| blob_file_fallback(adapter, base, &src))
@@ -301,22 +304,22 @@ fn projection_invents_line(src: &Sources, merged: &[u8]) -> bool {
         .any(|line| !line.trim_ascii().is_empty() && !allowed.contains(line))
 }
 
-fn git_ours_result<A: LangAdapter + ?Sized>(
+fn ours_result<A: LangAdapter + ?Sized>(
     adapter: &A,
     base: &IdentifiedTree,
     src: &Sources,
 ) -> Option<MergeResult> {
-    let merged = crate::text_merge::git_merge_ours(
-        src.base.as_slice(),
-        src.ours.as_slice(),
-        src.theirs.as_slice(),
+    let merged = text_merge::merge_ours(
+        str::from_utf8(src.base.as_slice()).ok()?,
+        str::from_utf8(src.ours.as_slice()).ok()?,
+        str::from_utf8(src.theirs.as_slice()).ok()?,
     )?;
     reparse(
         adapter,
         base,
-        &merged,
+        merged.as_bytes(),
         true,
-        "git auto-merge with landing-order (ours) conflict hunks",
+        "line 3-way with landing-order (ours) conflict hunks",
     )
 }
 
@@ -327,10 +330,10 @@ fn text_merge_result<A: LangAdapter + ?Sized>(
     base: &IdentifiedTree,
     src: &Sources,
 ) -> Option<MergeResult> {
-    let merged = crate::text_merge::merge_text(
-        std::str::from_utf8(src.base.as_slice()).ok()?,
-        std::str::from_utf8(src.ours.as_slice()).ok()?,
-        std::str::from_utf8(src.theirs.as_slice()).ok()?,
+    let merged = text_merge::merge_text(
+        str::from_utf8(src.base.as_slice()).ok()?,
+        str::from_utf8(src.ours.as_slice()).ok()?,
+        str::from_utf8(src.theirs.as_slice()).ok()?,
     )?;
     reparse(
         adapter,
