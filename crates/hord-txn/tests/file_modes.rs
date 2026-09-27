@@ -7,9 +7,15 @@ mod common;
 use std::fs;
 
 use common::*;
-use hord_core::{Blob, FileEntry, FileMode, ObjectId, Op, Snapshot, Tree, TreeEntry};
-use hord_txn::{BeginOptions, Materialization, QueueStatus, Repo, Workspace};
+use hord_core::{Blob, ObjectId};
+use hord_txn::BeginOptions;
+// The mode tests need exec bits on disk, so only run on Unix.
+#[cfg(unix)]
+use hord_core::{FileEntry, FileMode, Op, Snapshot, Tree, TreeEntry};
+#[cfg(unix)]
+use hord_txn::{Materialization, QueueStatus, Repo, Workspace};
 
+#[cfg(unix)]
 fn checkout_of(ws: &Workspace) -> TestResult<std::path::PathBuf> {
     match ws.materialization() {
         Materialization::Directory { path } => Ok(path.clone()),
@@ -18,6 +24,7 @@ fn checkout_of(ws: &Workspace) -> TestResult<std::path::PathBuf> {
 }
 
 /// The mode and bytes of `file` in head's snapshot.
+#[cfg(unix)]
 async fn head_file(repo: &Repo, file: &str) -> TestResult<(FileMode, Vec<u8>)> {
     let store = repo.store();
     let snapshot: Snapshot = store.get_object(repo.head().await?.snapshot)?;
@@ -57,6 +64,7 @@ fn is_exec(path: &std::path::Path) -> TestResult<bool> {
     Ok(fs::metadata(path)?.permissions().mode() & 0o100 != 0)
 }
 
+#[cfg(unix)]
 fn landed(repo_entries: &[hord_txn::QueueEntry]) -> bool {
     repo_entries
         .iter()

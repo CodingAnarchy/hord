@@ -6,7 +6,10 @@ mod common;
 use std::fs;
 
 use common::*;
-use hord_core::{Blob, FileEntry, FileMode, Op, RepoPath, Snapshot, Tree, TreeEntry, TreeOpKind};
+use hord_core::{Blob, FileEntry, FileMode, Op, RepoPath, Snapshot, Tree, TreeEntry};
+// Only the Unix-only symlink tests rename.
+#[cfg(unix)]
+use hord_core::TreeOpKind;
 use hord_txn::{BeginOptions, Materialization, MaterializeMode, Workspace};
 
 fn checkout_of(ws: &Workspace) -> TestResult<std::path::PathBuf> {
@@ -150,6 +153,8 @@ async fn ignored_files_alone_are_nothing_to_propose() -> TestResult {
 }
 
 /// The mode and bytes of the file entry at `file` in the proposal's result.
+/// Only the Unix-only symlink tests read one.
+#[cfg(unix)]
 fn result_file(
     t: &TempRepo,
     proposal: &hord_txn::Proposal,
