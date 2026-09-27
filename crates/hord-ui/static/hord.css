@@ -57,3 +57,25 @@ form.review, form.arbitrate { margin-top: 16px; display: flex; flex-wrap: wrap; 
 form textarea { flex: 1 1 100%; font: inherit; }
 button { font: inherit; padding: 4px 12px; }
 @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+.links { margin-top: -6px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; }
+.card p { margin: 4px 0; }
+.lineage, .timeline { padding-left: 24px; }
+.tag { font-size: 12px; padding: 1px 6px; border-radius: 10px; background: var(--line); }
+.step { border-left: 4px solid var(--stage, var(--line)); padding: 4px 10px; margin-bottom: 4px; }
+.step .at { color: var(--muted); font-size: 12px; margin-right: 6px; }
+.tree { list-style: none; padding-left: 0; } .tree .dir a { font-weight: 600; }
+.browse { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2.4fr); gap: 16px; }
+.defs { list-style: none; padding: 0; font-size: 13px; } .defs li { margin-bottom: 2px; overflow-wrap: anywhere; }
+table.source { border-collapse: collapse; width: 100%; display: block; overflow-x: auto; }
+table.source td { padding: 0 8px; vertical-align: top; white-space: pre; }
+table.source .ln { color: var(--muted); text-align: right; user-select: none; }
+table.source tr:target { background: var(--line); }
+svg.graph { max-width: 760px; display: block; }
+svg.graph .edge { stroke: var(--line); stroke-width: 1.5; }
+svg.graph .edge-test { stroke: var(--pass); stroke-dasharray: 4 3; }
+svg.graph .edge-contains { stroke: var(--muted); stroke-dasharray: 1 3; }
+svg.graph rect.centre { fill: var(--card); stroke: var(--accent); stroke-width: 2; }
+svg.graph text { fill: var(--fg); font: 13px system-ui, sans-serif; }
+svg.graph a text { fill: var(--accent); } svg.graph .nb-test { fill: var(--pass); }
+@media (max-width: 640px) { .browse { grid-template-columns: 1fr; } }

@@ -116,14 +116,6 @@ impl Hosts {
         }
     }
 
-    /// Also serve the `Changes` service (ADR 0030) for the repository
-    /// `name`, over `changes`.
-    #[must_use]
-    pub fn with_changes(mut self, name: &str, changes: Arc<dyn ChangesBackend>) -> Self {
-        self.changes.insert(name.to_owned(), changes);
-        self
-    }
-
     fn empty() -> Self {
         Self {
             repos: BTreeMap::new(),
@@ -164,6 +156,21 @@ impl Hosts {
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("no repository {name:?} on this server")))
+    }
+
+    /// The local repository a request names, or the only one.
+    pub(crate) fn resolve_local(
+        &self,
+        name: Option<&RepoName>,
+    ) -> Result<Arc<LocalRepo>, ApiError> {
+        let name = self.addressed(name)?;
+        self.locals
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, local)| Arc::clone(local))
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("no local repository {name:?} on this server"))
+            })
     }
 
     /// The `Changes` backend a request names, or the only one.

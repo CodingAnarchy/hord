@@ -11,11 +11,85 @@ use hord_api::{
 };
 use hord_core::ObjectId;
 use hord_txn::{ObjectSource, Repo, RepoOptions};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use tokio_stream::StreamExt;
-use tonic::transport::Endpoint;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
 use crate::Error;
 use crate::transport::{Transport, connect_local_io, split_url};
+
+/// How [`RemoteRepo::connect_with`] connects.
+#[derive(Clone, Default)]
+pub struct ConnectOptions {
+    /// Sent as a bearer token on every call (spec §10.5.4).
+    pub token: Option<String>,
+    /// For `https://`: a PEM CA certificate (or several) to trust besides
+    /// the system's roots, such as a team host's own CA.
+    pub ca_pem: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the token.
+        f.debug_struct("ConnectOptions")
+            .field("token", &self.token.is_some())
+            .field("ca_pem", &self.ca_pem.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+/// Configure TLS on `endpoint` (ADR 0032): the system's roots plus
+/// `ca_pem`. A host with no system roots (a bare container) still trusts
+/// `ca_pem` alone.
+fn with_tls(endpoint: Endpoint, url: &str, ca_pem: Option<&[u8]>) -> Result<Endpoint, Error> {
+    let reason = |err: tonic::transport::Error| {
+        std::error::Error::source(&err).map_or_else(|| err.to_string(), ToString::to_string)
+    };
+    let tls_error = |err| Error::Tls {
+        url: url.to_owned(),
+        reason: reason(err),
+    };
+    let Some(ca) = ca_pem else {
+        return endpoint
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(tls_error);
+    };
+    // A CA file that holds no certificate would be trusted as nothing, and
+    // the server then fail as "unknown issuer": say what is wrong instead.
+    let certificates = CertificateDer::pem_slice_iter(ca)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| Error::Tls {
+            url: url.to_owned(),
+            reason: format!("the CA file is not PEM certificates: {err}"),
+        })?;
+    if certificates.is_empty() {
+        return Err(Error::Tls {
+            url: url.to_owned(),
+            reason: "the CA file holds no PEM certificate".into(),
+        });
+    }
+    let ca = Certificate::from_pem(ca);
+    match endpoint.clone().tls_config(
+        ClientTlsConfig::new()
+            .with_native_roots()
+            .ca_certificate(ca.clone()),
+    ) {
+        Ok(endpoint) => Ok(endpoint),
+        // No system roots (a bare container): the CA alone. If that fails
+        // too, both reasons.
+        Err(with_roots) => endpoint
+            .tls_config(ClientTlsConfig::new().ca_certificate(ca))
+            .map_err(|alone| Error::Tls {
+                url: url.to_owned(),
+                reason: format!(
+                    "{}; with the CA file alone: {}",
+                    reason(with_roots),
+                    reason(alone)
+                ),
+            }),
+    }
+}
 
 /// A repository on a `hord serve` server, as a [`RepoBackend`] and an
 /// [`ObjectSource`]. Cheap to clone; clones share the connection.
@@ -28,28 +102,42 @@ pub struct RemoteRepo {
 }
 
 impl RemoteRepo {
-    /// Connect to `url` (`http://host:port`, or `http://host:port/r/<name>`
-    /// for one repository of a `--root` server). Must be called within a
+    /// Connect to `url` (`http[s]://host:port`, or
+    /// `http[s]://host:port/r/<name>` for one repository of a `--root`
+    /// server). `https` trusts the system's roots. Must be called within a
     /// tokio runtime; object reads through [`ObjectSource`] run on it.
     pub async fn connect(url: &str) -> Result<Self, Error> {
-        let (origin, prefix) = split_url(url).ok_or_else(|| Error::InvalidUrl(url.to_owned()))?;
-        let endpoint =
-            Endpoint::from_shared(origin).map_err(|_| Error::InvalidUrl(url.to_owned()))?;
-        let channel = endpoint.connect().await.map_err(|source| Error::Connect {
-            url: url.to_owned(),
-            source,
-        })?;
-        Ok(Self::from_transport(Transport::new(channel, prefix), url))
+        Self::connect_with(url, &ConnectOptions::default()).await
     }
 
     /// Connect to `url` as [`Self::connect`] does, sending `token` as a
     /// bearer token on every call (spec §10.5.4).
     pub async fn connect_with_token(url: &str, token: &str) -> Result<Self, Error> {
-        let remote = Self::connect(url).await?;
-        let transport = remote
-            .transport
-            .with_token(token)
-            .ok_or(Error::InvalidToken)?;
+        let options = ConnectOptions {
+            token: Some(token.to_owned()),
+            ca_pem: None,
+        };
+        Self::connect_with(url, &options).await
+    }
+
+    /// Connect to `url` as [`Self::connect`] does, with `options`: a bearer
+    /// token, and for `https` a CA to trust besides the system's roots.
+    pub async fn connect_with(url: &str, options: &ConnectOptions) -> Result<Self, Error> {
+        let (origin, prefix) = split_url(url).ok_or_else(|| Error::InvalidUrl(url.to_owned()))?;
+        let tls = origin.starts_with("https://");
+        let mut endpoint =
+            Endpoint::from_shared(origin).map_err(|_| Error::InvalidUrl(url.to_owned()))?;
+        if tls {
+            endpoint = with_tls(endpoint, url, options.ca_pem.as_deref())?;
+        }
+        let channel = endpoint.connect().await.map_err(|source| Error::Connect {
+            url: url.to_owned(),
+            source,
+        })?;
+        let mut transport = Transport::new(channel, prefix);
+        if let Some(token) = &options.token {
+            transport = transport.with_token(token).ok_or(Error::InvalidToken)?;
+        }
         Ok(Self::from_transport(transport, url))
     }
 
@@ -101,6 +189,12 @@ impl RemoteRepo {
     #[must_use]
     pub fn workspaces(&self) -> crate::RemoteWorkspaces {
         crate::RemoteWorkspaces::new(self.transport.clone())
+    }
+
+    /// The `Audit` service (`hord audit`) on the same connection.
+    #[must_use]
+    pub fn audit(&self) -> crate::RemoteAudit {
+        crate::RemoteAudit::new(self.transport.clone())
     }
 
     /// The read-only `Changes` service (ADR 0030) on the same connection.
@@ -297,6 +391,13 @@ impl RepoBackend for RemoteRepo {
     async fn events(&self, request: proto::EventsRequest) -> ApiResult<EventStream> {
         let stream = call!(self, events, request)?;
         Ok(Box::pin(stream.map(|item| item.map_err(ApiError::from))))
+    }
+
+    async fn record_bridge_check(
+        &self,
+        request: proto::BridgeChecked,
+    ) -> ApiResult<proto::RecordBridgeCheckResponse> {
+        call!(self, record_bridge_check, request)
     }
 }
 

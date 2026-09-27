@@ -13,6 +13,10 @@ Dependency additions (one line each):
 - `toml` 1 (`hord-lang-toml`, feature `preserve_order`): decodes and prints TOML values for the generic lockfile merge (ADR 0013). It is Cargo's own TOML crate, so printed values match what Cargo writes, and it avoids a hand-rolled TOML value decoder.
 - `semver` 1 (`hord-lang-rust`): orders `Cargo.lock` packages by semver version, as Cargo's `PackageId` does (ADR 0013).
 
+`time` 0.3 (hord-server, features `parsing` and `formatting`; already hord-cli's): reads and writes the auth file's RFC 3339 `revoked_at` times (ADR 0038).
+
+`rustls` 0.23 (hord-remote; already hord-git's, and tonic's TLS): its re-exported PEM reader checks that a `--ca-file` holds a certificate before trusting it (ADR 0032).
+
 `reflink-copy` 0.1 (hord-txn only, ADR 0016): safe wrapper over `clonefile(2)` / `FICLONE` for copy-on-write workspace checkouts, so no hord crate needs `unsafe` outside `hord-vfs`.
 
 `windows-sys` 0.61 (hord-cli, Windows only, feature `Win32_Foundation`, ADR 0027): `SetHandleInformation`, so the daemon does not inherit the CLI's stdio.
@@ -60,3 +64,12 @@ M5 identity and authorization dependencies (spec §10.5.4):
 `cookie` 0.18 (hord-ui, hord-server): builds and parses the web UI's HttpOnly, SameSite=Strict sign-in cookie that carries a bearer token (spec §10.5.4, ADR 0030). AGENTS.md forbids a hand-rolled `Cookie` header parser.
 
 `hord-eval-m5` (bench, the M5 conflict corpus): `anyhow`, `clap`, `hord-api`, `hord-core`, `hord-encoding`, `hord-remote`, `hord-txn`, `serde`, `serde_json`, `tokio` (feature `process`), `tokio-stream`, `toml`, all already workspace dependencies. `hord-remote` drives each case's `hord serve` over the same gRPC API as the CLI. `http`, `http-body-util`, `hyper-util`, and `bytes` (already in the tree) post the web workbench's arbitration form, as a browser would.
+- tonic 0.14 features `tls-ring` (hord-server, hord-remote) and `tls-native-roots` (hord-remote): TLS for `hord serve` and `https://` remotes (ADR 0032), in process with rustls 0.23 through tonic's own `tokio-rustls` 0.26 acceptor and connector, so gRPC, gRPC-Web and the web UI keep one port. `ring` rather than `aws-lc-rs` needs no CMake or NASM on Windows; `rustls-native-certs` supplies the system's roots. tonic parses the PEM files with `rustls-pki-types`, so `rustls-pemfile` (unmaintained) is not needed.
+- `rcgen` 0.14 (dev, hord-remote and hord-cli; features `crypto`, `pem`, `ring`): generates the TLS tests' CA and server certificate in the test, so no key material is checked in.
+- `time` 0.3 (hord-cli, features `parsing` and `formatting`; already in the tree under `cookie`): `hord audit --since`/`--until` take a date or an RFC 3339 time, and the report prints times in RFC 3339. AGENTS.md forbids a hand-rolled date parser.
+
+M6 git bridge (`hord git sync`, ADR 0036, ADR 0037), in hord-git's `sync` module:
+
+- `hyper-rustls` 0.27 (features `ring`, `native-tokio`, `http1`, `tls12`; no default `aws-lc-rs`) and `rustls` 0.23 (feature `ring`): HTTPS for the GitHub REST client, on the `hyper-util` legacy client already used for webhooks. They use the same ring provider and native roots as tonic's TLS in `hord serve`, so the tree has one TLS stack. `rustls` is named directly only to pass the ring provider explicitly.
+- `base64` 0.22 (already in the tree): the `Authorization: Basic` header GitHub's git-over-HTTPS endpoint takes the token in, passed to `git` through `GIT_CONFIG_*` environment variables. AGENTS.md forbids a hand-rolled encoder.
+- `hord-api`, `async-trait`, `bytes`, `http`, `http-body-util`, `hyper`, `hyper-util`, `serde_json`, `tokio` (feature `process`), `tokio-stream` in hord-git (all already workspace dependencies): the bridge drives any `RepoBackend`, runs `git` for fetch and push (gix does not push), talks JSON to GitHub, and keeps its state in `state.json`.

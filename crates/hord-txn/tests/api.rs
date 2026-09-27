@@ -41,6 +41,7 @@ fn name(kind: &Kind) -> &'static str {
         Kind::Landed(_) => "landed",
         Kind::Rejected(_) => "rejected",
         Kind::HeadMoved(_) => "head_moved",
+        Kind::BridgeChecked(_) => "bridge_checked",
     }
 }
 

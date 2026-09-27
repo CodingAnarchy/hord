@@ -236,6 +236,12 @@ pub struct Provenance {
     pub session: Option<String>,
     /// If this change was a replay of another, the original change.
     pub parent_intent: Option<ChangeId>,
+    /// Key id of the git bridge that vouched for this change (ADR 0037):
+    /// set on a pull request's proposal, whose actor is its git author and
+    /// which is unsigned. Omitted from the encoding when `None`, so other
+    /// records keep their ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voucher: Option<String>,
 }
 
 /// Detached signature over a [`ChangeRecord`] (spec §10.5.4).

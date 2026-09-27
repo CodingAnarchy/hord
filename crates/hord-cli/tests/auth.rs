@@ -7,11 +7,12 @@
 
 mod common;
 
+use common::{TempDir, git_command};
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hord_api::proto::event::Kind;
@@ -30,28 +31,6 @@ const LANDED: &str = "QUEUE_STATUS_LANDED";
 const PARKED: &str = "QUEUE_STATUS_PARKED";
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-        ));
-        common::clear_stale(&path)?;
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        common::drop_tree(&self.0);
-    }
-}
 
 /// `hord` in `dir` as the identity whose `~/.hord` is `home`.
 fn hord(dir: &Path, home: &Path, args: &[&str]) -> Command {
@@ -120,7 +99,7 @@ fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> TestResult<&'a str> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")
@@ -348,9 +327,23 @@ impl World {
         Ok(str_field(&login, "keyId")?.to_owned())
     }
 
-    /// As `home`: a workspace at head, `from` replaced by `to` in `file`,
-    /// proposed and submitted. The change id.
+    /// As `home`: [`Self::propose`], then submitted. The change id.
     fn submit(
+        &self,
+        home: &Path,
+        file: &str,
+        from: &str,
+        to: &str,
+        summary: &str,
+    ) -> TestResult<String> {
+        let change = self.propose(home, file, from, to, summary)?;
+        json(&self.clone.0, home, &["submit", &change])?;
+        Ok(change)
+    }
+
+    /// As `home`: a workspace at head, `from` replaced by `to` in `file`,
+    /// proposed. The change id.
+    fn propose(
         &self,
         home: &Path,
         file: &str,
@@ -372,9 +365,7 @@ impl World {
         fs::write(&intent, format!("---\nsummary: {summary}\n---\nWhy.\n"))?;
         let intent = intent.to_str().ok_or("intent path is UTF-8")?;
         let proposed = json(dir, home, &["propose", "-w", &id, "--intent", intent])?;
-        let change = str_field(&proposed, "change")?.to_owned();
-        json(dir, home, &["submit", &change])?;
-        Ok(change)
+        Ok(str_field(&proposed, "change")?.to_owned())
     }
 }
 
@@ -591,11 +582,9 @@ fn hord_arbitrate_resolves_a_parked_change_with_a_signed_decision() -> TestResul
                 },
             )
             .await?;
-            let found = view.history.iter().find_map(|e| {
-                match e.event.as_ref().and_then(|e| e.kind.as_ref()) {
-                    Some(Kind::Arbitrated(a)) => Some(a.clone()),
-                    _ => None,
-                }
+            let found = view.history.iter().find_map(|e| match e.kind() {
+                Some(Kind::Arbitrated(a)) => Some(a.clone()),
+                _ => None,
             });
             if let Some(found) = found {
                 return Ok::<_, Box<dyn std::error::Error>>(found);
@@ -728,5 +717,65 @@ fn daemon_proposals_are_signed_with_the_users_key() -> TestResult {
     let direct = propose(true, "    2\n", "    20\n", "beta")?;
     let verified = daemon_json(dir, &home.0, &["key", "verify", &direct, "--key", &key])?;
     assert_eq!(verified["verified"], true, "{verified:#}");
+    Ok(())
+}
+
+/// `hord token revoke` and `hord key revoke` (ADR 0038) mark entries
+/// revoked instead of deleting them: a revoked token is refused, and a
+/// revoked key signs nothing more, once the server reloads the file.
+#[test]
+fn revoked_tokens_and_keys_are_refused_and_kept() -> TestResult {
+    let w = world()?;
+    let dir = &w.clone.0;
+    let auth = w.homes.0.join("auth.toml");
+    let auth_arg = auth.to_str().ok_or("auth path is UTF-8")?;
+    w.login(&w.eve, "eve")?;
+    json(dir, &w.eve, &["queue"])?;
+    // The bot signs a change before its key is revoked.
+    let before = w.submit(
+        &w.bot,
+        "docs/notes.txt",
+        "notes\n",
+        "bot notes\n",
+        "bot notes",
+    )?;
+
+    let revoked = json(
+        dir,
+        &w.nobody,
+        &["key", "revoke", &w.bot_key, "--auth-file", auth_arg],
+    )?;
+    assert_eq!(str_field(&revoked, "keyId")?, w.bot_key);
+    let revoked = json(
+        dir,
+        &w.nobody,
+        &["token", "revoke", "--actor", "eve", "--auth-file", auth_arg],
+    )?;
+    assert_eq!(revoked["revoked"], 1, "{revoked:#}");
+    let text = fs::read_to_string(&auth)?;
+    assert!(text.contains(&w.bot_key), "the key's entry stays: {text}");
+    assert_eq!(text.matches("revoked_at").count(), 2, "{text}");
+
+    // The server reloads the file within a second: eve's token stops.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = run(dir, &w.eve, &["queue"], "")?;
+        if !out.status.success() {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err("the revoked token still works".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The same reload revoked the bot's key: what it signs is refused.
+    let change = w.propose(&w.bot, "src/lib.rs", "    1\n", "    10\n", "alpha ten")?;
+    let err = fails(dir, &w.bot, &["submit", &change])?;
+    assert!(err.contains("was revoked"), "{err}");
+    // What it signed before still verifies, and says the key is revoked.
+    let verified = json(dir, &w.bot, &["key", "verify", &before])?;
+    assert_eq!(verified["verified"], true, "{verified:#}");
+    assert!(verified["revokedAtMs"].is_string(), "{verified:#}");
+    assert!(verified["actor"].is_object(), "{verified:#}");
     Ok(())
 }

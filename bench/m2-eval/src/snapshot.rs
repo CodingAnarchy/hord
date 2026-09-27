@@ -294,6 +294,7 @@ pub(crate) fn blame(files: &[&FileSnap]) -> Result<BlameReport> {
             created_at: Timestamp::from_millis(0),
             session: None,
             parent_intent: None,
+            voucher: None,
         },
         read_set: std::collections::BTreeSet::new(),
         write_set: write_set.clone(),

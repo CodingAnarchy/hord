@@ -201,6 +201,25 @@ pub fn export_change<S: Store>(
     export_change_into(store, change_id, &repo, &cache).map(GitOid::from_gix)
 }
 
+/// Export each of `changes` as [`export_change`] does, in order, into one
+/// repository opened once; their commits, in order.
+///
+/// Trees and blobs are projected once for the whole batch, so exporting a
+/// run of landed changes costs what they changed, not a full tree walk
+/// each.
+pub fn export_changes<S: Store>(
+    store: &S,
+    changes: &[ChangeId],
+    git_dir: impl AsRef<Path>,
+) -> Result<Vec<GitOid>, Error> {
+    let repo = open_or_init(git_dir.as_ref())?;
+    let cache = ExportCache::default();
+    changes
+        .iter()
+        .map(|id| export_change_into(store, *id, &repo, &cache).map(GitOid::from_gix))
+        .collect()
+}
+
 /// Export `change_id` and any unexported ancestors, parents before children.
 ///
 /// Depth-first with an explicit stack: a linear history is as deep as it is
@@ -315,7 +334,10 @@ fn write_commit<S: Store>(
     Ok(commit_id)
 }
 
-fn lookup_exported(repo: &gix::Repository, change_id: ChangeId) -> Option<gix::ObjectId> {
+pub(crate) fn lookup_exported(
+    repo: &gix::Repository,
+    change_id: ChangeId,
+) -> Option<gix::ObjectId> {
     let name = format!("refs/hord/changes/{change_id}");
     let reference = repo.find_reference(name.as_str()).ok()?;
     let id = reference.id();
@@ -375,7 +397,7 @@ fn parse_git_author(id: &str) -> (String, String) {
     (id.to_owned(), "unknown@hord".to_owned())
 }
 
-fn open_or_init(path: &Path) -> Result<gix::Repository, Error> {
+pub(crate) fn open_or_init(path: &Path) -> Result<gix::Repository, Error> {
     if let Ok(mut repo) = open_repo(path) {
         repo.object_cache_size_if_unset(4 * 1024 * 1024);
         return Ok(repo);

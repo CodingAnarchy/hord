@@ -35,6 +35,9 @@ pub const CHANGE_DOMAIN: &str = "hord.change-record";
 /// Domain of `Evidence.signature`.
 pub const EVIDENCE_DOMAIN: &str = "hord.evidence";
 
+/// Domain of the lander's signature on a `Landed` event (ADR 0038).
+pub const LANDED_DOMAIN: &str = "hord.landed";
+
 /// Key id prefix: the algorithm.
 const KEY_ID_PREFIX: &str = "ed25519:";
 
@@ -237,6 +240,33 @@ pub fn verify_evidence(evidence: &Evidence, key: &PublicKey) -> Result<(), SignE
     )
 }
 
+/// What the lander's signature on a landing covers (ADR 0038): the landed
+/// id and its position in the log, so the signature is not valid for the
+/// same change at another position.
+fn landing_message(landed: ObjectId, position: u64) -> Vec<u8> {
+    let mut message = landed.as_bytes().to_vec();
+    message.extend_from_slice(&position.to_be_bytes());
+    message
+}
+
+/// The lander's signature on landing `landed` at `position` (ADR 0038). It
+/// sits in the `Landed` event, outside the landed id, which stays the same
+/// whichever repository landed it.
+#[must_use]
+pub fn sign_landing(landed: ObjectId, position: u64, key: &SigningKey) -> Signature {
+    key.sign(LANDED_DOMAIN, &landing_message(landed, position))
+}
+
+/// Check the lander's `signature` on landing `landed` at `position`,
+/// against the key it names.
+pub fn verify_landing(
+    landed: ObjectId,
+    position: u64,
+    signature: &Signature,
+) -> Result<(), SignError> {
+    signer(signature)?.verify(LANDED_DOMAIN, &landing_message(landed, position), signature)
+}
+
 /// The key a signature names, checked to verify it: for an object whose
 /// signer is not known in advance. Proves only that the named key signed.
 pub fn signer(signature: &Signature) -> Result<PublicKey, SignError> {
@@ -323,6 +353,18 @@ mod tests {
         assert_eq!(id.parse::<PublicKey>()?, key.public());
         assert!("ed25519:zz".parse::<PublicKey>().is_err());
         assert!("rsa:00".parse::<PublicKey>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_landing_signature_covers_the_id_and_its_position() -> Result<(), SignError> {
+        let key = SigningKey::generate()?;
+        let landed = ObjectId::from_canonical(b"landed");
+        let signature = sign_landing(landed, 7, &key);
+        verify_landing(landed, 7, &signature)?;
+        assert!(verify_landing(landed, 8, &signature).is_err());
+        let other = ObjectId::from_canonical(b"other");
+        assert!(verify_landing(other, 7, &signature).is_err());
         Ok(())
     }
 }

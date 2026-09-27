@@ -1,17 +1,13 @@
 //! Lander queue tables used by `hord-txn`, and the store format version.
 
+mod common;
+
 use std::fs;
-use std::path::PathBuf;
 
 use hord_core::ObjectId;
 use hord_store::Store;
 
-fn temp_repo() -> std::io::Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("hord-store-queue-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
+use common::temp_repo;
 
 #[test]
 fn queue_round_trips_and_persists() -> Result<(), Box<dyn std::error::Error>> {

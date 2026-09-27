@@ -8,11 +8,11 @@
 
 mod common;
 
+use common::{TempDir, git_command};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -54,28 +54,6 @@ fn log_ids(value: &serde_json::Value) -> TestResult<Vec<String>> {
     Ok(ids)
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        common::drop_tree(&self.0);
-    }
-}
-
 fn run(dir: &Path, args: &[&str]) -> TestResult<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_hord"))
         .args(args)
@@ -109,7 +87,7 @@ fn json(dir: &Path, args: &[&str]) -> TestResult<serde_json::Value> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")
@@ -403,8 +381,8 @@ fn read_write_through_references_is_explained() -> TestResult {
     json(dir, &["submit", &first])?;
     json(dir, &["submit", &second])?;
     let landed = json(dir, &["land", "--local"])?;
-    // No verifier until M4, so the default fails closed (spec §15): the
-    // overlap parks instead of landing flagged.
+    // Nothing verifies this repository, so the default fails closed (spec
+    // §15): the overlap parks instead of landing flagged.
     assert_eq!(landed["head"], first.as_str());
     let result = json(dir, &["conflicts", &second])?;
     assert_eq!(result["entry"]["status"], CONFLICTED);

@@ -151,6 +151,7 @@ mod tests {
                 submission: cursor,
                 change: format!("c{cursor}"),
                 actor: None,
+                voucher: None,
             }))),
         }
     }

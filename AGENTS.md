@@ -57,6 +57,7 @@ Decisions that constrain later work:
 - Async: `tokio`. No blocking I/O in async contexts.
 - No hand-rolled parsers, hashes, or serialization formats. Use `tree-sitter`, `blake3`, canonical CBOR.
 - Deterministic everything: same inputs → same `ObjectId`s. Non-determinism is a P0 bug.
+- Git is confined to the git bridge (hord-git and the CLI's hord git commands; ADR 0039).
 
 Preferred dependencies: `tree-sitter`, `tree-sitter-rust`, `tree-sitter-toml`, `blake3`, `redb`, `zstd`, `gix`, `tokio`, `hyper`/`axum`, `proptest`, `clap`, `serde`, `ulid`, `diffy`. New deps need a one-line justification in the ADR log.
 

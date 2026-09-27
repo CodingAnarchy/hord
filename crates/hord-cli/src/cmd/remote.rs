@@ -1,5 +1,7 @@
 //! `hord remote add|rm|list|set-default` (spec §10.2, ADR 0024 amendment).
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use hord_api::proto;
 
@@ -7,7 +9,7 @@ use crate::output;
 use crate::remotes::Remotes;
 use crate::repo;
 
-fn hord_dir() -> Result<std::path::PathBuf> {
+fn hord_dir() -> Result<PathBuf> {
     Ok(repo::discover_root()?.join(hord_store::HORD_DIR))
 }
 
@@ -36,10 +38,13 @@ fn print(json: bool, remotes: &Remotes) -> Result<()> {
     Ok(())
 }
 
-pub fn run_add(json: bool, name: String, url: String) -> Result<()> {
+pub fn run_add(json: bool, name: String, url: String, ca_file: Option<PathBuf>) -> Result<()> {
     let dir = hord_dir()?;
     let mut remotes = Remotes::load(&dir)?;
     remotes.add(&name, &url)?;
+    if let Some(ca_file) = ca_file {
+        remotes.set_ca_file(&name, &ca_file)?;
+    }
     remotes.save(&dir)?;
     print(json, &remotes)
 }

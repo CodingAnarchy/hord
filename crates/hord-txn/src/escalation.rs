@@ -31,14 +31,14 @@ use std::sync::Mutex;
 use hord_core::sign::{self, PublicKey, SigningKey};
 use hord_core::{
     Acceptance, Actor, Bytes, ChangeId, ChangeRecord, Intent, IntentRef, NodeId, ObjectId,
-    Provenance, RepoPath, Signature, SnapshotId,
+    Provenance, RepoPath, Signature, SnapshotId, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::events;
 use crate::lander::{QueueEntry, QueueStatus};
 use crate::pinned::Pinned;
-use crate::repo::{Base, BeginOptions, Inner, Repo, blocking, lock, now};
+use crate::repo::{Base, BeginOptions, Inner, Repo, blocking, lock};
 use crate::summary::ConflictSummary;
 use crate::{Error, Result};
 
@@ -135,6 +135,40 @@ pub struct PendingResolution {
     /// The arbiter's signature over the decision
     /// ([`arbitration_message`]), stored on the `Arbitrated` event.
     pub signature: Option<Signature>,
+    /// The decision the signature covers, stored on the `Arbitrated` event
+    /// so the audit can verify it (ADR 0038). Unset on entries written
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<SignedDecision>,
+}
+
+/// An [`Arbitration`] as the arbiter signed it (ADR 0038).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignedDecision {
+    /// `pick_ours`, `pick_theirs`, `replay` or `resolved`.
+    pub action: String,
+    /// With `resolved`: the resolving change.
+    pub resolved: Option<ChangeId>,
+    /// With `replay`: the note.
+    pub note: Option<String>,
+}
+
+impl SignedDecision {
+    /// `action` as signed.
+    #[must_use]
+    pub fn of(action: &Arbitration) -> Self {
+        let (name, resolved, note) = match action {
+            Arbitration::PickOurs => ("pick_ours", None, None),
+            Arbitration::PickTheirs => ("pick_theirs", None, None),
+            Arbitration::Replay { note } => ("replay", None, note.clone()),
+            Arbitration::Resolved(id) => ("resolved", Some(*id), None),
+        };
+        Self {
+            action: name.to_owned(),
+            resolved,
+            note,
+        }
+    }
 }
 
 /// A conflicted change's way up the ladder.
@@ -427,7 +461,7 @@ impl Inner {
 
     /// Write `entry` with a fresh `updated_at`.
     fn rewrite(&self, entry: &mut QueueEntry) -> Result<()> {
-        entry.updated_at = now();
+        entry.updated_at = Timestamp::now();
         self.put_entry(entry)
     }
 
@@ -688,17 +722,28 @@ impl Inner {
             entry.status = QueueStatus::Arbitrated { landed };
             escalation.note = None;
             self.rewrite(&mut entry)?;
-            let arbiter = pending.map_or_else(
-                || Arbiter {
-                    actor: lander_actor(),
-                    signature: None,
+            let (arbiter, decision) = pending.map_or_else(
+                || {
+                    let arbiter = Arbiter {
+                        actor: lander_actor(),
+                        signature: None,
+                    };
+                    (arbiter, None)
                 },
-                |p| Arbiter {
-                    actor: p.by,
-                    signature: p.signature,
+                |p| {
+                    let arbiter = Arbiter {
+                        actor: p.by,
+                        signature: p.signature,
+                    };
+                    (arbiter, p.decision)
                 },
             );
-            self.emit(vec![events::arbitrated(of, &arbiter, landed)])?;
+            self.emit(vec![events::arbitrated(
+                of,
+                &arbiter,
+                decision.as_ref(),
+                landed,
+            )])?;
             return Ok(());
         }
         escalation.note = Some(format!(
@@ -1172,9 +1217,10 @@ fn keep_ours(
         provenance: Provenance {
             actor: by.clone(),
             toolchain,
-            created_at: now(),
+            created_at: Timestamp::now(),
             session: None,
             parent_intent: None,
+            voucher: None,
         },
         read_set: Default::default(),
         write_set: Default::default(),
@@ -1224,6 +1270,7 @@ impl Repo {
                 sign::signer(signature).map_err(|err| Error::BadSignature(err.to_string()))?;
             verify_arbitration(change, &action, signature, &key)?;
         }
+        let decision = SignedDecision::of(&action);
         let entry = blocking(&self.inner, move |inner| {
             let entry = inner.submitted_entry(change)?;
             if !entry.status.is_arbitrable() {
@@ -1381,6 +1428,7 @@ impl Repo {
                 change: id,
                 by: arbiter.actor,
                 signature: arbiter.signature,
+                decision: Some(decision),
             });
             escalation.note = None;
             escalation.whole_file = whole_file;

@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::fs;
 use std::path::PathBuf;
 
 use hord_diff::{ConflictKind, MergeMode, apply, diff, merge};
@@ -120,7 +121,7 @@ fn container_replace_keeps_theirs_unique_fields() -> Result<(), Box<dyn std::err
 #[test]
 fn overlapping_edits_inside_one_function_keep_both() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpora/merges/0069");
-    let read = |name: &str| std::fs::read(root.join(name)).expect(name);
+    let read = |name: &str| fs::read(root.join(name)).expect(name);
     let base = read("base.rs");
     let ours = read("ours.rs");
     let theirs = read("theirs.rs");
@@ -130,15 +131,12 @@ fn overlapping_edits_inside_one_function_keep_both() -> Result<(), Box<dyn std::
         .map_err(|c| format!("0069 should resolve: {c:?}"))?;
     let got = adapter.project(&merged.tree.tree);
     // The merge commit mixes both sides of one conflict hunk. That is a manual
-    // resolution. Landing-order auto-resolution is `git merge-file --ours`.
-    let favor = std::process::Command::new("git")
-        .args(["merge-file", "-p", "--ours"])
-        .arg(root.join("ours.rs"))
-        .arg(root.join("base.rs"))
-        .arg(root.join("theirs.rs"))
-        .output()
-        .expect("git merge-file");
-    assert_eq!(got.as_slice(), favor.stdout.as_slice());
+    // resolution. Landing-order auto-resolution is what `git merge-file -p
+    // --ours ours.rs base.rs theirs.rs` gives, checked in so the test needs
+    // no git (ADR 0039).
+    let favor =
+        fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/0069-ours.rs"))?;
+    assert_eq!(got.as_slice(), favor.as_slice());
     assert_ne!(got.as_slice(), want.as_slice());
     Ok(())
 }
@@ -398,7 +396,7 @@ fn project_case(case: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .find(|ext| root.join(format!("base.{ext}")).exists())
         .ok_or_else(|| format!("{case} has no base.rs/base.toml"))?;
     let read = |name: &str| -> Result<Vec<u8>, String> {
-        std::fs::read(root.join(format!("{name}.{ext}"))).map_err(|e| format!("{case} {name}: {e}"))
+        fs::read(root.join(format!("{name}.{ext}"))).map_err(|e| format!("{case} {name}: {e}"))
     };
     let base = read("base")?;
     let ours = read("ours")?;

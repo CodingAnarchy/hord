@@ -314,7 +314,7 @@ impl Strip {
         }
         self.cursor = envelope.cursor;
         self.at_ms = envelope.at_ms;
-        let kind = envelope.event.as_ref()?.kind.as_ref()?;
+        let kind = envelope.kind()?;
         let touched = match kind {
             Kind::Submitted(s) => {
                 let i = self.row_for(&s.change);
@@ -408,6 +408,8 @@ impl Strip {
                 self.head = Some(h.to.clone());
                 None
             }
+            // Not a change: the strip shows no git bridge checks.
+            Kind::BridgeChecked(_) => None,
         };
         if let Some(i) = touched {
             self.rows[i].cursor = envelope.cursor;
@@ -486,6 +488,7 @@ mod tests {
                 submission: cursor,
                 change: change.into(),
                 actor: Some(agent("a")),
+                voucher: None,
             }),
         )
     }
@@ -529,6 +532,7 @@ mod tests {
                 position: 0,
                 submitted: Some("s1".into()),
                 evidence: vec!["e1".into(), "e2".into()],
+                ..Default::default()
             }),
         ));
         let row = strip.row("l1").expect("the landed id names the row");
@@ -624,6 +628,7 @@ mod tests {
                 position: 3,
                 submitted: Some("s".into()),
                 evidence: Vec::new(),
+                ..Default::default()
             }),
         ));
         let row = strip.row("l").expect("landed id is indexed");

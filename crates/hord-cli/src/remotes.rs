@@ -5,8 +5,14 @@
 //! default = "origin"
 //!
 //! [remotes]
-//! origin = "http://127.0.0.1:7878"
+//! origin = "https://hord.example:7878"
+//!
+//! [ca_files]                    # optional: a CA to trust besides the system's
+//! origin = "/etc/hord/ca.pem"
 //! ```
+//!
+//! Outside `[ca_files]`, `HORD_CA_FILE` names a CA for every `https`
+//! remote (ADR 0032).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,6 +22,9 @@ use serde::{Deserialize, Serialize};
 
 /// File name under `.hord/`.
 const FILE: &str = "remotes.toml";
+
+/// A PEM CA certificate to trust for `https` remotes without their own.
+pub const CA_FILE_ENV: &str = "HORD_CA_FILE";
 
 /// The remotes of one repository.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -27,6 +36,10 @@ pub struct Remotes {
     /// Name → address.
     #[serde(default)]
     pub remotes: BTreeMap<String, String>,
+    /// Name → a PEM CA certificate to trust for it besides the system's
+    /// roots (absolute path).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ca_files: BTreeMap<String, PathBuf>,
 }
 
 fn path(hord_dir: &Path) -> PathBuf {
@@ -59,8 +72,8 @@ impl Remotes {
         if self.remotes.contains_key(name) {
             bail!("remote {name} already exists");
         }
-        if !url.starts_with("http://") {
-            bail!("remote address must be http://host:port[/r/<name>] (no TLS until M5)");
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            bail!("remote address must be http[s]://host:port[/r/<name>]");
         }
         self.remotes.insert(name.to_owned(), url.to_owned());
         Ok(())
@@ -71,6 +84,7 @@ impl Remotes {
         if self.remotes.remove(name).is_none() {
             bail!("no remote {name}");
         }
+        self.ca_files.remove(name);
         if self.default.as_deref() == Some(name) {
             self.default = None;
         }
@@ -86,6 +100,38 @@ impl Remotes {
         }
         self.default = name.map(str::to_owned);
         Ok(())
+    }
+
+    /// Trust `file`'s CA for `name`, an `https` remote.
+    pub fn set_ca_file(&mut self, name: &str, file: &Path) -> Result<()> {
+        let url = self.url(name)?;
+        if !url.starts_with("https://") {
+            bail!("remote {name} is not https: a CA file only applies to TLS");
+        }
+        let file =
+            std::path::absolute(file).with_context(|| format!("CA file {}", file.display()))?;
+        if !file.is_file() {
+            bail!("CA file {} does not exist", file.display());
+        }
+        self.ca_files.insert(name.to_owned(), file);
+        Ok(())
+    }
+
+    /// The CA file to trust for `url`: that of a remote with this address,
+    /// else `HORD_CA_FILE`, else none.
+    pub fn ca_file_for(&self, url: &str) -> Option<PathBuf> {
+        if !url.starts_with("https://") {
+            return None;
+        }
+        self.remotes
+            .iter()
+            .filter(|(_, u)| u.as_str() == url)
+            .find_map(|(name, _)| self.ca_files.get(name).cloned())
+            .or_else(|| {
+                std::env::var_os(CA_FILE_ENV)
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            })
     }
 
     /// The address of `name`.
@@ -110,7 +156,15 @@ mod tests {
         remotes.add("origin", "http://127.0.0.1:1")?;
         assert!(remotes.add("origin", "http://x").is_err());
         assert!(remotes.add("a/b", "http://x").is_err());
-        assert!(remotes.add("tls", "https://x").is_err());
+        assert!(remotes.add("ftp", "ftp://x").is_err());
+        remotes.add("tls", "https://h:1")?;
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, "pem")?;
+        assert!(remotes.set_ca_file("origin", &ca).is_err());
+        assert!(remotes.set_ca_file("tls", &dir.join("nope.pem")).is_err());
+        remotes.set_ca_file("tls", &ca)?;
+        assert_eq!(remotes.ca_file_for("https://h:1"), Some(ca.clone()));
+        assert_eq!(remotes.ca_file_for("http://127.0.0.1:1"), None);
         remotes.set_default(Some("origin"))?;
         assert!(remotes.set_default(Some("nope")).is_err());
         remotes.save(&dir)?;
@@ -118,6 +172,8 @@ mod tests {
         assert_eq!(loaded, remotes);
         loaded.remove("origin")?;
         assert_eq!(loaded.default, None);
+        loaded.remove("tls")?;
+        assert!(loaded.ca_files.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

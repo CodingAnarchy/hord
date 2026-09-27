@@ -1,7 +1,10 @@
 //! Optional corpus check: every `.rs` blob at HEAD of the cargo git mirror.
 
+mod common;
+
+use common::git_command;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use hord_lang::LangAdapter;
 use hord_lang_rust::RustAdapter;
@@ -12,7 +15,7 @@ fn cargo_git_dir() -> PathBuf {
 }
 
 fn git(git_dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)

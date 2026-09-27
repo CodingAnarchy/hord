@@ -1,6 +1,6 @@
 //! Interned lossless CSTs (spec §3.3).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hord_core::{Bytes, LangId, Node, NodeKind, ObjectId, QualifiedName};
@@ -76,8 +76,9 @@ fn find_in_raw(raw: &[u8], stripped: &[u8]) -> Option<(u32, u32)> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeTree {
     root: Option<ObjectId>,
-    /// Keyed by content id. Iteration order is that key, not insertion order.
-    entries: Arc<BTreeMap<ObjectId, Entry>>,
+    /// Keyed by content id; unordered. Every walk looks each node up here,
+    /// so lookups must be cheap.
+    entries: Arc<HashMap<ObjectId, Entry>>,
 }
 
 impl NodeTree {
@@ -308,7 +309,7 @@ impl NodeTree {
     /// a cache holding clones over-estimates, which only evicts earlier.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        // BTreeMap slot, `Entry`, and the `Arc` headers of `raw`/`stripped`.
+        // Map slot, `Entry`, and the `Arc` headers of `raw`/`stripped`.
         const PER_NODE: usize = std::mem::size_of::<(ObjectId, Entry)>() + 48;
         self.entries
             .values()

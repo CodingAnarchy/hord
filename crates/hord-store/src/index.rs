@@ -718,6 +718,7 @@ mod tests {
                 created_at: Timestamp::from_millis(0),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: BTreeSet::from([read]),
             write_set: BTreeSet::from([write]),

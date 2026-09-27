@@ -155,6 +155,14 @@ pub enum Error {
     /// An arbiter's signature does not verify (spec §10.5.4).
     #[error("bad arbitration signature: {0}")]
     BadSignature(String),
+    /// The lander's key (ADR 0038) could not be read or created.
+    #[error("lander key {path}: {reason}")]
+    LanderKey {
+        /// The key file.
+        path: std::path::PathBuf,
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 fn list(nodes: &[NodeId]) -> String {

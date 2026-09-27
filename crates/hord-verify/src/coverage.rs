@@ -337,11 +337,22 @@ pub fn find_coverage(
     snapshots: impl IntoIterator<Item = SnapshotId>,
     toolchain: ObjectId,
 ) -> Result<Option<(ObjectId, CoverageRecord)>> {
+    newest_coverage(index, snapshots, Some(toolchain))
+}
+
+/// [`find_coverage`], for any toolchain when `toolchain` is `None`: the
+/// observed `Tests` edges the repository browser shows (spec §3.8), where
+/// no toolchain is at hand.
+pub fn newest_coverage(
+    index: &dyn EvidenceIndex,
+    snapshots: impl IntoIterator<Item = SnapshotId>,
+    toolchain: Option<ObjectId>,
+) -> Result<Option<(ObjectId, CoverageRecord)>> {
     for snapshot in snapshots {
         let mut best = None;
         for id in index.evidence_at(snapshot)? {
             let evidence = get_evidence(index, id)?;
-            if evidence.toolchain != toolchain
+            if toolchain.is_some_and(|t| t != evidence.toolchain)
                 || evidence.kind != EvidenceKind::Custom(COVERAGE_KIND.to_owned())
                 || evidence.result != EvidenceResult::Pass
             {

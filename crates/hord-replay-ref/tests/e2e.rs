@@ -111,7 +111,7 @@ fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> TestResult<&'a str> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")
@@ -320,4 +320,22 @@ fn serve_root_runs_each_repositorys_replay_harness() -> TestResult {
     conflict_is_replayed(&hord, &notes.0, &prompt_copy)?;
     drop(serving);
     Ok(())
+}
+
+/// `git`, isolated from the user's and the system's configuration (a
+/// global `commit.gpgsign`, hooks, a default branch name), so tests behave
+/// the same on every machine and on CI.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    command
+}
+
+/// Isolate `command`, and any `git` it runs, from the user's and the
+/// system's git configuration. Git (for Windows too) reads `/dev/null` as
+/// an empty file.
+fn isolate_git(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
 }

@@ -2,9 +2,13 @@
 
 #![allow(dead_code)]
 
+use std::env;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Remove `path` and everything under it, if it exists. Directory
 /// workspaces keep a read-only pristine checkout under `.hord/pristine/`
@@ -48,4 +52,54 @@ pub fn drop_tree(path: &Path) {
     if let Err(err) = remove_tree(path) {
         eprintln!("remove temp dir {}: {err}", path.display());
     }
+}
+
+/// A fresh directory under the system temp dir, removed on drop. Its
+/// name is `prefix`, the pid and a per-process counter, so tests running
+/// in parallel never share one, and a leftover from a reused pid is
+/// cleared first.
+pub struct TempDir(pub PathBuf);
+
+impl TempDir {
+    pub fn new(prefix: &str) -> Result<Self, String> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        clear_stale(&path)?;
+        fs::create_dir_all(&path)
+            .map_err(|err| format!("create temp dir {}: {err}", path.display()))?;
+        Ok(Self(path))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // A daemon exits once `.hord/` is gone.
+        drop_tree(&self.0);
+    }
+}
+
+/// `git`, isolated from the user's and the system's configuration (a
+/// global `commit.gpgsign`, hooks, a default branch name), so tests behave
+/// the same on every machine and on CI.
+pub fn git_command() -> Command {
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    command
+}
+
+/// Isolate `command`, and any `git` it runs, from the user's and the
+/// system's git configuration. Git (for Windows too) reads `/dev/null` as
+/// an empty file.
+pub fn isolate_git(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
 }

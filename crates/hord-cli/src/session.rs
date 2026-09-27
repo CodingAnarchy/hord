@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use hord_api::{RepoBackend, WorkspacesBackend};
 use hord_core::Actor;
 use hord_core::sign::SigningKey;
-use hord_remote::RemoteRepo;
+use hord_remote::{ConnectOptions, RemoteRepo};
 use hord_txn::{LocalRepo, Repo};
 
 use crate::identity::{self, Credential, Credentials};
@@ -51,20 +51,38 @@ pub fn local_signer() -> Result<Signer> {
 /// stored for it, if any.
 pub fn connect(name: &str, url: &str) -> Result<(RemoteRepo, Option<Credential>)> {
     let credential = Credentials::for_url(url)?;
-    let remote = match &credential {
-        Some(credential) => block_on(RemoteRepo::connect_with_token(url, &credential.token)),
-        None => block_on(RemoteRepo::connect(url)),
-    }
-    .with_context(|| format!("connect to remote {name}"))?;
+    let token = credential.as_ref().map(|c| c.token.clone());
+    let remote = connect_as(name, url, token)?;
     Ok((remote, credential))
+}
+
+/// Connect to the remote `name` at `url`, sending `token` if given. An
+/// `https` address trusts the system's roots plus the remote's CA file
+/// (`hord remote add --ca-file`) or `HORD_CA_FILE` (ADR 0032).
+pub fn connect_as(name: &str, url: &str, token: Option<String>) -> Result<RemoteRepo> {
+    let remotes = match repo::discover_root() {
+        Ok(root) => Remotes::load(&root.join(hord_store::HORD_DIR))?,
+        Err(_) => Remotes::default(),
+    };
+    let ca_pem = remotes
+        .ca_file_for(url)
+        .map(|file| {
+            std::fs::read(&file).with_context(|| format!("read CA file {}", file.display()))
+        })
+        .transpose()?;
+    block_on(RemoteRepo::connect_with(
+        url,
+        &ConnectOptions { token, ca_pem },
+    ))
+    .with_context(|| format!("connect to remote {name}"))
 }
 
 /// The remote a command that only makes sense against a server targets:
 /// `--remote`, else the clone's default upstream, else `name` given on the
-/// command line as a name or an `http://` address. Returns its name and
+/// command line as a name or an `http[s]://` address. Returns its name and
 /// address.
 pub fn remote_url(target: &Target, name: Option<&str>) -> Result<(String, String)> {
-    if let Some(url) = name.filter(|n| n.starts_with("http://")) {
+    if let Some(url) = name.filter(|n| n.starts_with("http://") || n.starts_with("https://")) {
         return Ok((url.to_owned(), url.to_owned()));
     }
     let root = repo::discover_root()?;

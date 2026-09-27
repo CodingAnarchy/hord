@@ -195,6 +195,7 @@ impl Fixture {
                 created_at: Timestamp::from_millis(1),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: Default::default(),
             write_set: [NodeId::file_root(&repo_path)].into_iter().collect(),
@@ -312,10 +313,7 @@ async fn until(
 }
 
 fn kinds(events: &[proto::EventEnvelope]) -> Vec<&Kind> {
-    events
-        .iter()
-        .filter_map(|e| e.event.as_ref().and_then(|e| e.kind.as_ref()))
-        .collect()
+    events.iter().filter_map(|e| e.kind()).collect()
 }
 
 fn expect_err<T: std::fmt::Debug>(

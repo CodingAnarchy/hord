@@ -40,7 +40,7 @@ fn run(cmd: &mut Command) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    run(Command::new("git")
+    run(git_command()
         .args([
             "-c",
             "user.name=t",
@@ -234,4 +234,22 @@ fn chains_faults_sample_and_merge() -> TestResult {
     assert_eq!(report["profraw_in_cwd"], serde_json::json!([]));
     let _ = fs::remove_dir_all(&root);
     Ok(())
+}
+
+/// `git`, isolated from the user's and the system's configuration (a
+/// global `commit.gpgsign`, hooks, a default branch name), so tests behave
+/// the same on every machine and on CI.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    command
+}
+
+/// Isolate `command`, and any `git` it runs, from the user's and the
+/// system's git configuration. Git (for Windows too) reads `/dev/null` as
+/// an empty file.
+fn isolate_git(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
 }

@@ -809,4 +809,19 @@ impl RepoBackend for LocalRepo {
     async fn events(&self, request: proto::EventsRequest) -> ApiResult<EventStream> {
         Ok(self.repo.events(request.from).await?)
     }
+
+    async fn record_bridge_check(
+        &self,
+        request: proto::BridgeChecked,
+    ) -> ApiResult<proto::RecordBridgeCheckResponse> {
+        api(&self.repo, move |inner| {
+            let log = inner.event_log()?;
+            let recorded = log.append(vec![proto::event::Kind::BridgeChecked(request)])?;
+            // A check is rare and audited (spec §12 M6): keep it at once.
+            log.sync()?;
+            let cursor = recorded.last().map_or(0, |e| e.cursor);
+            Ok(proto::RecordBridgeCheckResponse { cursor })
+        })
+        .await
+    }
 }

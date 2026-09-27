@@ -1,0 +1,349 @@
+//! `hord git sync [--once | --check | --repair]`: the git bridge (spec §9,
+//! ADR 0036, ADR 0037). Setup is in `docs/bridge.md`.
+//!
+//! The bridge's config is a TOML file (default `.hord/bridge.toml`):
+//!
+//! ```toml
+//! remote = "https://github.com/owner/hord.git"  # the mirror; no credentials
+//! token_file = "/etc/hord/github-token"         # outside the repository;
+//!                                               # relative to this file
+//! poll_secs = 60                                # pull request polling
+//! check_secs = 3600                             # divergence checks
+//! work_dir = "/var/lib/hord/bridge"             # default .hord/bridge
+//! follow = "origin"                             # a hord remote; default this repository
+//!
+//! [github]                                      # none: export and checks only
+//! repository = "owner/hord"
+//! api = "https://api.github.com"
+//! ```
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use hord_api::proto::{self, BridgeCheckTrigger};
+use hord_api::{RepoBackend, wire};
+use hord_core::sign::SigningKey;
+use hord_git::sync::{
+    Bridge, BridgeOptions, Check, GitHub, GitHubOptions, PullRequests, SyncReport,
+};
+use hord_txn::LocalRepo;
+use serde::Deserialize;
+
+use crate::output::Exit;
+use crate::session::{self, Session, Target};
+use crate::txn::block_on;
+use crate::{output, repo};
+
+/// What `hord git sync` does.
+#[derive(Clone, Copy, Debug)]
+pub enum Mode {
+    /// Run until interrupted.
+    Daemon,
+    /// One pass.
+    Once,
+    /// Check `main`, change nothing.
+    Check,
+    /// Force-push the export.
+    Repair,
+}
+
+/// The bridge's config file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    /// The mirror's git URL.
+    remote: String,
+    /// A file holding the token for the mirror and the GitHub API.
+    token_file: Option<PathBuf>,
+    /// Pull request polling interval.
+    poll_secs: Option<u64>,
+    /// Divergence check interval.
+    check_secs: Option<u64>,
+    /// The bridge's work directory.
+    work_dir: Option<PathBuf>,
+    /// The hord repository to follow: a remote name or address.
+    follow: Option<String>,
+    /// The pull request host.
+    github: Option<GitHubConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitHubConfig {
+    /// `owner/name`.
+    repository: String,
+    /// API root.
+    api: Option<String>,
+}
+
+pub fn run(
+    json: bool,
+    target: &Target,
+    mode: Mode,
+    config: Option<PathBuf>,
+    insecure: bool,
+) -> Result<()> {
+    let root = repo::discover_root().ok();
+    let config_path = match (config, &root) {
+        (Some(path), _) => path,
+        (None, Some(root)) => root.join(hord_store::HORD_DIR).join("bridge.toml"),
+        (None, None) => bail!("no .hord directory here: pass --config"),
+    };
+    let text = fs::read_to_string(&config_path)
+        .with_context(|| format!("read the bridge config {}", config_path.display()))?;
+    let config: Config = toml::from_str(&text)
+        .with_context(|| format!("parse the bridge config {}", config_path.display()))?;
+    let token = match &config.token_file {
+        Some(file) => Some(read_token(&beside(&config_path, file), root.as_deref())?),
+        None => None,
+    };
+    let work_dir = match (&config.work_dir, &root) {
+        (Some(dir), _) => dir.clone(),
+        (None, Some(root)) => root.join(hord_store::HORD_DIR).join("bridge"),
+        (None, None) => bail!("set work_dir in {}", config_path.display()),
+    };
+
+    let (backend, key, local) = backend(target, config.follow.as_deref())?;
+    let result = sync(json, mode, &config, backend, key, token, work_dir, insecure);
+    // A lander this process ran for the bridge stops, and the store closes,
+    // before the process exits (an unclosed store needs repair next time).
+    if let Some(local) = local {
+        block_on(local.shutdown());
+    }
+    result
+}
+
+/// [`run`] once the backend is open.
+#[allow(clippy::too_many_arguments)]
+fn sync(
+    json: bool,
+    mode: Mode,
+    config: &Config,
+    backend: Arc<dyn RepoBackend>,
+    key: Option<SigningKey>,
+    token: Option<String>,
+    work_dir: PathBuf,
+    insecure: bool,
+) -> Result<()> {
+    let pulls: Option<Arc<dyn PullRequests>> = match &config.github {
+        Some(github) => {
+            let token = token
+                .clone()
+                .ok_or_else(|| anyhow!("[github] needs token_file"))?;
+            let options = GitHubOptions {
+                api: github
+                    .api
+                    .clone()
+                    .unwrap_or_else(|| "https://api.github.com".into()),
+                repository: github.repository.clone(),
+                token,
+                base: "main".into(),
+                insecure,
+            };
+            Some(Arc::new(GitHub::new(options)?))
+        }
+        None => None,
+    };
+    let mut options = BridgeOptions::new(config.remote.clone(), work_dir);
+    options.token = token;
+    options.insecure = insecure;
+    options.voucher = key.as_ref().map(|k| k.public().key_id());
+    options.signer = key.map(Arc::new);
+    if let Some(secs) = config.poll_secs {
+        options.poll = Duration::from_secs(secs.max(1));
+    }
+    if let Some(secs) = config.check_secs {
+        options.check_every = Duration::from_secs(secs.max(1));
+    }
+    // A check saves no state: it may run beside the daemon.
+    options.shared = matches!(mode, Mode::Check);
+
+    let mut bridge = block_on(Bridge::open(backend, pulls, options))?;
+    match mode {
+        Mode::Once => {
+            let report = block_on(bridge.sync_once())?;
+            print_report(json, &report)
+        }
+        Mode::Check => {
+            let check = block_on(bridge.check(BridgeCheckTrigger::Check))?;
+            print_check(json, &check)?;
+            if check.diverged {
+                // Divergence is the answer, not a failure to run: exit 1
+                // after the report, like `hord policy check` on deny.
+                return Err(Exit(1).into());
+            }
+            Ok(())
+        }
+        Mode::Repair => {
+            let check = block_on(bridge.repair())?;
+            print_check(json, &check)
+        }
+        Mode::Daemon => {
+            if !json {
+                eprintln!("hord git sync: mirroring to {}", bridge.remote());
+            }
+            block_on(bridge.run(async {
+                let _ = tokio::signal::ctrl_c().await;
+            }))?;
+            Ok(())
+        }
+    }
+}
+
+/// The repository to follow, and the key that vouches for pull requests
+/// (ADR 0037) and signs bridge checks (ADR 0038): the logged-in
+/// credential's, against a remote. With neither a remote nor a daemon, the
+/// repository is served in this process, returned to be shut down.
+#[allow(clippy::type_complexity)]
+fn backend(
+    target: &Target,
+    follow: Option<&str>,
+) -> Result<(
+    Arc<dyn RepoBackend>,
+    Option<SigningKey>,
+    Option<Arc<LocalRepo>>,
+)> {
+    if follow.is_some() || target.remote.is_some() {
+        let (name, url) = session::remote_url(target, follow)?;
+        let (remote, credential) = session::connect(&name, &url)?;
+        let key = credential.map(|c| c.key()).transpose()?;
+        return Ok((Arc::new(remote), key, None));
+    }
+    match Session::open(target)? {
+        Session::Daemon { remote } => Ok((Arc::new(remote), None, None)),
+        Session::Remote {
+            remote, credential, ..
+        } => {
+            let key = credential.map(|c| c.key()).transpose()?;
+            Ok((Arc::new(remote), key, None))
+        }
+        // No daemon: land here, so pull requests do not wait for one.
+        Session::Direct { repo } => {
+            let local = Arc::new(LocalRepo::new(repo)?);
+            Ok((
+                Arc::clone(&local) as Arc<dyn RepoBackend>,
+                None,
+                Some(local),
+            ))
+        }
+    }
+}
+
+/// `file` as the config at `config` names it: a relative path is relative
+/// to the config file's directory, not to wherever the bridge was started.
+fn beside(config: &Path, file: &Path) -> PathBuf {
+    match config.parent() {
+        Some(dir) if file.is_relative() => dir.join(file),
+        _ => file.to_owned(),
+    }
+}
+
+/// The token in `file`, which must not be in the repository's tracked
+/// tree (ADR 0036: the token is the host's, never the repository's).
+fn read_token(file: &Path, root: Option<&Path>) -> Result<String> {
+    let path = file
+        .canonicalize()
+        .with_context(|| format!("token file {}", file.display()))?;
+    if let Some(root) = root.and_then(|r| r.canonicalize().ok())
+        && path.starts_with(&root)
+        && !path.starts_with(root.join(hord_store::HORD_DIR))
+    {
+        bail!(
+            "token file {} is inside the repository; keep it outside (or under .hord/)",
+            path.display()
+        );
+    }
+    let token =
+        fs::read_to_string(&path).with_context(|| format!("read token file {}", path.display()))?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        bail!("token file {} is empty", path.display());
+    }
+    Ok(token)
+}
+
+fn check_message(check: &Check) -> proto::BridgeChecked {
+    proto::BridgeChecked {
+        remote: check.remote.clone(),
+        diverged: check.diverged,
+        expected: check.expected.clone(),
+        actual: check.actual.clone(),
+        trigger: check.trigger.into(),
+        detail: check.detail.clone(),
+        head: check.head.map(wire::id),
+        recorder: None,
+        signature: None,
+    }
+}
+
+fn print_check(json: bool, check: &Check) -> Result<()> {
+    if json {
+        return output::print_json(&check_message(check));
+    }
+    let verdict = if check.diverged { "DIVERGED" } else { "ok" };
+    println!("{verdict}: {}", check.detail);
+    Ok(())
+}
+
+fn print_report(json: bool, report: &SyncReport) -> Result<()> {
+    if json {
+        let result = proto::GitSyncResult {
+            exported: report.exported.iter().copied().map(wire::id).collect(),
+            pushed: report.pushed.clone(),
+            proposed: report
+                .proposed
+                .iter()
+                .map(|(pull, change)| proto::GitSyncProposal {
+                    pull: *pull,
+                    change: wire::id(*change),
+                })
+                .collect(),
+            reported: report
+                .reported
+                .iter()
+                .map(|(pull, outcome)| proto::GitSyncReport {
+                    pull: *pull,
+                    outcome: outcome.clone(),
+                })
+                .collect(),
+            checks: report.checks.iter().map(check_message).collect(),
+        };
+        return output::print_json(&result);
+    }
+    println!("exported {} landed change(s)", report.exported.len());
+    if let Some(pushed) = &report.pushed {
+        println!("pushed {pushed} to main");
+    }
+    for (pull, change) in &report.proposed {
+        println!("pull request #{pull}: submitted {change}");
+    }
+    for (pull, outcome) in &report.reported {
+        println!("pull request #{pull}: reported {outcome}");
+    }
+    for check in &report.checks {
+        let verdict = if check.diverged { "DIVERGED" } else { "ok" };
+        println!("{verdict}: {}", check.detail);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::beside;
+
+    #[test]
+    fn a_relative_token_file_is_beside_the_config() {
+        let config = Path::new("/etc/hord/bridge.toml");
+        assert_eq!(
+            beside(config, Path::new("github-token")),
+            PathBuf::from("/etc/hord/github-token")
+        );
+        let absolute = std::env::temp_dir().join("token");
+        assert_eq!(beside(config, &absolute), absolute);
+    }
+}

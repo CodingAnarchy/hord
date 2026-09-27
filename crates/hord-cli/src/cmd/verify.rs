@@ -8,7 +8,7 @@
 use anyhow::Result;
 use hord_api::proto;
 
-use crate::output;
+use crate::output::{self, Exit};
 use crate::session::{Session, Target};
 use crate::txn::block_on;
 use crate::workspaces::this_caller;
@@ -52,7 +52,7 @@ pub fn run(json: bool, target: &Target, workspace: Option<String>, plan_only: bo
         }
     }
     if result.passed == Some(false) {
-        std::process::exit(1);
+        return Err(Exit(1).into());
     }
     Ok(())
 }

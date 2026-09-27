@@ -3,34 +3,13 @@
 
 mod common;
 
+use common::{TempDir, git_command};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> TestResult<Self> {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-        ));
-        common::clear_stale(&path)?;
-        fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        common::drop_tree(&self.0);
-    }
-}
 
 fn ok(dir: &Path, args: &[&str]) -> TestResult<String> {
     let out = Command::new(env!("CARGO_BIN_EXE_hord"))
@@ -51,7 +30,7 @@ fn ok(dir: &Path, args: &[&str]) -> TestResult<String> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> TestResult {
-    let out = Command::new("git")
+    let out = git_command()
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada")

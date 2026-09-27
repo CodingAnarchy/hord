@@ -1,29 +1,14 @@
 //! Waiting for a store another holder has open (ADR 0021, "Now").
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hord_store::{Error, Store};
 
-fn temp_repo() -> std::io::Result<PathBuf> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "hord-store-lock-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
-struct Guard(PathBuf);
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use common::{Guard, temp_repo};
 
 fn pid_file(repo: &Path) -> PathBuf {
     repo.join(".hord").join("index.pid")

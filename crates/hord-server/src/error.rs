@@ -29,19 +29,37 @@ pub enum Error {
     /// `--root` found no repository.
     #[error("no repository (.hord/) under {0}")]
     NoRepos(PathBuf),
-    /// A non-loopback bind address without `--insecure-bind` (ADR 0024;
-    /// there is no TLS, so tokens would travel in the clear).
+    /// A non-loopback plaintext bind without `--insecure-bind` (ADR 0024,
+    /// ADR 0032): without TLS, tokens would travel in the clear.
     #[error(
-        "refusing to bind {0}: not a loopback address, and there is no TLS (bearer \
-         tokens would travel in the clear); pass --insecure-bind to bind it anyway"
+        "refusing to bind {0}: not a loopback address, and TLS is off (bearer \
+         tokens would travel in the clear); configure [tls] in server.toml or \
+         --tls-cert/--tls-key, or pass --insecure-bind to bind it anyway"
     )]
     InsecureBind(std::net::SocketAddr),
+    /// The TLS certificate or key could not be read or used.
+    #[error("TLS {path}: {reason}")]
+    Tls {
+        /// The certificate or key file.
+        path: PathBuf,
+        /// What is wrong.
+        reason: String,
+    },
     /// `server.toml` is invalid.
     #[error("server config {path}: {reason}")]
     Config {
         /// The file.
         path: PathBuf,
         /// What is wrong.
+        reason: String,
+    },
+    /// A hosted repository's lander key could not be listed in the auth
+    /// file (ADR 0038).
+    #[error("repository {repo}: list its lander key: {reason}")]
+    Lander {
+        /// The repository's name.
+        repo: String,
+        /// Why.
         reason: String,
     },
     /// Socket or file I/O.

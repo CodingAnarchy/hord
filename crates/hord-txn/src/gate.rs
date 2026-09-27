@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hord_core::{ChangeId, ChangeRecord, Evidence, NodeId, RepoPath, SnapshotId};
+use hord_core::{ChangeId, ChangeRecord, Evidence, NodeId, ObjectId, RepoPath, SnapshotId};
 use hord_policy::{CompiledPolicy, Decision, EvidenceFact, Facts, POLICY_PATH, TouchedDefinition};
 use hord_verify::{
     Checkout, CoverageRecord, Drift, EvidenceIndex, ImpactBound, ImpactSet, Toolchain, VerifyPlan,
@@ -692,6 +692,14 @@ fn policy_path() -> Result<RepoPath> {
 /// where it came from, or why the file does not parse.
 pub(crate) type HeadPolicy = std::result::Result<(Arc<CompiledPolicy>, PolicySource), String>;
 
+/// Whether `policy` can require nothing of any change (no `land.require`,
+/// no `max_write_set`, no rules): it allows every change whatever its
+/// facts, so they need not be read.
+fn requires_nothing(policy: &CompiledPolicy) -> bool {
+    let p = policy.policy();
+    p.land.require.is_empty() && p.land.max_write_set.is_none() && p.rules.is_empty()
+}
+
 impl Inner {
     /// The policy in `snapshot` (ADR 0026). An unparseable file is an
     /// error message: the change is judged by nothing weaker.
@@ -722,8 +730,7 @@ impl Inner {
         policy: &CompiledPolicy,
         record: &ChangeRecord,
     ) -> Result<(Option<Facts>, BTreeSet<String>)> {
-        let p = policy.policy();
-        if p.land.require.is_empty() && p.land.max_write_set.is_none() && p.rules.is_empty() {
+        if requires_nothing(policy) {
             return Ok((None, BTreeSet::new()));
         }
         let facts = self.policy_facts(record, false)?;
@@ -764,29 +771,50 @@ impl Inner {
         Ok(out)
     }
 
-    /// Evidence facts for judging the candidate `landed` with its rebase
-    /// `report`: everything indexed for its result, plus, for a rebased
-    /// record whose rebase merged nothing (no `merge`, no `adapter_merged`),
-    /// the `review:*` evidence indexed for the submitted record's result
-    /// (ADR 0031). Machine evidence counts only for the exact snapshot.
-    pub(crate) fn candidate_evidence_facts(
+    /// The evidence the lander counts when judging the candidate `landed`
+    /// with its rebase `report`: everything indexed for its result, plus,
+    /// for a rebased record whose rebase merged nothing (no `merge`, no
+    /// `adapter_merged`), the `review:*` evidence indexed for the submitted
+    /// record's result (ADR 0031). Machine evidence counts only for the
+    /// exact snapshot. `Landed` lists these ids (ADR 0038).
+    pub(crate) fn candidate_evidence_ids(
         &self,
         landed: &ChangeRecord,
         report: &ConflictReport,
-    ) -> Result<Vec<EvidenceFact>> {
-        let mut out = self.evidence_facts(landed.result)?;
+    ) -> Result<Vec<ObjectId>> {
+        let mut ids = self.store.evidence_at(landed.result)?;
         if let Some(submitted) = landed.rebased_from
             && report.merge.is_empty()
             && report.adapter_merged.is_empty()
         {
             let submitted = self.change_record(submitted)?;
             if submitted.result != landed.result {
-                out.extend(
-                    self.evidence_facts(submitted.result)?
-                        .into_iter()
-                        .filter(|fact| fact.tag.kind() == "review"),
-                );
+                for id in self.store.evidence_at(submitted.result)? {
+                    let evidence: Evidence = self.get_object(id)?;
+                    if EvidenceFact::of(&evidence).is_some_and(|f| f.tag.kind() == "review") {
+                        ids.push(id);
+                    }
+                }
             }
+        }
+        Ok(ids)
+    }
+
+    /// Facts for [`Self::candidate_evidence_ids`].
+    pub(crate) fn candidate_evidence_facts(
+        &self,
+        landed: &ChangeRecord,
+        report: &ConflictReport,
+    ) -> Result<Vec<EvidenceFact>> {
+        self.evidence_facts_of(&self.candidate_evidence_ids(landed, report)?)
+    }
+
+    /// Evidence facts for the evidence `ids`.
+    pub(crate) fn evidence_facts_of(&self, ids: &[ObjectId]) -> Result<Vec<EvidenceFact>> {
+        let mut out = Vec::new();
+        for id in ids {
+            let evidence: Evidence = self.get_object(*id)?;
+            out.extend(EvidenceFact::of(&evidence));
         }
         Ok(out)
     }
@@ -1399,6 +1427,32 @@ impl crate::Repo {
             inner
                 .check_policy_file(base, result)?
                 .map_err(Error::Policy)
+        })
+        .await
+    }
+
+    /// Head's policy for the landed change `landed`, judged again: the
+    /// policy in its landing base (the head it landed on), over its facts
+    /// and exactly the evidence `evidence` (ADR 0038: what the lander
+    /// counted, as `Landed` lists it). An unparseable policy file is the
+    /// inner error's message. For `hord audit` (spec §12 M6).
+    pub async fn judge_landed(
+        &self,
+        landed: ChangeId,
+        evidence: Vec<ObjectId>,
+    ) -> Result<std::result::Result<(Decision, PolicySource), String>> {
+        crate::repo::blocking(&self.inner, move |inner| {
+            let record = inner.change_record(landed)?;
+            let (policy, source) = match inner.policy_at(record.base)? {
+                Ok(found) => found,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            if requires_nothing(&policy) {
+                return Ok(Ok((Decision::Allow, source)));
+            }
+            let mut facts = inner.policy_facts(&record, false)?;
+            facts.evidence = inner.evidence_facts_of(&evidence)?;
+            Ok(Ok((policy.evaluate(&facts), source)))
         })
         .await
     }

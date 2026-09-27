@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use hord_core::sign::{self, SigningKey};
 use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
     RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
@@ -207,6 +207,8 @@ pub(crate) struct Inner {
     pub wake: tokio::sync::Notify,
     /// The persisted event log (spec §10.5.3), opened on first use.
     pub events: Mutex<Option<Arc<crate::events::EventLog>>>,
+    /// The lander's key (ADR 0038), read or created on first landing.
+    pub lander_key: Mutex<Option<Arc<SigningKey>>>,
     /// Every task this repository spawns that holds it: blocking store
     /// work, verification, and replays. [`Repo::close`] waits for them.
     pub tasks: TaskTracker,
@@ -379,14 +381,6 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-pub(crate) fn now() -> Timestamp {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    Timestamp::from_millis(ms)
-}
-
 /// Toolchain descriptor hashed into `provenance.toolchain` (spec §3.5).
 #[derive(serde::Serialize)]
 struct Toolchain<'a> {
@@ -429,6 +423,7 @@ impl Inner {
             lander: tokio::sync::Mutex::new(crate::lander::LanderState::default()),
             wake: tokio::sync::Notify::new(),
             events: Mutex::new(None),
+            lander_key: Mutex::new(None),
             tasks: TaskTracker::new(),
             closing: CancellationToken::new(),
             verify_cancel: Cancel::new(),
@@ -636,9 +631,10 @@ impl Inner {
             provenance: Provenance {
                 actor,
                 toolchain: self.toolchain,
-                created_at: now(),
+                created_at: Timestamp::now(),
                 session: None,
                 parent_intent: None,
+                voucher: None,
             },
             read_set: Default::default(),
             write_set: Default::default(),
@@ -647,6 +643,7 @@ impl Inner {
             signature: None,
             rebased_from: None,
         };
+        let lander_key = self.lander_key()?;
         let change = self.store.put_object(&record)?;
         self.store.append_log(change)?;
         self.store.set_head(change)?;
@@ -655,7 +652,16 @@ impl Inner {
             change: Some(change),
             snapshot: result,
         });
-        self.emit(crate::events::landed(change, 0, None, &[], None))?;
+        let signature = sign::sign_landing(change, 0, &lander_key);
+        self.emit(crate::events::landed(
+            change,
+            0,
+            None,
+            &[],
+            &[],
+            &signature,
+            None,
+        ))?;
         Ok(change)
     }
 
@@ -931,6 +937,15 @@ impl Repo {
     /// Submitting a change that is already queued returns its entry.
     pub async fn submit(&self, change: ChangeId) -> Result<QueueEntry> {
         blocking(&self.inner, move |inner| inner.submit(change)).await
+    }
+
+    /// The id of this repository's lander key (ADR 0038), which signs its
+    /// `Landed` events; the key is created if the repository has none yet.
+    pub async fn lander_key_id(&self) -> Result<String> {
+        blocking(&self.inner, |inner| {
+            Ok(inner.lander_key()?.public().key_id())
+        })
+        .await
     }
 
     /// Every lander queue entry in submission order (`hord queue`).

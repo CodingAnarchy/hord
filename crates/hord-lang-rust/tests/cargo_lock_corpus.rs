@@ -4,8 +4,11 @@
 //! absent. Ignored by default (slow); run with
 //! `cargo test --release -p hord-lang-rust --test cargo_lock_corpus -- --ignored --nocapture`.
 
+mod common;
+
+use common::git_command;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use hord_lang::LangAdapter;
 use hord_lang_rust::{CargoLockAdapter, CargoLockMergeError, merge_cargo_lock};
@@ -18,7 +21,7 @@ fn cargo_git() -> Option<PathBuf> {
 }
 
 fn git(git_dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)

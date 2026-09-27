@@ -65,7 +65,7 @@ pub enum EvidenceKind {
     /// The lander's attestation that it rebased `submitted` onto the head
     /// it landed on (ADR 0018). [`Evidence::snapshot`] is the landed result,
     /// and the landed record, whose `rebased_from` is `submitted`, lists
-    /// this evidence. Unsigned until M5 adds lander keys.
+    /// this evidence. Unsigned: the lander has no key of its own yet.
     Rebase {
         /// The record the author submitted.
         submitted: crate::ChangeId,

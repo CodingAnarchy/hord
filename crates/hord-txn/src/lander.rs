@@ -49,9 +49,13 @@
 //! elsewhere a few entries ahead of itself, in parallel, off its own path.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::path::Path;
 use std::sync::Arc;
 
 use hord_api::EventStream;
+use hord_core::sign::{self, SigningKey};
 use hord_core::{
     Actor, Bytes, ChangeId, ChangeRecord, Evidence, EvidenceKind, EvidenceResult, IdentityDelta,
     NodeId, ObjectId, SnapshotId, Timestamp,
@@ -66,9 +70,43 @@ use crate::gate::{CandidateContext, HeadPolicy, Verdict, VerifyContext, VerifyRe
 use crate::pinned::Pinned;
 use crate::propose::declared;
 use crate::rebase::rebase;
-use crate::repo::{Head, Inner, Repo, blocking, lock, now};
+use crate::repo::{Head, Inner, Repo, blocking, lock};
 use crate::sets::sets_between;
 use crate::{Error, Result};
+
+/// The lander's key file under `.hord/` (ADR 0038).
+pub const LANDER_KEY_FILE: &str = "lander.pem";
+
+/// The key at `path`, or a new one written there (owner-only) if there is
+/// none. Two processes racing to create it agree: the loser reads the
+/// winner's.
+fn read_or_create_key(path: &Path) -> Result<SigningKey> {
+    let bad = |reason: String| Error::LanderKey {
+        path: path.to_owned(),
+        reason,
+    };
+    match std::fs::read_to_string(path) {
+        Ok(pem) => return SigningKey::from_pem(&pem).map_err(|err| bad(err.to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(bad(err.to_string())),
+    }
+    let key = SigningKey::generate().map_err(|err| bad(err.to_string()))?;
+    let pem = key.to_pem().map_err(|err| bad(err.to_string()))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(pem.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|err| bad(err.to_string()))?;
+            Ok(key)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => read_or_create_key(path),
+        Err(err) => Err(bad(err.to_string())),
+    }
+}
 
 /// Where a submitted change is in the lander (spec §6.2, §6.7).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -610,7 +648,7 @@ impl Inner {
         {
             return Ok(entry);
         }
-        let at = now();
+        let at = Timestamp::now();
         let stored = StoredEntry {
             change,
             status: QueueStatus::Queued,
@@ -630,11 +668,7 @@ impl Inner {
             .store
             .queue_push(&hord_encoding::encode(&stored)?, &[change], checked)?;
         // Emit before waking the lander, so `submitted` precedes its events.
-        self.emit(vec![events::submitted(
-            seq,
-            change,
-            &record.provenance.actor,
-        )])?;
+        self.emit(vec![events::submitted(seq, change, &record.provenance)])?;
         self.wake.notify_one();
         Ok(QueueEntry::from_stored(seq, stored))
     }
@@ -876,7 +910,7 @@ impl Inner {
     /// arbitration when no replay is allowed): it is never visible, or
     /// announced, as conflicted in between ([`Inner::enter_ladder`]).
     fn settle(&self, mut entry: QueueEntry) -> Result<QueueEntry> {
-        entry.updated_at = now();
+        entry.updated_at = Timestamp::now();
         if let Some(jobs) = self.enter_ladder(&mut entry)? {
             crate::repo::lock(&self.pending_replays).extend(jobs);
             return Ok(entry);
@@ -1042,7 +1076,7 @@ impl Inner {
     /// The lander's `Rebase` attestation for `submitted` landing as
     /// `result` (ADR 0018 amendment). A pure function of the two records,
     /// so the same landing gives the same landed id anywhere: its time is
-    /// the submitted record's `created_at`. Unsigned until M5.
+    /// the submitted record's `created_at`. Unsigned: the lander has no key.
     fn rebase_attestation(
         &self,
         submitted: ChangeId,
@@ -1068,6 +1102,19 @@ impl Inner {
             produced_at: record.provenance.created_at,
             signature: None,
         }
+    }
+
+    /// The lander's key (ADR 0038): `.hord/lander.pem`, created on first
+    /// use, readable by its owner only. It signs each `Landed` event.
+    pub(crate) fn lander_key(&self) -> Result<Arc<SigningKey>> {
+        let mut slot = lock(&self.lander_key);
+        if let Some(key) = &*slot {
+            return Ok(Arc::clone(key));
+        }
+        let path = self.store.hord_dir().join(LANDER_KEY_FILE);
+        let key = Arc::new(read_or_create_key(&path)?);
+        *slot = Some(Arc::clone(&key));
+        Ok(key)
     }
 
     /// The id `change` landed under, if it is in the log (as submitted, or
@@ -1123,8 +1170,10 @@ impl Inner {
             }
             Verdict::Pass { evidence } => evidence,
         };
+        // What the policy is judged over, and `Landed` lists (ADR 0038).
+        let counted = self.candidate_evidence_ids(&landed, &report)?;
         if let (Ok((policy, _)), Some(mut facts)) = (&policy, facts) {
-            facts.evidence = self.candidate_evidence_facts(&landed, &report)?;
+            facts.evidence = self.evidence_facts_of(&counted)?;
             if let hord_policy::Decision::Deny { reasons } = policy.evaluate(&facts) {
                 let summary = reasons
                     .iter()
@@ -1152,6 +1201,8 @@ impl Inner {
             }
         }
         let previous = self.head()?.change;
+        // Before the landing is durable: a landing is never left unsigned.
+        let lander_key = self.lander_key()?;
         if let Some(attestation) = &attestation {
             self.store.put_object(attestation)?;
         }
@@ -1160,7 +1211,7 @@ impl Inner {
         }
         entry.status = QueueStatus::Landed { landed: landed_id };
         entry.report = Some(report);
-        entry.updated_at = now();
+        entry.updated_at = Timestamp::now();
         let bytes = hord_encoding::encode(&entry.to_stored())?;
         let names: &[ChangeId] = if landed_id == entry.change {
             &[]
@@ -1181,8 +1232,9 @@ impl Inner {
         });
         let position = self.store.log_len()?.saturating_sub(1) as u64;
         let submitted = (landed_id != entry.change).then_some(entry.change);
+        let signature = sign::sign_landing(landed_id, position, &lander_key);
         self.emit(events::landed(
-            landed_id, position, submitted, &evidence, previous,
+            landed_id, position, submitted, &evidence, &counted, &signature, previous,
         ))?;
         // The footprint is a cache (`footprint` recomputes it on a miss).
         if let Ok(footprint) = self.footprint_of(landed_id, &landed) {

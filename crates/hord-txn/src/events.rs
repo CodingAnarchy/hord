@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use hord_api::proto::event::Kind;
 use hord_api::{ApiError, EventCursor, EventStream, proto, wire};
-use hord_core::{Actor, ChangeId, Evidence, ObjectId};
+use hord_core::{ChangeId, Evidence, ObjectId, Provenance, Signature, Timestamp};
 use prost::Message;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use tokio::sync::{broadcast, mpsc};
@@ -22,9 +22,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::conflict::{ConflictReport, MergeSeverity};
-use crate::escalation::Arbiter;
+use crate::escalation::{Arbiter, SignedDecision};
 use crate::lander::{QueueEntry, QueueStatus};
-use crate::repo::{Inner, lock, now};
+use crate::repo::{Inner, lock};
 use crate::{Error, Result};
 
 /// File name of the event log under `.hord/`.
@@ -103,7 +103,7 @@ impl EventLog {
             return Ok(Vec::new());
         }
         let mut last = lock(&self.last);
-        let at_ms = now().as_millis();
+        let at_ms = Timestamp::now().as_millis();
         let envelopes: Vec<_> = events
             .into_iter()
             .enumerate()
@@ -320,11 +320,12 @@ impl Inner {
 }
 
 /// `Submitted` for a new queue entry.
-pub(crate) fn submitted(seq: u64, change: ChangeId, actor: &Actor) -> Kind {
+pub(crate) fn submitted(seq: u64, change: ChangeId, provenance: &Provenance) -> Kind {
     Kind::Submitted(proto::Submitted {
         submission: seq,
         change: wire::id(change),
-        actor: Some(wire::actor(actor)),
+        actor: Some(wire::actor(&provenance.actor)),
+        voucher: provenance.voucher.clone(),
     })
 }
 
@@ -435,9 +436,30 @@ pub(crate) fn needs_arbitration(change: ChangeId, detail: String) -> Kind {
     })
 }
 
-/// `Arbitrated`: `change` was resolved by `arbiter`, landing as `result`.
-pub(crate) fn arbitrated(change: ChangeId, arbiter: &Arbiter, result: ChangeId) -> Kind {
+/// `Arbitrated`: `change` was resolved by `arbiter`, landing as `result`,
+/// with the `decision` the arbiter signed (ADR 0038).
+pub(crate) fn arbitrated(
+    change: ChangeId,
+    arbiter: &Arbiter,
+    decision: Option<&SignedDecision>,
+    result: ChangeId,
+) -> Kind {
+    use proto::arbitration::Action;
+    let action = decision.and_then(|d| {
+        let action = match d.action.as_str() {
+            "pick_ours" => Action::PickOurs(true),
+            "pick_theirs" => Action::PickTheirs(true),
+            "replay" => Action::Replay(true),
+            "resolved" => Action::Resolved(wire::id(d.resolved?)),
+            _ => return None,
+        };
+        Some(proto::Arbitration {
+            action: Some(action),
+        })
+    });
     Kind::Arbitrated(proto::Arbitrated {
+        action,
+        note: decision.and_then(|d| d.note.clone()),
         change: wire::id(change),
         by: Some(wire::actor(&arbiter.actor)),
         result: wire::id(result),
@@ -455,6 +477,8 @@ pub(crate) fn landed(
     position: u64,
     submitted: Option<ChangeId>,
     evidence: &[ObjectId],
+    counted: &[ObjectId],
+    lander: &Signature,
     previous: Option<ChangeId>,
 ) -> Vec<Kind> {
     vec![
@@ -463,6 +487,11 @@ pub(crate) fn landed(
             position,
             submitted: submitted.map(wire::id),
             evidence: evidence.iter().copied().map(wire::id).collect(),
+            lander_key_id: Some(lander.key_id.clone()),
+            lander_signature: Some(lander.bytes.to_vec()),
+            counted: Some(proto::CountedEvidence {
+                evidence: counted.iter().copied().map(wire::id).collect(),
+            }),
         }),
         Kind::HeadMoved(proto::HeadMoved {
             from: previous.map(wire::id),

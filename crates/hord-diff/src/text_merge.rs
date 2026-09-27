@@ -7,45 +7,70 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::align::spans;
+use crate::align::{Span, spans};
 
 const MAX_LINES: usize = 4_000;
 const MAX_TOKENS: usize = 2_000;
 
-/// Git's auto-merge with every conflict hunk taken from `ours` (landing order).
+/// A diff3 line merge that takes `ours` (landing order) for every conflict.
 ///
-/// This is `git merge-file --ours`: non-overlapping edits from both sides,
-/// and the landing-order side of each conflict. `None` if `git` is missing
-/// or the command fails.
-pub(crate) fn git_merge_ours(base: &[u8], ours: &[u8], theirs: &[u8]) -> Option<Vec<u8>> {
-    // Unique per call. A shared directory races when tests merge in parallel.
-    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("hord-git-merge-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
-    let base_p = dir.join("base");
-    let ours_p = dir.join("ours");
-    let theirs_p = dir.join("theirs");
-    std::fs::write(&base_p, base).ok()?;
-    std::fs::write(&ours_p, ours).ok()?;
-    std::fs::write(&theirs_p, theirs).ok()?;
-    let output = std::process::Command::new("git")
-        .args([
-            "merge-file",
-            "-p",
-            "--ours",
-            ours_p.to_str()?,
-            base_p.to_str()?,
-            theirs_p.to_str()?,
-        ])
-        .output()
-        .ok()?;
-    let _ = std::fs::remove_dir_all(&dir);
-    if output.stdout.is_empty() && !output.status.success() {
+/// Each side's changes against `base` are grouped into hunks, and changes
+/// from the two sides whose base ranges overlap or touch form one conflict
+/// hunk. A hunk changed on one side takes that side; a hunk both sides
+/// changed takes ours. `None` past the size limit.
+pub(crate) fn merge_ours(base: &str, ours: &str, theirs: &str) -> Option<String> {
+    let base = keep_lines(base);
+    let ours = keep_lines(ours);
+    let theirs = keep_lines(theirs);
+    if base.len() > MAX_LINES || ours.len() > MAX_LINES || theirs.len() > MAX_LINES {
         return None;
     }
-    Some(output.stdout)
+    let ours_spans = spans(&base, &ours);
+    let theirs_spans = spans(&base, &theirs);
+    let mut changes: Vec<(bool, &Span)> = ours_spans
+        .iter()
+        .map(|s| (true, s))
+        .chain(theirs_spans.iter().map(|s| (false, s)))
+        .collect();
+    changes.sort_by_key(|(is_ours, s)| (s.a0, s.a1, !is_ours));
+    let mut out = String::new();
+    let mut next = 0usize;
+    let mut i = 0usize;
+    while i < changes.len() {
+        let (g0, mut g1) = (changes[i].1.a0, changes[i].1.a1);
+        let mut j = i + 1;
+        while j < changes.len() && changes[j].1.a0 <= g1 {
+            g1 = g1.max(changes[j].1.a1);
+            j += 1;
+        }
+        let group = &changes[i..j];
+        let side = |want_ours: bool| {
+            let mut mine = group
+                .iter()
+                .filter(|(o, _)| *o == want_ours)
+                .map(|(_, s)| s);
+            let first = mine.next()?;
+            let last = mine.next_back().unwrap_or(first);
+            Some((first.b0 - (first.a0 - g0), last.b1 + (g1 - last.a1)))
+        };
+        for line in &base[next..g0] {
+            out.push_str(line);
+        }
+        let taken = match (side(true), side(false)) {
+            (Some((b0, b1)), _) => &ours[b0..b1],
+            (None, Some((b0, b1))) => &theirs[b0..b1],
+            (None, None) => &base[g0..g1],
+        };
+        for line in taken {
+            out.push_str(line);
+        }
+        next = g1;
+        i = j;
+    }
+    for line in &base[next..] {
+        out.push_str(line);
+    }
+    Some(out)
 }
 
 /// Merge three texts. `None` when the same line or token was changed two ways
@@ -213,4 +238,61 @@ fn scan_while(rest: &str, pred: impl Fn(char) -> bool) -> usize {
         .find(|(_, c)| !pred(*c))
         .map(|(i, _)| i)
         .unwrap_or(rest.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_ours;
+
+    #[test]
+    fn disjoint_hunks_keep_both_sides() {
+        let base = "a\nb\nc\nd\ne\n";
+        let ours = "A\nb\nc\nd\ne\n";
+        let theirs = "a\nb\nc\nd\nE\n";
+        assert_eq!(
+            merge_ours(base, ours, theirs).as_deref(),
+            Some("A\nb\nc\nd\nE\n")
+        );
+    }
+
+    #[test]
+    fn a_conflict_takes_ours_whole_hunk() {
+        let base = "a\nb\nc\n";
+        let ours = "a\nours\nc\n";
+        let theirs = "a\ntheirs\nmore\nc\n";
+        assert_eq!(
+            merge_ours(base, ours, theirs).as_deref(),
+            Some("a\nours\nc\n")
+        );
+    }
+
+    #[test]
+    fn touching_changes_are_one_conflict() {
+        // Git treats adjacent changes as one hunk: theirs' edit of `c` is
+        // dropped with the rest of the conflict.
+        let base = "a\nb\nc\nd\n";
+        let ours = "a\nB\nc\nd\n";
+        let theirs = "a\nb\nC\nd\n";
+        assert_eq!(
+            merge_ours(base, ours, theirs).as_deref(),
+            Some("a\nB\nc\nd\n")
+        );
+    }
+
+    #[test]
+    fn delete_against_edit_and_same_edit() {
+        let base = "a\nb\nc\n";
+        assert_eq!(
+            merge_ours(base, "a\nc\n", "a\nB\nc\n").as_deref(),
+            Some("a\nc\n")
+        );
+        assert_eq!(
+            merge_ours(base, "a\nB\nc\n", "a\nB\nc\n").as_deref(),
+            Some("a\nB\nc\n")
+        );
+        assert_eq!(
+            merge_ours(base, "a\nb\nc\n", "x\na\nb\nc\ny\n").as_deref(),
+            Some("x\na\nb\nc\ny\n")
+        );
+    }
 }

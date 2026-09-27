@@ -2,7 +2,7 @@
 {% block content %}
 <h1>Arbitration: {{ theirs.summary }}</h1>
 <p class="reason">{{ reason }}</p>
-<p class="legend">{{ status }}</p>
+<p class="legend">{{ status }} · <a href="{{ base }}/trace/{{ theirs.change }}">provenance trace</a></p>
 {% if let Some(flash) = flash %}<p class="flash">{{ flash }}</p>{% endif %}
 {% if let Some(pending) = pending %}<p class="flash">{{ pending }}</p>{% endif %}
 {% if !reasons.is_empty() %}<ul class="reasons">{% for r in reasons %}<li>{{ r }}</li>{% endfor %}</ul>{% endif %}
@@ -10,7 +10,7 @@
   <section class="side ours">
     <h2>Ours (landed)</h2>
     {% for side in ours %}
-    <p><a href="{{ base }}/changes/{{ side.change }}">{{ side.summary }}</a> · {{ side.actor }}</p>
+    <p><a href="{{ base }}/changes/{{ side.change }}">{{ side.summary }}</a> · {{ side.actor }} · <a href="{{ base }}/trace/{{ side.change }}">trace</a></p>
     {% if !side.body.is_empty() %}<pre class="intent">{{ side.body }}</pre>{% endif %}
     {% else %}
     <p>No landed change is named in the conflict report.</p>
@@ -28,10 +28,10 @@
   <thead><tr><th>definition</th><th>why</th><th>ours</th><th>theirs</th></tr></thead>
   <tbody>
   {% for c in contested %}<tr>
-    <td title="{{ c.node.id }}">{{ c.node.label }}{% if let Some(p) = c.node.path %} <small>{{ p }}</small>{% endif %}</td>
+    <td>{% let n = c.node %}{% include "node_link.html" %}</td>
     <td>{{ c.why }}</td>
-    <td><ul class="ops">{% for op in c.ours %}<li class="op op-{{ op.op }}">{{ op.text }}</li>{% endfor %}</ul></td>
-    <td><ul class="ops">{% for op in c.theirs %}<li class="op op-{{ op.op }}">{{ op.text }}</li>{% endfor %}</ul></td>
+    <td><ul class="ops">{% for op in c.ours %}{% include "op.html" %}{% endfor %}</ul></td>
+    <td><ul class="ops">{% for op in c.theirs %}{% include "op.html" %}{% endfor %}</ul></td>
   </tr>{% else %}<tr><td colspan="4">No definition is contested.</td></tr>{% endfor %}
   </tbody>
 </table>

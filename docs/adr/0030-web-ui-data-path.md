@@ -47,3 +47,5 @@ ADR 0024's line "the web UI uses gRPC-Web" now reads: "the web UI is a client of
 - **The M5 check** is a recording wrapper in the UI test suite. It fails on any call that is not an RPC of `hord.v1.RepoBackend`, `hord.v1.Changes`, or the RPCs of other slices that the UI's actions use (review and `Arbitrate`). `hord-ui` has no store, `hord-txn`, or `hord-diff` dependency.
 - The API boundary sits between the UI server and the backend, not between the browser and the server. Tests also run the UI over a `RemoteRepo`, to show it works over the wire.
 - `RepoBackend` stays §10.5.2 method for method. `hord-server` implements `Changes` over `LocalRepo`, and `hord-remote` gets its client.
+
+**Amended (2026-09-26, M6):** `Changes` gains five read-only RPCs for web UI views 4–6 (`NodeLineage`, `ChangeTrace`, `ListTree`, `GetFile`, `NodeEdges`), each requiring the `read` scope.

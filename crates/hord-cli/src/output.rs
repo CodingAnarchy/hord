@@ -4,6 +4,22 @@
 use anyhow::{Error, Result};
 use serde::Serialize;
 
+/// A command's answer that is a non-zero exit status rather than a
+/// failure (`hord git sync --check` finding divergence, `hord policy check`
+/// denying): `main` exits with the code and prints no error. Returned as an
+/// error, not by exiting in place, so everything the command held (a
+/// store, a lander) is dropped cleanly first.
+#[derive(Debug)]
+pub struct Exit(pub i32);
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit status {}", self.0)
+    }
+}
+
+impl std::error::Error for Exit {}
+
 /// Print `value` as pretty JSON on stdout.
 pub fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);

@@ -79,9 +79,13 @@ impl Service<http::Request<Body>> for Transport {
     }
 }
 
-/// Split `http://host:port/r/<name>` into the origin and `/r/<name>`.
+/// Split `http[s]://host:port/r/<name>` into the origin and `/r/<name>`.
 pub(crate) fn split_url(url: &str) -> Option<(String, Option<String>)> {
-    let rest = url.strip_prefix("http://")?;
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        ("http", url.strip_prefix("http://")?)
+    };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
         None => (rest, ""),
@@ -89,7 +93,7 @@ pub(crate) fn split_url(url: &str) -> Option<(String, Option<String>)> {
     if authority.is_empty() {
         return None;
     }
-    let origin = format!("http://{authority}");
+    let origin = format!("{scheme}://{authority}");
     match path {
         "" => Some((origin, None)),
         p if p.starts_with("/r/") && p.len() > 3 => Some((origin, Some(p.to_owned()))),
@@ -146,7 +150,11 @@ mod tests {
             split_url("http://h:1/r/team/app/"),
             Some(("http://h:1".into(), Some("/r/team/app".into())))
         );
-        assert_eq!(split_url("https://h"), None);
+        assert_eq!(
+            split_url("https://h:1/r/app"),
+            Some(("https://h:1".into(), Some("/r/app".into())))
+        );
+        assert_eq!(split_url("ftp://h"), None);
         assert_eq!(split_url("http://h/other"), None);
         assert_eq!(split_url("http:///r/x"), None);
     }

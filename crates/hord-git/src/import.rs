@@ -7,9 +7,9 @@ use std::rc::Rc;
 use gix::bstr::ByteSlice;
 use gix::objs::tree::{EntryKind, EntryMode};
 use hord_core::{
-    Actor, Blob, ChangeId, ChangeRecord, IdentityTree, IdentityTrees, Intent, IntentRef, ObjectId,
-    Op, Provenance, RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeEntry, TreeOpKind,
-    edit_identity_tree,
+    Actor, Blob, ChangeId, ChangeRecord, IdentityTree, IdentityTrees, Intent, IntentRef, NodeId,
+    ObjectId, Op, Provenance, RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeEntry,
+    TreeOpKind, edit_identity_tree,
 };
 
 use crate::leaf::{GitLeaf, MODE_BLOB};
@@ -23,6 +23,94 @@ fn git_import_toolchain() -> ObjectId {
 
 fn git_commit_ref(sha: &str) -> String {
     format!("git/commit/{sha}")
+}
+
+/// Build one Tier 0 proposal from the git commit `commit` of `git_dir`,
+/// against the landed change `base` (spec §9 Sync, ADR 0036).
+///
+/// This is how a pull request enters the lander. The commit's tree becomes
+/// the result snapshot, and the ops are the diff from `base`'s result to it,
+/// as [`import_git`] would record them. The read and write sets are the
+/// changed files' root ids (Tier 0). The change's parent is `base`, its
+/// actor the commit's git author, and its time the author time.
+///
+/// `intent` is the pull request's title and body; the commit is added to it
+/// as an [`IntentRef::GitCommit`]. `voucher` is the key id of the bridge that
+/// submits it on the author's behalf (ADR 0037).
+///
+/// Only objects are written: not the log, head, or refs. Returns the id of
+/// the stored [`ChangeRecord`].
+pub fn propose_git_commit<S: Store>(
+    store: &mut S,
+    git_dir: impl AsRef<Path>,
+    commit: GitOid,
+    base: ChangeId,
+    mut intent: Intent,
+    voucher: Option<String>,
+) -> Result<ChangeId, Error> {
+    let repo = open_repo(git_dir.as_ref())?;
+    let git_id = commit.as_gix();
+    let commit = repo.find_commit(git_id).map_err(Error::git)?;
+    let base_record: ChangeRecord = store.get_object(base)?;
+    let base_snapshot: Snapshot = store.get_object(base_record.result)?;
+
+    let mut cache = ImportCache::default();
+    let git_tree = commit.tree_id().map_err(Error::git)?.detach();
+    let result_tree = import_tree(store, &repo, git_tree, &mut cache)?;
+    let mut ops = Vec::new();
+    diff_trees(
+        store,
+        &mut cache,
+        &RepoPath::default(),
+        Some(base_snapshot.tree),
+        Some(result_tree),
+        &mut ops,
+    )?;
+    let changed = changed_paths(&ops);
+    let identity = match base_snapshot.identity() {
+        Some(identity) => identity_without(store, identity, &changed)?,
+        None => store.put_object(&IdentityTree::default())?,
+    };
+    let result = store.put_object(&Snapshot::new(result_tree, identity))?;
+
+    let author = commit.author().map_err(Error::git)?;
+    let actor_id = format!(
+        "{} <{}>",
+        author.name.to_str_lossy(),
+        author.email.to_str_lossy()
+    );
+    let created_at = timestamp_from_git(author.seconds());
+    let sha = GitOid::from_gix(git_id).to_hex();
+    if !intent
+        .refs
+        .iter()
+        .any(|r| matches!(r, IntentRef::GitCommit { sha: s } if *s == sha))
+    {
+        intent.refs.push(IntentRef::GitCommit { sha });
+    }
+    let files: BTreeSet<NodeId> = changed.iter().map(NodeId::file_root).collect();
+    let change = ChangeRecord {
+        base: base_record.result,
+        result,
+        parents: vec![base],
+        ops,
+        intent,
+        provenance: Provenance {
+            actor: Actor::Human { id: actor_id },
+            toolchain: git_import_toolchain(),
+            created_at,
+            session: None,
+            parent_intent: None,
+            voucher,
+        },
+        read_set: files.clone(),
+        write_set: files,
+        identity_deltas: Vec::new(),
+        evidence: Vec::new(),
+        signature: None,
+        rebased_from: None,
+    };
+    store.put_object(&change)
 }
 
 /// Import `HEAD` of `git_dir` into `store`.
@@ -374,6 +462,7 @@ fn import_commit<S: Store>(
             created_at,
             session: None,
             parent_intent: None,
+            voucher: None,
         },
         read_set: BTreeSet::new(),
         write_set: BTreeSet::new(),

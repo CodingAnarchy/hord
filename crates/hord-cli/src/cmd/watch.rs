@@ -35,6 +35,7 @@ fn changes(kind: &Kind) -> Vec<&str> {
         }
         Kind::Rejected(e) => vec![&e.change],
         Kind::HeadMoved(e) => vec![&e.to],
+        Kind::BridgeChecked(_) => vec![],
     }
 }
 
@@ -70,6 +71,11 @@ fn text(kind: &Kind) -> String {
         Kind::Landed(e) => format!("landed {} at {}", short(&e.change), e.position),
         Kind::Rejected(e) => format!("rejected {}: {}", short(&e.change), e.reason),
         Kind::HeadMoved(e) => format!("head {}", short(&e.to)),
+        Kind::BridgeChecked(e) => format!(
+            "bridge check {}: {}",
+            if e.diverged { "DIVERGED" } else { "ok" },
+            e.detail
+        ),
     }
 }
 
@@ -98,7 +104,7 @@ pub fn run(
                 Ok(Some(Ok(envelope))) => envelope,
             };
             cursor = Some(envelope.cursor);
-            let Some(kind) = envelope.event.as_ref().and_then(|e| e.kind.as_ref()) else {
+            let Some(kind) = envelope.kind() else {
                 continue;
             };
             if queue && !queue_kind(kind) {

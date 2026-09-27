@@ -15,7 +15,6 @@ use std::path::{self, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use hord_api::{proto, wire};
-use hord_remote::RemoteRepo;
 
 use crate::identity::{self, Credential, Credentials, StoredActor};
 use crate::output;
@@ -48,8 +47,7 @@ pub fn run(json: bool, target: &Target, remote: String, method: Method) -> Resul
             let key_file = identity::key_path(&user)?;
             let key = identity::load_or_create_key(&key_file)?;
             let password = identity::password(stdin, &format!("password for {user} at {url}: "))?;
-            let remote = block_on(RemoteRepo::connect(&url))
-                .with_context(|| format!("connect to remote {name}"))?;
+            let remote = session::connect_as(&name, &url, None)?;
             let reply = block_on(remote.auth().login(proto::LoginRequest {
                 user,
                 password,
@@ -68,8 +66,7 @@ pub fn run(json: bool, target: &Target, remote: String, method: Method) -> Resul
             let key_file = path::absolute(&key_file)
                 .with_context(|| format!("key file {}", key_file.display()))?;
             let key = identity::read_key(&key_file)?;
-            let remote = block_on(RemoteRepo::connect_with_token(&url, &token))
-                .with_context(|| format!("connect to remote {name}"))?;
+            let remote = session::connect_as(&name, &url, Some(token.clone()))?;
             let me = block_on(remote.auth().who_am_i()).context("check the token")?;
             let Some(actor) = me.actor else {
                 bail!("remote {name} does not require auth: there is nothing to log in to");

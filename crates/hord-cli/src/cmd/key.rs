@@ -1,15 +1,19 @@
 //! `hord key show` and `hord key verify <object> [--key <key-id>]` (spec
 //! §10.5.4): this user's key id, and checking a signed change or evidence
 //! (such as a review) against a public key. Exits 1 when it does not
-//! verify.
+//! verify. `hord key revoke <key-id> --auth-file <file>` revokes a key in
+//! the server's auth file (ADR 0038).
 
-use std::process;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use hord_api::{RepoBackend, proto, wire};
 use hord_core::sign::{self, PublicKey};
 use hord_core::{ChangeRecord, Evidence, ObjectId, Signature};
+use hord_server::AuthStore;
 
+use crate::cmd::audit::show_time;
+use crate::output::Exit;
 use crate::session::{Session, Target};
 use crate::txn::{self, block_on};
 use crate::{identity, output};
@@ -94,14 +98,13 @@ pub fn run_verify(json: bool, target: &Target, object: String, key: Option<Strin
     } else {
         PublicKey::from_key_id(&key_id).and_then(|key| signed.verify(&key))
     };
-    let actor = match &session {
+    let binding = match &session {
         Session::Remote { remote, .. } if !key_id.is_empty() => {
-            block_on(remote.auth().get_key(&key_id))
-                .ok()
-                .and_then(|k| k.actor)
+            block_on(remote.auth().get_key(&key_id)).ok()
         }
         _ => None,
     };
+    let (actor, revoked_at_ms) = binding.map_or((None, None), |k| (k.actor, k.revoked_at_ms));
     let result = proto::KeyVerifyResult {
         object: wire::id(id),
         kind: signed.kind().to_owned(),
@@ -109,6 +112,7 @@ pub fn run_verify(json: bool, target: &Target, object: String, key: Option<Strin
         verified: outcome.is_ok(),
         reason: outcome.err().map(|e| e.to_string()),
         actor,
+        revoked_at_ms,
     };
     if json {
         output::print_json(&result)?;
@@ -118,8 +122,12 @@ pub fn run_verify(json: bool, target: &Target, object: String, key: Option<Strin
             .as_ref()
             .map(|a| format!(" ({})", wire::actor_id(a)))
             .unwrap_or_default();
+        let revoked = result
+            .revoked_at_ms
+            .map(|at| format!("; the key was revoked at {}", show_time(at)))
+            .unwrap_or_default();
         println!(
-            "verified: {} {} signed by {}{who}",
+            "verified: {} {} signed by {}{who}{revoked}",
             result.kind,
             txn::short(&result.object),
             result.key_id
@@ -133,7 +141,20 @@ pub fn run_verify(json: bool, target: &Target, object: String, key: Option<Strin
         );
     }
     if !result.verified {
-        process::exit(1);
+        return Err(Exit(1).into());
     }
+    Ok(())
+}
+
+pub fn run_revoke(json: bool, key_id: &str, auth_file: &Path) -> Result<()> {
+    AuthStore::revoke_key(auth_file, key_id).with_context(|| format!("revoke key {key_id}"))?;
+    let result = proto::KeyRevokeResult {
+        key_id: key_id.to_owned(),
+        auth_file: auth_file.display().to_string(),
+    };
+    if json {
+        return output::print_json(&result);
+    }
+    println!("revoked key {} in {}", result.key_id, result.auth_file);
     Ok(())
 }

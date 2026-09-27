@@ -54,6 +54,13 @@ pub(crate) struct RefIndex {
     packages: HashSet<String>,
 }
 
+impl RefIndex {
+    /// The file `node` is defined in, when the snapshot has it.
+    pub(crate) fn path_of(&self, node: NodeId) -> Option<RepoPath> {
+        self.nodes.get(&node).map(|(path, _)| path.clone())
+    }
+}
+
 /// Cache of per-file refs and per-snapshot indexes.
 #[derive(Default)]
 pub(crate) struct RefCache {

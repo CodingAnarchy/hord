@@ -1,4 +1,4 @@
-//! The hord web UI (spec §10.4): views 1–3 and flight-recorder playback.
+//! The hord web UI (spec §10.4): views 1–6 and flight-recorder playback.
 //!
 //! This crate holds the `askama` templates and static assets, and the
 //! state they render:
@@ -10,6 +10,8 @@
 //! - [`view`]: display-ready view models and the page templates (landing
 //!   strip, semantic change, arbitration workbench, playback);
 //! - [`present`]: API messages mapped to view models;
+//! - [`browse`]: views 4–6 (node lineage, provenance trace, and the
+//!   repository browser with its graph view), models and mapping;
 //! - [`assets`]: the stylesheet and the two small scripts, embedded;
 //! - [`router`]: the routes `hord serve` mounts (ADR 0030);
 //! - [`audit`]: the M5 check that every call is an RPC of `hord.proto`.
@@ -26,6 +28,7 @@
 mod app;
 pub mod assets;
 pub mod audit;
+pub mod browse;
 pub mod playback;
 pub mod present;
 pub mod strip;
