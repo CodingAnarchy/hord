@@ -1,0 +1,11 @@
+# Hord's own landing policy (spec §7.2, ADR 0026), read from head.
+# Every change to hord must build, pass clippy, and pass the tests coverage
+# selects for it (ADR 0022) before the lander lands it. CI on the git mirror
+# still runs fmt, rustdoc, the full suite and the M0–M5 harnesses.
+[land]
+require = ["check", "lint", "test:selected"]
+
+[[rule]]
+name = "unsafe requires human"
+when = { touches_kind = "unsafe_block" }
+require = ["review:human"]
