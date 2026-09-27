@@ -7,12 +7,12 @@ use std::rc::Rc;
 use gix::bstr::ByteSlice;
 use gix::objs::tree::{EntryKind, EntryMode};
 use hord_core::{
-    Actor, Blob, ChangeId, ChangeRecord, IdentityTree, IdentityTrees, Intent, IntentRef, NodeId,
-    ObjectId, Op, Provenance, RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeEntry,
+    Actor, Blob, ChangeId, ChangeRecord, IdentityTree, IdentityTrees, Intent, IntentRef, ModedBlob,
+    NodeId, ObjectId, Op, Provenance, RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeEntry,
     TreeOpKind, edit_identity_tree,
 };
 
-use crate::leaf::{GitLeaf, MODE_BLOB};
+use crate::leaf::file_mode;
 use crate::store::Store;
 use crate::{Error, GitOid};
 
@@ -336,7 +336,7 @@ struct ImportCache {
     commits: HashMap<gix::ObjectId, ChangeId>,
     /// Result [`Snapshot`] of each imported commit.
     snapshots: HashMap<gix::ObjectId, SnapshotId>,
-    /// [`GitLeaf`] ids by (blob, raw git mode); every tree holding an
+    /// [`ModedBlob`] ids by (blob, raw git mode); every tree holding an
     /// executable or symlink would otherwise rewrite the same leaf object.
     leaves: HashMap<(ObjectId, u16), ObjectId>,
     decoded: HashMap<ObjectId, Rc<Tree>>,
@@ -593,24 +593,23 @@ fn import_tree<S: Store>(
 }
 
 /// Regular `100644` files are stored as a plain [`Blob`]. Any other git mode
-/// is a [`GitLeaf`] so chmod-only trees get a distinct [`ObjectId`].
+/// is a [`ModedBlob`] so chmod-only trees get a distinct [`ObjectId`].
 fn put_leaf<S: Store>(
     store: &mut S,
     mode: EntryMode,
     blob: ObjectId,
     cache: &mut ImportCache,
 ) -> Result<ObjectId, Error> {
-    if mode.kind() == EntryKind::Blob {
-        return Ok(blob);
-    }
     let key = (blob, mode.value());
     if let Some(id) = cache.leaves.get(&key) {
         return Ok(*id);
     }
-    let mut buf = [0u8; 6];
-    let octal = mode.as_bytes(&mut buf);
-    let mode = octal.to_str().unwrap_or(MODE_BLOB).to_owned();
-    let id = store.put_object(&GitLeaf { mode, blob })?;
+    let file_mode = file_mode(mode.kind())
+        .ok_or_else(|| Error::Git(format!("tree mode {:o} on a leaf", mode.value())))?;
+    let Some(leaf) = ModedBlob::new(file_mode, blob) else {
+        return Ok(blob);
+    };
+    let id = store.put_object(&leaf)?;
     cache.leaves.insert(key, id);
     Ok(id)
 }

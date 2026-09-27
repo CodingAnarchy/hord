@@ -1,31 +1,27 @@
-//! Git-bridge leaf encoding: a Blob wrapper that carries the git mode.
+//! Git modes of [`ModedBlob`](hord_core::ModedBlob) leaves (ADR 0042).
 //!
 //! Hord [`TreeEntry`](hord_core::TreeEntry) has no mode field. Two git trees
 //! with the same file bytes but different modes (`chmod +x`, symlink, gitlink)
 //! would otherwise share a [`ObjectId`](hord_core::ObjectId). Export then
-//! cannot tell them apart. Non-default modes are stored as [`GitLeaf`] so the
-//! tree id itself changes. `100644` blobs stay plain [`Blob`](hord_core::Blob)s.
+//! cannot tell them apart. Non-default modes are stored as a
+//! [`ModedBlob`](hord_core::ModedBlob) so the tree id itself changes. `100644`
+//! blobs stay plain [`Blob`](hord_core::Blob)s.
 
-use gix::objs::tree::EntryMode;
-use hord_core::ObjectId;
-use serde::{Deserialize, Serialize};
+use gix::objs::tree::{EntryKind, EntryMode};
+use hord_core::FileMode;
 
-/// Git mode octal for a regular non-executable file.
-pub(crate) const MODE_BLOB: &str = "100644";
-
-/// A git tree leaf whose mode is not [`MODE_BLOB`].
-///
-/// `blob` is the [`ObjectId`](hord_core::ObjectId) of a [`hord_core::Blob`]
-/// holding the file bytes (or, for gitlinks, the hex SHA of the target commit).
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub(crate) struct GitLeaf {
-    /// Git tree-entry mode in the on-wire octal form (`100755`, `120000`, `160000`, …).
-    pub mode: String,
-    /// Inner [`hord_core::Blob`] object.
-    pub blob: ObjectId,
+/// The [`FileMode`] of a git leaf of kind `kind`; `None` for a tree.
+pub(crate) fn file_mode(kind: EntryKind) -> Option<FileMode> {
+    match kind {
+        EntryKind::Blob => Some(FileMode::Regular),
+        EntryKind::BlobExecutable => Some(FileMode::Executable),
+        EntryKind::Link => Some(FileMode::Symlink),
+        EntryKind::Commit => Some(FileMode::Gitlink),
+        EntryKind::Tree => None,
+    }
 }
 
-/// Parse a git mode octal as stored in [`GitLeaf::mode`].
+/// Parse a git mode octal as stored in [`ModedBlob::mode`](hord_core::ModedBlob::mode).
 pub(crate) fn parse_mode(octal: &str) -> Option<EntryMode> {
     // `EntryMode::from_bytes` is built to parse the tree encoding, which has a
     // trailing space after the digits.
@@ -37,8 +33,6 @@ pub(crate) fn parse_mode(octal: &str) -> Option<EntryMode> {
 
 #[cfg(test)]
 mod tests {
-    use gix::objs::tree::EntryKind;
-
     use super::*;
 
     fn octal(kind: EntryKind) -> String {

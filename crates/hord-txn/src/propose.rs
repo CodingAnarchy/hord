@@ -39,8 +39,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hord_core::{
-    Actor, Bytes, ChangeId, ChangeRecord, IdentityDelta, Intent, LangId, NodeId, ObjectId, Op,
-    Provenance, RepoPath, SnapshotId, Timestamp, TreeOpKind,
+    Actor, Bytes, ChangeId, ChangeRecord, FileMode, IdentityDelta, Intent, LangId, NodeId,
+    ObjectId, Op, Provenance, RepoPath, SnapshotId, Timestamp, TreeOpKind,
 };
 use hord_lang::{Anchor, IdentifiedTree, NodeTree, Site, enclosing_site};
 use serde::{Deserialize, Serialize};
@@ -64,11 +64,18 @@ pub enum ReadDeclaration {
     Path(RepoPath),
 }
 
+/// A file's new content: its bytes and its mode (ADR 0042).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FileContent {
+    pub bytes: Bytes,
+    pub mode: FileMode,
+}
+
 pub(crate) struct ProposeInput {
     pub base: SnapshotId,
     pub parents: Vec<ChangeId>,
     /// Changed paths and their new content; `None` is a deletion.
-    pub changes: BTreeMap<RepoPath, Option<Bytes>>,
+    pub changes: BTreeMap<RepoPath, Option<FileContent>>,
     pub access: AccessLog,
     pub declared: Vec<ReadDeclaration>,
     pub intent: Intent,
@@ -89,10 +96,19 @@ struct Edit {
     path: RepoPath,
     base: Option<FileView>,
     result: Option<Bytes>,
+    /// Mode of the result; `None` when deleted.
+    mode: Option<FileMode>,
     blob: Option<ObjectId>,
 }
 
 impl Edit {
+    /// Whether both sides, where present, hold file contents an adapter
+    /// may parse (not a symlink or gitlink, ADR 0042).
+    fn parseable(&self) -> bool {
+        self.mode.is_none_or(FileMode::holds_contents)
+            && self.base.as_ref().is_none_or(|v| v.mode.holds_contents())
+    }
+
     fn base_blob(&self) -> Option<ObjectId> {
         self.base.as_ref().map(|v| v.blob)
     }
@@ -137,7 +153,7 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
     for (path, result) in &input.changes {
         let base_view = inner.file_view(base, path)?;
         let blob = match result {
-            Some(bytes) => Some(inner.put_blob(bytes.as_slice())?),
+            Some(content) => Some(inner.put_file(content.mode, content.bytes.as_slice())?),
             None => None,
         };
         if base_view.as_ref().map(|v| v.blob) == blob {
@@ -146,7 +162,8 @@ pub(crate) fn propose(inner: &Inner, input: ProposeInput, store: bool) -> Result
         edits.push(Edit {
             path: path.clone(),
             base: base_view,
-            result: result.clone(),
+            result: result.as_ref().map(|c| c.bytes.clone()),
+            mode: result.as_ref().map(|c| c.mode),
             blob,
         });
     }
@@ -258,7 +275,11 @@ fn propose_file<'a>(
         (None, Some(view)) => view.bytes.clone(),
         (None, None) => Bytes::default(),
     };
-    let adapter = inner.adapter(path, head.as_slice());
+    let adapter = if edit.parseable() {
+        inner.adapter(path, head.as_slice())
+    } else {
+        None
+    };
     // A parsed base must parse for a structural diff; a new file needs none.
     let structural = match (adapter, &edit.result, result_blob) {
         (Some(adapter), Some(bytes), Some(blob))
@@ -279,6 +300,10 @@ fn propose_file<'a>(
             let file_ops = hord_diff::diff(path, base_ref, &result_tree, &mapping);
             check_reproduces(adapter, path, base_ref, &file_ops, &result_tree, bytes)?;
             build.declared.extend(declared(&mapping.deltas));
+            // Same bytes, new mode: no structural op records it (ADR 0042).
+            if file_ops.is_empty() && base_blob.is_some() {
+                build.ops.push(blob_op.clone());
+            }
             build.ops.extend(file_ops);
             build.pending.push(Pending {
                 adapter,
@@ -500,7 +525,7 @@ fn pair_moves(inner: &Inner, edits: &[Edit]) -> Result<BTreeMap<usize, Pairing>>
         .filter(|i| edits[*i].blob.is_none() && edits[*i].base_parsed().is_some())
         .collect();
     let created: Vec<usize> = (0..edits.len())
-        .filter(|i| edits[*i].base.is_none() && edits[*i].blob.is_some())
+        .filter(|i| edits[*i].base.is_none() && edits[*i].blob.is_some() && edits[*i].parseable())
         .collect();
     let mut out = BTreeMap::new();
     if deleted.is_empty() || created.is_empty() {

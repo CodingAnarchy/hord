@@ -14,12 +14,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hord_api::{ApiError, MAX_BATCH_BYTES, MAX_BATCH_IDS, RepoBackend, proto, wire};
-use hord_core::{ChangeId, ChangeRecord, NodeFile, ObjectId, Snapshot, Tree, TreeEntry};
+use hord_core::{ChangeId, ChangeRecord, ModedBlob, NodeFile, ObjectId, Snapshot, Tree, TreeEntry};
 use serde::de::DeserializeOwned;
 use tokio::runtime::Handle;
 
 use super::SyncError;
-use crate::leaf::GitLeaf;
 use crate::{Error, Store};
 
 /// Canonical bytes by id, shared by every step of one bridge.
@@ -130,7 +129,7 @@ impl ObjectCache {
                 let Some(bytes) = self.cached(id) else {
                     continue;
                 };
-                if let Ok(leaf) = hord_encoding::decode::<GitLeaf>(&bytes) {
+                if let Ok(leaf) = hord_encoding::decode::<ModedBlob>(&bytes) {
                     inner.push(leaf.blob);
                 } else if let Ok(file) = hord_encoding::decode::<NodeFile>(&bytes) {
                     inner.push(file.raw_hash);

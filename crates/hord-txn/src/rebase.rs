@@ -3,15 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hord_core::{Bytes, ChangeRecord, IdentityDelta, NodeId, ObjectId, Op, RepoPath, SnapshotId};
+use hord_core::{
+    Bytes, ChangeRecord, FileMode, IdentityDelta, NodeId, ObjectId, Op, RepoPath, SnapshotId,
+};
 use hord_lang::{IdentifiedTree, IdentityMapping, NodeTree, Site};
 
 use crate::conflict::{AdapterMerge, MergeConflict, MergeSeverity};
 use crate::files::{FileChange, file_changes};
-use crate::propose::check_reproduces;
+use crate::propose::{FileContent, check_reproduces};
 use crate::repo::Inner;
 use crate::semantic::carry;
-use crate::snapshot::IdentityEdits;
+use crate::snapshot::{IdentityEdits, merged_mode};
 use crate::{Error, Result};
 
 /// A rebase that produced a tree (possibly with soft conflicts).
@@ -95,19 +97,36 @@ pub(crate) fn rebase(
     let work: Vec<usize> = (0..files.len())
         .filter(|i| ours_of[*i] != files[*i].to && ours_of[*i] != files[*i].from)
         .collect();
+    // The mode each merged file takes (ADR 0042).
+    let mode_of = |entry: Option<ObjectId>| match entry {
+        Some(id) => inner.file_mode(id),
+        None => Ok(FileMode::Regular),
+    };
+    let modes = work
+        .iter()
+        .map(|&i| {
+            let file = &files[i];
+            Ok(merged_mode(
+                mode_of(file.from)?,
+                mode_of(ours_of[i])?,
+                mode_of(file.to)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut merged_files: BTreeMap<usize, Merged> = BTreeMap::new();
     let results: Vec<(usize, Result<Merged>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = work
             .iter()
-            .map(|&i| {
+            .zip(&modes)
+            .map(|(&i, &mode)| {
                 let (file, ours) = (&files[i], ours_of[i]);
                 let job = move || -> Result<Merged> {
                     // Spec §6.3: ops on definitions no landed change wrote
                     // re-apply on head. Only a file whose ops name something
                     // `L` wrote (or replace its glue) needs the 3-way merge.
-                    match reapply(inner, record, head, file, own)? {
+                    match reapply(inner, record, head, file, mode, own)? {
                         Some(merged) => Ok(merged),
-                        None => merge_file(inner, record, head, file, ours, own),
+                        None => merge_file(inner, record, head, file, ours, mode, own),
                     }
                 };
                 (i, scope.spawn(job))
@@ -219,6 +238,7 @@ fn reapply(
     record: &ChangeRecord,
     head: SnapshotId,
     file: &FileChange,
+    mode: FileMode,
     own: &Own<'_>,
 ) -> Result<Option<Merged>> {
     let landed_writes = own.landed;
@@ -258,7 +278,7 @@ fn reapply(
         return Ok(None);
     };
     let bytes = adapter.project(&applied.tree).into_vec();
-    let blob = inner.put_blob(&bytes)?;
+    let blob = inner.put_file(mode, &bytes)?;
     let Some(parsed) = inner.parse(adapter, blob, &bytes) else {
         return Ok(None);
     };
@@ -282,7 +302,11 @@ fn reapply(
         }));
     }
     let theirs = Some(&*theirs.tree);
-    match finish_parsed(inner, head, path, bytes, Vec::new(), theirs, own)? {
+    let merged = FileContent {
+        bytes: Bytes::new(bytes),
+        mode,
+    };
+    match finish_parsed(inner, head, path, merged, Vec::new(), theirs, own)? {
         Merged::Hard(_) => Ok(None),
         clean => Ok(Some(clean)),
     }
@@ -373,6 +397,7 @@ fn merge_file(
     head: SnapshotId,
     file: &FileChange,
     ours: Option<ObjectId>,
+    mode: FileMode,
     own: &Own<'_>,
 ) -> Result<Merged> {
     let path = &file.path;
@@ -399,7 +424,10 @@ fn merge_file(
                     inner,
                     head,
                     path,
-                    bytes,
+                    FileContent {
+                        bytes: Bytes::new(bytes),
+                        mode,
+                    },
                     Vec::new(),
                     Some(&theirs_tree),
                     own,
@@ -421,7 +449,7 @@ fn merge_file(
                 },
             ),
             Err(hord_lang_rust::CargoLockMergeError::Unsupported { .. }) => {
-                finish_blob(inner, path, &base_bytes, &ours_bytes, &theirs_bytes)
+                finish_blob(inner, path, &base_bytes, &ours_bytes, &theirs_bytes, mode)
             }
             Err(err) => Ok(hard(path, Vec::new(), err.to_string())),
         };
@@ -441,7 +469,7 @@ fn merge_file(
         _ => None,
     };
     let (Some(adapter), Some((base, ours_tree, theirs_tree))) = (adapter, parsed) else {
-        return finish_blob(inner, path, &base_bytes, &ours_bytes, &theirs_bytes);
+        return finish_blob(inner, path, &base_bytes, &ours_bytes, &theirs_bytes, mode);
     };
     let merged_result = hord_diff::merge(
         adapter,
@@ -464,7 +492,18 @@ fn merge_file(
                 })
                 .collect();
             let bytes = adapter.project(&merged.tree.tree).into_vec();
-            finish_parsed(inner, head, path, bytes, soft, Some(&theirs_tree), own)
+            finish_parsed(
+                inner,
+                head,
+                path,
+                FileContent {
+                    bytes: Bytes::new(bytes),
+                    mode,
+                },
+                soft,
+                Some(&theirs_tree),
+                own,
+            )
         }
         Err(conflict) => Ok(hard(path, conflict.nodes.clone(), conflict.reason.clone())),
     }
@@ -476,10 +515,11 @@ fn finish_blob(
     base: &[u8],
     ours: &[u8],
     theirs: &[u8],
+    mode: FileMode,
 ) -> Result<Merged> {
     match hord_diff::merge_blob(base, ours, theirs) {
         Ok(bytes) => {
-            let blob = inner.put_blob(&bytes)?;
+            let blob = inner.put_file(mode, &bytes)?;
             Ok(Merged::Clean {
                 blob,
                 ops: Vec::new(),
@@ -492,20 +532,21 @@ fn finish_blob(
     }
 }
 
-/// Store merged parsed bytes: ids carried from `head` (births derived with
-/// the head snapshot), except that a birth the change made keeps its id when
-/// no landed change wrote it ([`keep_own_births`]); ops diffed from `head`.
+/// Store merged parsed content: ids carried from `head` (births derived
+/// with the head snapshot), except that a birth the change made keeps its id
+/// when no landed change wrote it ([`keep_own_births`]); ops diffed from
+/// `head`.
 fn finish_parsed(
     inner: &Inner,
     head: SnapshotId,
     path: &RepoPath,
-    bytes: Vec<u8>,
+    merged: FileContent,
     soft: Vec<MergeConflict>,
     theirs: Option<&IdentifiedTree>,
     own: &Own<'_>,
 ) -> Result<Merged> {
-    let blob = inner.put_blob(&bytes)?;
-    let bytes = Bytes::new(bytes);
+    let blob = inner.put_file(merged.mode, merged.bytes.as_slice())?;
+    let bytes = merged.bytes;
     let Some(adapter) = inner.adapter(path, bytes.as_slice()) else {
         return Ok(Merged::Clean {
             blob,

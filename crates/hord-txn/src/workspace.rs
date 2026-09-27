@@ -6,17 +6,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hord_core::{
-    Actor, Bytes, ChangeId, ChangeRecord, Intent, NodeId, ObjectId, RepoPath, SnapshotId,
+    Actor, Bytes, ChangeId, ChangeRecord, FileMode, Intent, NodeId, ObjectId, RepoPath, SnapshotId,
 };
 use hord_lang::IdentifiedTree;
 use hord_store::WorkspaceId;
 use serde::{Deserialize, Serialize};
 
-use crate::materialize::{MaterializeMode, load_stat_index, read_checkout_file, walk_checkout};
-use crate::propose::{ProposeInput, ReadDeclaration};
+use crate::materialize::{MaterializeMode, load_stat_index, read_checkout_entry, walk_checkout};
+use crate::propose::{FileContent, ProposeInput, ReadDeclaration};
 use crate::repo::{Inner, Repo, blocking, fs_path};
 use crate::semantic::{DefinitionInfo, carry, definitions};
-use crate::snapshot::blob_object_id;
+use crate::snapshot::file_object_id;
 use crate::{Error, Result};
 
 /// How a workspace's files are presented (spec §6.1).
@@ -79,7 +79,8 @@ pub struct Workspace {
     session: Option<String>,
     materialization: Materialization,
     access_log: AccessLog,
-    /// In-memory writes: `None` is a deletion.
+    /// In-memory writes: `None` is a deletion. A written file keeps the
+    /// mode it has in the base (a new one is regular).
     overlay: BTreeMap<RepoPath, Option<Bytes>>,
     declared: Vec<ReadDeclaration>,
     /// Parsed view of edited files, keyed by content.
@@ -94,7 +95,7 @@ pub struct Workspace {
 
 /// Changed paths with their new content (`None`: deleted), and the untracked
 /// paths a `Directory` walk skipped.
-type Changes = (BTreeMap<RepoPath, Option<Bytes>>, Vec<RepoPath>);
+type Changes = (BTreeMap<RepoPath, Option<FileContent>>, Vec<RepoPath>);
 
 #[derive(Clone, Debug)]
 struct View {
@@ -156,7 +157,7 @@ impl Workspace {
     /// [`Self::propose`] or [`Self::preview`] left out, sorted: those an
     /// ignore rule matches (the base snapshot's `.gitignore` files, plus
     /// `.hord/` and `.git`), with an ignored directory listed once rather than
-    /// its contents, and symlinks or other non-files, which a tree cannot
+    /// its contents, and special files (fifos, sockets), which a tree cannot
     /// hold. A tracked file is never skipped. Empty for `InMemory`.
     #[must_use]
     pub fn skipped(&self) -> &[RepoPath] {
@@ -217,18 +218,20 @@ impl Workspace {
     /// Current content of `path`, or `None` if it does not exist. Records the
     /// path (even when it is missing: its absence was read) and every
     /// definition in the file as read.
+    ///
+    /// A symlink's content is its target (ADR 0042).
     pub async fn read_file(&mut self, path: &RepoPath) -> Result<Option<Bytes>> {
         let current = self.current(path).await?;
         self.access_log.read_paths.insert(path.clone());
-        let Some(bytes) = current else {
+        let Some(content) = current else {
             return Ok(None);
         };
-        if let Some(view) = self.view(path, &bytes).await? {
+        if let Some(view) = self.view(path, &content).await? {
             self.access_log
                 .reads
                 .extend(view.defs.iter().map(|d| d.node));
         }
-        Ok(Some(bytes))
+        Ok(Some(content.bytes))
     }
 
     /// Bytes `range` of `path` (clamped to the file). Records the path (even
@@ -240,12 +243,13 @@ impl Workspace {
     ) -> Result<Option<Bytes>> {
         let current = self.current(path).await?;
         self.access_log.read_paths.insert(path.clone());
-        let Some(bytes) = current else {
+        let Some(content) = current else {
             return Ok(None);
         };
+        let bytes = &content.bytes;
         let end = range.end.min(bytes.len());
         let start = range.start.min(end);
-        if let Some(view) = self.view(path, &bytes).await? {
+        if let Some(view) = self.view(path, &content).await? {
             self.access_log.reads.extend(
                 view.defs
                     .iter()
@@ -331,11 +335,11 @@ impl Workspace {
     /// Definitions in `path` with their ids, names, and spans. Listing
     /// definitions is not a content read.
     pub async fn definitions(&mut self, path: &RepoPath) -> Result<Vec<DefinitionInfo>> {
-        let bytes = self
+        let content = self
             .current(path)
             .await?
             .ok_or_else(|| Error::MissingFile(path.clone()))?;
-        match self.view(path, &bytes).await? {
+        match self.view(path, &content).await? {
             Some(view) => Ok(view.defs.as_ref().clone()),
             None => Err(Error::NotParsed(path.clone())),
         }
@@ -344,12 +348,13 @@ impl Workspace {
     /// Source text of definition `node` in `path`. Records `node` and every
     /// definition nested in it as read.
     pub async fn read_definition(&mut self, path: &RepoPath, node: NodeId) -> Result<Bytes> {
-        let bytes = self
+        let content = self
             .current(path)
             .await?
             .ok_or_else(|| Error::MissingFile(path.clone()))?;
+        let bytes = &content.bytes;
         let view = self
-            .view(path, &bytes)
+            .view(path, &content)
             .await?
             .ok_or_else(|| Error::NotParsed(path.clone()))?;
         let def =
@@ -380,12 +385,13 @@ impl Workspace {
         node: NodeId,
         text: impl AsRef<[u8]>,
     ) -> Result<()> {
-        let bytes = self
+        let content = self
             .current(path)
             .await?
             .ok_or_else(|| Error::MissingFile(path.clone()))?;
+        let bytes = &content.bytes;
         let view = self
-            .view(path, &bytes)
+            .view(path, &content)
             .await?
             .ok_or_else(|| Error::NotParsed(path.clone()))?;
         let span = view
@@ -443,12 +449,12 @@ impl Workspace {
         // ADR 0026 amendment: the lander rejects a change whose
         // `.hord-policy.toml` does not parse; say so before proposing it.
         if store
-            && let Some(Some(bytes)) = hord_policy::POLICY_PATH
+            && let Some(Some(content)) = hord_policy::POLICY_PATH
                 .parse::<RepoPath>()
                 .ok()
                 .and_then(|p| changes.get(&p))
         {
-            crate::gate::parse_policy_file(bytes.as_slice()).map_err(Error::Policy)?;
+            crate::gate::parse_policy_file(content.bytes.as_slice()).map_err(Error::Policy)?;
         }
         self.access_log
             .written_paths
@@ -480,12 +486,19 @@ impl Workspace {
                     let mut out = BTreeMap::new();
                     for (path, bytes) in overlay {
                         let before = inner.blob_id(base, &path)?;
-                        let after = match &bytes {
-                            Some(b) => Some(blob_object_id(b.as_slice())?),
+                        let content = match bytes {
+                            Some(bytes) => Some(FileContent {
+                                mode: base_mode(inner, before)?,
+                                bytes,
+                            }),
+                            None => None,
+                        };
+                        let after = match &content {
+                            Some(c) => Some(file_object_id(c.mode, c.bytes.as_slice())?),
                             None => None,
                         };
                         if before != after {
-                            out.insert(path, bytes);
+                            out.insert(path, content);
                         }
                     }
                     Ok((out, Vec::new()))
@@ -504,45 +517,77 @@ impl Workspace {
         }
     }
 
-    /// Current bytes of `path` in the workspace view.
-    async fn current(&self, path: &RepoPath) -> Result<Option<Bytes>> {
+    /// Current content of `path` in the workspace view, with its mode.
+    async fn current(&self, path: &RepoPath) -> Result<Option<FileContent>> {
+        let base = self.base;
+        let path = path.clone();
         match &self.materialization {
             Materialization::InMemory => {
-                if let Some(bytes) = self.overlay.get(path) {
-                    return Ok(bytes.clone());
-                }
-                let base = self.base;
-                let path = path.clone();
-                blocking(&self.repo.inner, move |inner| inner.file_bytes(base, &path)).await
+                let written = self.overlay.get(&path).cloned();
+                blocking(&self.repo.inner, move |inner| {
+                    let entry = inner.blob_id(base, &path)?;
+                    match written {
+                        Some(Some(bytes)) => Ok(Some(FileContent {
+                            mode: base_mode(inner, entry)?,
+                            bytes,
+                        })),
+                        Some(None) => Ok(None),
+                        None => match entry {
+                            Some(id) => {
+                                let (mode, bytes) = inner.file_content(id)?;
+                                Ok(Some(FileContent { bytes, mode }))
+                            }
+                            None => Ok(None),
+                        },
+                    }
+                })
+                .await
             }
             Materialization::Directory { path: dir } => {
-                match tokio::fs::read(fs_path(dir, path)).await {
-                    Ok(bytes) => Ok(Some(Bytes::new(bytes))),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(err) => Err(err.into()),
-                }
+                let dir = dir.clone();
+                blocking(&self.repo.inner, move |inner| {
+                    let base_mode = match inner.blob_id(base, &path)? {
+                        Some(id) => Some(inner.file_mode(id)?),
+                        None => None,
+                    };
+                    read_checkout_entry(&dir, &path, base_mode)
+                })
+                .await
             }
         }
     }
 
-    /// Parsed, identified view of `path` with content `bytes`. Unedited files
-    /// use the base snapshot's ids; edited files carry ids from the base.
-    async fn view(&mut self, path: &RepoPath, bytes: &Bytes) -> Result<Option<View>> {
-        let content = blob_object_id(bytes.as_slice())?;
+    /// Parsed, identified view of `path` with `content`. Unedited files use
+    /// the base snapshot's ids; edited files carry ids from the base. A
+    /// symlink or gitlink is never parsed (ADR 0042).
+    async fn view(&mut self, path: &RepoPath, content: &FileContent) -> Result<Option<View>> {
+        if !content.mode.holds_contents() {
+            return Ok(None);
+        }
+        let id = file_object_id(content.mode, content.bytes.as_slice())?;
         if let Some((cached, view)) = self.views.get(path)
-            && *cached == content
+            && *cached == id
         {
             return Ok(view.clone());
         }
         let base = self.base;
         let path_owned = path.clone();
-        let bytes = bytes.clone();
+        let bytes = content.bytes.clone();
         let view = blocking(&self.repo.inner, move |inner| {
-            view_of(inner, base, &path_owned, content, &bytes)
+            view_of(inner, base, &path_owned, id, &bytes)
         })
         .await?;
-        self.views.insert(path.clone(), (content, view.clone()));
+        self.views.insert(path.clone(), (id, view.clone()));
         Ok(view)
+    }
+}
+
+/// The mode a file written through the API takes: its base entry's, or
+/// regular for a new file.
+fn base_mode(inner: &Inner, entry: Option<ObjectId>) -> Result<FileMode> {
+    match entry {
+        Some(id) => inner.file_mode(id),
+        None => Ok(FileMode::Regular),
     }
 }
 
@@ -612,13 +657,28 @@ fn directory_changes(
         if unchanged {
             continue;
         }
-        let bytes = read_checkout_file(dir, &path)?;
-        if base_blob != Some(blob_object_id(&bytes)?) {
-            out.insert(path, Some(Bytes::new(bytes)));
+        // Only a platform without exec bits or symlinks needs the base's
+        // mode (see `materialize`); reading it costs an object read.
+        let base_mode = match base_blob {
+            Some(id) if cfg!(not(unix)) => Some(inner.file_mode(id)?),
+            _ => None,
+        };
+        // Gone since the walk: a deletion, found below.
+        let Some(content) = read_checkout_entry(dir, &path, base_mode)? else {
+            seen.remove(&path);
+            continue;
+        };
+        if base_blob != Some(file_object_id(content.mode, content.bytes.as_slice())?) {
+            out.insert(path, Some(content));
         }
     }
-    for path in base_files.keys() {
-        if !seen.contains(path) {
+    for (path, id) in base_files {
+        if seen.contains(path) {
+            continue;
+        }
+        // A gitlink is checked out as a directory, never walked as a file.
+        let gitlink = fs_path(dir, path).is_dir() && inner.file_mode(*id)? == FileMode::Gitlink;
+        if !gitlink {
             out.insert(path.clone(), None);
         }
     }

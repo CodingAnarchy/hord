@@ -9,11 +9,12 @@ use gix::bstr::BString;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::objs::{Kind as GitKind, WriteTo};
 use hord_core::{
-    Actor, Blob, ChangeId, ChangeRecord, NodeFile, ObjectId, Snapshot, SnapshotId, Tree, TreeEntry,
+    Actor, Blob, ChangeId, ChangeRecord, FileEntry, NodeFile, ObjectId, Snapshot, SnapshotId, Tree,
+    TreeEntry,
 };
 
 use crate::import::open_repo;
-use crate::leaf::{GitLeaf, parse_mode};
+use crate::leaf::parse_mode;
 use crate::store::Store;
 use crate::{Error, GitOid};
 
@@ -136,8 +137,8 @@ fn walk_tree<S: Store>(
     Ok(oid)
 }
 
-/// A leaf is a plain [`Blob`] (`100644`), a [`GitLeaf`] carrying another
-/// mode, or a [`NodeFile`] whose raw bytes are exported.
+/// A leaf is a plain [`Blob`] (`100644`), a [`hord_core::ModedBlob`]
+/// carrying another mode, or a [`NodeFile`] whose raw bytes are exported.
 fn walk_leaf<S: Store>(
     store: &S,
     id: ObjectId,
@@ -149,30 +150,32 @@ fn walk_leaf<S: Store>(
     }
     // Read once and try each leaf shape against the same bytes.
     let bytes = store.get(id)?;
-    let pair = if let Ok(blob) = hord_encoding::decode::<Blob>(&bytes) {
-        (EntryKind::Blob.into(), sink.blob(&blob.bytes)?)
-    } else if let Ok(leaf) = hord_encoding::decode::<GitLeaf>(&bytes) {
-        let mode = parse_mode(&leaf.mode)
-            .ok_or_else(|| Error::Git(format!("invalid stored git mode {:?}", leaf.mode)))?;
-        let blob: Blob = store.get_object(leaf.blob)?;
-        let oid = if mode.kind() == EntryKind::Commit {
-            let hex = std::str::from_utf8(&blob.bytes)
-                .map_err(|_| Error::Git("gitlink blob is not UTF-8 hex".into()))?;
-            gix::ObjectId::from_hex(hex.as_bytes())
-                .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")))?
-        } else {
-            sink.blob(&blob.bytes)?
-        };
-        (mode, oid)
-    } else {
-        let node_file: NodeFile =
-            hord_encoding::decode(&bytes).map_err(|source| Error::UnexpectedObject {
-                id,
-                kind: std::any::type_name::<NodeFile>(),
-                source,
-            })?;
-        let blob: Blob = store.get_object(node_file.raw_hash)?;
-        (EntryKind::Blob.into(), sink.blob(&blob.bytes)?)
+    let pair = match FileEntry::decode(&bytes) {
+        Ok(FileEntry::Blob(blob)) => (EntryKind::Blob.into(), sink.blob(&blob.bytes)?),
+        Ok(FileEntry::Moded(leaf)) => {
+            let mode = parse_mode(&leaf.mode)
+                .ok_or_else(|| Error::Git(format!("invalid stored git mode {:?}", leaf.mode)))?;
+            let blob: Blob = store.get_object(leaf.blob)?;
+            let oid = if mode.kind() == EntryKind::Commit {
+                let hex = std::str::from_utf8(&blob.bytes)
+                    .map_err(|_| Error::Git("gitlink blob is not UTF-8 hex".into()))?;
+                gix::ObjectId::from_hex(hex.as_bytes())
+                    .map_err(|e| Error::Git(format!("invalid gitlink oid {hex:?}: {e}")))?
+            } else {
+                sink.blob(&blob.bytes)?
+            };
+            (mode, oid)
+        }
+        Err(_) => {
+            let node_file: NodeFile =
+                hord_encoding::decode(&bytes).map_err(|source| Error::UnexpectedObject {
+                    id,
+                    kind: std::any::type_name::<NodeFile>(),
+                    source,
+                })?;
+            let blob: Blob = store.get_object(node_file.raw_hash)?;
+            (EntryKind::Blob.into(), sink.blob(&blob.bytes)?)
+        }
     };
     lock_map(&cache.leaves).insert(id, pair);
     Ok(pair)

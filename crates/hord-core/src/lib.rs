@@ -27,7 +27,7 @@ mod snapshot;
 mod tree;
 
 pub use actor::{Actor, Timestamp};
-pub use blob::Blob;
+pub use blob::{Blob, FileEntry, FileMode, ModedBlob};
 pub use bytes::Bytes;
 pub use change::{
     Acceptance, ChangeRecord, Intent, IntentRef, Op, Provenance, Signature, TreeOpKind,
