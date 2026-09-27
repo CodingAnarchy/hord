@@ -549,7 +549,7 @@ Hord is agent-native and **human-governed**. Humans sit at three structural poin
 
 **Stack (DECIDED for M5, ADR before M7):** server-rendered HTML (`askama` templates) with server-sent events for live regions and minimal vanilla JS. No frontend build pipeline. Rationale: one language, one binary, agents can modify it without a Node toolchain. A richer client (Leptos/Dioxus or TypeScript) is an ADR once the views stabilize.
 
-**Not in the UI:** issues, discussion threads, permissions administration, CI dashboards. Link out; do not build.
+**Not in the UI:** permissions administration, CI dashboards. Link out; do not build. (Issues, discussions and proposals are hord objects, ADR 0041.)
 
 ### 10.5 Hosting server and API
 
@@ -786,14 +786,14 @@ Accept:
 
 ### M6 — Self-hosting
 
-Deliver: hord's own repository is a hord repository, served by `hord serve` on a team host. The git mirror (`hord git sync`) is what GitHub sees. All contributions — human and agent — go through the lander. Web UI views 4–6 (lineage, provenance trace, repository browser). TLS for `hord serve` (in-process `rustls` or a documented terminating proxy; ADR 0032).
+Deliver: hord's own repository is a hord repository, served by `hord serve` (run locally first; a team host when needed, ADR 0040). The git mirror (`hord git sync`) is what GitHub sees. All contributions — human and agent — go through the lander. Web UI views 4–6 (lineage, provenance trace, repository browser). TLS for `hord serve` (in-process `rustls` or a documented terminating proxy; ADR 0032).
 
-Accept:
-- Thirty consecutive days of development with zero manual git operations by the core team.
-- Every change in that window has an intent, provenance, and passing evidence.
-- Every human review and arbitration in that window was performed through the UI or CLI against the server, not by editing the store.
-- Bridge sync never diverges (checked hourly).
-- **Usability (from M5, ADR 0035):** a person unfamiliar with hord can explain from the UI alone why a given change was parked, on the self-hosted server (5 participants).
+Accept (ADR 0040):
+- **Hord-first development:** hord's own repository is served by a locally run `hord serve` (TLS and auth on), and every agent change to hord is proposed, verified and landed through it; the git mirror (`hord git sync`) is what GitHub sees, and humans contribute through pull requests (ADR 0036).
+- **Feature programme:** at least one substantive feature in each of language coverage/controls, a new capability, reliability, and the forge (ADR 0041) lands end to end through that workflow.
+- **No regressions:** the M0–M5 acceptance harnesses stay green on every landing; `hord audit --require-bridge` over the programme's window passes; the M4 selection gate and the M5 conflict corpus pass when re-run at the end.
+- Every human review and arbitration in the programme is performed through the UI or CLI against the server, not by editing the store.
+- **Usability (from M5, ADR 0035):** a person unfamiliar with hord can explain from the UI alone why a given change was parked, on the hord-first server (5 participants).
 
 ### M7 — Scale and breadth (OPEN, sequenced by need)
 
