@@ -6,10 +6,10 @@ mod common;
 use std::fs;
 
 use common::*;
-use hord_core::{Blob, FileEntry, FileMode, Op, RepoPath, Snapshot, Tree, TreeEntry};
-// Only the Unix-only symlink tests rename.
+use hord_core::{Op, RepoPath};
+// Only the Unix-only symlink tests read file entries back and rename.
 #[cfg(unix)]
-use hord_core::TreeOpKind;
+use hord_core::{Blob, FileEntry, FileMode, Snapshot, Tree, TreeEntry, TreeOpKind};
 use hord_txn::{BeginOptions, Materialization, MaterializeMode, Workspace};
 
 fn checkout_of(ws: &Workspace) -> TestResult<std::path::PathBuf> {
