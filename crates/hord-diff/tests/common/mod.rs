@@ -8,7 +8,6 @@ use hord_core::{IdentityDelta, NodeId, ObjectId, Op};
 use hord_lang::{IdentifiedTree, IdentityMapping, LangAdapter, NodeTree, Site, default_identify};
 use hord_lang_rust::RustAdapter;
 use hord_lang_toml::TomlAdapter;
-use std::process::Command;
 
 /// Path the test trees are diffed as. Only the file-root id depends on it.
 pub fn file() -> hord_core::RepoPath {
@@ -300,22 +299,4 @@ fn table_name(s: &str, array: bool) -> Option<String> {
     } else {
         Some(name.to_owned())
     }
-}
-
-/// `git`, isolated from the user's and the system's configuration (a
-/// global `commit.gpgsign`, hooks, a default branch name), so tests behave
-/// the same on every machine and on CI.
-pub fn git_command() -> Command {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    command
-}
-
-/// Isolate `command`, and any `git` it runs, from the user's and the
-/// system's git configuration. Git (for Windows too) reads `/dev/null` as
-/// an empty file.
-pub fn isolate_git(command: &mut Command) -> &mut Command {
-    command
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
 }
