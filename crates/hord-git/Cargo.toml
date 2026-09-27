@@ -33,3 +33,4 @@ axum.workspace = true
 hord-remote.workspace = true
 hord-server.workspace = true
 hord-txn.workspace = true
+toml.workspace = true

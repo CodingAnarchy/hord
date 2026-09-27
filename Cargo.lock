@@ -2333,6 +2333,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "toml",
 ]
 
 [[package]]
