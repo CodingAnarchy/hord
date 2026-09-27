@@ -317,7 +317,7 @@ Rules:
 2. `Replace` on the same `NodeId` from both sides is a hard conflict, **unless** `normalized` results are equal (both made the same edit) — then it composes.
 3. `Delete` vs any other op on the same `NodeId` is a hard conflict.
 4. `Rename` composes with `Replace` (rename applied, then body replaced; references updated by re-running the adapter's resolver).
-5. Blob-tier files use git's 3-way line merge (`diffy` or similar). Binary conflicts are hard conflicts.
+5. Blob-tier files use a diff3-style 3-way line merge (`diffy` or similar; no git, ADR 0039). Binary conflicts are hard conflicts.
 
 Every merge result must re-parse cleanly under the adapter. A merge that produces an unparseable file is a hard conflict regardless of rules above.
 
