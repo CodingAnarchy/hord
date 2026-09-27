@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use hord_core::sign::{self, SigningKey};
 use hord_core::{
-    Actor, Bytes, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ObjectId, Op, Provenance,
-    RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
+    Actor, Bytes, ChangeId, ChangeRecord, IdentityTree, Intent, LangId, ModedBlob, ObjectId, Op,
+    Provenance, RepoPath, Snapshot, SnapshotId, Timestamp, Tree, TreeOpKind,
 };
 use hord_lang::{AdapterRegistry, IdentifiedTree, NodeTree};
 use hord_store::{Store, WorkspaceId};
@@ -17,7 +17,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::gate::Verifier;
 use crate::lander::QueueEntry;
-use crate::materialize::MaterializeMode;
+use crate::materialize::{MaterializeMode, write_checkout_entry};
 use crate::semantic::RustCtx;
 use crate::source::ObjectSource;
 use crate::workspace::{Materialization, Workspace};
@@ -529,6 +529,22 @@ impl Inner {
         Ok(())
     }
 
+    /// The blobs the [`ModedBlob`]s among the file entries `entries` wrap,
+    /// for a [`Self::prefetch`] after theirs. Empty without an
+    /// [`ObjectSource`]: local reads need no batching.
+    pub(crate) fn moded_blobs(&self, entries: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        if self.objects.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for id in entries {
+            if let Ok(leaf) = hord_encoding::decode::<ModedBlob>(&self.get_bytes(*id)?) {
+                out.push(leaf.blob);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read and decode `id` from the repository's [`ObjectSource`]. A
     /// decoding failure is `Error::Store(hord_store::Error::Encoding(_))`,
     /// as the store reports it.
@@ -866,8 +882,16 @@ impl Repo {
         let (meta, parent, used) = blocking(&self.inner, move |inner| {
             let (snapshot, parent) = inner.resolve_base(base)?;
             let meta = inner.store.create_workspace(snapshot)?;
-            let used = inner.materialize_dir(snapshot, &meta.path, mode)?;
-            Ok((meta, parent, used))
+            match inner.materialize_dir(snapshot, &meta.path, mode) {
+                Ok(used) => Ok((meta, parent, used)),
+                Err(err) => {
+                    // Leave no half-made workspace behind: its row, its
+                    // directory, and its stat index go. The checkout's
+                    // failure is the error that matters.
+                    let _ = inner.store.remove_workspace(meta.id);
+                    Err(err)
+                }
+            }
         })
         .await?;
         let mut ws = Workspace::new(
@@ -1032,16 +1056,21 @@ impl Inner {
     /// [`ObjectSource`], the blobs the store lacks are fetched first, in
     /// batches (a remote `Directory` workspace fetches its base's blobs when
     /// its checkout is first written, ADR 0024).
+    ///
+    /// Each file is written with its mode (ADR 0042): an executable with
+    /// its exec bits, a symlink as a symlink where the platform has them.
     pub(crate) fn checkout(&self, snapshot: SnapshotId, dir: &Path) -> Result<()> {
         let files = self.list_files(snapshot)?;
-        let blobs: Vec<ObjectId> = files.iter().map(|(_, blob)| *blob).collect();
-        self.prefetch(&blobs)?;
-        for (path, blob) in files {
+        let entries: Vec<ObjectId> = files.iter().map(|(_, entry)| *entry).collect();
+        self.prefetch(&entries)?;
+        self.prefetch(&self.moded_blobs(&entries)?)?;
+        for (path, entry) in files {
             let target = fs_path(dir, &path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&target, self.blob_bytes(blob)?.as_slice())?;
+            let (mode, bytes) = self.file_content(entry)?;
+            write_checkout_entry(&target, mode, bytes.as_slice())?;
         }
         Ok(())
     }

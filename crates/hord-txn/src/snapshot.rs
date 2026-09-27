@@ -7,13 +7,18 @@
 //! op's node objects are reproducible from the result blob without storing
 //! each CST node. The identity tree holds a [`hord_core::FileIdentity`] for
 //! each parsed file whose ids differ from the fresh assignment.
+//!
+//! A file entry names a [`Blob`] for a regular file, or a [`ModedBlob`] for
+//! an executable, a symlink, or a gitlink (ADR 0042). Its id (the "blob" of
+//! a path throughout this crate) covers the mode, so a mode change is a
+//! change of the file.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use hord_core::{
-    Blob, Bytes, IdentityEntry, IdentityTree, IdentityTrees, ObjectId, RepoPath, Snapshot,
-    SnapshotId, Tree, TreeEntry, edit_identity_tree,
+    Blob, Bytes, FileEntry, FileMode, IdentityEntry, IdentityTree, IdentityTrees, ModedBlob,
+    ObjectId, RepoPath, Snapshot, SnapshotId, Tree, TreeEntry, edit_identity_tree,
 };
 
 use crate::repo::{Inner, lock};
@@ -57,6 +62,23 @@ fn cache_insert<K: Eq + std::hash::Hash, V>(
 /// [`ObjectId`] of `bytes` stored as a [`Blob`], without storing it.
 pub(crate) fn blob_object_id(bytes: &[u8]) -> Result<ObjectId> {
     Ok(ObjectId::of(&Blob::new(bytes.to_vec()))?)
+}
+
+/// Id of the file entry for `bytes` with `mode`, without storing it: the
+/// [`Blob`] for a regular file, else the [`ModedBlob`] wrapping it.
+pub(crate) fn file_object_id(mode: FileMode, bytes: &[u8]) -> Result<ObjectId> {
+    let blob = blob_object_id(bytes)?;
+    Ok(match ModedBlob::new(mode, blob) {
+        Some(leaf) => ObjectId::of(&leaf)?,
+        None => blob,
+    })
+}
+
+/// The mode that results from merging a file whose mode was `base` and is
+/// `ours` and `theirs` on the two sides: a side's change wins, and `theirs`
+/// when both changed it.
+pub(crate) fn merged_mode(base: FileMode, ours: FileMode, theirs: FileMode) -> FileMode {
+    if theirs == base { ours } else { theirs }
 }
 
 impl Inner {
@@ -244,9 +266,42 @@ impl Inner {
         }
     }
 
+    /// The file entry `id`: its mode and the [`Blob`] with its bytes.
+    fn file_entry(&self, id: ObjectId) -> Result<(FileMode, FileEntry)> {
+        let bytes = self.get_bytes(id)?;
+        let entry = FileEntry::decode(&bytes).map_err(|err| Error::Corrupt {
+            id,
+            reason: format!("not a file: {err}"),
+        })?;
+        let mode = match &entry {
+            FileEntry::Blob(_) => FileMode::Regular,
+            FileEntry::Moded(leaf) => leaf.file_mode().ok_or_else(|| Error::Corrupt {
+                id,
+                reason: format!("unknown file mode {:?}", leaf.mode),
+            })?,
+        };
+        Ok((mode, entry))
+    }
+
+    /// The mode of the file entry `id`.
+    pub(crate) fn file_mode(&self, id: ObjectId) -> Result<FileMode> {
+        Ok(self.file_entry(id)?.0)
+    }
+
+    /// The mode and bytes of the file entry `id`.
+    pub(crate) fn file_content(&self, id: ObjectId) -> Result<(FileMode, Bytes)> {
+        match self.file_entry(id)? {
+            (mode, FileEntry::Blob(blob)) => Ok((mode, blob.bytes)),
+            (mode, FileEntry::Moded(leaf)) => {
+                let blob: Blob = self.get_object(leaf.blob)?;
+                Ok((mode, blob.bytes))
+            }
+        }
+    }
+
+    /// The bytes of the file entry `id` (a symlink's are its target).
     pub(crate) fn blob_bytes(&self, id: ObjectId) -> Result<Bytes> {
-        let blob: Blob = self.get_object(id)?;
-        Ok(blob.bytes)
+        Ok(self.file_content(id)?.1)
     }
 
     pub(crate) fn file_bytes(
@@ -262,6 +317,16 @@ impl Inner {
 
     pub(crate) fn put_blob(&self, bytes: &[u8]) -> Result<ObjectId> {
         Ok(self.store.put_object(&Blob::new(bytes.to_vec()))?)
+    }
+
+    /// Store `bytes` as a file entry with `mode`; returns the entry's id
+    /// ([`file_object_id`]).
+    pub(crate) fn put_file(&self, mode: FileMode, bytes: &[u8]) -> Result<ObjectId> {
+        let blob = self.put_blob(bytes)?;
+        match ModedBlob::new(mode, blob) {
+            Some(leaf) => Ok(self.store.put_object(&leaf)?),
+            None => Ok(blob),
+        }
     }
 
     /// Every file in `snapshot`, in path order.

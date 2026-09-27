@@ -269,6 +269,117 @@ async fn a_remote_workspace_fetches_lazily_pushes_and_lands() -> TestResult {
     Ok(())
 }
 
+/// ADR 0042: a symlink and an executable proposed in a remote directory
+/// workspace are pushed with the blobs their entries wrap, land, and check
+/// out from the server in a fresh client.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn symlinks_and_exec_bits_travel_through_a_server() -> TestResult {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let origin = temp("origin-modes")?;
+    seeded(&origin.0).await?;
+    let hosts = Hosts::open_repo(
+        &origin.0,
+        RepoOptions {
+            verifier: Some(Arc::new(hord_txn::StubVerifier)),
+            ..RepoOptions::default()
+        },
+    )
+    .await?;
+    let running = serve(hosts, ServerConfig::default()).await?;
+    let remote = RemoteRepo::connect(&running.url()).await?;
+    let head = remote.head(proto::HeadRequest {}).await?;
+    let head = wire::object_id(
+        "head",
+        head.change
+            .as_deref()
+            .ok_or("the seeded repository has a head")?,
+    )?;
+
+    let client = temp("client-modes")?;
+    let cache = open_cache(&client.0, remote.clone(), RepoOptions::default()).await?;
+    let mut ws = cache
+        .begin_directory(BeginOptions {
+            base: Base::Change(head),
+            ..BeginOptions::at_head(actor("remote-agent"))
+        })
+        .await?;
+    let hord_txn::Materialization::Directory { path: checkout } = ws.materialization().clone()
+    else {
+        return Err("expected a directory workspace".into());
+    };
+    symlink("docs", checkout.join("link-dir"))?;
+    std::fs::write(checkout.join("run.sh"), "#!/bin/sh\n")?;
+    std::fs::set_permissions(
+        checkout.join("run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    let proposal = ws.propose(intent("modes")).await?;
+    push_change(&remote, &cache, proposal.change).await?;
+
+    let mut events = remote.events(proto::EventsRequest { from: None }).await?;
+    remote
+        .submit(proto::SubmitRequest {
+            change: wire::id(proposal.change),
+        })
+        .await?;
+    let change = wire::id(proposal.change);
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .map_err(|e| format!("wait for {change} to land: {e}"))?
+            .ok_or("the event stream ended")??;
+        match event
+            .event
+            .ok_or("an event envelope")?
+            .kind
+            .ok_or("an event kind")?
+        {
+            Kind::Landed(l) if l.change == change => break,
+            Kind::Rejected(r) if r.change == change => {
+                return Err(format!("rejected: {}", r.reason).into());
+            }
+            Kind::Parked(p) if p.change == change => {
+                return Err(format!("parked: {}", p.detail).into());
+            }
+            _ => {}
+        }
+    }
+
+    // A fresh client has none of the objects: all come from the server.
+    let fresh = temp("client-modes-fresh")?;
+    let fresh_cache = open_cache(&fresh.0, remote.clone(), RepoOptions::default()).await?;
+    let fresh_ws = fresh_cache
+        .begin_directory(BeginOptions {
+            base: Base::Change(proposal.change),
+            ..BeginOptions::at_head(actor("fresh"))
+        })
+        .await?;
+    let hord_txn::Materialization::Directory { path: after } = fresh_ws.materialization().clone()
+    else {
+        return Err("expected a directory workspace".into());
+    };
+    assert_eq!(
+        std::fs::read_link(after.join("link-dir"))?,
+        Path::new("docs")
+    );
+    assert_eq!(
+        std::fs::read_to_string(after.join("link-dir/notes.txt"))?,
+        "notes\n"
+    );
+    let mode = std::fs::metadata(after.join("run.sh"))?
+        .permissions()
+        .mode();
+    assert_ne!(mode & 0o100, 0, "run.sh is executable: {mode:o}");
+    drop(fresh_ws);
+    drop(fresh_cache);
+    drop(ws);
+    drop(cache);
+    running.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_schema_is_served_by_rpc_and_at_schema_json() -> TestResult {
     let dir = temp("schema")?;

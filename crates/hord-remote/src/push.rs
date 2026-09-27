@@ -2,8 +2,8 @@
 
 use hord_api::{ApiError, ApiResult, wire};
 use hord_core::{
-    ChangeId, ChangeRecord, Evidence, FileIdentity, IdentityEntry, IdentityTree, ObjectId,
-    Snapshot, Tree, TreeEntry,
+    ChangeId, ChangeRecord, Evidence, FileIdentity, IdentityEntry, IdentityTree, ModedBlob,
+    ObjectId, Snapshot, Tree, TreeEntry,
 };
 use hord_txn::Repo;
 
@@ -18,6 +18,8 @@ enum Kind {
     IdentityTree,
     FileIdentity,
     Evidence,
+    /// A tree's file entry: a blob, or a [`ModedBlob`] naming one (ADR 0042).
+    File,
     /// Names nothing that must travel with it (a blob, a toolchain).
     Leaf,
 }
@@ -109,7 +111,7 @@ fn expand(repo: &Repo, items: &[(ObjectId, Kind)]) -> ApiResult<(Vec<Vec<u8>>, F
                     match entry {
                         TreeEntry::Tree(child) => name(*child, Kind::Tree),
                         TreeEntry::Blob(child) | TreeEntry::NodeFile(child) => {
-                            name(*child, Kind::Leaf);
+                            name(*child, Kind::File);
                         }
                     }
                 }
@@ -133,6 +135,12 @@ fn expand(repo: &Repo, items: &[(ObjectId, Kind)]) -> ApiResult<(Vec<Vec<u8>>, F
                     name(log, Kind::Leaf);
                 }
                 name(evidence.toolchain, Kind::Leaf);
+            }
+            Kind::File => {
+                // A regular file's blob does not decode as one.
+                if let Ok(leaf) = hord_encoding::decode::<ModedBlob>(&data) {
+                    name(leaf.blob, Kind::Leaf);
+                }
             }
             Kind::Leaf => {}
         }

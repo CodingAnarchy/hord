@@ -30,6 +30,15 @@
 //! `.git`): an untracked path an ignore rule matches is skipped and reported,
 //! and an ignored directory with no tracked file under it is not descended.
 //! A tracked path is never skipped, as in git.
+//!
+//! File modes (ADR 0042): an executable file is checked out with its exec
+//! bits, and a symlink as a real symlink on Unix. Elsewhere a symlink is a
+//! regular file holding its target and the exec bit is not on disk, as git
+//! does with `core.symlinks` and `core.fileMode` off: reading such a
+//! checkout back keeps each tracked file's mode from the base, so a
+//! symlink's file there edits its target, and a new file is regular. A
+//! gitlink is checked out as an empty directory, as git leaves an
+//! uninitialized submodule.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -39,11 +48,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use hord_core::{ObjectId, RepoPath, SnapshotId};
+use hord_core::{Bytes, FileMode, ObjectId, RepoPath, SnapshotId};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{WalkBuilder, WalkState};
 use serde::{Deserialize, Serialize};
 
+use crate::propose::FileContent;
 use crate::repo::{Inner, fs_path, lock};
 use crate::{Error, Result};
 
@@ -75,6 +85,11 @@ impl MaterializeMode {
 pub(crate) struct Stat {
     pub size: u64,
     pub mtime_ns: i128,
+    /// Whether the owner exec bit is set (`chmod` leaves the mtime alone).
+    /// Absent from an index written before ADR 0042: such an entry reads
+    /// as not executable, so an executable file there is re-read once.
+    #[serde(default)]
+    pub exec: bool,
 }
 
 impl Stat {
@@ -87,8 +102,80 @@ impl Stat {
         Self {
             size: meta.len(),
             mtime_ns,
+            exec: is_executable(meta),
         }
     }
+}
+
+/// Whether `meta` has the owner exec bit, git's test for `100755`. Never
+/// on a platform without one.
+#[cfg(unix)]
+fn is_executable(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.is_file() && meta.permissions().mode() & 0o100 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// Write the file entry `mode` with `bytes` at `target`, replacing a file
+/// or symlink there (never writing through a symlink).
+pub(crate) fn write_checkout_entry(target: &Path, mode: FileMode, bytes: &[u8]) -> Result<()> {
+    let existing = fs::symlink_metadata(target).ok();
+    if let Some(meta) = &existing
+        && (meta.file_type().is_symlink() || (mode == FileMode::Symlink && !meta.is_dir()))
+    {
+        fs::remove_file(target)?;
+    }
+    match mode {
+        FileMode::Symlink => write_symlink(target, bytes),
+        FileMode::Gitlink => Ok(fs::create_dir_all(target)?),
+        FileMode::Regular | FileMode::Executable => {
+            fs::write(target, bytes)?;
+            let was_exec = existing
+                .as_ref()
+                .is_some_and(|m| !m.file_type().is_symlink() && is_executable(m));
+            let exec = mode == FileMode::Executable;
+            if exec != was_exec {
+                set_executable(target, exec)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_symlink(target: &Path, link: &[u8]) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::os::unix::fs::symlink(OsStr::from_bytes(link), target)?)
+}
+
+/// Without symlinks, a regular file holding the target (git's
+/// `core.symlinks=false`).
+#[cfg(not(unix))]
+fn write_symlink(target: &Path, link: &[u8]) -> Result<()> {
+    Ok(fs::write(target, link)?)
+}
+
+/// Add (where read is allowed) or clear the exec bits of `path`.
+#[cfg(unix)]
+fn set_executable(path: &Path, exec: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)?.permissions().mode();
+    let mode = if exec {
+        mode | ((mode & 0o444) >> 2)
+    } else {
+        mode & !0o111
+    };
+    Ok(fs::set_permissions(path, fs::Permissions::from_mode(mode))?)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path, _exec: bool) -> Result<()> {
+    Ok(())
 }
 
 /// How close to the index's own write time a recorded mtime must be to count
@@ -186,10 +273,19 @@ impl Inner {
         ));
         fs::create_dir_all(&tmp)?;
         let backdate = backdate_from_now();
-        self.checkout(snapshot, &tmp)?;
+        let index = match self
+            .checkout(snapshot, &tmp)
+            .and_then(|()| index_of(&tmp, Some(MaterializeMode::Clone), backdate))
+        {
+            Ok(index) => index,
+            Err(err) => {
+                // A failed checkout leaves nothing behind.
+                let _ = remove_tree(&tmp);
+                return Err(err);
+            }
+        };
         // The index is written before the rename, so a pristine directory
         // that exists always has one.
-        let index = index_of(&tmp, Some(MaterializeMode::Clone), backdate)?;
         write_stat_index(&dir, &index)?;
         match fs::rename(&tmp, &dir) {
             Ok(()) => set_mode(&dir, true, true)?,
@@ -288,8 +384,11 @@ fn clone_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
             clone_tree(&entry.path(), &target)?;
+        } else if kind.is_symlink() {
+            copy_symlink(&entry.path(), &target)?;
         } else {
             reflink_copy::reflink(entry.path(), &target)?;
         }
@@ -297,13 +396,29 @@ fn clone_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Recreate the symlink `from` at `to` (not a copy of what it points at).
+#[cfg(unix)]
+fn copy_symlink(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(from)?, to)
+}
+
+/// A checkout holds no symlinks here ([`write_symlink`]); one made by hand
+/// is copied as what it points at.
+#[cfg(not(unix))]
+fn copy_symlink(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::copy(from, to).map(|_| ())
+}
+
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
             copy_tree(&entry.path(), &target)?;
+        } else if kind.is_symlink() {
+            copy_symlink(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), &target)?;
         }
@@ -320,9 +435,11 @@ fn set_readonly_tree(dir: &Path, readonly: bool) -> std::io::Result<()> {
     }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
             set_readonly_tree(&entry.path(), readonly)?;
-        } else {
+        } else if !kind.is_symlink() {
+            // A symlink's own mode is not used; chmod would follow it.
             set_mode(&entry.path(), false, readonly)?;
         }
     }
@@ -352,12 +469,12 @@ fn set_mode(path: &Path, _dir: bool, readonly: bool) -> std::io::Result<()> {
 }
 
 fn remove_tree(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
-    }
-    if path.is_dir() {
+    };
+    if meta.is_dir() {
         set_readonly_tree(path, false)?;
         fs::remove_dir_all(path)?;
     } else {
@@ -369,11 +486,13 @@ fn remove_tree(path: &Path) -> Result<()> {
 /// What a walk of a `Directory` checkout found.
 #[derive(Debug, Default)]
 pub(crate) struct Walked {
-    /// Regular files that are tracked or not ignored, with their stat.
+    /// Regular files and symlinks that are tracked or not ignored, with
+    /// their stat.
     pub files: Vec<(RepoPath, Stat)>,
     /// Untracked paths left out, sorted: those an ignore rule matches (an
     /// ignored directory is listed once, not its contents) and entries that
-    /// are neither regular files nor directories (a tree has no symlinks).
+    /// are neither files, symlinks, nor directories (a tree cannot hold a
+    /// fifo or a socket).
     pub skipped: Vec<RepoPath>,
 }
 
@@ -518,12 +637,13 @@ enum Visit {
     Nothing,
 }
 
-/// Walk the checkout at `dir` in parallel. With a `filter`, untracked
-/// ignored paths and untracked non-files are skipped (and reported), and a
-/// tracked path that is now a symlink or other non-file is
-/// [`Error::UnsupportedEntry`]: the tree cannot hold it, and it must not be
-/// taken for a deletion. With `backdate`, any file mtime later than it is set
-/// to it before the file is stat'ed.
+/// Walk the checkout at `dir` in parallel. Symlinks are files (ADR 0042),
+/// never followed. With a `filter`, untracked ignored paths and untracked
+/// special files are skipped (and reported), and a tracked path that is now
+/// a special file (a fifo, a socket) is [`Error::UnsupportedEntry`]: the
+/// tree cannot hold it, and it must not be taken for a deletion. With
+/// `backdate`, any regular file mtime later than it is set to it before the
+/// file is stat'ed (a symlink's cannot be set portably).
 pub(crate) fn walk_checkout(
     dir: &Path,
     filter: Option<&CheckoutFilter>,
@@ -599,6 +719,7 @@ fn visit(
     let kind = entry.file_type();
     let is_dir = kind.is_some_and(|k| k.is_dir());
     let is_file = kind.is_some_and(|k| k.is_file());
+    let is_symlink = kind.is_some_and(|k| k.is_symlink());
     let tracked = filter.is_none_or(|f| f.tracked.contains_key(&path));
     if is_dir {
         let prune = filter.is_some_and(|f| {
@@ -627,21 +748,86 @@ fn visit(
         }
         return Ok(Visit::File(path, Stat::of(&meta)));
     }
+    if is_symlink {
+        let meta = fs::symlink_metadata(entry.path())?;
+        return Ok(Visit::File(path, Stat::of(&meta)));
+    }
     let Some(f) = filter else {
         return Ok(Visit::Nothing);
     };
     if tracked || f.tracked_dirs.contains_key(&path) {
-        let kind = if kind.is_some_and(|k| k.is_symlink()) {
-            "symlink"
-        } else {
-            "special file"
-        };
-        return Err(Error::UnsupportedEntry { path, kind });
+        return Err(Error::UnsupportedEntry {
+            path,
+            kind: "special file",
+        });
     }
     Ok(Visit::Skip(path, false))
 }
 
-/// Read `path` under `dir`.
-pub(crate) fn read_checkout_file(dir: &Path, path: &RepoPath) -> Result<Vec<u8>> {
-    Ok(fs::read(fs_path(dir, path))?)
+/// Read the file `path` under `dir` with its mode: a symlink's bytes are
+/// its target. `base` is the mode the base snapshot gives the path, which a
+/// platform without symlinks or exec bits keeps (see the module docs).
+/// `None` when nothing is there.
+pub(crate) fn read_checkout_entry(
+    dir: &Path,
+    path: &RepoPath,
+    base: Option<FileMode>,
+) -> Result<Option<FileContent>> {
+    let abs = fs_path(dir, path);
+    let meta = match fs::symlink_metadata(&abs) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(Some(FileContent {
+            bytes: Bytes::new(link_bytes(&fs::read_link(&abs)?)?),
+            mode: FileMode::Symlink,
+        }));
+    }
+    let bytes = match fs::read(&abs) {
+        Ok(bytes) => Bytes::new(bytes),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(Some(FileContent {
+        bytes,
+        mode: disk_mode(&meta, base),
+    }))
+}
+
+/// A regular file's mode as the disk records it.
+#[cfg(unix)]
+fn disk_mode(meta: &fs::Metadata, _base: Option<FileMode>) -> FileMode {
+    if is_executable(meta) {
+        FileMode::Executable
+    } else {
+        FileMode::Regular
+    }
+}
+
+/// No exec bits or symlinks on disk: the base's mode stands.
+#[cfg(not(unix))]
+fn disk_mode(_meta: &fs::Metadata, base: Option<FileMode>) -> FileMode {
+    match base {
+        Some(mode @ (FileMode::Executable | FileMode::Symlink)) => mode,
+        _ => FileMode::Regular,
+    }
+}
+
+/// A symlink target's bytes, as git stores them.
+#[cfg(unix)]
+fn link_bytes(target: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(target.as_os_str().as_bytes().to_vec())
+}
+
+/// A symlink made by hand on a platform whose checkouts have none: its
+/// target as UTF-8 with `/` separators.
+#[cfg(not(unix))]
+fn link_bytes(target: &Path) -> Result<Vec<u8>> {
+    let text = target
+        .to_str()
+        .ok_or_else(|| Error::InvalidPath(target.to_string_lossy().into_owned()))?;
+    Ok(text.replace('\\', "/").into_bytes())
 }

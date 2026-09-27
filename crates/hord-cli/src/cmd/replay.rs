@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use hord_api::RepoBackend;
 use hord_api::proto::replay_result::Status;
 use hord_api::{proto, wire};
-use hord_core::{Blob, ObjectId, ReplayBudget, Snapshot, Tree, TreeEntry};
+use hord_core::{Blob, ModedBlob, ObjectId, ReplayBudget, Snapshot, Tree, TreeEntry};
 use hord_policy::POLICY_PATH;
 use hord_txn::{CommandHarness, ReplayHarness, RepoOptions};
 use serde::Deserialize;
@@ -119,7 +119,14 @@ pub fn head_budget(backend: &dyn RepoBackend) -> Result<ReplayBudget> {
     let Some(TreeEntry::Blob(blob)) = root.entries.get(POLICY_PATH) else {
         return Ok(ReplayBudget::default());
     };
-    let blob: Blob = backend_object(backend, *blob)?;
+    // An executable policy file is a `ModedBlob` naming its blob (ADR 0042).
+    let blob: Blob = match backend_object(backend, *blob) {
+        Ok(blob) => blob,
+        Err(_) => {
+            let leaf: ModedBlob = backend_object(backend, *blob)?;
+            backend_object(backend, leaf.blob)?
+        }
+    };
     let text = std::str::from_utf8(blob.bytes.as_slice())
         .with_context(|| format!("head's {} is not UTF-8", POLICY_PATH))?;
     let policy = hord_policy::parse(text)

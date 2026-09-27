@@ -27,8 +27,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use hord_core::{
-    Bytes, FileIdentity, LangId, Node, NodeId, NodeKind, ObjectId, QualifiedName, RepoPath,
-    SnapshotId,
+    Bytes, FileIdentity, FileMode, LangId, Node, NodeId, NodeKind, ObjectId, QualifiedName,
+    RepoPath, SnapshotId,
 };
 use hord_lang::{Anchor, IdentifiedTree, LangAdapter, NodeTree, ResolveCtx, Site, enclosing_site};
 use hord_lang_rust::{ManifestFile, RustAdapter};
@@ -42,6 +42,7 @@ use crate::{Error, Result};
 #[derive(Clone, Debug)]
 pub(crate) struct FileView {
     pub blob: ObjectId,
+    pub mode: FileMode,
     pub bytes: Bytes,
     /// Parsed file with definition ids; `None` for blob-tier files and files
     /// that do not parse.
@@ -115,11 +116,18 @@ impl Inner {
         let Some(blob) = self.blob_id(snapshot, path)? else {
             return Ok(None);
         };
-        let bytes = self.blob_bytes(blob)?;
-        let identity = self.file_identity(snapshot, path)?;
-        let parsed = self.identify_blob(path, blob, &bytes, identity)?;
+        let (mode, bytes) = self.file_content(blob)?;
+        // A symlink's bytes are its target, a gitlink's a commit: neither
+        // is parsed (ADR 0042).
+        let parsed = if mode.holds_contents() {
+            let identity = self.file_identity(snapshot, path)?;
+            self.identify_blob(path, blob, &bytes, identity)?
+        } else {
+            None
+        };
         Ok(Some(FileView {
             blob,
+            mode,
             bytes,
             parsed,
         }))

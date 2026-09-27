@@ -88,7 +88,7 @@ Every persistent value is an `Object` with a canonical encoding (see §3.9). Obj
 |---|---|
 | `Blob` | Raw bytes for files with no adapter (images, lockfiles, unknown languages). |
 | `Node` | One syntax-tree node, holding its exact source bytes and its children. |
-| `Tree` | A directory: ordered map of name → (`Blob` \| `Tree` \| `NodeFile`). |
+| `Tree` | A directory: ordered map of name → (`Blob` \| `Tree` \| `NodeFile`). A file whose git mode is not `100644` (an executable, a symlink, a gitlink) names a `ModedBlob` that wraps its `Blob` (ADR 0042). |
 | `NodeFile` | The root of a parsed file: adapter id, language id, root `Node`, raw-bytes hash for round-trip checking. |
 | `Snapshot` | Root `Tree` + repository-level metadata + index pointers. |
 | `ChangeRecord` | See §3.5. |

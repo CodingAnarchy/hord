@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 
 use common::*;
-use hord_core::{Op, RepoPath};
+use hord_core::{Blob, FileEntry, FileMode, Op, RepoPath, Snapshot, Tree, TreeEntry, TreeOpKind};
 use hord_txn::{BeginOptions, Materialization, MaterializeMode, Workspace};
 
 fn checkout_of(ws: &Workspace) -> TestResult<std::path::PathBuf> {
@@ -149,9 +149,40 @@ async fn ignored_files_alone_are_nothing_to_propose() -> TestResult {
     Ok(())
 }
 
+/// The mode and bytes of the file entry at `file` in the proposal's result.
+fn result_file(
+    t: &TempRepo,
+    proposal: &hord_txn::Proposal,
+    file: &str,
+) -> TestResult<(FileMode, Vec<u8>)> {
+    let store = t.repo.store();
+    let snapshot: Snapshot = store.get_object(proposal.record.result)?;
+    let mut tree: Tree = store.get_object(snapshot.tree)?;
+    let path = path(file);
+    let (last, dirs) = path.components().split_last().ok_or("a file path")?;
+    for dir in dirs {
+        match tree.entries.get(dir) {
+            Some(TreeEntry::Tree(id)) => tree = store.get_object(*id)?,
+            other => return Err(format!("{dir} is {other:?}").into()),
+        }
+    }
+    let Some(TreeEntry::Blob(id)) = tree.entries.get(last) else {
+        return Err(format!("no file at {file}").into());
+    };
+    match FileEntry::decode(&store.get(*id)?)? {
+        FileEntry::Blob(blob) => Ok((FileMode::Regular, blob.bytes.as_slice().to_vec())),
+        FileEntry::Moded(leaf) => {
+            let blob: Blob = store.get_object(leaf.blob)?;
+            let mode = leaf.file_mode().ok_or("a known mode")?;
+            Ok((mode, blob.bytes.as_slice().to_vec()))
+        }
+    }
+}
+
+/// ADR 0042: a symlink is a file whose bytes are its target.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_tracked_file_replaced_by_a_symlink_is_an_error_not_a_deletion() -> TestResult {
+async fn a_tracked_file_replaced_by_a_symlink_proposes_the_symlink() -> TestResult {
     let t = repo(&fixture()).await?;
     let mut ws = t
         .repo
@@ -160,19 +191,27 @@ async fn a_tracked_file_replaced_by_a_symlink_is_an_error_not_a_deletion() -> Te
     let dir = checkout_of(&ws)?;
     fs::rename(dir.join("README.md"), dir.join("docs-README.md"))?;
     std::os::unix::fs::symlink("docs-README.md", dir.join("README.md"))?;
-    match ws.propose(intent("symlink")).await {
-        Err(hord_txn::Error::UnsupportedEntry { path, kind }) => {
-            assert_eq!(path.to_string(), "README.md");
-            assert_eq!(kind, "symlink");
-        }
-        other => return Err(format!("expected UnsupportedEntry, got {other:?}").into()),
-    }
+    let proposal = ws.propose(intent("symlink")).await?;
+    assert_eq!(
+        blob_paths(&proposal.record.ops),
+        ["README.md", "docs-README.md"]
+    );
+    assert_eq!(
+        result_file(&t, &proposal, "README.md")?,
+        (FileMode::Symlink, b"docs-README.md".to_vec())
+    );
+    assert_eq!(
+        result_file(&t, &proposal, "docs-README.md")?,
+        (FileMode::Regular, README.as_bytes().to_vec())
+    );
+    assert!(ws.skipped().is_empty());
     Ok(())
 }
 
+/// The symlink takes the directory's name; the walk does not follow it.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_tracked_directory_replaced_by_a_symlink_is_an_error() -> TestResult {
+async fn a_tracked_directory_replaced_by_a_symlink_is_a_symlink() -> TestResult {
     let t = repo(&fixture()).await?;
     let mut ws = t
         .repo
@@ -181,19 +220,41 @@ async fn a_tracked_directory_replaced_by_a_symlink_is_an_error() -> TestResult {
     let dir = checkout_of(&ws)?;
     fs::rename(dir.join("src"), dir.join("src2"))?;
     std::os::unix::fs::symlink("src2", dir.join("src"))?;
-    match ws.preview(intent("symlink dir")).await {
-        Err(hord_txn::Error::UnsupportedEntry { path, kind }) => {
-            assert_eq!(path.to_string(), "src");
-            assert_eq!(kind, "symlink");
-        }
-        other => return Err(format!("expected UnsupportedEntry, got {other:?}").into()),
-    }
+    let proposal = ws.preview(intent("symlink dir")).await?;
+    assert_eq!(
+        result_file(&t, &proposal, "src")?,
+        (FileMode::Symlink, b"src2".to_vec())
+    );
+    assert_eq!(
+        result_file(&t, &proposal, "src2/lib.rs")?,
+        (FileMode::Regular, LIB.as_bytes().to_vec())
+    );
+    // The files moved (ADR 0020), under the symlink's target.
+    let renamed: Vec<(String, String)> = proposal
+        .record
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Tree {
+                path,
+                kind: TreeOpKind::Rename { to },
+            } => Some((path.to_string(), to.to_string())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        renamed,
+        [
+            ("src/lib.rs".to_owned(), "src2/lib.rs".to_owned()),
+            ("src/other.rs".to_owned(), "src2/other.rs".to_owned())
+        ]
+    );
     Ok(())
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn an_untracked_symlink_is_skipped_and_reported() -> TestResult {
+async fn an_untracked_symlink_is_proposed() -> TestResult {
     let t = repo(&fixture()).await?;
     let mut ws = t
         .repo
@@ -203,8 +264,38 @@ async fn an_untracked_symlink_is_skipped_and_reported() -> TestResult {
     std::os::unix::fs::symlink("README.md", dir.join("link.md"))?;
     fs::write(dir.join("README.md"), README.replace("two", "2"))?;
     let proposal = ws.propose(intent("edit")).await?;
-    assert_eq!(blob_paths(&proposal.record.ops), ["README.md"]);
-    assert_eq!(strings(ws.skipped()), ["link.md"]);
+    assert_eq!(blob_paths(&proposal.record.ops), ["README.md", "link.md"]);
+    assert_eq!(
+        result_file(&t, &proposal, "link.md")?,
+        (FileMode::Symlink, b"README.md".to_vec())
+    );
+    assert!(ws.skipped().is_empty());
+    Ok(())
+}
+
+/// A fifo is neither a file nor a symlink: a tree cannot hold it, and a
+/// tracked path that became one is not taken for a deletion.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tracked_file_replaced_by_a_fifo_is_an_error_not_a_deletion() -> TestResult {
+    let t = repo(&fixture()).await?;
+    let mut ws = t
+        .repo
+        .begin_directory(BeginOptions::at_head(actor("a")))
+        .await?;
+    let dir = checkout_of(&ws)?;
+    fs::remove_file(dir.join("README.md"))?;
+    let made = std::process::Command::new("mkfifo")
+        .arg(dir.join("README.md"))
+        .status()?;
+    assert!(made.success(), "mkfifo failed");
+    match ws.propose(intent("fifo")).await {
+        Err(hord_txn::Error::UnsupportedEntry { path, kind }) => {
+            assert_eq!(path.to_string(), "README.md");
+            assert_eq!(kind, "special file");
+        }
+        other => return Err(format!("expected UnsupportedEntry, got {other:?}").into()),
+    }
     Ok(())
 }
 
